@@ -1,19 +1,19 @@
-name: Daily report
+name: Daily report PDF only
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "smoke = быстрый тест без S3; full = полный отчет; s3_only = полный отчет без Telegram"
+        description: "pdf_only = пересобрать только PDF; smoke = быстрый тест; s3_only = полный пересчет без Telegram"
         required: true
-        default: "smoke"
+        default: "pdf_only"
         type: choice
         options:
+          - pdf_only
           - smoke
-          - full
           - s3_only
   schedule:
-    # 06:17 Moscow time = 03:17 UTC
+    # 06:17 Moscow time = 03:17 UTC. By default schedule runs pdf_only.
     - cron: "17 3 * * *"
 
 permissions:
@@ -22,20 +22,18 @@ permissions:
 jobs:
   build-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
 
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
 
-      # Fast defaults for GitHub runner. For deep/full audit increase these in REPORT_ENV or here.
+      # Fast defaults for full rebuild mode. PDF-only does not read raw weekly search/stock files.
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
       WB_MAX_STOCK_FILES: "5"
 
-      # Demand policy:
-      # 0 = do not use duplicated fallback, but do not crash late; missing demand becomes blank + warning.
-      # 1 = crash if unique demand is missing for a PDF contour.
+      # PDF demand policy: do not use duplicated demand fallback and do not crash late.
       PDF_FAIL_ON_MISSING_DEMAND: "0"
       PDF_ALLOW_DEMAND_FALLBACK: "0"
 
@@ -91,8 +89,8 @@ jobs:
           INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
           set -euo pipefail
-          MODE="${INPUT_MODE:-full}"
-          if [ "$MODE" = "" ]; then MODE="full"; fi
+          MODE="${INPUT_MODE:-pdf_only}"
+          if [ "$MODE" = "" ]; then MODE="pdf_only"; fi
           echo "Run mode: $MODE"
 
           if [ "$MODE" = "smoke" ]; then
@@ -110,8 +108,8 @@ jobs:
           test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
-          if [ "$MODE" = "full" ]; then
-            python report_runner.py --root . --send-telegram
+          if [ "$MODE" = "pdf_only" ]; then
+            python report_runner.py --root . --pdf-only
           elif [ "$MODE" = "s3_only" ]; then
             python report_runner.py --root .
           else
@@ -131,7 +129,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: daily-report-output
+          name: pdf-only-report-output
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
