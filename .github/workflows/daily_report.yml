@@ -22,15 +22,6 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
 
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
-
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-
       WB_MAX_SEARCH_QUERY_FILES: "8"
       WB_MAX_ENTRY_POINT_FILES: "8"
       WB_MAX_STOCK_FILES: "10"
@@ -83,9 +74,20 @@ jobs:
 
       - name: Run report
         shell: bash
+        env:
+          REPORT_ENV: ${{ secrets.REPORT_ENV }}
         run: |
           set -euo pipefail
-          python report_runner.py --root . --send-telegram
+          test -n "${REPORT_ENV:-}" || { echo "ERROR: secret REPORT_ENV is empty or missing"; exit 1; }
+          umask 077
+          printf '%s\n' "$REPORT_ENV" > .env
+          set -a
+          source ./.env
+          set +a
+          test -n "${YC_ACCESS_KEY_ID:-}" || { echo "ERROR: YC_ACCESS_KEY_ID is missing in REPORT_ENV"; exit 1; }
+          test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
+          test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
+          python report_runner.py --root .
 
       - name: Show generated files
         if: always()
