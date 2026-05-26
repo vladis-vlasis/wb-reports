@@ -1,0 +1,108 @@
+name: Daily report
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    # 06:17 Moscow time = 03:17 UTC. Shifted from 03:00 UTC to avoid top-of-hour Actions load.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+      WB_MAX_SEARCH_QUERY_FILES: "8"
+      WB_MAX_ENTRY_POINT_FILES: "8"
+      WB_MAX_STOCK_FILES: "10"
+
+      PDF_ALLOW_DEMAND_FALLBACK: "0"
+      PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
+      PDF_TRACE_SAMPLE_PRODUCT: "901"
+      PDF_TRACE_SAMPLE_ARTICLE: ""
+      PDF_DETAIL_MIN_ORDER_SUM: "5000"
+      PDF_DETAIL_MIN_GP: "1000"
+      PDF_MIN_PRODUCT_GP_SHARE_PCT: "1.0"
+      PDF_MIN_PRODUCT_CURRENT_WEEK_GP: "1000"
+      PDF_MIN_PRODUCT_CURRENT_WEEK_ORDER_SUM: "10000"
+      PDF_FORCE_INCLUDE_PRODUCTS: "901,605,611,613,614,617,618,154,155,156,157"
+      PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install system packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fonts-dejavu-core
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check repository files
+        shell: bash
+        run: |
+          set -euo pipefail
+          pwd
+          ls -la
+          test -f report_runner.py || { echo "ERROR: report_runner.py is missing in repository root"; exit 1; }
+          python -m py_compile report_runner.py
+          echo "Compile OK"
+
+      - name: Run report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python report_runner.py --root . --send-telegram
+
+      - name: Show generated files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Generated report files:"
+          find "Отчёты" -maxdepth 5 -type f -print 2>/dev/null || true
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report-output
+          path: |
+            Отчёты/**/*.xlsx
+            Отчёты/**/*.pdf
+            Отчёты/**/*.json
+          if-no-files-found: warn
+          retention-days: 30
