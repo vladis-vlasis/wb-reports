@@ -740,6 +740,36 @@ class Loader:
         self.reports_root = reports_root.strip("/")
         self.store = store
         self.diag = diagnostics
+        self.current_week_only = os.getenv("WB_CURRENT_WEEK_ONLY", "0").strip().lower() in {"1", "true", "yes", "y"}
+        target_raw = os.getenv("WB_DAILY_TARGET_DATE", "").strip()
+        if target_raw:
+            self.daily_target_day = pd.Timestamp(target_raw).normalize()
+        else:
+            # GitHub run at 12:00 MSK should take yesterday as the latest completed day.
+            self.daily_target_day = pd.Timestamp(datetime.utcnow().date()).normalize() - pd.Timedelta(days=1)
+
+    def _filter_current_week_files(self, files: List[str], keep_unparsed: bool = False, fallback_tail: int = 1) -> List[str]:
+        if not self.current_week_only:
+            return files
+        target = self.daily_target_day
+        week_start = target - pd.Timedelta(days=int(target.weekday()))
+        week_end = week_start + pd.Timedelta(days=6)
+        selected, unparsed = [], []
+        for key in files:
+            start, end = parse_period_from_name(Path(key).name)
+            if start is None or end is None:
+                unparsed.append(key)
+                continue
+            start = pd.Timestamp(start).normalize(); end = pd.Timestamp(end).normalize()
+            if start <= week_end and end >= week_start:
+                selected.append(key)
+        if selected:
+            log(f"current_week_only: selected {len(selected)}/{len(files)} files for week {week_start.date()}..{week_end.date()}")
+            return sorted(set(selected))
+        if keep_unparsed and unparsed:
+            log(f"current_week_only: no dated files found, using {min(fallback_tail, len(unparsed))} unparsed/latest files")
+            return sorted(set(unparsed))[-fallback_tail:]
+        return sorted(set(files))[-fallback_tail:]
 
     def path(self, *parts: str) -> str:
         return "/".join([self.reports_root, *parts]).replace("//", "/")
@@ -765,6 +795,7 @@ class Loader:
 
     def load_orders(self) -> pd.DataFrame:
         files = self.list_reports("Заказы", self.store, "Недельные")
+        files = self._filter_current_week_files(files, keep_unparsed=False, fallback_tail=1)
         frames = []
         for key, data in self._read_candidates(files):
             try:
@@ -800,6 +831,7 @@ class Loader:
             files.append(direct)
         files += self.list_reports("Воронка продаж", self.store)
         files += self.list_reports("Воронка продаж")
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=1)
         frames = []
         for key, data in self._read_candidates(files):
             try:
@@ -843,6 +875,7 @@ class Loader:
         consolidated = self.path("Реклама", self.store, "Анализ рекламы.xlsx")
         if self.storage.exists(consolidated):
             files.append(consolidated)
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=1)
         raw_frames, campaign_frames = [], []
         for key, data in self._read_candidates(files):
             try:
@@ -1150,9 +1183,15 @@ class Loader:
         log(f"preliminary_latest_day: {preliminary_latest_day.date()}")
 
         search_queries = self.load_search_queries(preliminary_latest_day)
-        entry_points = self.load_entry_points(preliminary_latest_day)
-        stock = self.load_stock(preliminary_latest_day)
-        economics = self.load_economics()
+        if self.current_week_only:
+            entry_points = pd.DataFrame()
+            stock = pd.DataFrame()
+            economics = pd.DataFrame()
+            log("current_week_only: skip entry_points/stock/economics/ABC; daily mode updates only current-week operational block")
+        else:
+            entry_points = self.load_entry_points(preliminary_latest_day)
+            stock = self.load_stock(preliminary_latest_day)
+            economics = self.load_economics()
         candidates = []
         for df, col in [(orders, "day"), (funnel, "day"), (ads_daily, "day"), (search_queries, "day"), (stock, "day")]:
             if not df.empty and col in df.columns:
@@ -1160,9 +1199,12 @@ class Loader:
                 if pd.notna(mx):
                     candidates.append(pd.Timestamp(mx).normalize())
         latest_day = max(candidates) if candidates else preliminary_latest_day
-        abc_weekly, abc_monthly = self.load_abc(latest_day.year)
-        if not abc_weekly.empty:
-            latest_day = max(latest_day, pd.to_datetime(abc_weekly["period_end"], errors="coerce").max())
+        if self.current_week_only:
+            abc_weekly, abc_monthly = pd.DataFrame(), pd.DataFrame()
+        else:
+            abc_weekly, abc_monthly = self.load_abc(latest_day.year)
+            if not abc_weekly.empty:
+                latest_day = max(latest_day, pd.to_datetime(abc_weekly["period_end"], errors="coerce").max())
         return DataPack(
             orders=orders, funnel=funnel, ads_daily=ads_daily, ads_raw=ads_raw, campaigns=campaigns,
             search_queries=search_queries, entry_points=entry_points, stock=stock, abc_weekly=abc_weekly,
@@ -2394,7 +2436,7 @@ def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Time
         "commission_model", "acquiring_model", "logistics_direct_model", "logistics_return_model",
         "storage_model", "other_costs_model", "cost_model"
     ]
-    base_mean_cols = ["finished_price", "price_with_disc", "spp", "finished_price_funnel", "spp_funnel", "rating_reviews", "localization_with_replacements_pct"]
+    base_mean_cols = ["finished_price", "price_with_disc", "spp", "finished_price_funnel", "spp_funnel", "rating_reviews", "direct_localization_pct", "localization_with_replacements_pct"]
     derived_cols = ["ad_spend_total", "ad_clicks_total", "ad_impressions_total", "drr_pct", "cpc", "ctr_pct", "cart_conv_pct", "order_conv_pct", "card_to_order_pct", "search_traffic_capture_pct", "avg_order_price"]
 
     if daily is None or daily.empty:
@@ -4887,6 +4929,31 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             return "—"
         return f"{_num(x):.1f} ₽".replace(".", ",")
 
+    def _fmt_loc_pair(direct, repl):
+        # Compact localization display requested by user: direct coverage -> coverage with replacements.
+        # Header stays simply "Локализация"; no explanatory text in PDF.
+        d = _num(direct, np.nan)
+        r = _num(repl, np.nan)
+        if pd.isna(d) and pd.isna(r):
+            return "—"
+        if pd.isna(d):
+            return f"— → {int(round(r))}%"
+        if pd.isna(r):
+            return f"{int(round(d))}% → —"
+        return f"{int(round(d))}% → {int(round(r))}%"
+
+    def _delta_abs(cur, prev):
+        cur, prev = _num(cur), _num(prev)
+        if abs(prev) < 1e-9 and abs(cur) < 1e-9:
+            return 0.0
+        return cur - prev
+
+    def _arrow_money(delta, lower_bad=False):
+        if delta is None or abs(_num(delta)) < 0.5:
+            return "→ 0 ₽"
+        d = _num(delta)
+        return ("↑ +" if d > 0 else "↓ -") + f"{int(round(abs(d))):,} ₽".replace(",", " ")
+
     def _delta(cur, prev):
         cur, prev = _num(cur), _num(prev)
         # Управленческий отчет: не показываем мусорные +10000% / -3000%
@@ -4975,7 +5042,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             "Запусти полный пересчет источников или временно поставь PDF_ALLOW_DEMAND_FALLBACK=1 только для диагностики."
         )
 
-    for col in ["order_sum", "orders", "gross_profit_model", "open_cards", "add_to_cart", "search_frequency", "search_traffic_capture_pct", "localization_with_replacements_pct", "rating_reviews", "finished_price", "price_with_disc", "spp", "commission_%", "acquiring_%", "logistics_direct", "storage", "other_costs", "cost", "cart_conv_pct", "order_conv_pct"]:
+    for col in ["order_sum", "orders", "gross_profit_model", "open_cards", "add_to_cart", "search_frequency", "search_traffic_capture_pct", "direct_localization_pct", "localization_with_replacements_pct", "rating_reviews", "finished_price", "price_with_disc", "spp", "commission_%", "acquiring_%", "logistics_direct", "storage", "other_costs", "cost", "cart_conv_pct", "order_conv_pct"]:
         if col not in daily.columns:
             daily[col] = 0.0
         daily[col] = pd.to_numeric(daily[col], errors="coerce").fillna(0)
@@ -5183,10 +5250,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             carts=("add_to_cart", "sum"),
             demand=("search_frequency", "sum"),
             search_share=("search_traffic_capture_pct", _safe_mean),
+            localization_direct=("direct_localization_pct", _safe_mean),
             localization=("localization_with_replacements_pct", _safe_mean),
             rating=("rating_reviews", _safe_mean),
-            price_sale=("finished_price", _safe_mean),
-            buyer_price=("price_with_disc", _safe_mean),
+            # buyer_price is average finishedPrice from Orders; sale price is later overwritten by ABC revenue / ABC qty where available.
+            buyer_price=("finished_price", _safe_mean),
+            price_with_disc_avg=("price_with_disc", _safe_mean),
             spp=("spp", _safe_mean),
             commission_pct_model=("commission_%", _safe_mean),
             acquiring_pct_model=("acquiring_%", _safe_mean),
@@ -5252,7 +5321,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
         out = out.merge(abc_prev, on=keys, how="left")
         # fill numeric values
-        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
+        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
             if col not in out.columns: out[col] = 0.0
             if col + "_prev" not in out.columns: out[col + "_prev"] = 0.0
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
@@ -5295,6 +5364,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         out["gp_prev_use"] = np.where(out["has_abc_prev"], abc_gp_prev, out["gp_model_prev"])
         out["orders"] = np.where(out["has_abc"] & (abc_orders.abs() > 1e-9), abc_orders, out["orders"])
         out["orders_prev"] = np.where(out["has_abc_prev"] & (abc_orders_prev.abs() > 1e-9), abc_orders_prev, out["orders_prev"])
+        out["price_sale"] = np.where(out["orders"].astype(float).abs() > 1e-9, out["sum_use"] / out["orders"].replace(0, np.nan), out.get("buyer_price", np.nan))
+        out["price_sale_prev"] = np.where(out["orders_prev"].astype(float).abs() > 1e-9, out["sum_prev_use"] / out["orders_prev"].replace(0, np.nan), out.get("buyer_price_prev", np.nan))
 
         # Расход РК для ABC-периода считаем только из ABC: Валовая выручка × ДРР ABC.
         out["ad_spend"] = np.where(out["has_abc"], abc_ad, out["ad_spend"])
@@ -5337,8 +5408,18 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         x = df.copy()
         x["product_code"] = x["product_code"].astype(str)
         x = x[x["product_code"].ne("") & ~x["product_code"].isin(DETAIL_EXCLUDE)].copy()
-        x = x[(pd.to_numeric(x["sum_use"], errors="coerce").fillna(0) > 0) | (pd.to_numeric(x["gp_use"], errors="coerce").fillna(0) > 0)].copy()
-        # Sort strictly by gross profit inside category, as requested. Product reference only controls inclusion.
+        x = x[(pd.to_numeric(x["sum_use"], errors="coerce").fillna(0).abs() > 0) | (pd.to_numeric(x["gp_use"], errors="coerce").fillna(0).abs() > 0) | (pd.to_numeric(x.get("sum_prev_use",0), errors="coerce").fillna(0).abs() > 0)].copy()
+        # Detailed product pages are created only for products with >=10% of category GP.
+        # Rows below threshold remain in the category table, but do not explode into dozens of article pages.
+        gp_abs = pd.to_numeric(x["gp_use"], errors="coerce").fillna(0).clip(lower=0)
+        x["_cat_gp_total"] = gp_abs.groupby(x["subject_disp"]).transform("sum").replace(0, np.nan)
+        x["_gp_share_cat"] = gp_abs / x["_cat_gp_total"] * 100
+        keep_detail = x["_gp_share_cat"].fillna(0) >= float(os.getenv("PDF_PRODUCT_DETAIL_MIN_GP_SHARE", "10"))
+        # Mandatory important products can still be forced into detail pages by config.
+        forced = set((os.getenv("PDF_FORCE_DETAIL_PRODUCTS", "901,614,617,618,154,155,156,157,158") or "").replace(";", ",").split(","))
+        forced = {v.strip() for v in forced if v.strip()}
+        keep_detail = keep_detail | x["product_code"].isin(forced)
+        x = x[keep_detail].copy()
         x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
         return x.sort_values(["_cat_order", "gp_use", "sum_use"], ascending=[True, False, False])
 
@@ -5515,10 +5596,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         dtext = _arrow(delta, _lower_bad(metric)) if delta is not None else ""
         # Значение крупно по центру, подпись внизу, динамика маленькая справа от подписи.
         _draw_text(str(value), x+10, y+h-50, w-20, F_BLACK, 30, BLACK, align="center")
-        label_w = w*0.68 if dtext else w-20
-        _draw_text(label, x+12, y+18, label_w, F_BOLD, 12, GRAY, align="center")
+        label_text = str(label)
+        label_size = 12
+        label_w_real = min(stringWidth(label_text, F_BOLD, label_size) + 8, w*0.68)
+        lx = x + max(10, (w - (label_w_real + (stringWidth(dtext, F_BOLD, 9) + 8 if dtext else 0))) / 2)
+        _draw_text(label_text, lx, y+18, label_w_real, F_BOLD, label_size, GRAY, align="left")
         if dtext:
-            _draw_text(dtext, x+w*0.66, y+18, w*0.30, F_BOLD, 9, _tone(delta, _lower_bad(metric)), align="right")
+            _draw_text(dtext, lx + label_w_real + 4, y+18, w - (lx-x) - label_w_real - 10, F_BOLD, 9, _tone(delta, _lower_bad(metric)), align="left")
         if sub:
             _draw_text(sub, x+10, y+6, w-20, F_REG, 9, GRAY, align="center")
 
@@ -5529,14 +5613,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def _draw_cell_value(x, y, w, value, delta=None, metric="", size=12, align="left"):
         txt = str(value)
         val_size = size + 1
+        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК"])
+        # Keep dynamic arrow next to the value, not at the far edge of the cell.
         if align == "center":
-            _draw_text(txt, x, y, w*0.74 if delta is not None else w, F_BOLD, val_size, BLACK, align="center")
-            vx = x + w*0.64
+            _draw_text(txt, x, y, w*0.62 if delta is not None else w, F_BOLD, val_size, BLACK, align="center")
+            vx = x + w*0.60
         else:
-            _draw_text(txt, x+5, y, w*0.70 if delta is not None else w-10, F_BOLD, val_size, BLACK)
-            vx = x + w*0.66
+            _draw_text(txt, x+5, y, w*0.62 if delta is not None else w-10, F_BOLD, val_size, BLACK)
+            vx = x + w*0.61
         if delta is not None:
-            _draw_text(_arrow(delta, _lower_bad(metric)), vx, y, w*0.30-4, F_BOLD, max(7, size-4), _tone(delta, _lower_bad(metric)), align="right")
+            dtext = _arrow_money(delta, _lower_bad(metric)) if money_metric else _arrow(delta, _lower_bad(metric))
+            _draw_text(dtext, vx, y, w*0.38-4, F_BOLD, max(7, size-4), _tone(delta, _lower_bad(metric)), align="left")
 
     def _draw_table(x, y, w, headers, widths, rows, row_h=36, font_size=11, link_col=None, max_rows=None):
         rows = rows[:max_rows] if max_rows else rows
@@ -5545,6 +5632,19 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if total_width > 0 and abs(total_width - w) > 1:
             widths = [ww * w / total_width for ww in widths]
         h = 42 + row_h*len(rows)
+        # Basic PDFQualityGuard: never let a table overlap the header/navigation zone.
+        safe_top = 705
+        safe_bottom = 62
+        if y + h > safe_top:
+            y = max(safe_bottom, safe_top - h)
+        if y < safe_bottom:
+            # If still too tall, reduce row height and font before drawing.
+            available = max(120, safe_top - safe_bottom)
+            if len(rows) > 0:
+                row_h = max(24, int((available - 42) / max(1, len(rows))))
+                font_size = max(8, min(font_size, row_h - 18))
+                h = 42 + row_h*len(rows)
+                y = max(safe_bottom, safe_top - h)
         c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
         c.setFillColor(RED_DARK); c.roundRect(x, y+h-42, w, 42, 11, fill=1, stroke=0)
         # column separators
@@ -5611,15 +5711,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             for _, r in x.iterrows():
                 rows.append({"cells": [
                     str(r["subject_disp"]),
-                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
-                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                     (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
                     (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
                     (_fmt_num(r.get("demand")), _delta(r.get("demand"), r.get("demand_prev")), "Спрос"),
                     (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
                 ]})
             t = _summary_total_row(x, current_only=True)
-            rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["ad_spend"]), _delta(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), "—", "—", "—"]})
+            rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), "—", "—", "—"]})
             _draw_table(75, 330, W-150, ["Категория", "Сумма", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [250,220,220,170,160,240,200], rows, row_h=72, font_size=15)
             return
 
@@ -5629,17 +5729,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             tgt = _cat_key(target_contour, cat) if target_contour and _has_category_detail(target_contour, cat) else None
             rows.append({"_target": tgt, "cells": [
                 cat,
-                (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
-                (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
                 (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
-                (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                 (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
                 (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
                 (_fmt_num(r.get("demand")), _delta(r.get("demand"), r.get("demand_prev")), "Спрос"),
                 (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
             ]})
         t = _summary_total_row(x)
-        rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["gp_use"]), _delta(t["gp_use"], t["gp_prev_use"]), "ВП"), (_fmt_pct(t["margin"]), _delta(t["margin"], t["margin_prev"]), "Рент."), (_fmt_money(t["ad_spend"]), _delta(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), (_fmt_rub1(t["cpc"]), _delta(t["cpc"], t["cpc_prev"]), "CPC"), (_fmt_num(t["demand"]), _delta(t["demand"], t["demand_prev"]), "Спрос"), (_fmt_pct(t["search_share"]), _delta(t["search_share"], t["search_share_prev"]), "% поиска")]})
+        rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["gp_use"]), _delta_abs(t["gp_use"], t["gp_prev_use"]), "ВП"), (_fmt_pct(t["margin"]), _delta(t["margin"], t["margin_prev"]), "Рент."), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), (_fmt_rub1(t["cpc"]), _delta(t["cpc"], t["cpc_prev"]), "CPC"), (_fmt_num(t["demand"]), _delta(t["demand"], t["demand_prev"]), "Спрос"), (_fmt_pct(t["search_share"]), _delta(t["search_share"], t["search_share_prev"]), "% поиска")]})
         _draw_table(75, 315, W-150, ["Категория", "Сумма", "ВП", "Рент.", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [190,170,160,125,170,115,100,170,140], rows, row_h=68, font_size=14)
     def _current_week_overview():
         _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / оперативный обзор без детализации", "Текущая неделя", key="cur_overview", top_menu=True)
@@ -5653,8 +5753,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         search_share = opens_total / demand * 100 if demand else np.nan
         search_prev = opens_prev_total / demand_prev * 100 if demand_prev else np.nan
         cards = [
-            (_fmt_money(total_sum), "Сумма заказов", _delta(total_sum,total_prev), "Сумма", ""),
-            (_fmt_money(total_ad), "Расход РК", _delta(total_ad,total_ad_prev), "Расход РК", ""),
+            (_fmt_money(total_sum), "Сумма заказов", _delta_abs(total_sum,total_prev), "Сумма", ""),
+            (_fmt_money(total_ad), "Расход РК", _delta_abs(total_ad,total_ad_prev), "Расход РК", ""),
             (_fmt_pct(drr), "ДРР", _delta(drr,drr_prev), "ДРР", ""),
             (_fmt_num(demand), "Спрос WB", _delta(demand,demand_prev), "Спрос", ""),
             (_fmt_pct(search_share), "% поискового трафика", _delta(search_share,search_prev), "% поиска", ""),
@@ -5680,8 +5780,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             else:
                 rows.append({"cells": [
                     dt.strftime("%a %d.%m"),
-                    (_fmt_money(osum), _delta(osum, psum), "Сумма"),
-                    (_fmt_money(ad), _delta(ad, pad), "Расход РК"),
+                    (_fmt_money(osum), _delta_abs(osum, psum), "Сумма"),
+                    (_fmt_money(ad), _delta_abs(ad, pad), "Расход РК"),
                     (_fmt_pct(d), _delta(d, pdrr), "ДРР"),
                     (_fmt_num(ddemand), _delta(ddemand, pdemand), "Спрос"),
                     (_fmt_pct(ss), _delta(ss, pss), "% поиска"),
@@ -5728,7 +5828,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             mtd_to_week = _metrics_period(month_start, we, closed_start, closed_start + (we-month_start), ["subject_disp"])
             gp_to_week = _num(mtd_to_week["gp_use"].sum()) if mtd_to_week is not None and not mtd_to_week.empty else 0.0
             pct_to_week = gp_to_week / week_plan_to_date * 100 if week_plan_to_date else np.nan
-            rows.append({"cells":[f"{ws:%d.%m}-{we:%d.%m}", (_fmt_money(wk_gp), _delta(wk_gp, prev_week_gp), "ВП"), _fmt_pct(pct_to_week), _fmt_money(wk_sum), _fmt_money(wk_ad)]})
+            rows.append({"cells":[f"{ws:%d.%m}-{we:%d.%m}", (_fmt_money(wk_gp), _delta_abs(wk_gp, prev_week_gp), "ВП"), _fmt_pct(pct_to_week), _fmt_money(wk_sum), _fmt_money(wk_ad)]})
             prev_week_gp = wk_gp
             ws = we + pd.Timedelta(days=1)
         _draw_table(120, 230, W-240, ["Неделя", "ВП", "% выполнения плана", "Сумма заказов", "Расход РК"], [240,300,300,300,260], rows, row_h=58, font_size=17, max_rows=8)
@@ -5759,9 +5859,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 rows.append({"cells":[
                     month_name,
                     str(r.get("subject_disp")),
-                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev")), "Сумма"),
-                    (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev")), "ВП"),
-                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_prev")), "Расход РК"),
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_prev")), "Расход РК"),
                 ]})
         if not rows:
             rows=[{"cells":["—","—","—","—","—"]}]
@@ -5833,20 +5933,22 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             (_fmt_num(row.get("opens")), "Открытия", _delta(row.get("opens"), row.get("opens_prev")), "Открытия", ""),
             (_fmt_num(row.get("orders")), "Заказы", _delta(row.get("orders"), row.get("orders_prev")), "Заказы", ""),
             (_fmt_pct(row.get("order_from_open_conv")), "Конв. в заказ", _delta(row.get("order_from_open_conv"), row.get("order_from_open_conv_prev")), "Конверсия", ""),
+            (_fmt_pct(row.get("order_conv")), "Корзина→заказ", _delta(row.get("order_conv"), row.get("order_conv_prev")), "Конверсия", ""),
         ]
         for i, card in enumerate(cards2):
-            _metric_card(105+i*285, 330, 260, 95, *card)
+            _metric_card(75+i*245, 330, 225, 95, *card)
         _section_bar(260, "Блок 3. Расходы на единицу / доля расходов")
         cards3 = [
             (_fmt_pct(row.get("commission_pct")), "Комиссия, %", _delta(row.get("commission_pct"), row.get("commission_pct_prev")), "Комиссия", ""),
             (_fmt_pct(row.get("acquiring_pct")), "Эквайринг, %", _delta(row.get("acquiring_pct"), row.get("acquiring_pct_prev")), "Эквайринг", ""),
             (_fmt_rub1(row.get("logistics_per_unit")), "Логистика/шт", _delta(row.get("logistics_per_unit"), row.get("logistics_per_unit_prev")), "Логистика", ""),
-            (_fmt_rub1(row.get("storage_per_unit")), "Хранение/шт", _delta(row.get("storage_per_unit"), row.get("storage_per_unit_prev")), "Хранение", ""),
             (_fmt_rub1(row.get("cost_per_unit")), "Себест./шт", _delta(row.get("cost_per_unit"), row.get("cost_per_unit_prev")), "Себест", ""),
-            (_fmt_rub1(row.get("other_per_unit")), "Прочие/шт", _delta(row.get("other_per_unit"), row.get("other_per_unit_prev")), "Прочие", ""),
+            (_fmt_rub1(row.get("price_sale")), "Цена продажи", _delta(row.get("price_sale"), row.get("price_sale_prev")), "Цена", ""),
+            (_fmt_rub1(row.get("buyer_price")), "Цена покупателя", _delta(row.get("buyer_price"), row.get("buyer_price_prev")), "Цена", ""),
+            (_fmt_loc_pair(row.get("localization_direct"), row.get("localization")), "Локализация", _delta(row.get("localization"), row.get("localization_prev")), "Локализация", ""),
         ]
         for i, card in enumerate(cards3):
-            _metric_card(85+i*245, 140, 225, 95, *card)
+            _metric_card(65+i*215, 140, 200, 95, *card)
 
     def _draw_listing_pages(title, subtitle, section, base_key, back_buttons, headers, widths, rows, row_h=50, font_size=14, rows_per_page=12):
         chunks = [rows[i:i+rows_per_page] for i in range(0, len(rows), rows_per_page)] or [[]]
@@ -5877,9 +5979,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 art = _clean_article_local(r.get("supplier_article"))
                 rows.append({"_target": _art_key(contour, cat, "901", art, 1), "cells": [
                     art,
-                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
-                    (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
-                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                     (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
                     (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
                 ]})
@@ -5891,9 +5993,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 prod = str(r.get("product_code"))
                 rows.append({"_target": _prod_key(contour, cat, prod), "cells": [
                     prod,
-                    (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
-                    (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
-                    (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                     (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
                     (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
                 ]})
@@ -5917,9 +6019,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             art = _clean_article_local(r.get("supplier_article"))
             rows.append({"_target": _art_key(contour, cat, prod, art, 1), "cells": [
                 art,
-                (_fmt_money(r.get("sum_use")), _delta(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
-                (_fmt_money(r.get("gp_use")), _delta(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
-                (_fmt_money(r.get("ad_spend")), _delta(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                 (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
                 (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
             ]})
@@ -6011,18 +6113,19 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                         _draw_article_pages(contour, ar)
 
     # ---------- build pages in the requested order ----------
-    # 0) Current week smoke/operational page must be in the beginning.
+    # 1) Current week.
     _current_week_overview()
-    # 1) Previous full week + full drilldown
+    # 2) Previous full week summary.
     _summary_category_page("prev_summary", "Прошлая полная неделя", f"{_period_label(prev_start, prev_end)} / категория → товар → артикул", "Прошлая неделя", prev_cat, target_contour="prev")
-    _render_contour("prev")
-    # 2) Last closed month + full drilldown
-    _summary_category_page("closed_summary", "Последний закрытый месяц", f"{_period_label(closed_start, closed_end)} / категория → товар → артикул", "Закрытый месяц", closed_cat, target_contour="closed")
-    _render_contour("closed")
-    # 3) Current month weekly plan dashboard
+    # 3) Current month.
     _current_month_page()
-    # 4) Current-year monthly ABC dynamics
+    # 4) Last closed month summary.
+    _summary_category_page("closed_summary", "Последний закрытый месяц", f"{_period_label(closed_start, closed_end)} / категория → товар → артикул", "Закрытый месяц", closed_cat, target_contour="closed")
+    # 5) Current-year monthly ABC dynamics.
     _summary_page()
+    # Details go after the 5 executive pages.
+    _render_contour("prev")
+    _render_contour("closed")
 
     c.save()
 
@@ -6357,10 +6460,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             pd.DataFrame(source_rows).to_excel(writer, sheet_name="sources", index=False)
             fix_checklist_rows = [
                 {"check":"unique_demand_required", "status":"OK" if not search_unique_demand.empty else "FAIL", "how_to_fix":"полный запуск должен создать search_unique_demand; fallback запрещён"},
-                {"check":"report_order", "status":"OK", "how_to_fix":"страницы идут: прошлая неделя → детализация → закрытый месяц → детализация → текущий месяц → год"},
+                {"check":"report_order", "status":"OK", "how_to_fix":"страницы идут: 1 текущая неделя → 2 прошлая неделя → 3 текущий месяц → 4 закрытый месяц → 5 год → детализация"},
                 {"check":"current_month_weekly_only_gp_plan", "status":"OK", "how_to_fix":"лист current_month содержит ВП и % выполнения плана"},
                 {"check":"product_sort_by_gp", "status":"OK", "how_to_fix":"товары внутри категории сортируются по gp_use desc"},
-                {"check":"article_noise_filter", "status":"OK", "how_to_fix":"минимумы PDF_DETAIL_MIN_ORDER_SUM/PDF_DETAIL_MIN_GP и 90% ВП"},
+                {"check":"article_noise_filter", "status":"OK", "how_to_fix":"детализация товаров >=10% ВП категории; внутри детального товара выводятся все артикулы"},
                 {"check":"ad_source_current", "status":"OK" if not ads_truth.empty else "WARN", "how_to_fix":"для текущих периодов нужен ads_raw_source из рекламного отчёта, иначе article_day_fact может задваивать расход"},
             ]
             pd.DataFrame(fix_checklist_rows).to_excel(writer, sheet_name="fix_checklist", index=False)
@@ -6463,6 +6566,7 @@ def run_smoke_test(root: str = ".") -> None:
                 "add_to_cart": orders * 7,
                 "search_frequency": orders * 450,
                 "search_traffic_capture_pct": 6.2,
+                "direct_localization_pct": 66.0,
                 "localization_with_replacements_pct": 91.0,
                 "rating_reviews": 4.8,
                 "finished_price": 450.0,
@@ -6573,6 +6677,8 @@ def main() -> None:
     parser.add_argument("--store", default="TOPFACE")
     parser.add_argument("--no-pdf", action="store_true", help="Не формировать PDF")
     parser.add_argument("--pdf-only", action="store_true", help="Сформировать только PDF из уже готовых Excel-файлов без пересчета источников")
+    parser.add_argument("--current-week-only", action="store_true", help="Быстро обновить только оперативный блок текущей недели из кэша/свежих данных; Telegram не отправляется")
+    parser.add_argument("--full-refresh", action="store_true", help="Явный полный пересчет всех источников; синоним обычного запуска")
     parser.add_argument("--send-telegram", action="store_true", help="Отправить PDF в Telegram через TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
     parser.add_argument("--smoke-test", action="store_true", help="Быстрый синтетический тест PDF/кода без S3 и тяжелых Excel; должен занимать секунды")
     args = parser.parse_args()
@@ -6582,6 +6688,57 @@ def main() -> None:
     diagnostics = Diagnostics()
     storage = make_storage(args.root)
     local_dir = Path(args.root) / OUT_DIR
+    if args.current_week_only:
+        # Lightweight daily mode: load cached full-report outputs, then refresh only current-week
+        # operational rows from a limited set of current-week source files. It does NOT rebuild ABC/month/year details.
+        local_dir.mkdir(parents=True, exist_ok=True)
+        outputs = load_existing_outputs_for_pdf(storage, local_dir, args.reports_root, args.store, diagnostics)
+        os.environ["WB_CURRENT_WEEK_ONLY"] = "1"
+        try:
+            loader = Loader(storage, args.reports_root, args.store, diagnostics)
+            pack = loader.load_all()
+            builder = AnalyticsBuilder(pack)
+            upd = builder.build_all()
+            refreshed = upd.get("article_day_fact", pd.DataFrame())
+            if refreshed is not None and not refreshed.empty and "day" in refreshed.columns:
+                refreshed = refreshed.copy()
+                refreshed["day"] = pd.to_datetime(refreshed["day"], errors="coerce").dt.normalize()
+                latest = refreshed["day"].max()
+                cw_start = latest - pd.Timedelta(days=int(pd.Timestamp(latest).weekday()))
+                cw_end = cw_start + pd.Timedelta(days=6)
+                log(f"current_week_only: refresh cache dates {cw_start.date()}..{cw_end.date()} using limited source load")
+                for name in ["article_day_fact", "search_unique_demand", "ads_raw_source", "ads_daily_source"]:
+                    new_df = upd.get(name, pd.DataFrame())
+                    old_df = outputs.get(name, pd.DataFrame())
+                    if new_df is None or new_df.empty or "day" not in new_df.columns:
+                        continue
+                    new_df = new_df.copy(); new_df["day"] = pd.to_datetime(new_df["day"], errors="coerce").dt.normalize()
+                    new_df = new_df[(new_df["day"] >= cw_start) & (new_df["day"] <= cw_end)].copy()
+                    if old_df is not None and not old_df.empty and "day" in old_df.columns:
+                        old_df = old_df.copy(); old_df["day"] = pd.to_datetime(old_df["day"], errors="coerce").dt.normalize()
+                        old_df = old_df[~((old_df["day"] >= cw_start) & (old_df["day"] <= cw_end))].copy()
+                        outputs[name] = pd.concat([old_df, new_df], ignore_index=True, sort=False)
+                    else:
+                        outputs[name] = new_df
+                    log(f"current_week_only: merged {name}, new_rows={len(new_df):,}")
+            else:
+                log("current_week_only: WARN no refreshed article_day_fact rows; PDF will be rebuilt from existing cache only")
+        except Exception as exc:
+            log(f"current_week_only: WARN limited refresh failed, using existing cache only: {exc}")
+        pdf_path = local_dir / PDF_REPORT_NAME
+        pdf_created = generate_management_pdf(outputs, pdf_path)
+        if not pdf_created or not pdf_path.exists():
+            raise RuntimeError(f"PDF не создан: {pdf_path}")
+        log(f"Saved local PDF current-week-only: {pdf_path}")
+        if storage.is_s3:
+            storage.write_bytes(f"{OUT_DIR}/{pdf_path.name}", pdf_path.read_bytes())
+            log(f"Saved: {OUT_DIR}/{pdf_path.name}")
+            trace_path = pdf_path.parent / PDF_CALC_TRACE_NAME
+            if trace_path.exists():
+                storage.write_bytes(f"{OUT_DIR}/{trace_path.name}", trace_path.read_bytes())
+                log(f"Saved: {OUT_DIR}/{trace_path.name}")
+        log("Done")
+        return
     if args.pdf_only:
         if args.no_pdf:
             raise SystemExit("Нельзя одновременно использовать --pdf-only и --no-pdf")
