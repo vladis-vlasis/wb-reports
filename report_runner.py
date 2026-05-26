@@ -1373,6 +1373,18 @@ class AnalyticsBuilder:
             add_to_cart=("add_to_cart", "sum"), buyouts_count=("buyouts_count", "sum"), cancels_count=("cancels_count", "sum"),
             finished_price_funnel=("finished_price", "mean"), spp_funnel=("spp", "mean"),
         )
+        # WB funnel can contain ordered and cancelled units separately. For управленческий
+        # оперативный контур cancelled units must not remain in orders/order_sum.
+        # We keep raw columns for audit and proportionally remove cancellations from order_sum.
+        if os.getenv("WB_EXCLUDE_CANCELS_FROM_FUNNEL", "1").strip().lower() not in {"0", "false", "no", "n"}:
+            raw_orders = pd.to_numeric(g["orders"], errors="coerce").fillna(0.0)
+            cancels = pd.to_numeric(g["cancels_count"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            net_orders = (raw_orders - cancels).clip(lower=0.0)
+            g["orders_raw_including_cancels"] = raw_orders
+            g["order_sum_raw_including_cancels"] = pd.to_numeric(g["order_sum"], errors="coerce").fillna(0.0)
+            ratio = np.where(raw_orders > 0, net_orders / raw_orders, 1.0)
+            g["orders"] = net_orders
+            g["order_sum"] = g["order_sum_raw_including_cancels"] * ratio
         g["cart_conv_pct"] = np.where(g["open_cards"] > 0, g["add_to_cart"] / g["open_cards"] * 100, np.nan)
         g["order_conv_pct"] = np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan)
         return g
@@ -1686,7 +1698,7 @@ class AnalyticsBuilder:
             return pd.DataFrame()
         metric_defs = [
             ("orders", "Заказы в день"), ("order_sum", "Сумма заказов"), ("gross_profit_model", "Валовая прибыль модель"),
-            ("open_cards", "Открытия карточки / клики"), ("add_to_cart", "Добавления в корзину"),
+            ("open_cards", "Открытия карточки / клики"), ("ad_spend_model", "Расход РК"), ("add_to_cart", "Добавления в корзину"),
             ("cart_conv_pct", "Конверсия в корзину, %"), ("order_conv_pct", "Конверсия в заказ, %"),
             ("finished_price", "finishedPrice"), ("spp", "СПП, %"),
             ("manual_impressions", "manual показы"), ("manual_clicks", "manual клики"), ("manual_ctr_pct", "manual CTR, %"), ("manual_cpc", "manual CPC"), ("manual_drr_pct", "manual ДРР, %"),
@@ -2008,7 +2020,7 @@ COLUMN_RU = {
     "target_above_mean_90d": "Целевое значение", "best_days_avg": "Среднее в лучшие дни", "last_full_week_avg": "Среднее за последнюю полную неделю",
     "last_full_week_sum": "Сумма за последнюю полную неделю", "gap_to_target_pct": "Отклонение от цели, %", "days_count": "Дней в анализе", "best_days_count": "Лучших дней",
     "orders": "Заказы", "orders_rows": "Строк заказов", "order_sum": "Сумма заказов", "gross_profit_model": "Валовая прибыль модель",
-    "open_cards": "Открытия карточки / клики", "add_to_cart": "Добавления в корзину", "cart_conv_pct": "Конверсия в корзину, %", "order_conv_pct": "Конверсия в заказ, %",
+    "open_cards": "Открытия карточки / клики", "ad_spend_model": "Расход РК", "add_to_cart": "Добавления в корзину", "cart_conv_pct": "Конверсия в корзину, %", "order_conv_pct": "Конверсия в заказ, %",
     "finished_price": "finishedPrice", "price_with_disc": "priceWithDisc", "spp": "СПП, %",
     "manual_impressions": "Показы manual", "manual_clicks": "Клики manual", "manual_orders": "Заказы manual", "manual_order_sum": "Сумма заказов manual", "manual_spend": "Расход manual", "manual_ctr_pct": "CTR manual, %", "manual_cpc": "CPC manual, ₽", "manual_cr_pct": "CR manual, %", "manual_drr_pct": "ДРР manual, %",
     "unified_impressions": "Показы unified", "unified_clicks": "Клики unified", "unified_orders": "Заказы unified", "unified_order_sum": "Сумма заказов unified", "unified_spend": "Расход unified", "unified_ctr_pct": "CTR unified, %", "unified_cpc": "CPC unified, ₽", "unified_cr_pct": "CR unified, %", "unified_drr_pct": "ДРР unified, %",
@@ -2276,7 +2288,7 @@ PDF_REPORT_NAME = "Управленческий_отчет_TOPFACE.pdf"
 
 
 PDF_ONLY_SHEETS = {
-    TECH_REPORT_NAME: ["article_day_fact", "search_unique_demand", "ads_raw_source", "ads_daily_source", "gp_potential_90d"],
+    TECH_REPORT_NAME: ["article_day_fact", "metrics_summary_90d", "search_unique_demand", "ads_raw_source", "ads_daily_source", "gp_potential_90d"],
     FACTOR_REPORT_NAME: ["optimal_benchmarks", "factor_bridge", "entry_points_bridge", "factor_summary_for_pdf"],
 }
 
@@ -5459,6 +5471,100 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         },
     }
 
+    # Metrics for the compact article benchmark panel: Среднее 90 д. / В лучшие дни.
+    # Source of truth is metrics_summary_90d. If an old file does not contain Расход РК yet,
+    # the value is calculated from article_day_fact as a safe fallback.
+    metrics_90 = outputs.get("metrics_summary_90d", pd.DataFrame()).copy()
+    if metrics_90 is None:
+        metrics_90 = pd.DataFrame()
+    if not metrics_90.empty:
+        try:
+            metrics_90 = metrics_90.rename(columns={c: PDF_ONLY_RU_TO_EN.get(str(c), str(c)) for c in metrics_90.columns})
+        except Exception:
+            pass
+        if "subject_disp" not in metrics_90.columns:
+            metrics_90["subject_disp"] = metrics_90.get("subject", "").map(_subject_disp) if "subject" in metrics_90.columns else ""
+        if "product_code" not in metrics_90.columns:
+            metrics_90["product_code"] = metrics_90.get("product", "").map(_prod) if "product" in metrics_90.columns else ""
+        if "supplier_article" in metrics_90.columns:
+            metrics_90["supplier_article"] = metrics_90["supplier_article"].map(_clean_article_local)
+        else:
+            metrics_90["supplier_article"] = ""
+        for _c in ["nm_id", "avg_90d_all_days", "target_above_mean_90d"]:
+            if _c not in metrics_90.columns:
+                metrics_90[_c] = np.nan
+        metrics_90["nm_id_num"] = pd.to_numeric(metrics_90["nm_id"], errors="coerce")
+        for _c in ["avg_90d_all_days", "target_above_mean_90d"]:
+            metrics_90[_c] = metrics_90[_c].map(to_number)
+        metrics_90["metric_norm"] = metrics_90.get("metric", "").map(norm_key) if "metric" in metrics_90.columns else ""
+
+    _BENCHMARK_METRICS = [
+        ("order_sum", "Сумма заказов", ["Сумма заказов"], _fmt_money),
+        ("open_cards", "Клики", ["Открытия карточки / клики", "Клики"], _fmt_num),
+        ("ad_spend_model", "Расход РК", ["Расход РК"], _fmt_money),
+        ("finished_price", "Цена покупателя", ["finishedPrice", "Цена покупателя"], _fmt_rub1),
+    ]
+
+    def _target_above_mean(values: pd.Series, ignore_zero: bool = True) -> float:
+        s = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if ignore_zero:
+            s = s.replace(0, np.nan)
+        s = s.dropna()
+        if s.empty:
+            return np.nan
+        avg = s.mean()
+        above = s[s > avg]
+        return float(above.mean()) if not above.empty else float(avg)
+
+    def _benchmark_from_daily(row: pd.Series, metric_col: str) -> Tuple[float, float]:
+        col = metric_col
+        if col == "ad_spend_model" and col not in daily.columns and "ad_spend_total" in daily.columns:
+            col = "ad_spend_total"
+        if col not in daily.columns:
+            return np.nan, np.nan
+        cat = str(row.get("subject_disp", ""))
+        prod = str(row.get("product_code", ""))
+        art = _clean_article_local(row.get("supplier_article"))
+        nm = _num(row.get("nm_id"), np.nan)
+        q = daily[(daily["subject_disp"].astype(str).eq(cat)) & (daily["product_code"].astype(str).eq(prod)) & (daily["supplier_article"].astype(str).eq(art))].copy()
+        if pd.notna(nm) and "nm_id" in q.columns:
+            q_nm = q[pd.to_numeric(q["nm_id"], errors="coerce").eq(nm)].copy()
+            if not q_nm.empty:
+                q = q_nm
+        if q.empty:
+            return np.nan, np.nan
+        s = pd.to_numeric(q[col], errors="coerce")
+        return float(s.mean()) if s.notna().any() else np.nan, _target_above_mean(s, ignore_zero=True)
+
+    def _benchmark_metric(row: pd.Series, metric_col: str, aliases: List[str]) -> Tuple[float, float]:
+        if not metrics_90.empty and "metric_norm" in metrics_90.columns:
+            cat = str(row.get("subject_disp", ""))
+            prod = str(row.get("product_code", ""))
+            art = _clean_article_local(row.get("supplier_article"))
+            nm = _num(row.get("nm_id"), np.nan)
+            alias_norms = {norm_key(a) for a in aliases}
+            q = metrics_90[(metrics_90["subject_disp"].astype(str).eq(cat)) & (metrics_90["product_code"].astype(str).eq(prod)) & (metrics_90["supplier_article"].astype(str).eq(art)) & (metrics_90["metric_norm"].isin(alias_norms))].copy()
+            if pd.notna(nm) and "nm_id_num" in q.columns:
+                q_nm = q[pd.to_numeric(q["nm_id_num"], errors="coerce").eq(nm)].copy()
+                if not q_nm.empty:
+                    q = q_nm
+            if not q.empty:
+                avg = pd.to_numeric(q["avg_90d_all_days"], errors="coerce").dropna()
+                tgt = pd.to_numeric(q["target_above_mean_90d"], errors="coerce").dropna()
+                if len(avg) or len(tgt):
+                    return (float(avg.mean()) if len(avg) else np.nan, float(tgt.mean()) if len(tgt) else np.nan)
+        return _benchmark_from_daily(row, metric_col)
+
+    def _article_benchmark_table(row: pd.Series) -> Tuple[List[str], List[str], List[str]]:
+        headers = [label for _, label, _, _ in _BENCHMARK_METRICS]
+        avg_row: List[str] = []
+        target_row: List[str] = []
+        for col, label, aliases, fmt in _BENCHMARK_METRICS:
+            avg, target = _benchmark_metric(row, col, aliases)
+            avg_row.append(fmt(avg) if pd.notna(avg) else "—")
+            target_row.append(fmt(target) if pd.notna(target) else "—")
+        return headers, avg_row, target_row
+
     def _slug(x):
         # Bookmark names must be unique. Cyrillic category names used to collapse to the same "_" slug,
         # so all category links could jump to the last category page. Use a stable hash.
@@ -5609,6 +5715,37 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def _section_bar(y, text):
         c.setFillColor(RED_DARK); c.roundRect(75, y, W-150, 42, 10, fill=1, stroke=0)
         _draw_text(text, 105, y+14, W-210, F_BLACK, 20, WHITE)
+
+    def _draw_article_benchmark_panel(row: pd.Series):
+        # Compact white table in the right header zone of article pages.
+        # No separate title: user asked to keep only the 2x4 table so it fits.
+        headers, avg_values, target_values = _article_benchmark_table(row)
+        x, y, w, h = 650, 688, 565, 92
+        label_w = 104
+        col_ws = [135, 86, 116, 124]
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
+        c.setStrokeColor(LINE); c.setLineWidth(0.7)
+        # horizontal separators: header/body and the two value rows
+        c.line(x+10, y+58, x+w-10, y+58)
+        c.line(x+10, y+31, x+w-10, y+31)
+        xx = x + label_w
+        for cw in col_ws[:-1]:
+            xx += cw
+            c.line(xx, y+9, xx, y+h-9)
+        # header
+        xx = x + label_w
+        for head, cw in zip(headers, col_ws):
+            _draw_text(head, xx+4, y+67, cw-8, F_BOLD, 9.5, RED_DARK, align="center", min_size=7)
+            xx += cw
+        # row labels
+        _draw_text("Среднее 90 д.", x+6, y+41, label_w-12, F_BOLD, 9.5, GRAY, align="center", min_size=7)
+        _draw_text("В лучшие дни", x+6, y+14, label_w-12, F_BOLD, 9.5, GRAY, align="center", min_size=7)
+        # values centered under headers
+        for vals, yy in [(avg_values, y+40), (target_values, y+13)]:
+            xx = x + label_w
+            for val, cw in zip(vals, col_ws):
+                _draw_text(val, xx+4, yy, cw-8, F_BLACK, 12, BLACK, align="center", min_size=7)
+                xx += cw
 
     def _draw_cell_value(x, y, w, value, delta=None, metric="", size=12, align="left"):
         txt = str(value)
@@ -5847,25 +5984,30 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     src[col] = 0
                 src[col] = pd.to_numeric(src[col], errors="coerce").fillna(0)
             src["_ad"] = src["gross_revenue"] * src["abc_drr_pct"] / 100.0
-            mon = src.groupby(["period_start", "subject_disp"], as_index=False).agg(sum_use=("gross_revenue","sum"), gp_use=("gross_profit","sum"), ad_spend=("_ad","sum"))
-            mon["_cat_order"] = mon["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
-            mon = mon.sort_values(["subject_disp", "period_start"])
-            mon["sum_prev"] = mon.groupby("subject_disp")["sum_use"].shift(1)
-            mon["gp_prev"] = mon.groupby("subject_disp")["gp_use"].shift(1)
-            mon["ad_prev"] = mon.groupby("subject_disp")["ad_spend"].shift(1)
-            mon = mon.sort_values(["period_start", "_cat_order"], ascending=[False, True])
+
+            # Пользователь просил: помесячно без разбивки по категориям.
+            # Поэтому каждая строка = общий итог по четырём категориям за месяц.
+            mon = src.groupby("period_start", as_index=False).agg(
+                sum_use=("gross_revenue", "sum"),
+                gp_use=("gross_profit", "sum"),
+                ad_spend=("_ad", "sum"),
+            )
+            mon = mon.sort_values("period_start", ascending=True)
+            mon["sum_prev"] = mon["sum_use"].shift(1)
+            mon["gp_prev"] = mon["gp_use"].shift(1)
+            mon["ad_prev"] = mon["ad_spend"].shift(1)
+            mon = mon.sort_values("period_start", ascending=False)
             for _, r in mon.iterrows():
                 month_name = MONTH_RU.get(int(r["period_start"].month), str(r["period_start"].month)).lower()
                 rows.append({"cells":[
                     month_name,
-                    str(r.get("subject_disp")),
                     (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev")), "Сумма"),
                     (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev")), "ВП"),
                     (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_prev")), "Расход РК"),
                 ]})
         if not rows:
-            rows=[{"cells":["—","—","—","—","—"]}]
-        _draw_table(95, 115, W-190, ["Месяц", "Категория", "Сумма заказов", "ВП", "Расход РК"], [180,250,330,330,330], rows, row_h=42, font_size=13, max_rows=16)
+            rows=[{"cells":["—","—","—","—"]}]
+        _draw_table(160, 185, W-320, ["Месяц", "Сумма заказов", "ВП", "Расход РК"], [240,360,360,360], rows, row_h=64, font_size=17, max_rows=12)
 
     def _children_for_category(contour: str, cat: str) -> pd.DataFrame:
         info = contours[contour]
@@ -6082,6 +6224,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         else:
             back_buttons = [(1120,798,170,"← товар", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
         _draw_level_overview(f"Артикул: {art}", f"{cat} / товар {prod} / {info['period']}", "Артикул 1/2", a1, art_row, back_buttons=None)
+        _draw_article_benchmark_panel(art_row)
         # overwrite top buttons on the page with correct buttons (because _draw_level_overview already started page)
         for bx,by,bw,label,target in back_buttons:
             c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
