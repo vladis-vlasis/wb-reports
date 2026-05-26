@@ -2,12 +2,18 @@ name: Daily report
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
+    inputs:
+      mode:
+        description: "smoke = быстрый тест без S3; full = полный отчет; s3_only = полный отчет без Telegram"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - full
+          - s3_only
   schedule:
-    # 06:17 Moscow time = 03:17 UTC. Shifted from 03:00 UTC to avoid top-of-hour Actions load.
+    # 06:17 Moscow time = 03:17 UTC
     - cron: "17 3 * * *"
 
 permissions:
@@ -22,11 +28,17 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
 
-      WB_MAX_SEARCH_QUERY_FILES: "8"
-      WB_MAX_ENTRY_POINT_FILES: "8"
-      WB_MAX_STOCK_FILES: "10"
+      # Fast defaults for GitHub runner. For deep/full audit increase these in REPORT_ENV or here.
+      WB_MAX_SEARCH_QUERY_FILES: "4"
+      WB_MAX_ENTRY_POINT_FILES: "4"
+      WB_MAX_STOCK_FILES: "5"
 
+      # Demand policy:
+      # 0 = do not use duplicated fallback, but do not crash late; missing demand becomes blank + warning.
+      # 1 = crash if unique demand is missing for a PDF contour.
+      PDF_FAIL_ON_MISSING_DEMAND: "0"
       PDF_ALLOW_DEMAND_FALLBACK: "0"
+
       PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
       PDF_TRACE_SAMPLE_PRODUCT: "901"
       PDF_TRACE_SAMPLE_ARTICLE: ""
@@ -76,8 +88,18 @@ jobs:
         shell: bash
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
           set -euo pipefail
+          MODE="${INPUT_MODE:-full}"
+          if [ "$MODE" = "" ]; then MODE="full"; fi
+          echo "Run mode: $MODE"
+
+          if [ "$MODE" = "smoke" ]; then
+            python report_runner.py --root . --smoke-test
+            exit 0
+          fi
+
           test -n "${REPORT_ENV:-}" || { echo "ERROR: secret REPORT_ENV is empty or missing"; exit 1; }
           umask 077
           printf '%s\n' "$REPORT_ENV" > .env
@@ -87,7 +109,15 @@ jobs:
           test -n "${YC_ACCESS_KEY_ID:-}" || { echo "ERROR: YC_ACCESS_KEY_ID is missing in REPORT_ENV"; exit 1; }
           test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
-          python report_runner.py --root .
+
+          if [ "$MODE" = "full" ]; then
+            python report_runner.py --root . --send-telegram
+          elif [ "$MODE" = "s3_only" ]; then
+            python report_runner.py --root .
+          else
+            echo "ERROR: unknown mode: $MODE"
+            exit 1
+          fi
 
       - name: Show generated files
         if: always()
@@ -106,5 +136,6 @@ jobs:
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
             Отчёты/**/*.json
+            Отчёты/**/*.txt
           if-no-files-found: warn
           retention-days: 30
