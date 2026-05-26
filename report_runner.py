@@ -1217,12 +1217,12 @@ class AnalyticsBuilder:
         """
         Add subject/product/supplier_article to source rows using nm_id dictionary.
 
-        The advertising raw source can arrive without product/supplier_article columns.
-        In some pandas merge cases duplicated or suffixed columns may leave no plain
-        `product` column before the final filter, which previously caused
-        KeyError: 'product' for ads_raw_source. This implementation normalizes
-        all candidate columns explicitly and always recreates the canonical
-        columns before filtering.
+        HARD FIX 2026-05-26: this function must never crash with
+        KeyError: 'product' on advertising sources. Some sources arrive without
+        product/supplier_article and some pandas merge/filter paths can leave
+        the canonical columns in an unsafe state. We therefore build canonical
+        Series first, remove any old/duplicate canonical columns, reinsert clean
+        columns, and use local Series for all filters.
         """
         if df is None or df.empty:
             return pd.DataFrame(columns=list(df.columns) if isinstance(df, pd.DataFrame) else [])
@@ -1230,7 +1230,7 @@ class AnalyticsBuilder:
         out = df.copy()
 
         def _series(frame: pd.DataFrame, name: str, default="") -> pd.Series:
-            """Return a 1-D Series even if the dataframe has duplicate column names."""
+            """Return a 1-D Series even if duplicate column labels exist."""
             if name in frame.columns:
                 value = frame[name]
                 if isinstance(value, pd.DataFrame):
@@ -1238,43 +1238,54 @@ class AnalyticsBuilder:
                 return value
             return pd.Series(default, index=frame.index, dtype="object")
 
-        for col in ["subject", "product", "supplier_article", "nm_id"]:
-            if col not in out.columns:
-                out[col] = "" if col != "nm_id" else np.nan
+        # Ensure merge keys exist before dictionary merge.
+        if "nm_id" not in out.columns:
+            out["nm_id"] = np.nan
+        if "subject" not in out.columns:
+            out["subject"] = ""
+        if "product" not in out.columns:
+            out["product"] = ""
+        if "supplier_article" not in out.columns:
+            out["supplier_article"] = ""
 
-        if "nm_id" in out.columns and not self.dictionary.empty:
+        if not self.dictionary.empty:
             d_nm = (
                 self.dictionary.dropna(subset=["nm_id"])
                 .drop_duplicates("nm_id")[["nm_id", "subject", "product", "supplier_article"]]
             )
             out = out.merge(d_nm, on="nm_id", how="left", suffixes=("", "_dict"))
 
-            subject_raw = _series(out, "subject").map(normalize_text)
-            subject_dict = _series(out, "subject_dict").map(normalize_text)
-            out["subject"] = subject_raw.where(subject_raw.ne(""), subject_dict)
+        # Canonical values are calculated as local Series. Never use direct
+        # out["product"] in filters because it can fail when the label is missing
+        # or duplicated in rare pandas states.
+        subject_raw = _series(out, "subject").map(normalize_text)
+        subject_dict = _series(out, "subject_dict").map(normalize_text)
+        subject_clean = subject_raw.where(subject_raw.ne(""), subject_dict)
 
-            article_raw = _series(out, "supplier_article").map(clean_article)
-            article_dict = _series(out, "supplier_article_dict").map(clean_article)
-            out["supplier_article"] = article_raw.where(article_raw.ne(""), article_dict)
+        article_raw = _series(out, "supplier_article").map(clean_article)
+        article_dict = _series(out, "supplier_article_dict").map(clean_article)
+        article_clean = article_raw.where(article_raw.ne(""), article_dict)
 
-            product_raw = _series(out, "product").map(normalize_text)
-            product_dict = _series(out, "product_dict").map(normalize_text)
-            out["product"] = product_raw.where(product_raw.ne(""), product_dict)
+        product_raw = _series(out, "product").map(normalize_text)
+        product_dict = _series(out, "product_dict").map(normalize_text)
+        product_clean = product_raw.where(product_raw.ne(""), product_dict)
+        product_clean = product_clean.where(product_clean.ne(""), article_clean.map(product_code))
 
-            out = out.drop(columns=[c for c in out.columns if str(c).endswith("_dict")], errors="ignore")
+        # Drop old canonical/dict columns, including duplicates, and reinsert clean canonical columns.
+        drop_cols = [c for c in out.columns if str(c) in {"subject", "product", "supplier_article", "subject_dict", "product_dict", "supplier_article_dict"}]
+        out = out.drop(columns=drop_cols, errors="ignore")
+        out.insert(0, "subject", subject_clean.values)
+        out.insert(1, "product", product_clean.values)
+        out.insert(2, "supplier_article", article_clean.values)
 
-        # Recreate canonical columns unconditionally before filters. This is the
-        # guard that prevents KeyError on ads_raw/ads_daily and keeps the source
-        # usable even if a future report has missing product columns.
-        out["supplier_article"] = _series(out, "supplier_article").map(clean_article)
-        out["subject"] = _series(out, "subject").map(normalize_text)
-        product_clean = _series(out, "product").map(normalize_text)
-        out["product"] = product_clean.where(product_clean.ne(""), out["supplier_article"].map(product_code))
-
-        out = out[out["subject"].isin(TARGET_SUBJECTS)]
-        out = out[out["supplier_article"].ne("") & out["product"].ne("")]
-        out = out[~out["supplier_article"].map(is_excluded_article)]
-        out = out[out["product"].map(is_valid_product_code)]
+        mask = (
+            subject_clean.isin(TARGET_SUBJECTS)
+            & article_clean.ne("")
+            & product_clean.ne("")
+            & (~article_clean.map(is_excluded_article))
+            & product_clean.map(is_valid_product_code)
+        )
+        out = out.loc[mask.values].copy()
         return out
 
     def buyout_rates(self) -> pd.DataFrame:
