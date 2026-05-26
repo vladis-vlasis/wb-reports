@@ -1,52 +1,58 @@
-name: Daily report PDF only
+name: Daily TOPFACE report
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "pdf_only = пересобрать только PDF; smoke = быстрый тест; s3_only = полный пересчет без Telegram"
+        description: "smoke / current_week / pdf_only / full_refresh"
         required: true
         default: "pdf_only"
         type: choice
         options:
-          - pdf_only
           - smoke
-          - s3_only
+          - current_week
+          - pdf_only
+          - full_refresh
   schedule:
-    # 06:17 Moscow time = 03:17 UTC. By default schedule runs pdf_only.
-    - cron: "17 3 * * *"
+    # Tue-Sun 12:00 MSK = 09:00 UTC: обновляем только блок текущей недели.
+    - cron: "0 9 * * 2-6"
+    - cron: "0 9 * * 0"
+    # Monday 18:00 MSK = 15:00 UTC: полный пересчет после обновления недельных данных.
+    - cron: "0 15 * * 1"
 
 permissions:
   contents: read
 
+concurrency:
+  group: wb-report-topface
+  cancel-in-progress: false
+
 jobs:
   build-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
 
-      # Fast defaults for full rebuild mode. PDF-only does not read raw weekly search/stock files.
+      # Полный режим: ограничиваем самые тяжелые недельные источники.
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
       WB_MAX_STOCK_FILES: "5"
 
-      # PDF demand policy: do not use duplicated demand fallback and do not crash late.
+      # PDF policy: спрос WB только через уникальные запросы, без задваивающего fallback.
       PDF_FAIL_ON_MISSING_DEMAND: "0"
       PDF_ALLOW_DEMAND_FALLBACK: "0"
 
+      # Детализация: товар детализируется от 10% ВП категории, внутри товара показываются все артикулы.
+      PDF_PRODUCT_DETAIL_MIN_GP_SHARE: "10"
+      PDF_FORCE_DETAIL_PRODUCTS: "901,614,617,618,154,155,156,157,158"
+      PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
+
       PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
       PDF_TRACE_SAMPLE_PRODUCT: "901"
-      PDF_TRACE_SAMPLE_ARTICLE: ""
-      PDF_DETAIL_MIN_ORDER_SUM: "5000"
-      PDF_DETAIL_MIN_GP: "1000"
-      PDF_MIN_PRODUCT_GP_SHARE_PCT: "1.0"
-      PDF_MIN_PRODUCT_CURRENT_WEEK_GP: "1000"
-      PDF_MIN_PRODUCT_CURRENT_WEEK_ORDER_SUM: "10000"
-      PDF_FORCE_INCLUDE_PRODUCTS: "901,605,611,613,614,617,618,154,155,156,157"
-      PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
+      PDF_TRACE_SAMPLE_ARTICLE: "901/2"
 
     steps:
       - name: Checkout repository
@@ -72,32 +78,43 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Check repository files
+      - name: Compile check
         shell: bash
         run: |
           set -euo pipefail
-          pwd
-          ls -la
-          test -f report_runner.py || { echo "ERROR: report_runner.py is missing in repository root"; exit 1; }
+          test -f report_runner.py || { echo "ERROR: report_runner.py is missing"; exit 1; }
           python -m py_compile report_runner.py
           echo "Compile OK"
 
-      - name: Run report
+      - name: Decide mode
+        id: mode
         shell: bash
         env:
-          REPORT_ENV: ${{ secrets.REPORT_ENV }}
           INPUT_MODE: ${{ github.event.inputs.mode }}
         run: |
           set -euo pipefail
-          MODE="${INPUT_MODE:-pdf_only}"
-          if [ "$MODE" = "" ]; then MODE="pdf_only"; fi
-          echo "Run mode: $MODE"
-
-          if [ "$MODE" = "smoke" ]; then
-            python report_runner.py --root . --smoke-test
-            exit 0
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${INPUT_MODE:-pdf_only}"
+          elif [ "${{ github.event.schedule }}" = "0 15 * * 1" ]; then
+            MODE="full_refresh"
+          else
+            MODE="current_week"
           fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Selected mode: $MODE"
 
+      - name: Run smoke test
+        if: steps.mode.outputs.mode == 'smoke'
+        shell: bash
+        run: python report_runner.py --root . --smoke-test
+
+      - name: Load REPORT_ENV
+        if: steps.mode.outputs.mode != 'smoke'
+        shell: bash
+        env:
+          REPORT_ENV: ${{ secrets.REPORT_ENV }}
+        run: |
+          set -euo pipefail
           test -n "${REPORT_ENV:-}" || { echo "ERROR: secret REPORT_ENV is empty or missing"; exit 1; }
           umask 077
           printf '%s\n' "$REPORT_ENV" > .env
@@ -108,28 +125,48 @@ jobs:
           test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
-          if [ "$MODE" = "pdf_only" ]; then
-            python report_runner.py --root . --pdf-only
-          elif [ "$MODE" = "s3_only" ]; then
-            python report_runner.py --root .
-          else
-            echo "ERROR: unknown mode: $MODE"
-            exit 1
-          fi
+      - name: Run current week update
+        if: steps.mode.outputs.mode == 'current_week'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source ./.env
+          set +a
+          python report_runner.py --root . --current-week-only
+
+      - name: Run PDF only
+        if: steps.mode.outputs.mode == 'pdf_only'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source ./.env
+          set +a
+          python report_runner.py --root . --pdf-only
+
+      - name: Run full refresh
+        if: steps.mode.outputs.mode == 'full_refresh'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source ./.env
+          set +a
+          python report_runner.py --root . --full-refresh
 
       - name: Show generated files
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          echo "Generated report files:"
           find "Отчёты" -maxdepth 5 -type f -print 2>/dev/null || true
 
       - name: Upload report artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pdf-only-report-output
+          name: topface-report-output
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
