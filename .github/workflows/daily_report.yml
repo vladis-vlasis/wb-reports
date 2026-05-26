@@ -13,6 +13,11 @@ on:
           - current_week
           - pdf_only
           - full_refresh
+      send_telegram:
+        description: "Send generated PDF to Telegram"
+        required: true
+        default: true
+        type: boolean
   schedule:
     # Tue-Sun 12:00 MSK = 09:00 UTC: обновляем только блок текущей недели.
     - cron: "0 9 * * 2-6"
@@ -35,6 +40,9 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
       # Полный режим: ограничиваем самые тяжелые недельные источники.
       WB_MAX_SEARCH_QUERY_FILES: "4"
@@ -91,17 +99,23 @@ jobs:
         shell: bash
         env:
           INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_SEND_TELEGRAM: ${{ github.event.inputs.send_telegram }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${INPUT_MODE:-pdf_only}"
+            SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
           elif [ "${{ github.event.schedule }}" = "0 15 * * 1" ]; then
             MODE="full_refresh"
+            SEND_TELEGRAM="true"
           else
             MODE="current_week"
+            SEND_TELEGRAM="true"
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "send_telegram=$SEND_TELEGRAM" >> "$GITHUB_OUTPUT"
           echo "Selected mode: $MODE"
+          echo "Send Telegram: $SEND_TELEGRAM"
 
       - name: Run smoke test
         if: steps.mode.outputs.mode == 'smoke'
@@ -133,7 +147,9 @@ jobs:
           set -a
           source ./.env
           set +a
-          python report_runner.py --root . --current-week-only
+          TG_FLAG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
+          python report_runner.py --root . --current-week-only $TG_FLAG
 
       - name: Run PDF only
         if: steps.mode.outputs.mode == 'pdf_only'
@@ -143,7 +159,9 @@ jobs:
           set -a
           source ./.env
           set +a
-          python report_runner.py --root . --pdf-only
+          TG_FLAG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
+          python report_runner.py --root . --pdf-only $TG_FLAG
 
       - name: Run full refresh
         if: steps.mode.outputs.mode == 'full_refresh'
@@ -153,7 +171,9 @@ jobs:
           set -a
           source ./.env
           set +a
-          python report_runner.py --root . --full-refresh
+          TG_FLAG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
+          python report_runner.py --root . --full-refresh $TG_FLAG
 
       - name: Show generated files
         if: always()
