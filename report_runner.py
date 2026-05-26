@@ -4962,6 +4962,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     # Strict mode: the user explicitly rejected duplicated demand from article_day_fact.
     # Therefore a PDF with fallback demand is not a valid управленческий отчет.
     PDF_ALLOW_DEMAND_FALLBACK = os.getenv("PDF_ALLOW_DEMAND_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "y"}
+    # Default is no duplicated fallback, but also no late 30-minute crash: missing unique demand
+    # is rendered as blank/diagnostic unless PDF_FAIL_ON_MISSING_DEMAND=1 is explicitly set.
+    PDF_FAIL_ON_MISSING_DEMAND = os.getenv("PDF_FAIL_ON_MISSING_DEMAND", "0").strip().lower() in {"1", "true", "yes", "y"}
     if (search_unique_demand is None or search_unique_demand.empty) and not PDF_ALLOW_DEMAND_FALLBACK:
         raise RuntimeError(
             "PDF остановлен: нет листа/данных search_unique_demand. "
@@ -5197,11 +5200,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             g["duplicate_query_rows_removed"] = 0
             g["raw_query_rows"] = 0
             if not PDF_ALLOW_DEMAND_FALLBACK:
-                raise RuntimeError(
-                    f"PDF остановлен: для периода {pd.Timestamp(start):%d.%m.%Y}-{pd.Timestamp(end):%d.%m.%Y} "
+                msg = (
+                    f"PDF WARN: для периода {pd.Timestamp(start):%d.%m.%Y}-{pd.Timestamp(end):%d.%m.%Y} "
                     f"и уровня {keys} нет уникального спроса search_unique_demand. "
-                    "Fallback SUM(search_frequency) запрещён."
+                    "Fallback SUM(search_frequency) НЕ используется; спрос/% поиска будут пустыми."
                 )
+                if PDF_FAIL_ON_MISSING_DEMAND:
+                    raise RuntimeError(msg)
+                log(msg)
+                g["demand"] = np.nan
         # % поиска = все открытия карточки / Спрос WB.
         g["search_share"] = np.where(g["demand"] > 0, g["opens"] / g["demand"] * 100, np.nan)
         g["drr_model"] = np.where(g["order_sum"] > 0, g["ad_spend"] / g["order_sum"] * 100, 0.0)
@@ -6344,6 +6351,152 @@ def send_telegram_document(file_path: Path, caption: str = "") -> bool:
         return False
 
 
+
+
+def run_smoke_test(root: str = ".") -> None:
+    """Fast self-test: no S3, no heavy Excel parsing, finishes in seconds.
+
+    Purpose: verify that the current code version imports, builds the PDF renderer,
+    handles the management-report data model, writes local PDF/XLSX artifacts, and exits 0.
+    It intentionally uses tiny synthetic data for March-April-May so the closed-month,
+    current-week and previous-week PDF contours are all exercised.
+    """
+    log("SMOKE_TEST: start synthetic report test; S3 is not used")
+    local_dir = Path(root) / OUT_DIR
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    latest = pd.Timestamp("2026-05-25")
+    days = pd.date_range("2026-03-01", latest, freq="D")
+    entities = [
+        ("Кисти косметические", "901", "901/5", 110254021),
+        ("Косметические карандаши", "605", "605/1", 213000001),
+        ("Помады", "154", "154/1", 101000001),
+        ("Блески", "207", "207/1", 102000001),
+    ]
+    rows = []
+    for subject, product, article, nm_id in entities:
+        base = 9000 if product == "901" else 5000 if subject == "Косметические карандаши" else 3500
+        for d in days:
+            weekday_mult = 1.15 if d.weekday() in (0, 1, 2) else 0.85
+            order_sum = base * weekday_mult
+            orders = max(1, int(order_sum / 450))
+            ad_spend = order_sum * (0.11 if subject in {"Кисти косметические", "Косметические карандаши"} else 0.14)
+            rows.append({
+                "day": d,
+                "subject": subject,
+                "product": product,
+                "supplier_article": article,
+                "nm_id": nm_id,
+                "orders": orders,
+                "order_sum": order_sum,
+                "gross_profit_model": order_sum * 0.32,
+                "open_cards": orders * 28,
+                "add_to_cart": orders * 7,
+                "search_frequency": orders * 450,
+                "search_traffic_capture_pct": 6.2,
+                "localization_with_replacements_pct": 91.0,
+                "rating_reviews": 4.8,
+                "finished_price": 450.0,
+                "price_with_disc": 430.0,
+                "spp": 12.0,
+                "commission_%": 18.0,
+                "acquiring_%": 1.5,
+                "logistics_direct": 38.0,
+                "storage": 4.0,
+                "other_costs": 8.0,
+                "cost": 120.0,
+                "cart_conv_pct": 25.0,
+                "order_conv_pct": 28.0,
+                "manual_spend": ad_spend * 0.65,
+                "unified_spend": ad_spend * 0.35,
+                "unknown_spend": 0.0,
+                "manual_clicks": max(1, int(ad_spend * 0.65 / 14)),
+                "unified_clicks": max(1, int(ad_spend * 0.35 / 18)),
+                "unknown_clicks": 0,
+                "manual_impressions": max(1, int(ad_spend * 0.65 / 14 / 0.035)),
+                "unified_impressions": max(1, int(ad_spend * 0.35 / 18 / 0.03)),
+                "unknown_impressions": 0,
+                "ad_spend_model": ad_spend,
+            })
+    daily = pd.DataFrame(rows)
+
+    # Unique demand for all levels and all days: this prevents strict demand crashes.
+    demand_rows = []
+    subj_disp_map = {"Кисти косметические": "Кисти", "Косметические карандаши": "Карандаши", "Помады": "Помады", "Блески": "Блески"}
+    for _, r in daily.iterrows():
+        sf = float(r["search_frequency"])
+        common = {"day": r["day"], "subject": r["subject"], "subject_disp": subj_disp_map[r["subject"]], "unique_search_frequency": sf, "unique_search_queries": 3, "duplicate_query_rows_removed": 1, "raw_query_rows": 4}
+        demand_rows.append({**common, "level": "category"})
+        demand_rows.append({**common, "level": "product", "product": r["product"], "product_code": r["product"]})
+        demand_rows.append({**common, "level": "article", "product": r["product"], "product_code": r["product"], "supplier_article": r["supplier_article"], "nm_id": r["nm_id"]})
+    search_unique = pd.DataFrame(demand_rows)
+
+    ads = daily[["day", "subject", "product", "supplier_article", "nm_id"]].copy()
+    ads["spend"] = daily[["manual_spend", "unified_spend", "unknown_spend"]].sum(axis=1)
+    ads["clicks"] = daily[["manual_clicks", "unified_clicks", "unknown_clicks"]].sum(axis=1)
+    ads["impressions"] = daily[["manual_impressions", "unified_impressions", "unknown_impressions"]].sum(axis=1)
+
+    # Exact ABC periods for weekly and monthly contours.
+    abc_rows = []
+    periods = [
+        (pd.Timestamp("2026-05-18"), pd.Timestamp("2026-05-24"), "weekly"),
+        (pd.Timestamp("2026-05-11"), pd.Timestamp("2026-05-17"), "weekly"),
+        (pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), "monthly"),
+        (pd.Timestamp("2026-03-01"), pd.Timestamp("2026-03-31"), "monthly"),
+    ]
+    for start, end, kind in periods:
+        part = daily[(daily["day"] >= start) & (daily["day"] <= end)]
+        for keys, g in part.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            subject, product, article, nm_id = keys
+            gross_revenue = float(g["order_sum"].sum())
+            abc_rows.append({
+                "period_start": start,
+                "period_end": end,
+                "week_code": week_code(start),
+                "week_label": f"{start:%d.%m}-{end:%d.%m}",
+                "month_key": month_key(start),
+                "subject": subject,
+                "product": product,
+                "supplier_article": article,
+                "nm_id": nm_id,
+                "gross_profit": gross_revenue * 0.32,
+                "gross_revenue": gross_revenue,
+                "orders": float(g["orders"].sum()),
+                "abc_margin_pct": 32.0,
+                "abc_drr_pct": 12.0,
+                "abc_commission_amount": gross_revenue * 0.18,
+                "abc_acquiring_amount": gross_revenue * 0.015,
+            })
+    abc = pd.DataFrame(abc_rows)
+    abc_weekly = abc[abc["period_start"].isin([pd.Timestamp("2026-05-18"), pd.Timestamp("2026-05-11")])].copy()
+    abc_monthly = abc[abc["period_start"].isin([pd.Timestamp("2026-04-01"), pd.Timestamp("2026-03-01")])].copy()
+
+    outputs = {
+        "article_day_fact": daily,
+        "search_unique_demand": search_unique,
+        "ads_raw_source": ads,
+        "ads_daily_source": ads,
+        "abc_weekly": abc_weekly,
+        "abc_monthly": abc_monthly,
+        "factor_bridge": pd.DataFrame(),
+        "entry_points_bridge": pd.DataFrame(),
+        "optimal_benchmarks": pd.DataFrame(),
+        "factor_summary_for_pdf": pd.DataFrame(),
+    }
+    pdf_path = local_dir / "SMOKE_TEST_Управленческий_отчет_TOPFACE.pdf"
+    pdf_created = generate_management_pdf(outputs, pdf_path)
+    if not pdf_created or not pdf_path.exists() or pdf_path.stat().st_size < 10_000:
+        raise RuntimeError(f"SMOKE_TEST failed: PDF не создан или слишком маленький: {pdf_path}")
+    ok_path = local_dir / "SMOKE_TEST_OK.txt"
+    ok_path.write_text(
+        "SMOKE_TEST_OK\n"
+        f"time={datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"pdf={pdf_path}\n"
+        f"pdf_size={pdf_path.stat().st_size}\n",
+        encoding="utf-8",
+    )
+    log(f"SMOKE_TEST_OK: PDF={pdf_path} size={pdf_path.stat().st_size:,} bytes")
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".", help="Local root used for local copies and local mode")
@@ -6352,7 +6505,11 @@ def main() -> None:
     parser.add_argument("--no-pdf", action="store_true", help="Не формировать PDF")
     parser.add_argument("--pdf-only", action="store_true", help="Сформировать только PDF из уже готовых Excel-файлов без пересчета источников")
     parser.add_argument("--send-telegram", action="store_true", help="Отправить PDF в Telegram через TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
+    parser.add_argument("--smoke-test", action="store_true", help="Быстрый синтетический тест PDF/кода без S3 и тяжелых Excel; должен занимать секунды")
     args = parser.parse_args()
+    if args.smoke_test:
+        run_smoke_test(args.root)
+        return
     diagnostics = Diagnostics()
     storage = make_storage(args.root)
     local_dir = Path(args.root) / OUT_DIR
