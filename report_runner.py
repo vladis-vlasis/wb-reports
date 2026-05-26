@@ -1214,21 +1214,63 @@ class AnalyticsBuilder:
         return d
 
     def enrich(self, df: pd.DataFrame, source: str = "") -> pd.DataFrame:
+        """
+        Add subject/product/supplier_article to source rows using nm_id dictionary.
+
+        The advertising raw source can arrive without product/supplier_article columns.
+        In some pandas merge cases duplicated or suffixed columns may leave no plain
+        `product` column before the final filter, which previously caused
+        KeyError: 'product' for ads_raw_source. This implementation normalizes
+        all candidate columns explicitly and always recreates the canonical
+        columns before filtering.
+        """
         if df is None or df.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(columns=list(df.columns) if isinstance(df, pd.DataFrame) else [])
+
         out = df.copy()
+
+        def _series(frame: pd.DataFrame, name: str, default="") -> pd.Series:
+            """Return a 1-D Series even if the dataframe has duplicate column names."""
+            if name in frame.columns:
+                value = frame[name]
+                if isinstance(value, pd.DataFrame):
+                    value = value.iloc[:, 0]
+                return value
+            return pd.Series(default, index=frame.index, dtype="object")
+
         for col in ["subject", "product", "supplier_article", "nm_id"]:
             if col not in out.columns:
                 out[col] = "" if col != "nm_id" else np.nan
+
         if "nm_id" in out.columns and not self.dictionary.empty:
-            d_nm = self.dictionary.dropna(subset=["nm_id"]).drop_duplicates("nm_id")[["nm_id", "subject", "product", "supplier_article"]]
+            d_nm = (
+                self.dictionary.dropna(subset=["nm_id"])
+                .drop_duplicates("nm_id")[["nm_id", "subject", "product", "supplier_article"]]
+            )
             out = out.merge(d_nm, on="nm_id", how="left", suffixes=("", "_dict"))
-            for col in ["subject", "product", "supplier_article"]:
-                out[col] = out[col].where(out[col].map(normalize_text).ne(""), out[f"{col}_dict"])
-            out = out.drop(columns=[c for c in out.columns if c.endswith("_dict")], errors="ignore")
-        out["supplier_article"] = out["supplier_article"].map(clean_article)
-        out["subject"] = out["subject"].map(normalize_text)
-        out["product"] = out["product"].map(normalize_text).where(out["product"].map(normalize_text).ne(""), out["supplier_article"].map(product_code))
+
+            subject_raw = _series(out, "subject").map(normalize_text)
+            subject_dict = _series(out, "subject_dict").map(normalize_text)
+            out["subject"] = subject_raw.where(subject_raw.ne(""), subject_dict)
+
+            article_raw = _series(out, "supplier_article").map(clean_article)
+            article_dict = _series(out, "supplier_article_dict").map(clean_article)
+            out["supplier_article"] = article_raw.where(article_raw.ne(""), article_dict)
+
+            product_raw = _series(out, "product").map(normalize_text)
+            product_dict = _series(out, "product_dict").map(normalize_text)
+            out["product"] = product_raw.where(product_raw.ne(""), product_dict)
+
+            out = out.drop(columns=[c for c in out.columns if str(c).endswith("_dict")], errors="ignore")
+
+        # Recreate canonical columns unconditionally before filters. This is the
+        # guard that prevents KeyError on ads_raw/ads_daily and keeps the source
+        # usable even if a future report has missing product columns.
+        out["supplier_article"] = _series(out, "supplier_article").map(clean_article)
+        out["subject"] = _series(out, "subject").map(normalize_text)
+        product_clean = _series(out, "product").map(normalize_text)
+        out["product"] = product_clean.where(product_clean.ne(""), out["supplier_article"].map(product_code))
+
         out = out[out["subject"].isin(TARGET_SUBJECTS)]
         out = out[out["supplier_article"].ne("") & out["product"].ne("")]
         out = out[~out["supplier_article"].map(is_excluded_article)]
