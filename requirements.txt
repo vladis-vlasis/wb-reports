@@ -1,0 +1,10 @@
+boto3
+botocore
+numpy
+openpyxl
+pandas
+Pillow
+PyYAML
+reportlab
+requests
+XlsxWriter
