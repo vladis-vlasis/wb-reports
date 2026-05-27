@@ -3,27 +3,22 @@ name: Расчет юнит-экономики
 on:
   workflow_dispatch:
   schedule:
-    # Каждый понедельник в 06:00 по Москве / 03:00 UTC
-    - cron: "0 3 * * 1"
+    # 12:00 МСК = 09:00 UTC
+    - cron: "0 9 * * *"
 
 jobs:
-  raschet-ekonomiki:
-    name: Обновить Экономика.xlsx
+  run:
+    name: Запустить расчет юнит-экономики
     runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      TZ: Europe/Moscow
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+
     steps:
-      - name: Скачать код из репозитория
+      - name: Скачать репозиторий
         uses: actions/checkout@v4
 
       - name: Установить Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
 
       - name: Установить зависимости
         run: |
@@ -31,4 +26,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: Запустить расчет юнит-экономики
-        run: python scripts/raschet_unit_ekonomiki.py
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          python raschet_unit_ekonomiki.py
