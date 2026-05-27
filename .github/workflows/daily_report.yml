@@ -6,7 +6,7 @@ on:
       mode:
         description: "smoke / current_week / pdf_only / full_refresh"
         required: true
-        default: "pdf_only"
+        default: "current_week"
         type: choice
         options:
           - smoke
@@ -99,23 +99,17 @@ jobs:
         shell: bash
         env:
           INPUT_MODE: ${{ github.event.inputs.mode }}
-          INPUT_SEND_TELEGRAM: ${{ github.event.inputs.send_telegram }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${INPUT_MODE:-pdf_only}"
-            SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
           elif [ "${{ github.event.schedule }}" = "0 15 * * 1" ]; then
             MODE="full_refresh"
-            SEND_TELEGRAM="true"
           else
             MODE="current_week"
-            SEND_TELEGRAM="true"
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "send_telegram=$SEND_TELEGRAM" >> "$GITHUB_OUTPUT"
           echo "Selected mode: $MODE"
-          echo "Send Telegram: $SEND_TELEGRAM"
 
       - name: Run smoke test
         if: steps.mode.outputs.mode == 'smoke'
@@ -147,9 +141,7 @@ jobs:
           set -a
           source ./.env
           set +a
-          TG_FLAG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
-          python report_runner.py --root . --current-week-only $TG_FLAG
+          python report_runner.py --root . --current-week-only
 
       - name: Run PDF only
         if: steps.mode.outputs.mode == 'pdf_only'
@@ -159,9 +151,7 @@ jobs:
           set -a
           source ./.env
           set +a
-          TG_FLAG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
-          python report_runner.py --root . --pdf-only $TG_FLAG
+          python report_runner.py --root . --pdf-only
 
       - name: Run full refresh
         if: steps.mode.outputs.mode == 'full_refresh'
@@ -171,9 +161,7 @@ jobs:
           set -a
           source ./.env
           set +a
-          TG_FLAG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
-          python report_runner.py --root . --full-refresh $TG_FLAG
+          python report_runner.py --root . --full-refresh
 
       - name: Show generated files
         if: always()
@@ -181,6 +169,61 @@ jobs:
         run: |
           set -euo pipefail
           find "Отчёты" -maxdepth 5 -type f -print 2>/dev/null || true
+
+      - name: Check Telegram settings
+        if: steps.mode.outputs.mode != 'smoke' && (github.event_name != 'workflow_dispatch' || github.event.inputs.send_telegram != 'false')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ./.env ]; then
+            set -a
+            source ./.env
+            set +a
+          fi
+          test -n "${TELEGRAM_BOT_TOKEN:-}" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing. Add it to REPORT_ENV or GitHub Actions secrets."; exit 1; }
+          test -n "${TELEGRAM_CHAT_ID:-}" || { echo "ERROR: TELEGRAM_CHAT_ID is missing. Add it to REPORT_ENV or GitHub Actions secrets."; exit 1; }
+          echo "Telegram settings OK"
+
+      - name: Send PDF to Telegram
+        if: steps.mode.outputs.mode != 'smoke' && (github.event_name != 'workflow_dispatch' || github.event.inputs.send_telegram != 'false')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ./.env ]; then
+            set -a
+            source ./.env
+            set +a
+          fi
+          REPORT_DIR="Отчёты/Объединенный отчет/TOPFACE"
+          PDF_FILE=""
+          if [ -d "$REPORT_DIR" ]; then
+            PDF_FILE="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'Отчет по продажам Влад *.pdf' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
+            if [ -z "$PDF_FILE" ]; then
+              PDF_FILE="$(find "$REPORT_DIR" -maxdepth 1 -type f -name '*.pdf' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
+            fi
+          fi
+          test -n "$PDF_FILE" || { echo "ERROR: PDF file not found in $REPORT_DIR"; find "Отчёты" -maxdepth 5 -type f -print 2>/dev/null || true; exit 1; }
+          test -s "$PDF_FILE" || { echo "ERROR: PDF file is empty: $PDF_FILE"; exit 1; }
+          echo "Telegram: sending file: $PDF_FILE"
+          EXTRA_ARGS=()
+          if [ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]; then
+            EXTRA_ARGS+=( -F "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}" )
+          fi
+          RESPONSE_FILE="telegram_response.json"
+          curl -sS -f -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            "${EXTRA_ARGS[@]}" \
+            -F "document=@${PDF_FILE}" \
+            -F "caption=$(basename "$PDF_FILE")" \
+            -o "$RESPONSE_FILE"
+          cat "$RESPONSE_FILE"
+          python - <<'PY2'
+          import json, sys
+          data=json.load(open('telegram_response.json', encoding='utf-8'))
+          if not data.get('ok'):
+              raise SystemExit('Telegram API returned ok=false: '+json.dumps(data, ensure_ascii=False))
+          print('Telegram: sent successfully')
+          PY2
 
       - name: Upload report artifacts
         if: always()
