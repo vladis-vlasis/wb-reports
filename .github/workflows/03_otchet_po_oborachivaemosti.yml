@@ -3,37 +3,22 @@ name: Отчет по оборачиваемости
 on:
   workflow_dispatch:
   schedule:
-    # Каждый день в 06:30 по Москве / 03:30 UTC.
-    # Скрипт сам отправляет отчет в Telegram по своему расписанию.
-    - cron: "30 3 * * *"
+    # Каждый понедельник в 12:00 МСК = 09:00 UTC
+    - cron: "0 9 * * 1"
 
 jobs:
-  otchet-po-oborachivaemosti:
-    name: Сформировать отчет по оборачиваемости
+  run:
+    name: Запустить отчет по оборачиваемости
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      TZ: Europe/Moscow
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      WB_FORCE_SEND: ${{ vars.WB_FORCE_SEND }}
-      WB_SEND_REDISTRIBUTION_ALWAYS: ${{ vars.WB_SEND_REDISTRIBUTION_ALWAYS }}
-      WB_REDISTRIBUTION_TEMPLATE_KEY: ${{ vars.WB_REDISTRIBUTION_TEMPLATE_KEY }}
-      WB_REDISTRIBUTION_LOOKBACK_DAYS: ${{ vars.WB_REDISTRIBUTION_LOOKBACK_DAYS }}
-      WB_REDISTRIBUTION_TARGET_DAYS: ${{ vars.WB_REDISTRIBUTION_TARGET_DAYS }}
-      WB_STOP_LIST_KEY: ${{ vars.WB_STOP_LIST_KEY }}
+
     steps:
-      - name: Скачать код из репозитория
+      - name: Скачать репозиторий
         uses: actions/checkout@v4
 
       - name: Установить Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.11"
 
       - name: Установить зависимости
         run: |
@@ -41,12 +26,11 @@ jobs:
           pip install -r requirements.txt
 
       - name: Запустить отчет по оборачиваемости
-        run: python scripts/otchet_po_oborachivaemosti.py
-
-      - name: Сохранить сформированные Excel как артефакты Actions
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: otchet-po-oborachivaemosti
-          path: output/*.xlsx
-          if-no-files-found: ignore
+        env:
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python otchet_po_oborachivaemosti.py
