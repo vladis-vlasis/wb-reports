@@ -1,5 +1,5 @@
-# VERSION: TOPFACE_WORKFLOW_ORDERS_ONLY_TG_REPORTLAB_20260527_1058
-name: TOPFACE orders-only TG 20260527-1058
+# VERSION: DAILY_REPORT_TOPFACE_ORDERS_ONLY_TG_REPORTLAB_20260527
+name: Daily TOPFACE report
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: wb-report-topface-orders-only-20260527-1058
+  group: wb-report-topface-daily
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
-      REPORT_SCRIPT: "report_runner_orders_only_tg_20260527_1058.py"
+      REPORT_SCRIPT: "report_runner.py"
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
