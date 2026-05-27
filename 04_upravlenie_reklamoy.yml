@@ -1,0 +1,117 @@
+name: Управление рекламой
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим запуска: preview — только предпросмотр, run — боевой запуск"
+        required: true
+        default: "preview"
+        type: choice
+        options:
+          - preview
+          - run
+      dry_run:
+        description: "Для run: посчитать без реальных API-изменений"
+        required: true
+        default: false
+        type: boolean
+      apply_pause:
+        description: "Для run: разрешить паузы кампаний"
+        required: true
+        default: false
+        type: boolean
+      apply_start:
+        description: "Для run: разрешить запуск кампаний"
+        required: true
+        default: false
+        type: boolean
+      apply_price:
+        description: "Для run: разрешить изменение скидок/цен"
+        required: true
+        default: false
+        type: boolean
+      apply_experiment:
+        description: "Для run: разрешить эксперимент 1 РК на группу"
+        required: true
+        default: false
+        type: boolean
+      skip_price:
+        description: "Для run: не строить контур цен"
+        required: true
+        default: false
+        type: boolean
+  schedule:
+    # Каждый день в 07:00 по Москве / 04:00 UTC
+    - cron: "0 4 * * *"
+
+jobs:
+  upravlenie-reklamoy:
+    name: Запустить управление рекламой WB
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      TZ: Europe/Moscow
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      WB_PAUSE_MIN_IMPRESSIONS: ${{ vars.WB_PAUSE_MIN_IMPRESSIONS }}
+      WB_PAUSE_ANALYSIS_DAYS: ${{ vars.WB_PAUSE_ANALYSIS_DAYS }}
+      WB_RAMP_TARGET_IMPRESSIONS_PER_DAY: ${{ vars.WB_RAMP_TARGET_IMPRESSIONS_PER_DAY }}
+      WB_RAMP_MAX_SPEND_PER_DAY: ${{ vars.WB_RAMP_MAX_SPEND_PER_DAY }}
+      WB_RAMP_CHECK_DAYS: ${{ vars.WB_RAMP_CHECK_DAYS }}
+      WB_ONE_CAMPAIGN_TARGET_POSITION: ${{ vars.WB_ONE_CAMPAIGN_TARGET_POSITION }}
+      WB_PRICE_MIN_SELLER_DISCOUNT_PCT: ${{ vars.WB_PRICE_MIN_SELLER_DISCOUNT_PCT }}
+      WB_MAX_PRICE_TEST_ITEMS_PER_RUN: ${{ vars.WB_MAX_PRICE_TEST_ITEMS_PER_RUN }}
+      WB_ECONOMICS_SUBTRACT_COGS: ${{ vars.WB_ECONOMICS_SUBTRACT_COGS }}
+    steps:
+      - name: Скачать код из репозитория
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Запустить рекламу по расписанию
+        if: github.event_name == 'schedule'
+        run: python scripts/upravlenie_reklamoy.py run
+
+      - name: Запустить рекламу вручную
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          CMD="python scripts/upravlenie_reklamoy.py ${{ inputs.mode }}"
+
+          if [ "${{ inputs.mode }}" = "run" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
+          if [ "${{ inputs.mode }}" = "run" ] && [ "${{ inputs.apply_pause }}" = "true" ]; then
+            CMD="$CMD --apply-pause"
+          fi
+
+          if [ "${{ inputs.mode }}" = "run" ] && [ "${{ inputs.apply_start }}" = "true" ]; then
+            CMD="$CMD --apply-start"
+          fi
+
+          if [ "${{ inputs.mode }}" = "run" ] && [ "${{ inputs.apply_price }}" = "true" ]; then
+            CMD="$CMD --apply-price"
+          fi
+
+          if [ "${{ inputs.mode }}" = "run" ] && [ "${{ inputs.apply_experiment }}" = "true" ]; then
+            CMD="$CMD --apply-experiment"
+          fi
+
+          if [ "${{ inputs.mode }}" = "run" ] && [ "${{ inputs.skip_price }}" = "true" ]; then
+            CMD="$CMD --skip-price"
+          fi
+
+          echo "Команда запуска: $CMD"
+          eval "$CMD"
