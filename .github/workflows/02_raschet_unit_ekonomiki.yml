@@ -25,11 +25,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Запустить расчет юнит-экономики
+      - name: Загрузить переменные из REPORT_ENV и отдельные secrets
         env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          REPORT_ENV: ${{ secrets.REPORT_ENV }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          if [ -z "$REPORT_ENV" ]; then
+            echo "::error::Не задан secret REPORT_ENV"
+            exit 1
+          fi
+
+          # Все строки вида NAME=value из REPORT_ENV добавляем в окружение job
+          printf '%s\n' "$REPORT_ENV" >> "$GITHUB_ENV"
+
+          # WB-ключ у тебя заведён отдельным secret, поэтому добавляем его отдельно
+          if [ -n "$WB_PROMO_KEY_TOPFACE" ]; then
+            echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
+          fi
+
+      - name: Запустить расчет юнит-экономики
         run: |
           python raschet_unit_ekonomiki.py
