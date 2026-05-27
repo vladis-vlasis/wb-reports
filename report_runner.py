@@ -1,4 +1,4 @@
-# VERSION: PDF_ONLY_NO_TG_20260526
+# VERSION: ORDERS_ONLY_AND_TG_YAML_FIX_20260527
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -99,7 +99,10 @@ ALIASES: Dict[str, Sequence[str]] = {
     "title": ["Название", "Название товара", "Товар", "Наименование"],
     "warehouse": ["Склад", "warehouseName", "warehouse"],
     "orders": ["Заказы", "orders", "ordersCount", "Количество заказов", "Кол-во заказов", "Заказали товаров, шт", "Заказали, шт", "Заказали"],
-    "order_sum": ["Сумма заказов", "ordersSumRub", "Сумма заказов, руб", "Сумма заказов со скидкой", "Сумма заказов (со скидкой)"],
+    "order_sum": ["Сумма заказов", "ordersSumRub", "ordersSum", "Сумма заказов, руб", "Сумма заказов со скидкой", "Сумма заказов (со скидкой)", "Заказали на сумму", "Заказали, руб", "Сумма", "Итого"],
+    "is_cancel": ["isCancel", "is_cancel", "Отменен", "Отменён", "Отмена", "Отменено", "Заказ отменен", "Заказ отменён"],
+    "cancel_date": ["cancelDate", "cancel_date", "Дата отмены", "Дата отмены заказа", "Дата отмены/возврата"],
+    "order_status": ["Статус", "status", "Статус заказа", "Статус товара", "Состояние"],
     "open_cards": ["Открытия карточки", "openCardCount", "Переходы в карточку", "Клики", "Клики карточки"],
     "add_to_cart": ["Добавления в корзину", "addToCartCount", "Корзины", "ATBS"],
     "cart_conv": ["Конверсия в корзину", "addToCartConversion", "Конверсия в корзину %"],
@@ -723,6 +726,7 @@ class DataPack:
     funnel: pd.DataFrame
     ads_daily: pd.DataFrame
     ads_raw: pd.DataFrame
+    ads_category: pd.DataFrame
     campaigns: pd.DataFrame
     search_queries: pd.DataFrame
     entry_points: pd.DataFrame
@@ -794,30 +798,90 @@ class Loader:
                 self.diag.add("ERROR", "read", f"Не удалось прочитать {key}", exc)
 
     def load_orders(self) -> pd.DataFrame:
+        """Load WB orders as the only source of orders/order_sum.
+
+        Hard business rule 2026-05-27:
+        - order_sum is taken only from the Orders report column (no finishedPrice × qty fallback);
+        - cancelled orders are excluded here;
+        - funnel is not allowed to replace orders/order_sum later.
+        """
         files = self.list_reports("Заказы", self.store, "Недельные")
         files = self._filter_current_week_files(files, keep_unparsed=False, fallback_tail=1)
         frames = []
+
+        def _cancel_mask(src: pd.DataFrame) -> pd.Series:
+            mask = pd.Series(False, index=src.index)
+            # Boolean/text cancel flags.
+            if "is_cancel" in src.columns:
+                flag = src["is_cancel"].map(normalize_text).str.lower().str.replace("ё", "е")
+                mask = mask | flag.isin({"1", "true", "да", "yes", "y", "отменен", "отмена", "отменено"})
+                mask = mask | flag.str.contains("отмен|cancel", na=False)
+            # Cancellation date: only real non-empty dates count.
+            if "cancel_date" in src.columns:
+                raw = src["cancel_date"].map(normalize_text)
+                raw_bad = raw.str.lower().isin({"", "nan", "none", "null", "0", "0001-01-01", "0001-01-01 00:00:00"})
+                dt = date_series(src["cancel_date"])
+                mask = mask | (dt.notna() & ~raw_bad)
+            # Status field fallback.
+            if "order_status" in src.columns:
+                st = src["order_status"].map(normalize_text).str.lower().str.replace("ё", "е")
+                mask = mask | st.str.contains("отмен|cancel", na=False)
+            return mask.fillna(False)
+
         for key, data in self._read_candidates(files):
             try:
                 df = read_excel_table(data, "Заказы")
                 if df.empty:
                     continue
+                df = add_alias_columns(df)
+                rows_before = len(df)
+                cancel_mask = _cancel_mask(df)
+                df_active = df.loc[~cancel_mask].copy()
+                rows_cancelled = int(cancel_mask.sum())
+
+                order_sum_series = num_series(get_col(df_active, "order_sum"))
+                order_sum_col = _source_column_name(df_active, "order_sum")
+                if order_sum_series.isna().all():
+                    order_sum_col = ""
+                    self.diag.add("ERROR", "orders", f"В файле заказов не распознана колонка суммы заказов: {key}", "fallback finishedPrice × quantity запрещён")
+                    log(f"orders: ERROR no order_sum column recognized in {Path(key).name}; finishedPrice fallback is forbidden")
+
                 out = pd.DataFrame({
-                    "day": date_series(get_col(df, "day")),
-                    "nm_id": num_series(get_col(df, "nm_id")),
-                    "supplier_article": get_col(df, "supplier_article").map(clean_article),
-                    "subject": get_col(df, "subject").map(normalize_text),
-                    "warehouse": get_col(df, "warehouse").map(normalize_text),
-                    "orders": num_series(get_col(df, "orders")),
-                    "finished_price": num_series(get_col(df, "finished_price")),
-                    "price_with_disc": num_series(get_col(df, "price_with_disc")),
-                    "spp": num_series(get_col(df, "spp")),
+                    "day": date_series(get_col(df_active, "day")),
+                    "nm_id": num_series(get_col(df_active, "nm_id")),
+                    "supplier_article": get_col(df_active, "supplier_article").map(clean_article),
+                    "subject": get_col(df_active, "subject").map(normalize_text),
+                    "warehouse": get_col(df_active, "warehouse").map(normalize_text),
+                    "orders": num_series(get_col(df_active, "orders")),
+                    "order_sum": order_sum_series,
+                    "finished_price": num_series(get_col(df_active, "finished_price")),
+                    "price_with_disc": num_series(get_col(df_active, "price_with_disc")),
+                    "spp": num_series(get_col(df_active, "spp")),
                     "source_file": key,
+                    "source_sheet": df.attrs.get("source_sheet", ""),
+                    "source_order_sum_col": order_sum_col,
                 })
                 if out["orders"].isna().all():
                     out["orders"] = 1.0
                 out["orders"] = out["orders"].fillna(1.0)
-                frames.append(out[out["day"].notna()])
+                # No fallback from finishedPrice. Missing sums become 0 and are visible in diagnostics.
+                missing_sum_rows = int(out["order_sum"].isna().sum())
+                out["order_sum"] = out["order_sum"].fillna(0.0)
+                out = out[out["day"].notna()].copy()
+                frames.append(out)
+                log(
+                    "orders: file=%s sheet=%s rows_before=%s cancelled_excluded=%s rows_after=%s order_sum_col=%s sum=%s" % (
+                        Path(key).name,
+                        df.attrs.get("source_sheet", ""),
+                        rows_before,
+                        rows_cancelled,
+                        len(out),
+                        order_sum_col or "NOT_FOUND",
+                        f"{pd.to_numeric(out['order_sum'], errors='coerce').fillna(0).sum():.2f}",
+                    )
+                )
+                if missing_sum_rows:
+                    self.diag.add("WARN", "orders", f"В файле заказов есть строки без суммы заказов: {key}", f"rows={missing_sum_rows}; fallback запрещён")
             except Exception as exc:
                 self.diag.add("ERROR", "orders", f"Не прочитан файл заказов {key}", exc)
         out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -942,6 +1006,67 @@ class Loader:
         self._log("ads_raw", raw, "day")
         self._log("ads_daily", daily, "day")
         return raw, daily, campaigns
+
+    def load_ads_category(self) -> pd.DataFrame:
+        """Read category-level advertising spend from WB advertising report.
+
+        This is the source of truth for current-week category/current overview spend.
+        Raw campaign/article sheets can duplicate spend across articles, so they are not used
+        for the first PDF page when this category sheet exists.
+        """
+        files = self.list_reports("Реклама", self.store, "Недельные")
+        consolidated = self.path("Реклама", self.store, "Анализ рекламы.xlsx")
+        if self.storage.exists(consolidated):
+            files.append(consolidated)
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=1)
+        frames = []
+        wanted_sheets = {"отчет_по_категории", "отчет по категории", "отчет_по_категории_итог", "отчет по категории итог", "отчёт_по_категории", "отчёт по категории", "отчёт_по_категории_итог", "отчёт по категории итог"}
+        for key, data in self._read_candidates(files):
+            try:
+                raw_bytes = unwrap_excel_bytes(data)
+                book = pd.ExcelFile(io.BytesIO(raw_bytes))
+                period_start, period_end = parse_period_from_name(Path(key).name)
+                for sheet in book.sheet_names:
+                    if norm_key(sheet).replace(" ", "_") not in {s.replace(" ", "_") for s in wanted_sheets} and norm_key(sheet) not in wanted_sheets:
+                        continue
+                    df = read_excel_table(raw_bytes, sheet)
+                    if df.empty:
+                        continue
+                    day = date_series(get_col(df, "day"))
+                    if day.isna().all() and period_end is not None:
+                        day = pd.Series([period_end] * len(df), index=df.index)
+                    out = pd.DataFrame({
+                        "day": day,
+                        "subject": get_col(df, "subject").map(normalize_text),
+                        "spend": num_series(get_col(df, "spend")).fillna(0.0),
+                        "clicks": num_series(get_col(df, "clicks")).fillna(0.0),
+                        "impressions": num_series(get_col(df, "impressions")).fillna(0.0),
+                        "orders": num_series(get_col(df, "ad_orders")).fillna(0.0),
+                        "order_sum": num_series(get_col(df, "ad_order_sum")).fillna(0.0),
+                        "source_file": key,
+                        "source_sheet": sheet,
+                    })
+                    out = out[out["day"].notna()].copy()
+                    out = out[out["subject"].isin(TARGET_SUBJECTS)].copy()
+                    if out.empty:
+                        continue
+                    frames.append(out)
+                    log(f"ads_category: file={Path(key).name} sheet={sheet} rows={len(out):,} spend={out['spend'].sum():.2f}")
+            except Exception as exc:
+                self.diag.add("ERROR", "ads_category", f"Не прочитан категорийный лист рекламы {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not out.empty:
+            out = out.groupby(["day", "subject"], dropna=False, as_index=False).agg(
+                spend=("spend", "sum"),
+                clicks=("clicks", "sum"),
+                impressions=("impressions", "sum"),
+                orders=("orders", "sum"),
+                order_sum=("order_sum", "sum"),
+                source_file=("source_file", lambda s: "; ".join(sorted(set(map(str, s)))[:3])),
+                source_sheet=("source_sheet", lambda s: "; ".join(sorted(set(map(str, s)))[:3])),
+            )
+        self._log("ads_category", out, "day")
+        return out
 
     def load_search_queries(self, latest_day: Optional[pd.Timestamp] = None) -> pd.DataFrame:
         files_all = self.list_reports("Поисковые запросы", self.store, "Недельные")
@@ -1170,6 +1295,7 @@ class Loader:
         orders = self.load_orders()
         funnel = self.load_funnel()
         ads_raw, ads_daily, campaigns = self.load_ads()
+        ads_category = self.load_ads_category()
 
         # Preliminary latest date is known before heavy Stage 2 sources.
         # Use it to read only the recent 90-110 day window and avoid silent 20+ minute parsing of old files.
@@ -1206,7 +1332,7 @@ class Loader:
             if not abc_weekly.empty:
                 latest_day = max(latest_day, pd.to_datetime(abc_weekly["period_end"], errors="coerce").max())
         return DataPack(
-            orders=orders, funnel=funnel, ads_daily=ads_daily, ads_raw=ads_raw, campaigns=campaigns,
+            orders=orders, funnel=funnel, ads_daily=ads_daily, ads_raw=ads_raw, ads_category=ads_category, campaigns=campaigns,
             search_queries=search_queries, entry_points=entry_points, stock=stock, abc_weekly=abc_weekly,
             abc_monthly=abc_monthly, economics=economics, latest_day=pd.Timestamp(latest_day).normalize(), diagnostics=self.diag,
         )
@@ -1357,8 +1483,12 @@ class AnalyticsBuilder:
         if orders.empty:
             return pd.DataFrame()
         orders = orders[(orders["day"] >= self.cutoff_90) & (orders["day"] <= self.latest_day)].copy()
+        if "order_sum" not in orders.columns:
+            orders["order_sum"] = 0.0
         g = orders.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            orders=("orders", "sum"),
             orders_rows=("orders", "sum"),
+            order_sum=("order_sum", "sum"),
             finished_price=("finished_price", "mean"), price_with_disc=("price_with_disc", "mean"), spp=("spp", "mean"),
         )
         return g
@@ -1373,18 +1503,6 @@ class AnalyticsBuilder:
             add_to_cart=("add_to_cart", "sum"), buyouts_count=("buyouts_count", "sum"), cancels_count=("cancels_count", "sum"),
             finished_price_funnel=("finished_price", "mean"), spp_funnel=("spp", "mean"),
         )
-        # WB funnel can contain ordered and cancelled units separately. For управленческий
-        # оперативный контур cancelled units must not remain in orders/order_sum.
-        # We keep raw columns for audit and proportionally remove cancellations from order_sum.
-        if os.getenv("WB_EXCLUDE_CANCELS_FROM_FUNNEL", "1").strip().lower() not in {"0", "false", "no", "n"}:
-            raw_orders = pd.to_numeric(g["orders"], errors="coerce").fillna(0.0)
-            cancels = pd.to_numeric(g["cancels_count"], errors="coerce").fillna(0.0).clip(lower=0.0)
-            net_orders = (raw_orders - cancels).clip(lower=0.0)
-            g["orders_raw_including_cancels"] = raw_orders
-            g["order_sum_raw_including_cancels"] = pd.to_numeric(g["order_sum"], errors="coerce").fillna(0.0)
-            ratio = np.where(raw_orders > 0, net_orders / raw_orders, 1.0)
-            g["orders"] = net_orders
-            g["order_sum"] = g["order_sum_raw_including_cancels"] * ratio
         g["cart_conv_pct"] = np.where(g["open_cards"] > 0, g["add_to_cart"] / g["open_cards"] * 100, np.nan)
         g["order_conv_pct"] = np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan)
         return g
@@ -1615,21 +1733,30 @@ class AnalyticsBuilder:
         return weekly, pd.DataFrame(rows)
 
     def article_day_fact(self) -> pd.DataFrame:
-        base = self.funnel_daily()
-        if base.empty:
-            base = self.order_prices_daily()
-        prices = self.order_prices_daily()
+        # HARD RULE: orders/order_sum come only from WB Orders file.
+        # Funnel is used only for traffic/conversion/buyout context and must never override sales.
+        base = self.order_prices_daily()
+        funnel = self.funnel_daily()
         ads = self.ads_daily_pivot()
         search_summary, _ = self.search_daily_summary()
         loc_detail, loc_summary = self.localization()
         gp_weekly, gp_potential = self.gross_profit_potential()
         buyouts = self.buyout_rates()
-        # Merge all by day+article.
-        out = base.copy()
-        if out.empty:
-            return pd.DataFrame()
         keys = ["day", "subject", "product", "supplier_article", "nm_id"]
-        for df in [prices, ads, search_summary]:
+        if base.empty:
+            if funnel is None or funnel.empty:
+                return pd.DataFrame()
+            # Keep traffic-only rows, but sales stay zero because Orders file has no row.
+            base = funnel[keys].drop_duplicates().copy()
+            base["orders"] = 0.0
+            base["orders_rows"] = 0.0
+            base["order_sum"] = 0.0
+        out = base.copy()
+        funnel_metrics = pd.DataFrame()
+        if funnel is not None and not funnel.empty:
+            drop_sales = [c for c in ["orders", "order_sum", "finished_price"] if c in funnel.columns]
+            funnel_metrics = funnel.drop(columns=drop_sales, errors="ignore").copy()
+        for df in [funnel_metrics, ads, search_summary]:
             if df is not None and not df.empty:
                 out = out.merge(df, on=keys, how="outer", suffixes=("", "_dup"))
                 for c in [c for c in out.columns if c.endswith("_dup")]:
@@ -1641,6 +1768,11 @@ class AnalyticsBuilder:
             out = out.merge(buyouts[["supplier_article", "nm_id", "used_buyout_pct_90", "buyout_pct_90", "buyout_pct_wrong_orders"]], on=["supplier_article", "nm_id"], how="left")
         if not loc_summary.empty:
             out = out.merge(loc_summary[["supplier_article", "nm_id", "direct_localization_pct", "localization_with_replacements_pct", "localization_status", "stock_qty_total"]], on=["supplier_article", "nm_id"], how="left")
+        # Sales are Orders-only. Rows created from funnel/search/ad without Orders row remain 0.
+        for _sales_col in ["orders", "orders_rows", "order_sum"]:
+            if _sales_col not in out.columns:
+                out[_sales_col] = 0.0
+            out[_sales_col] = pd.to_numeric(out[_sales_col], errors="coerce").fillna(0.0)
         # Fill price fields
         out["finished_price"] = out.get("finished_price", np.nan)
         if "finished_price_funnel" in out.columns:
@@ -1698,7 +1830,7 @@ class AnalyticsBuilder:
             return pd.DataFrame()
         metric_defs = [
             ("orders", "Заказы в день"), ("order_sum", "Сумма заказов"), ("gross_profit_model", "Валовая прибыль модель"),
-            ("open_cards", "Открытия карточки / клики"), ("ad_spend_model", "Расход РК"), ("add_to_cart", "Добавления в корзину"),
+            ("open_cards", "Открытия карточки / клики"), ("add_to_cart", "Добавления в корзину"),
             ("cart_conv_pct", "Конверсия в корзину, %"), ("order_conv_pct", "Конверсия в заказ, %"),
             ("finished_price", "finishedPrice"), ("spp", "СПП, %"),
             ("manual_impressions", "manual показы"), ("manual_clicks", "manual клики"), ("manual_ctr_pct", "manual CTR, %"), ("manual_cpc", "manual CPC"), ("manual_drr_pct", "manual ДРР, %"),
@@ -1995,6 +2127,7 @@ class AnalyticsBuilder:
             "channel_summary": channel,
             # Raw ad source for PDF current-week advertising truth.
             # article_day_fact can repeat campaign spend across articles; this source is grouped from the ad report itself.
+            "ads_category_source": self.pack.ads_category.copy() if getattr(self.pack, "ads_category", pd.DataFrame()) is not None else pd.DataFrame(),
             "ads_raw_source": self.enrich(self.pack.ads_raw, "ads_raw"),
             "ads_daily_source": self.enrich(self.pack.ads_daily, "ads_daily"),
             "search_daily_summary": search_summary,
@@ -2020,7 +2153,7 @@ COLUMN_RU = {
     "target_above_mean_90d": "Целевое значение", "best_days_avg": "Среднее в лучшие дни", "last_full_week_avg": "Среднее за последнюю полную неделю",
     "last_full_week_sum": "Сумма за последнюю полную неделю", "gap_to_target_pct": "Отклонение от цели, %", "days_count": "Дней в анализе", "best_days_count": "Лучших дней",
     "orders": "Заказы", "orders_rows": "Строк заказов", "order_sum": "Сумма заказов", "gross_profit_model": "Валовая прибыль модель",
-    "open_cards": "Открытия карточки / клики", "ad_spend_model": "Расход РК", "add_to_cart": "Добавления в корзину", "cart_conv_pct": "Конверсия в корзину, %", "order_conv_pct": "Конверсия в заказ, %",
+    "open_cards": "Открытия карточки / клики", "add_to_cart": "Добавления в корзину", "cart_conv_pct": "Конверсия в корзину, %", "order_conv_pct": "Конверсия в заказ, %",
     "finished_price": "finishedPrice", "price_with_disc": "priceWithDisc", "spp": "СПП, %",
     "manual_impressions": "Показы manual", "manual_clicks": "Клики manual", "manual_orders": "Заказы manual", "manual_order_sum": "Сумма заказов manual", "manual_spend": "Расход manual", "manual_ctr_pct": "CTR manual, %", "manual_cpc": "CPC manual, ₽", "manual_cr_pct": "CR manual, %", "manual_drr_pct": "ДРР manual, %",
     "unified_impressions": "Показы unified", "unified_clicks": "Клики unified", "unified_orders": "Заказы unified", "unified_order_sum": "Сумма заказов unified", "unified_spend": "Расход unified", "unified_ctr_pct": "CTR unified, %", "unified_cpc": "CPC unified, ₽", "unified_cr_pct": "CR unified, %", "unified_drr_pct": "ДРР unified, %",
@@ -2212,7 +2345,7 @@ def export_outputs(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> List[Pa
     # Technical report
     wb = Workbook()
     wb.remove(wb.active)
-    for name in ["article_day_fact", "metrics_summary_90d", "best_days", "best_day_factors", "price_ranges", "channel_summary", "ads_raw_source", "ads_daily_source", "core_queries_80", "search_unique_demand", "entry_points_summary", "localization_summary", "localization_detail", "gp_potential_90d", "buyout_validation", "dictionary", "diagnostics"]:
+    for name in ["article_day_fact", "metrics_summary_90d", "best_days", "best_day_factors", "price_ranges", "channel_summary", "ads_category_source", "ads_raw_source", "ads_daily_source", "core_queries_80", "search_unique_demand", "entry_points_summary", "localization_summary", "localization_detail", "gp_potential_90d", "buyout_validation", "dictionary", "diagnostics"]:
         write_df_sheet(wb, name[:31], outputs.get(name, pd.DataFrame()))
     p = local_dir / TECH_REPORT_NAME
     wb.save(p)
@@ -2286,9 +2419,38 @@ def upload_to_storage(storage: Storage, local_paths: List[Path], root: str) -> N
 FACTOR_REPORT_NAME = "Факторный_мост_ВП_TOPFACE.xlsx"
 PDF_REPORT_NAME = "Управленческий_отчет_TOPFACE.pdf"
 
+REPORT_MONTH_GENITIVE_RU = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
+    7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
+def _max_report_day_from_outputs(outputs: Dict[str, Any]) -> pd.Timestamp:
+    """Return the latest real date represented in report outputs for PDF naming/caption."""
+    max_day = pd.NaT
+    for name in ["article_day_fact", "ads_daily_source", "search_unique_demand", "ads_raw_source"]:
+        df = outputs.get(name) if isinstance(outputs, dict) else None
+        if not isinstance(df, pd.DataFrame) or df.empty or "day" not in df.columns:
+            continue
+        days = pd.to_datetime(df["day"], errors="coerce").dropna()
+        if days.empty:
+            continue
+        d = days.max().normalize()
+        if pd.isna(max_day) or d > max_day:
+            max_day = d
+    if pd.isna(max_day):
+        max_day = pd.Timestamp.today().normalize()
+    return pd.Timestamp(max_day).normalize()
+
+def report_date_label_ru(outputs: Dict[str, Any]) -> str:
+    d = _max_report_day_from_outputs(outputs)
+    return f"{int(d.day)} {REPORT_MONTH_GENITIVE_RU.get(int(d.month), d.strftime('%m'))}"
+
+def sales_pdf_report_name(outputs: Dict[str, Any]) -> str:
+    return f"Отчет по продажам Влад {report_date_label_ru(outputs)}.pdf"
+
 
 PDF_ONLY_SHEETS = {
-    TECH_REPORT_NAME: ["article_day_fact", "metrics_summary_90d", "search_unique_demand", "ads_raw_source", "ads_daily_source", "gp_potential_90d"],
+    TECH_REPORT_NAME: ["article_day_fact", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source", "gp_potential_90d"],
     FACTOR_REPORT_NAME: ["optimal_benchmarks", "factor_bridge", "entry_points_bridge", "factor_summary_for_pdf"],
 }
 
@@ -5076,9 +5238,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     # Advertising truth source. For current/incomplete periods do NOT trust repeated article_day_fact spend
     # when the raw ad report is available. It is grouped directly from Отчёты/Реклама/...
-    ads_truth = outputs.get("ads_raw_source", pd.DataFrame()).copy()
+    ads_truth = outputs.get("ads_category_source", pd.DataFrame()).copy()
+    ads_truth_source_name = "ads_category_source" if ads_truth is not None and not ads_truth.empty else ""
+    if ads_truth is None or ads_truth.empty:
+        ads_truth = outputs.get("ads_raw_source", pd.DataFrame()).copy()
+        ads_truth_source_name = "ads_raw_source" if ads_truth is not None and not ads_truth.empty else ""
     if ads_truth is None or ads_truth.empty:
         ads_truth = outputs.get("ads_daily_source", pd.DataFrame()).copy()
+        ads_truth_source_name = "ads_daily_source" if ads_truth is not None and not ads_truth.empty else ""
     if ads_truth is None:
         ads_truth = pd.DataFrame()
     if not ads_truth.empty:
@@ -5280,7 +5447,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if at is not None and not at.empty:
             g = g.merge(at, on=keys, how="left")
             mask = pd.to_numeric(g.get("ad_truth_rows"), errors="coerce").fillna(0) > 0
-            g["ad_spend_source"] = np.where(mask, "ads_raw_source", "article_day_fact")
+            g["ad_spend_source"] = np.where(mask, ads_truth_source_name or "ads_truth", "article_day_fact")
             g["ad_spend"] = np.where(mask, pd.to_numeric(g.get("ad_spend_truth"), errors="coerce").fillna(0), g["ad_spend"])
             g["clicks"] = np.where(mask, pd.to_numeric(g.get("clicks_truth"), errors="coerce").fillna(0), g["clicks"])
             g["impressions"] = np.where(mask, pd.to_numeric(g.get("impressions_truth"), errors="coerce").fillna(0), g["impressions"])
@@ -5404,6 +5571,48 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             out[_c] = pd.to_numeric(out[_c], errors="coerce").fillna(0.0)
         return out
 
+    def _abc_periods_inside(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        """ABC-only facts for a date range.
+
+        Used for current-month GP: if ABC for a day/week has not been released,
+        that period contributes nothing to GP and is displayed as blank.
+        """
+        frames = []
+        for nm in ["abc_weekly", "abc_monthly"]:
+            src = outputs.get(nm, pd.DataFrame()).copy()
+            if src is None or src.empty or "period_start" not in src.columns or "period_end" not in src.columns:
+                continue
+            src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
+            src["period_end"] = pd.to_datetime(src["period_end"], errors="coerce").dt.normalize()
+            src = src[(src["period_start"] >= pd.Timestamp(start).normalize()) & (src["period_end"] <= pd.Timestamp(end).normalize())].copy()
+            if src.empty:
+                continue
+            if "subject_disp" not in src.columns:
+                src["subject_disp"] = src.get("subject", "").map(_subject_disp) if "subject" in src.columns else ""
+            if "product_code" not in src.columns:
+                src["product_code"] = src.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+            if "supplier_article" in src.columns:
+                src["supplier_article"] = src["supplier_article"].map(_clean_article_local)
+            src = src[src["subject_disp"].isin(CATEGORY_ORDER)].copy()
+            for c0 in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct"]:
+                if c0 not in src.columns:
+                    src[c0] = 0.0
+                src[c0] = pd.to_numeric(src[c0], errors="coerce").fillna(0.0)
+            frames.append(src)
+        if not frames:
+            return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows"])
+        x = pd.concat(frames, ignore_index=True)
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x["_abc_ad"] = np.where(x["gross_revenue"] > 0, x["gross_revenue"] * x["abc_drr_pct"] / 100.0, 0.0)
+        return x.groupby(keys, dropna=False, as_index=False).agg(
+            gp_abc=("gross_profit", "sum"),
+            revenue_abc=("gross_revenue", "sum"),
+            abc_ad_spend=("_abc_ad", "sum"),
+            abc_rows=("gross_profit", "size"),
+        )
+
     cur_cat = _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"])
     prev_cat = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp"])
     closed_cat = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
@@ -5470,100 +5679,6 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             "back_label": "← закр. месяц",
         },
     }
-
-    # Metrics for the compact article benchmark panel: Среднее 90 д. / В лучшие дни.
-    # Source of truth is metrics_summary_90d. If an old file does not contain Расход РК yet,
-    # the value is calculated from article_day_fact as a safe fallback.
-    metrics_90 = outputs.get("metrics_summary_90d", pd.DataFrame()).copy()
-    if metrics_90 is None:
-        metrics_90 = pd.DataFrame()
-    if not metrics_90.empty:
-        try:
-            metrics_90 = metrics_90.rename(columns={c: PDF_ONLY_RU_TO_EN.get(str(c), str(c)) for c in metrics_90.columns})
-        except Exception:
-            pass
-        if "subject_disp" not in metrics_90.columns:
-            metrics_90["subject_disp"] = metrics_90.get("subject", "").map(_subject_disp) if "subject" in metrics_90.columns else ""
-        if "product_code" not in metrics_90.columns:
-            metrics_90["product_code"] = metrics_90.get("product", "").map(_prod) if "product" in metrics_90.columns else ""
-        if "supplier_article" in metrics_90.columns:
-            metrics_90["supplier_article"] = metrics_90["supplier_article"].map(_clean_article_local)
-        else:
-            metrics_90["supplier_article"] = ""
-        for _c in ["nm_id", "avg_90d_all_days", "target_above_mean_90d"]:
-            if _c not in metrics_90.columns:
-                metrics_90[_c] = np.nan
-        metrics_90["nm_id_num"] = pd.to_numeric(metrics_90["nm_id"], errors="coerce")
-        for _c in ["avg_90d_all_days", "target_above_mean_90d"]:
-            metrics_90[_c] = metrics_90[_c].map(to_number)
-        metrics_90["metric_norm"] = metrics_90.get("metric", "").map(norm_key) if "metric" in metrics_90.columns else ""
-
-    _BENCHMARK_METRICS = [
-        ("order_sum", "Сумма заказов", ["Сумма заказов"], _fmt_money),
-        ("open_cards", "Клики", ["Открытия карточки / клики", "Клики"], _fmt_num),
-        ("ad_spend_model", "Расход РК", ["Расход РК"], _fmt_money),
-        ("finished_price", "Цена покупателя", ["finishedPrice", "Цена покупателя"], _fmt_rub1),
-    ]
-
-    def _target_above_mean(values: pd.Series, ignore_zero: bool = True) -> float:
-        s = pd.to_numeric(values, errors="coerce").replace([np.inf, -np.inf], np.nan)
-        if ignore_zero:
-            s = s.replace(0, np.nan)
-        s = s.dropna()
-        if s.empty:
-            return np.nan
-        avg = s.mean()
-        above = s[s > avg]
-        return float(above.mean()) if not above.empty else float(avg)
-
-    def _benchmark_from_daily(row: pd.Series, metric_col: str) -> Tuple[float, float]:
-        col = metric_col
-        if col == "ad_spend_model" and col not in daily.columns and "ad_spend_total" in daily.columns:
-            col = "ad_spend_total"
-        if col not in daily.columns:
-            return np.nan, np.nan
-        cat = str(row.get("subject_disp", ""))
-        prod = str(row.get("product_code", ""))
-        art = _clean_article_local(row.get("supplier_article"))
-        nm = _num(row.get("nm_id"), np.nan)
-        q = daily[(daily["subject_disp"].astype(str).eq(cat)) & (daily["product_code"].astype(str).eq(prod)) & (daily["supplier_article"].astype(str).eq(art))].copy()
-        if pd.notna(nm) and "nm_id" in q.columns:
-            q_nm = q[pd.to_numeric(q["nm_id"], errors="coerce").eq(nm)].copy()
-            if not q_nm.empty:
-                q = q_nm
-        if q.empty:
-            return np.nan, np.nan
-        s = pd.to_numeric(q[col], errors="coerce")
-        return float(s.mean()) if s.notna().any() else np.nan, _target_above_mean(s, ignore_zero=True)
-
-    def _benchmark_metric(row: pd.Series, metric_col: str, aliases: List[str]) -> Tuple[float, float]:
-        if not metrics_90.empty and "metric_norm" in metrics_90.columns:
-            cat = str(row.get("subject_disp", ""))
-            prod = str(row.get("product_code", ""))
-            art = _clean_article_local(row.get("supplier_article"))
-            nm = _num(row.get("nm_id"), np.nan)
-            alias_norms = {norm_key(a) for a in aliases}
-            q = metrics_90[(metrics_90["subject_disp"].astype(str).eq(cat)) & (metrics_90["product_code"].astype(str).eq(prod)) & (metrics_90["supplier_article"].astype(str).eq(art)) & (metrics_90["metric_norm"].isin(alias_norms))].copy()
-            if pd.notna(nm) and "nm_id_num" in q.columns:
-                q_nm = q[pd.to_numeric(q["nm_id_num"], errors="coerce").eq(nm)].copy()
-                if not q_nm.empty:
-                    q = q_nm
-            if not q.empty:
-                avg = pd.to_numeric(q["avg_90d_all_days"], errors="coerce").dropna()
-                tgt = pd.to_numeric(q["target_above_mean_90d"], errors="coerce").dropna()
-                if len(avg) or len(tgt):
-                    return (float(avg.mean()) if len(avg) else np.nan, float(tgt.mean()) if len(tgt) else np.nan)
-        return _benchmark_from_daily(row, metric_col)
-
-    def _article_benchmark_table(row: pd.Series) -> Tuple[List[str], List[str], List[str]]:
-        headers = [label for _, label, _, _ in _BENCHMARK_METRICS]
-        avg_row: List[str] = []
-        target_row: List[str] = []
-        for col, label, aliases, fmt in _BENCHMARK_METRICS:
-            avg, target = _benchmark_metric(row, col, aliases)
-            avg_row.append(fmt(avg) if pd.notna(avg) else "—")
-            target_row.append(fmt(target) if pd.notna(target) else "—")
-        return headers, avg_row, target_row
 
     def _slug(x):
         # Bookmark names must be unique. Cyrillic category names used to collapse to the same "_" slug,
@@ -5715,37 +5830,6 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def _section_bar(y, text):
         c.setFillColor(RED_DARK); c.roundRect(75, y, W-150, 42, 10, fill=1, stroke=0)
         _draw_text(text, 105, y+14, W-210, F_BLACK, 20, WHITE)
-
-    def _draw_article_benchmark_panel(row: pd.Series):
-        # Compact white table in the right header zone of article pages.
-        # No separate title: user asked to keep only the 2x4 table so it fits.
-        headers, avg_values, target_values = _article_benchmark_table(row)
-        x, y, w, h = 650, 688, 565, 92
-        label_w = 104
-        col_ws = [135, 86, 116, 124]
-        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
-        c.setStrokeColor(LINE); c.setLineWidth(0.7)
-        # horizontal separators: header/body and the two value rows
-        c.line(x+10, y+58, x+w-10, y+58)
-        c.line(x+10, y+31, x+w-10, y+31)
-        xx = x + label_w
-        for cw in col_ws[:-1]:
-            xx += cw
-            c.line(xx, y+9, xx, y+h-9)
-        # header
-        xx = x + label_w
-        for head, cw in zip(headers, col_ws):
-            _draw_text(head, xx+4, y+67, cw-8, F_BOLD, 9.5, RED_DARK, align="center", min_size=7)
-            xx += cw
-        # row labels
-        _draw_text("Среднее 90 д.", x+6, y+41, label_w-12, F_BOLD, 9.5, GRAY, align="center", min_size=7)
-        _draw_text("В лучшие дни", x+6, y+14, label_w-12, F_BOLD, 9.5, GRAY, align="center", min_size=7)
-        # values centered under headers
-        for vals, yy in [(avg_values, y+40), (target_values, y+13)]:
-            xx = x + label_w
-            for val, cw in zip(vals, col_ws):
-                _draw_text(val, xx+4, yy, cw-8, F_BLACK, 12, BLACK, align="center", min_size=7)
-                xx += cw
 
     def _draw_cell_value(x, y, w, value, delta=None, metric="", size=12, align="left"):
         txt = str(value)
@@ -5939,7 +6023,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         elapsed = min((cur_actual_end - month_start).days + 1, month_days)
         plan_to_date = month_plan / month_days * elapsed if month_days else 0.0
         mtd = _metrics_period(month_start, cur_actual_end, closed_start, closed_start + (cur_actual_end-month_start), ["subject_disp"])
-        mtd_gp = _num(mtd["gp_use"].sum()) if mtd is not None and not mtd.empty else 0.0
+        # ВП МТД: только по вышедшим ABC-периодам. Оперативную модельную ВП за 25.05 и другие дни без ABC не добавляем.
+        mtd_abc = _abc_periods_inside(month_start, cur_actual_end, ["subject_disp"])
+        mtd_gp = _num(mtd_abc["gp_abc"].sum()) if mtd_abc is not None and not mtd_abc.empty else 0.0
         mtd_sum = _num(mtd["sum_use"].sum()) if mtd is not None and not mtd.empty else 0.0
         mtd_ad = _num(mtd["ad_spend"].sum()) if mtd is not None and not mtd.empty else 0.0
         pct_plan = mtd_gp / plan_to_date * 100 if plan_to_date else np.nan
@@ -5957,16 +6043,21 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         while ws <= cur_actual_end:
             we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), cur_actual_end)
             wk = _metrics_period(ws, we, ws-pd.Timedelta(days=7), we-pd.Timedelta(days=7), ["subject_disp"])
-            wk_gp = _num(wk["gp_use"].sum()) if wk is not None and not wk.empty else 0.0
+            wk_abc = _abc_periods_inside(ws, we, ["subject_disp"])
+            wk_gp_val = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
             wk_sum = _num(wk["sum_use"].sum()) if wk is not None and not wk.empty else 0.0
             wk_ad = _num(wk["ad_spend"].sum()) if wk is not None and not wk.empty else 0.0
             elapsed_to_week = min((we - month_start).days + 1, month_days)
             week_plan_to_date = month_plan / month_days * elapsed_to_week if month_days else 0.0
-            mtd_to_week = _metrics_period(month_start, we, closed_start, closed_start + (we-month_start), ["subject_disp"])
-            gp_to_week = _num(mtd_to_week["gp_use"].sum()) if mtd_to_week is not None and not mtd_to_week.empty else 0.0
+            mtd_to_week_abc = _abc_periods_inside(month_start, we, ["subject_disp"])
+            gp_to_week = _num(mtd_to_week_abc["gp_abc"].sum()) if mtd_to_week_abc is not None and not mtd_to_week_abc.empty else 0.0
             pct_to_week = gp_to_week / week_plan_to_date * 100 if week_plan_to_date else np.nan
-            rows.append({"cells":[f"{ws:%d.%m}-{we:%d.%m}", (_fmt_money(wk_gp), _delta_abs(wk_gp, prev_week_gp), "ВП"), _fmt_pct(pct_to_week), _fmt_money(wk_sum), _fmt_money(wk_ad)]})
-            prev_week_gp = wk_gp
+            if pd.isna(wk_gp_val):
+                gp_cell = "—"
+            else:
+                gp_cell = (_fmt_money(wk_gp_val), _delta_abs(wk_gp_val, prev_week_gp), "ВП")
+                prev_week_gp = wk_gp_val
+            rows.append({"cells":[f"{ws:%d.%m}-{we:%d.%m}", gp_cell, _fmt_pct(pct_to_week), _fmt_money(wk_sum), _fmt_money(wk_ad)]})
             ws = we + pd.Timedelta(days=1)
         _draw_table(120, 230, W-240, ["Неделя", "ВП", "% выполнения плана", "Сумма заказов", "Расход РК"], [240,300,300,300,260], rows, row_h=58, font_size=17, max_rows=8)
 
@@ -5984,30 +6075,25 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     src[col] = 0
                 src[col] = pd.to_numeric(src[col], errors="coerce").fillna(0)
             src["_ad"] = src["gross_revenue"] * src["abc_drr_pct"] / 100.0
-
-            # Пользователь просил: помесячно без разбивки по категориям.
-            # Поэтому каждая строка = общий итог по четырём категориям за месяц.
-            mon = src.groupby("period_start", as_index=False).agg(
-                sum_use=("gross_revenue", "sum"),
-                gp_use=("gross_profit", "sum"),
-                ad_spend=("_ad", "sum"),
-            )
-            mon = mon.sort_values("period_start", ascending=True)
-            mon["sum_prev"] = mon["sum_use"].shift(1)
-            mon["gp_prev"] = mon["gp_use"].shift(1)
-            mon["ad_prev"] = mon["ad_spend"].shift(1)
-            mon = mon.sort_values("period_start", ascending=False)
+            mon = src.groupby(["period_start", "subject_disp"], as_index=False).agg(sum_use=("gross_revenue","sum"), gp_use=("gross_profit","sum"), ad_spend=("_ad","sum"))
+            mon["_cat_order"] = mon["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+            mon = mon.sort_values(["subject_disp", "period_start"])
+            mon["sum_prev"] = mon.groupby("subject_disp")["sum_use"].shift(1)
+            mon["gp_prev"] = mon.groupby("subject_disp")["gp_use"].shift(1)
+            mon["ad_prev"] = mon.groupby("subject_disp")["ad_spend"].shift(1)
+            mon = mon.sort_values(["period_start", "_cat_order"], ascending=[False, True])
             for _, r in mon.iterrows():
                 month_name = MONTH_RU.get(int(r["period_start"].month), str(r["period_start"].month)).lower()
                 rows.append({"cells":[
                     month_name,
+                    str(r.get("subject_disp")),
                     (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev")), "Сумма"),
                     (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev")), "ВП"),
                     (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_prev")), "Расход РК"),
                 ]})
         if not rows:
-            rows=[{"cells":["—","—","—","—"]}]
-        _draw_table(160, 185, W-320, ["Месяц", "Сумма заказов", "ВП", "Расход РК"], [240,360,360,360], rows, row_h=64, font_size=17, max_rows=12)
+            rows=[{"cells":["—","—","—","—","—"]}]
+        _draw_table(95, 115, W-190, ["Месяц", "Категория", "Сумма заказов", "ВП", "Расход РК"], [180,250,330,330,330], rows, row_h=42, font_size=13, max_rows=16)
 
     def _children_for_category(contour: str, cat: str) -> pd.DataFrame:
         info = contours[contour]
@@ -6224,7 +6310,6 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         else:
             back_buttons = [(1120,798,170,"← товар", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
         _draw_level_overview(f"Артикул: {art}", f"{cat} / товар {prod} / {info['period']}", "Артикул 1/2", a1, art_row, back_buttons=None)
-        _draw_article_benchmark_panel(art_row)
         # overwrite top buttons on the page with correct buttons (because _draw_level_overview already started page)
         for bx,by,bw,label,target in back_buttons:
             c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
@@ -6634,9 +6719,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 def send_telegram_document(file_path: Path, caption: str = "") -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not file_path.exists():
+        log(f"Telegram: файл не найден, отправка невозможна: {file_path}")
+        return False
     if not token or not chat_id:
         log("Telegram: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы, отправка пропущена")
         return False
+    log(f"Telegram: отправка PDF file={file_path.name} size={file_path.stat().st_size:,} bytes chat_id={chat_id}")
     import urllib.request
     import uuid
     boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
@@ -6658,8 +6747,9 @@ def send_telegram_document(file_path: Path, caption: str = "") -> bool:
     req = urllib.request.Request(url, data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
+            body_resp = resp.read().decode("utf-8", errors="replace")[:500]
             ok = 200 <= resp.status < 300
-            log(f"Telegram: {'sent' if ok else 'failed'} status={resp.status}")
+            log(f"Telegram: {'sent' if ok else 'failed'} status={resp.status} response={body_resp}")
             return ok
     except Exception as exc:
         log(f"Telegram: ошибка отправки PDF: {exc}")
@@ -6790,6 +6880,7 @@ def run_smoke_test(root: str = ".") -> None:
     outputs = {
         "article_day_fact": daily,
         "search_unique_demand": search_unique,
+        "ads_category_source": pd.DataFrame(),
         "ads_raw_source": ads,
         "ads_daily_source": ads,
         "abc_weekly": abc_weekly,
@@ -6820,7 +6911,7 @@ def main() -> None:
     parser.add_argument("--store", default="TOPFACE")
     parser.add_argument("--no-pdf", action="store_true", help="Не формировать PDF")
     parser.add_argument("--pdf-only", action="store_true", help="Сформировать только PDF из уже готовых Excel-файлов без пересчета источников")
-    parser.add_argument("--current-week-only", action="store_true", help="Быстро обновить только оперативный блок текущей недели из кэша/свежих данных; Telegram не отправляется")
+    parser.add_argument("--current-week-only", action="store_true", help="Быстро обновить только оперативный блок текущей недели из кэша/свежих данных")
     parser.add_argument("--full-refresh", action="store_true", help="Явный полный пересчет всех источников; синоним обычного запуска")
     parser.add_argument("--send-telegram", action="store_true", help="Отправить PDF в Telegram через TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
     parser.add_argument("--smoke-test", action="store_true", help="Быстрый синтетический тест PDF/кода без S3 и тяжелых Excel; должен занимать секунды")
@@ -6850,7 +6941,7 @@ def main() -> None:
                 cw_start = latest - pd.Timedelta(days=int(pd.Timestamp(latest).weekday()))
                 cw_end = cw_start + pd.Timedelta(days=6)
                 log(f"current_week_only: refresh cache dates {cw_start.date()}..{cw_end.date()} using limited source load")
-                for name in ["article_day_fact", "search_unique_demand", "ads_raw_source", "ads_daily_source"]:
+                for name in ["article_day_fact", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source"]:
                     new_df = upd.get(name, pd.DataFrame())
                     old_df = outputs.get(name, pd.DataFrame())
                     if new_df is None or new_df.empty or "day" not in new_df.columns:
@@ -6868,7 +6959,7 @@ def main() -> None:
                 log("current_week_only: WARN no refreshed article_day_fact rows; PDF will be rebuilt from existing cache only")
         except Exception as exc:
             log(f"current_week_only: WARN limited refresh failed, using existing cache only: {exc}")
-        pdf_path = local_dir / PDF_REPORT_NAME
+        pdf_path = local_dir / sales_pdf_report_name(outputs)
         pdf_created = generate_management_pdf(outputs, pdf_path)
         if not pdf_created or not pdf_path.exists():
             raise RuntimeError(f"PDF не создан: {pdf_path}")
@@ -6880,6 +6971,10 @@ def main() -> None:
             if trace_path.exists():
                 storage.write_bytes(f"{OUT_DIR}/{trace_path.name}", trace_path.read_bytes())
                 log(f"Saved: {OUT_DIR}/{trace_path.name}")
+        if args.send_telegram:
+            caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
+            if not send_telegram_document(pdf_path, caption):
+                raise RuntimeError("Telegram: PDF не отправлен")
         log("Done")
         return
     if args.pdf_only:
@@ -6887,7 +6982,7 @@ def main() -> None:
             raise SystemExit("Нельзя одновременно использовать --pdf-only и --no-pdf")
         local_dir.mkdir(parents=True, exist_ok=True)
         outputs = load_existing_outputs_for_pdf(storage, local_dir, args.reports_root, args.store, diagnostics)
-        pdf_path = local_dir / PDF_REPORT_NAME
+        pdf_path = local_dir / sales_pdf_report_name(outputs)
         pdf_created = generate_management_pdf(outputs, pdf_path)
         if not pdf_created or not pdf_path.exists():
             raise RuntimeError(f"PDF не создан: {pdf_path}")
@@ -6904,8 +6999,9 @@ def main() -> None:
                 storage.write_bytes(f"{OUT_DIR}/{trace_path.name}", trace_path.read_bytes())
                 log(f"Saved: {OUT_DIR}/{trace_path.name}")
         if args.send_telegram:
-            caption = f"TOPFACE WB: управленческий отчёт {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-            send_telegram_document(pdf_path, caption)
+            caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
+            if not send_telegram_document(pdf_path, caption):
+                raise RuntimeError("Telegram: PDF не отправлен")
         log("Done")
         return
     loader = Loader(storage, args.reports_root, args.store, diagnostics)
@@ -6922,7 +7018,7 @@ def main() -> None:
     factor_path = local_dir / FACTOR_REPORT_NAME
     write_factor_report(factor_path, factor_outputs)
     paths.append(factor_path)
-    pdf_path = local_dir / PDF_REPORT_NAME
+    pdf_path = local_dir / sales_pdf_report_name(outputs)
     if not args.no_pdf:
         global builder_global_for_pdf
         builder_global_for_pdf = builder
@@ -6942,8 +7038,9 @@ def main() -> None:
             storage.write_bytes(f"{OUT_DIR}/{p.name}", p.read_bytes())
             log(f"Saved: {OUT_DIR}/{p.name}")
     if args.send_telegram and pdf_path.exists():
-        caption = f"TOPFACE WB: управленческий отчёт {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-        send_telegram_document(pdf_path, caption)
+        caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
+        if not send_telegram_document(pdf_path, caption):
+            raise RuntimeError("Telegram: PDF не отправлен")
     log("Done")
 
 
