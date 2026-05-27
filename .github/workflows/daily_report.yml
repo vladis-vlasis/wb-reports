@@ -1,5 +1,5 @@
-# VERSION: TOPFACE_WORKFLOW_CURRENT_WEEK_FULL_REFRESH_TG_REPORTLAB_20260527_1018
-name: TOPFACE current-week/full-refresh TG 20260527-1018
+# VERSION: TOPFACE_WORKFLOW_ORDERS_ONLY_TG_REPORTLAB_20260527_1058
+name: TOPFACE orders-only TG 20260527-1058
 
 on:
   workflow_dispatch:
@@ -19,17 +19,17 @@ on:
         default: true
         type: boolean
   schedule:
-    # Tue-Sun 12:00 MSK = 09:00 UTC: обновляем только блок текущей недели.
+    # Tue-Sun 12:00 MSK = 09:00 UTC: current-week update.
     - cron: "0 9 * * 2-6"
     - cron: "0 9 * * 0"
-    # Monday 18:00 MSK = 15:00 UTC: полный пересчет после обновления недельных данных.
+    # Monday 18:00 MSK = 15:00 UTC: full refresh after weekly data is available.
     - cron: "0 15 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: wb-report-topface
+  group: wb-report-topface-orders-only-20260527-1058
   cancel-in-progress: false
 
 jobs:
@@ -40,24 +40,20 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
+      REPORT_SCRIPT: "report_runner_orders_only_tg_20260527_1058.py"
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
-      # Полный режим: ограничиваем самые тяжелые недельные источники.
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
       WB_MAX_STOCK_FILES: "5"
 
-      # PDF policy: спрос WB только через уникальные запросы, без задваивающего fallback.
       PDF_FAIL_ON_MISSING_DEMAND: "0"
       PDF_ALLOW_DEMAND_FALLBACK: "0"
-
-      # Детализация: товар детализируется от 10% ВП категории, внутри товара показываются все артикулы.
       PDF_PRODUCT_DETAIL_MIN_GP_SHARE: "10"
       PDF_FORCE_DETAIL_PRODUCTS: "901,614,617,618,154,155,156,157,158"
       PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
-
       PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
       PDF_TRACE_SAMPLE_PRODUCT: "901"
       PDF_TRACE_SAMPLE_ARTICLE: "901/2"
@@ -84,15 +80,22 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install reportlab
 
-      - name: Compile check
+      - name: Validate report script file
         shell: bash
         run: |
           set -euo pipefail
-          test -f report_runner.py || { echo "ERROR: report_runner.py is missing"; exit 1; }
-          python -m py_compile report_runner.py
+          test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
+          echo "Using report script: $REPORT_SCRIPT"
+          head -5 "$REPORT_SCRIPT"
+          grep -q "# VERSION: ORDERS_ONLY_AND_TG_YAML_FIX_20260527" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version"; exit 1; }
+          if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
+            echo "ERROR: workflow/shell text was pasted into the Python report script"
+            exit 1
+          fi
+          python -m py_compile "$REPORT_SCRIPT"
           echo "Compile OK"
 
       - name: Decide mode
@@ -121,7 +124,7 @@ jobs:
       - name: Run smoke test
         if: steps.mode.outputs.mode == 'smoke'
         shell: bash
-        run: python report_runner.py --root . --smoke-test
+        run: python "$REPORT_SCRIPT" --root . --smoke-test
 
       - name: Load REPORT_ENV
         if: steps.mode.outputs.mode != 'smoke'
@@ -141,7 +144,7 @@ jobs:
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
       - name: Check Telegram settings
-        if: steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true'
+        if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -168,7 +171,7 @@ jobs:
           set -a
           source ./.env
           set +a
-          python report_runner.py --root . --current-week-only
+          python "$REPORT_SCRIPT" --root . --current-week-only
 
       - name: Run full refresh
         if: steps.mode.outputs.mode == 'full_refresh'
@@ -178,10 +181,10 @@ jobs:
           set -a
           source ./.env
           set +a
-          python report_runner.py --root . --full-refresh
+          python "$REPORT_SCRIPT" --root . --full-refresh
 
       - name: Send PDF to Telegram
-        if: steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true'
+        if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -232,7 +235,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-report-output
+          name: topface-report-output-20260527-1058
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
