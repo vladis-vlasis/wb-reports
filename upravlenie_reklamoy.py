@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "upravlenie_reklamoy.py"
-SCRIPT_VERSION = "strict-drr-v19-economics-zero-base-hotfix-2026-05-22"
+SCRIPT_VERSION = "strict-drr-v19-economics-zero-base-hotfix-dtype-fix-2026-05-27"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -4811,7 +4811,13 @@ def build_campaign_7d_comparison(
         ]
         no_after = pd.to_numeric(out.get("after_days", pd.Series(dtype=float)), errors="coerce").fillna(0).le(0)
         if no_after.any():
-            out.loc[no_after, after_cols] = ""
+            # pandas в GitHub Actions стал строже: нельзя записывать строку "" в int/float-колонки.
+            # Для строк без зрелого after-периода в Excel должны быть пустые ячейки, поэтому
+            # переводим только эти output-колонки в object и затем проставляем пустые значения.
+            after_cols = [c for c in after_cols if c in out.columns]
+            for col in after_cols:
+                out[col] = out[col].astype("object")
+                out.loc[no_after, col] = ""
             out.loc[no_after, "after_period"] = ""
             out.loc[no_after, "diagnostic_conclusion"] = (
                 "WAIT_AFTER_DATA: после изменения ставки ещё нет зрелых данных для сравнения; "
