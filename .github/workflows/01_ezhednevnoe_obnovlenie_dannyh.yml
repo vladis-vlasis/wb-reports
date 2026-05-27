@@ -25,14 +25,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Запустить ежедневное обновление данных
+      - name: Загрузить переменные из REPORT_ENV
         env:
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-          URL_1C_STOCKS: ${{ secrets.URL_1C_STOCKS }}
-          _1C_USER: ${{ secrets._1C_USER }}
-          _1C_PASSWORD: ${{ secrets._1C_PASSWORD }}
+          REPORT_ENV: ${{ secrets.REPORT_ENV }}
+        run: |
+          if [ -z "$REPORT_ENV" ]; then
+            echo "::error::Не задан secret REPORT_ENV"
+            exit 1
+          fi
+          printf '%s\n' "$REPORT_ENV" >> "$GITHUB_ENV"
+
+      - name: Запустить ежедневное обновление данных
         run: |
           python ezhednevnoe_obnovlenie_dannyh.py --full --store TOPFACE
