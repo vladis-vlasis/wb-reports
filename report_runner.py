@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_YAML_FIX_20260527
+# VERSION: ORDERS_ONLY_AND_TG_FIX2_20260527
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -801,8 +801,9 @@ class Loader:
         """Load WB orders as the only source of orders/order_sum.
 
         Hard business rule 2026-05-27:
-        - order_sum is taken only from the Orders report column (no finishedPrice × qty fallback);
-        - cancelled orders are excluded here;
+        - order_sum is taken only from the Orders report data; if WB does not export a separate
+          order_sum column, the script uses finishedPrice/priceWithDisc from the same Orders file;
+        - technical zero cancellation dates like 0001-01-01 are not treated as cancellations;
         - funnel is not allowed to replace orders/order_sum later.
         """
         files = self.list_reports("Заказы", self.store, "Недельные")
@@ -816,12 +817,15 @@ class Loader:
                 flag = src["is_cancel"].map(normalize_text).str.lower().str.replace("ё", "е")
                 mask = mask | flag.isin({"1", "true", "да", "yes", "y", "отменен", "отмена", "отменено"})
                 mask = mask | flag.str.contains("отмен|cancel", na=False)
-            # Cancellation date: only real non-empty dates count.
+            # Cancellation date: only real non-empty business dates count.
+            # WB active rows often contain technical dates like 0001-01-01T00:00:00;
+            # these must not exclude the whole Orders file.
             if "cancel_date" in src.columns:
-                raw = src["cancel_date"].map(normalize_text)
-                raw_bad = raw.str.lower().isin({"", "nan", "none", "null", "0", "0001-01-01", "0001-01-01 00:00:00"})
+                raw = src["cancel_date"].map(normalize_text).str.lower()
+                raw_bad = raw.isin({"", "nan", "none", "null", "0"}) | raw.str.contains(r"^0+|0001[-/.]01[-/.]01|1970[-/.]01[-/.]01", na=False)
                 dt = date_series(src["cancel_date"])
-                mask = mask | (dt.notna() & ~raw_bad)
+                real_cancel_date = dt.notna() & (dt >= pd.Timestamp("2000-01-01")) & ~raw_bad
+                mask = mask | real_cancel_date
             # Status field fallback.
             if "order_status" in src.columns:
                 st = src["order_status"].map(normalize_text).str.lower().str.replace("ё", "е")
@@ -839,12 +843,31 @@ class Loader:
                 df_active = df.loc[~cancel_mask].copy()
                 rows_cancelled = int(cancel_mask.sum())
 
+                orders_series = num_series(get_col(df_active, "orders"))
+                if orders_series.isna().all():
+                    orders_series = pd.Series(1.0, index=df_active.index)
+                orders_series = orders_series.fillna(1.0)
+
+                finished_price_series = num_series(get_col(df_active, "finished_price"))
+                price_with_disc_series = num_series(get_col(df_active, "price_with_disc"))
                 order_sum_series = num_series(get_col(df_active, "order_sum"))
                 order_sum_col = _source_column_name(df_active, "order_sum")
                 if order_sum_series.isna().all():
-                    order_sum_col = ""
-                    self.diag.add("ERROR", "orders", f"В файле заказов не распознана колонка суммы заказов: {key}", "fallback finishedPrice × quantity запрещён")
-                    log(f"orders: ERROR no order_sum column recognized in {Path(key).name}; finishedPrice fallback is forbidden")
+                    # Still Orders-only: fallback is from the same WB Orders file, never from Funnel.
+                    fallback_price = finished_price_series.copy()
+                    fallback_col = _source_column_name(df_active, "finished_price")
+                    if fallback_price.isna().all():
+                        fallback_price = price_with_disc_series.copy()
+                        fallback_col = _source_column_name(df_active, "price_with_disc")
+                    if not fallback_price.isna().all():
+                        order_sum_series = fallback_price * orders_series
+                        order_sum_col = f"{fallback_col or 'finished_price/price_with_disc'} × orders (Orders file)"
+                        self.diag.add("WARN", "orders", f"В файле заказов нет отдельной колонки суммы заказов: {key}", f"использую {order_sum_col}; источник всё равно Orders")
+                        log(f"orders: no explicit order_sum in {Path(key).name}; use {order_sum_col}")
+                    else:
+                        order_sum_col = ""
+                        self.diag.add("ERROR", "orders", f"В файле заказов не распознана ни сумма, ни цена заказа: {key}", "продажи из воронки запрещены")
+                        log(f"orders: ERROR no order_sum/price column recognized in {Path(key).name}; Funnel fallback is forbidden")
 
                 out = pd.DataFrame({
                     "day": date_series(get_col(df_active, "day")),
@@ -852,19 +875,16 @@ class Loader:
                     "supplier_article": get_col(df_active, "supplier_article").map(clean_article),
                     "subject": get_col(df_active, "subject").map(normalize_text),
                     "warehouse": get_col(df_active, "warehouse").map(normalize_text),
-                    "orders": num_series(get_col(df_active, "orders")),
+                    "orders": orders_series,
                     "order_sum": order_sum_series,
-                    "finished_price": num_series(get_col(df_active, "finished_price")),
-                    "price_with_disc": num_series(get_col(df_active, "price_with_disc")),
+                    "finished_price": finished_price_series,
+                    "price_with_disc": price_with_disc_series,
                     "spp": num_series(get_col(df_active, "spp")),
                     "source_file": key,
                     "source_sheet": df.attrs.get("source_sheet", ""),
                     "source_order_sum_col": order_sum_col,
                 })
-                if out["orders"].isna().all():
-                    out["orders"] = 1.0
-                out["orders"] = out["orders"].fillna(1.0)
-                # No fallback from finishedPrice. Missing sums become 0 and are visible in diagnostics.
+                # Missing sums become 0 and are visible in diagnostics; sales never come from Funnel.
                 missing_sum_rows = int(out["order_sum"].isna().sum())
                 out["order_sum"] = out["order_sum"].fillna(0.0)
                 out = out[out["day"].notna()].copy()
@@ -2101,6 +2121,11 @@ class AnalyticsBuilder:
             rows.append(rec)
         out = pd.DataFrame(rows)
         first = ["subject", "product", "supplier_article", "nm_id", "status", "main_reason", "secondary_reason", "recommendation", "localization_with_replacements_pct", "localization_status", "uncovered_warehouses"]
+        # When Orders/localization are empty, these localization columns may not exist.
+        # Keep report generation stable and leave the values blank instead of crashing.
+        for col in first:
+            if col not in out.columns:
+                out[col] = np.nan
         rest = [c for c in out.columns if c not in first]
         return out[first + rest]
 
