@@ -1,4 +1,4 @@
-# VERSION: DAILY_REPORT_TOPFACE_CTR_ORDERS_FIX8_20260528
+# VERSION: DAILY_REPORT_TOPFACE_TG_DAILY_CLEANUP_FIX12_20260528
 name: Daily TOPFACE report
 
 on:
@@ -41,6 +41,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       REPORT_SCRIPT: "report_runner.py"
+      WB_KEEP_ONLY_MONDAY_REPORTS: "1"
 
       # Repository secrets. These have priority over values inside REPORT_ENV.
       TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -92,7 +93,7 @@ jobs:
           test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
           echo "Using report script: $REPORT_SCRIPT"
           head -5 "$REPORT_SCRIPT"
-          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX9_WEEK_AVG_DYNAMICS_20260528" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX9_WEEK_AVG_DYNAMICS_20260528"; exit 1; }
+          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX10_TG_DAILY_CLEANUP_20260528" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX10_TG_DAILY_CLEANUP_20260528"; exit 1; }
           if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
             echo "ERROR: workflow/shell text was pasted into the Python report script"
             exit 1
