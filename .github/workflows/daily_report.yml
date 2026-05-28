@@ -1,4 +1,4 @@
-# VERSION: DAILY_REPORT_TOPFACE_MONTH_TOTALS_FIX19_20260528
+# VERSION: DAILY_REPORT_TOPFACE_ORDERS_ONLY_TG_REPORTLAB_20260527
 name: Daily TOPFACE report
 
 on:
@@ -41,12 +41,9 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       REPORT_SCRIPT: "report_runner.py"
-      WB_KEEP_ONLY_MONDAY_REPORTS: "1"
-
-      # Repository secrets. These have priority over values inside REPORT_ENV.
-      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
@@ -93,7 +90,7 @@ jobs:
           test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
           echo "Using report script: $REPORT_SCRIPT"
           head -5 "$REPORT_SCRIPT"
-          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX17_MONTH_TOTALS_20260528" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX17_MONTH_TOTALS_20260528"; exit 1; }
+          grep -q "# VERSION: ORDERS_ONLY_AND_TG_YAML_FIX_20260527" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version"; exit 1; }
           if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
             echo "ERROR: workflow/shell text was pasted into the Python report script"
             exit 1
@@ -146,121 +143,25 @@ jobs:
           test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
-      - name: Prepare and validate Telegram settings
+      - name: Check Telegram settings
         if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-
-          clean_token() {
-            local raw="$1"
-            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
-            raw="${raw%\"}"; raw="${raw#\"}"
-            raw="${raw%\'}"; raw="${raw#\'}"
-            if [[ "$raw" == TELEGRAM_BOT_TOKEN=* ]]; then raw="${raw#TELEGRAM_BOT_TOKEN=}"; fi
-            if [[ "$raw" == telegram_bot_token=* ]]; then raw="${raw#telegram_bot_token=}"; fi
-            if [[ "$raw" =~ ^https?://api\.telegram\.org/bot([^/]+) ]]; then raw="${BASH_REMATCH[1]}"; fi
-            raw="${raw%%/getUpdates*}"
-            raw="${raw%%/sendDocument*}"
-            if [[ "$raw" == bot* ]]; then raw="${raw#bot}"; fi
-            printf '%s' "$raw"
-          }
-
-          clean_chat() {
-            local raw="$1"
-            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
-            raw="${raw%\"}"; raw="${raw#\"}"
-            raw="${raw%\'}"; raw="${raw#\'}"
-            if [[ "$raw" == TELEGRAM_CHAT_ID=* ]]; then raw="${raw#TELEGRAM_CHAT_ID=}"; fi
-            if [[ "$raw" == telegram_chat_id=* ]]; then raw="${raw#telegram_chat_id=}"; fi
-            printf '%s' "$raw"
-          }
-
-          SECRET_TG_TOKEN="${TELEGRAM_BOT_TOKEN_SECRET:-}"
-          SECRET_TG_CHAT="${TELEGRAM_CHAT_ID_SECRET:-}"
-          SECRET_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}"
-
-          ENV_TG_TOKEN=""
-          ENV_TG_CHAT=""
-          ENV_TG_THREAD=""
+          PRE_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+          PRE_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
+          PRE_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
           if [ -f ./.env ]; then
             set -a
             source ./.env
             set +a
-            ENV_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-            ENV_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
-            ENV_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
           fi
-
-          TG_TOKEN="$SECRET_TG_TOKEN"
-          TG_CHAT="$SECRET_TG_CHAT"
-          TG_THREAD="$SECRET_TG_THREAD"
-          if [ -z "$TG_TOKEN" ]; then TG_TOKEN="$ENV_TG_TOKEN"; fi
-          if [ -z "$TG_CHAT" ]; then TG_CHAT="$ENV_TG_CHAT"; fi
-          if [ -z "$TG_THREAD" ]; then TG_THREAD="$ENV_TG_THREAD"; fi
-
-          TG_TOKEN="$(clean_token "$TG_TOKEN")"
-          TG_CHAT="$(clean_chat "$TG_CHAT")"
-          TG_THREAD="$(clean_chat "$TG_THREAD")"
-
-          test -n "$TG_TOKEN" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing"; exit 1; }
-          test -n "$TG_CHAT" || { echo "ERROR: TELEGRAM_CHAT_ID is missing"; exit 1; }
-          if ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
-            echo "ERROR: TELEGRAM_BOT_TOKEN has invalid format after cleanup. Secret value must be only the token like 123456789:AA..."
-            exit 1
-          fi
-          if ! [[ "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
-            echo "ERROR: TELEGRAM_CHAT_ID has invalid format. For your group it must be -1003664843585"
-            exit 1
-          fi
-
-          export TG_TOKEN TG_CHAT TG_THREAD
-          python - <<'PY_WRITE_TG'
-          import os, pathlib, shlex
-          p = pathlib.Path('.telegram.env')
-          with p.open('w', encoding='utf-8') as f:
-              print('TELEGRAM_BOT_TOKEN=' + shlex.quote(os.environ['TG_TOKEN']), file=f)
-              print('TELEGRAM_CHAT_ID=' + shlex.quote(os.environ['TG_CHAT']), file=f)
-              print('TELEGRAM_MESSAGE_THREAD_ID=' + shlex.quote(os.environ.get('TG_THREAD', '')), file=f)
-          p.chmod(0o600)
-          PY_WRITE_TG
-
-          echo "Telegram token prefix: ${TG_TOKEN:0:6}***"
-          echo "Telegram chat id: $TG_CHAT"
-          if [ -n "$TG_THREAD" ]; then echo "Telegram thread id: $TG_THREAD"; fi
-
-          HTTP_CODE="$(curl -sS -w '%{http_code}' -o telegram_getme_response.json "https://api.telegram.org/bot${TG_TOKEN}/getMe" || true)"
-          cat telegram_getme_response.json || true
-          echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Telegram getMe returned HTTP $HTTP_CODE. Check TELEGRAM_BOT_TOKEN."
-            exit 1
-          fi
-          python - <<'PY_CHECK_TG'
-          import json, pathlib, sys
-          data = json.loads(pathlib.Path('telegram_getme_response.json').read_text(encoding='utf-8'))
-          if not data.get('ok'):
-              print('ERROR: Telegram getMe ok=false:', data)
-              sys.exit(1)
-          print('Telegram bot validated:', data.get('result', {}).get('username', 'unknown'))
-          PY_CHECK_TG
-
-          HTTP_CODE="$(curl -sS -G -w '%{http_code}' -o telegram_getchat_response.json "https://api.telegram.org/bot${TG_TOKEN}/getChat" --data-urlencode "chat_id=${TG_CHAT}" || true)"
-          cat telegram_getchat_response.json || true
-          echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Telegram getChat returned HTTP $HTTP_CODE. Check TELEGRAM_CHAT_ID and make sure the bot is added to the group."
-            exit 1
-          fi
-          python - <<'PY_CHECK_CHAT'
-          import json, pathlib, sys
-          data = json.loads(pathlib.Path('telegram_getchat_response.json').read_text(encoding='utf-8'))
-          if not data.get('ok'):
-              print('ERROR: Telegram getChat ok=false:', data)
-              sys.exit(1)
-          chat = data.get('result', {})
-          print('Telegram chat validated:', chat.get('title') or chat.get('username') or chat.get('id'))
-          PY_CHECK_CHAT
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$PRE_TG_TOKEN" ]; then export TELEGRAM_BOT_TOKEN="$PRE_TG_TOKEN"; fi
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ] && [ -n "$PRE_TG_CHAT" ]; then export TELEGRAM_CHAT_ID="$PRE_TG_CHAT"; fi
+          if [ -z "${TELEGRAM_MESSAGE_THREAD_ID:-}" ] && [ -n "$PRE_TG_THREAD" ]; then export TELEGRAM_MESSAGE_THREAD_ID="$PRE_TG_THREAD"; fi
+          test -n "${TELEGRAM_BOT_TOKEN:-}" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing"; exit 1; }
+          test -n "${TELEGRAM_CHAT_ID:-}" || { echo "ERROR: TELEGRAM_CHAT_ID is missing"; exit 1; }
+          echo "Telegram settings OK"
 
       - name: Run current week update
         if: steps.mode.outputs.mode == 'current_week'
@@ -270,15 +171,7 @@ jobs:
           set -a
           source ./.env
           set +a
-          SEND_ARG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
-            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
-            set -a
-            source ./.telegram.env
-            set +a
-            SEND_ARG="--send-telegram"
-          fi
-          python "$REPORT_SCRIPT" --root . --current-week-only $SEND_ARG
+          python "$REPORT_SCRIPT" --root . --current-week-only
 
       - name: Run full refresh
         if: steps.mode.outputs.mode == 'full_refresh'
@@ -288,15 +181,48 @@ jobs:
           set -a
           source ./.env
           set +a
-          SEND_ARG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
-            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
+          python "$REPORT_SCRIPT" --root . --full-refresh
+
+      - name: Send PDF to Telegram
+        if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRE_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+          PRE_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
+          PRE_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
+          if [ -f ./.env ]; then
             set -a
-            source ./.telegram.env
+            source ./.env
             set +a
-            SEND_ARG="--send-telegram"
           fi
-          python "$REPORT_SCRIPT" --root . --full-refresh $SEND_ARG
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$PRE_TG_TOKEN" ]; then export TELEGRAM_BOT_TOKEN="$PRE_TG_TOKEN"; fi
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ] && [ -n "$PRE_TG_CHAT" ]; then export TELEGRAM_CHAT_ID="$PRE_TG_CHAT"; fi
+          if [ -z "${TELEGRAM_MESSAGE_THREAD_ID:-}" ] && [ -n "$PRE_TG_THREAD" ]; then export TELEGRAM_MESSAGE_THREAD_ID="$PRE_TG_THREAD"; fi
+
+          REPORT_DIR="Отчёты/Объединенный отчет/TOPFACE"
+          PDF_FILE="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'Отчет по продажам Влад *.pdf' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+          if [ -z "$PDF_FILE" ]; then
+            PDF_FILE="$(find "$REPORT_DIR" -maxdepth 1 -type f -name '*.pdf' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+          fi
+          test -n "$PDF_FILE" || { echo "ERROR: PDF file not found in $REPORT_DIR"; exit 1; }
+          test -s "$PDF_FILE" || { echo "ERROR: PDF file is empty: $PDF_FILE"; exit 1; }
+
+          CAPTION="$(basename "$PDF_FILE" .pdf)"
+          echo "Telegram: sending file: $PDF_FILE"
+          CURL_ARGS=(
+            -sS -f
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
+            -F "chat_id=${TELEGRAM_CHAT_ID}"
+            -F "caption=${CAPTION}"
+            -F "document=@${PDF_FILE}"
+          )
+          if [ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]; then
+            CURL_ARGS+=(-F "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+          fi
+          curl "${CURL_ARGS[@]}"
+          echo
+          echo "Telegram: sent successfully"
 
       - name: Show generated files
         if: always()
@@ -309,7 +235,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-report-output-fix13-20260528
+          name: topface-report-output-20260527-1058
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
