@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX11_TG_RUN_CARD_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX12_TG_SIMPLE_ABC_MTD_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -339,6 +339,27 @@ def parse_period_from_name(name: str) -> Tuple[Optional[pd.Timestamp], Optional[
         if len(m.group(1)) == 4:
             return pd.Timestamp(date(int(m.group(1)), int(m.group(2)), int(m.group(3)))), pd.Timestamp(date(int(m.group(4)), int(m.group(5)), int(m.group(6))))
         return pd.Timestamp(date(int(m.group(3)), int(m.group(2)), int(m.group(1)))), pd.Timestamp(date(int(m.group(6)), int(m.group(5)), int(m.group(4))))
+    # Russian month period names, for example: "ABC 1-27 мая.xlsx" or "АБС анализ 01-27 мая 2026".
+    months_ru = {
+        "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
+        "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+    }
+    txt = normalize_text(name).lower().replace("ё", "е")
+    m_ru = re.search(r"(?:^|[^0-9])(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+([а-я]+)(?:\s+(20\d{2}))?", txt)
+    if m_ru:
+        d1, d2 = int(m_ru.group(1)), int(m_ru.group(2))
+        mon_word = m_ru.group(3)
+        yy = int(m_ru.group(4)) if m_ru.group(4) else datetime.today().year
+        mon = None
+        for prefix, mm in months_ru.items():
+            if mon_word.startswith(prefix):
+                mon = mm
+                break
+        if mon:
+            try:
+                return pd.Timestamp(date(yy, mon, d1)), pd.Timestamp(date(yy, mon, d2))
+            except Exception:
+                pass
     wk = parse_week_from_name(name)
     if wk:
         return week_bounds(wk)
@@ -1301,10 +1322,22 @@ class Loader:
         return out
 
     def load_abc(self, current_year: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        files = self.list_reports("ABC")
+        # ABC/АБС reports may be uploaded into different folders by hand.
+        # Read both Latin ABC and Russian АБС/ABS-analysis folders; current-month partial files
+        # such as "1-27 мая" are intentionally treated as monthly facts for page 3.
+        abc_prefixes = [
+            "ABC", "ABS", "ABC анализ", "ABS анализ",
+            "АБС", "АБС анализ", "АБС Анализ", "АБС-анализ", "АБС анализа",
+            "Абс", "Абс анализ", "АВС", "АВС анализ",
+        ]
+        files: List[str] = []
+        for pref in abc_prefixes:
+            files += self.list_reports(pref)
+        files = sorted(set(files))
         weekly_frames, monthly_frames = [], []
         for key, data in self._read_candidates(files):
-            if "abc" not in key.lower():
+            key_l = key.lower()
+            if not any(token in key_l for token in ["abc", "abs", "абс", "авс"]):
                 continue
             start, end = parse_period_from_name(Path(key).name)
             if start is None or end is None:
@@ -1343,7 +1376,10 @@ class Loader:
                     "cell_drr_pct": [_source_cell_ref(df, "drr", i) for i in df.index],
                 })
                 out["product"] = out["supplier_article"].map(product_code)
-                if is_month_file(start, end) and start.year == current_year:
+                # Full closed months and current-month partial accumulated ABC (1..N days) are monthly facts.
+                # Weekly ABC remains weekly when the period does not start on day 1.
+                is_monthly_or_mtd = (start.year == current_year and start.day == 1 and start.month == end.month)
+                if is_monthly_or_mtd:
                     monthly_frames.append(out)
                 else:
                     weekly_frames.append(out)
@@ -6311,12 +6347,26 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # Текущий месяц: ВП берём из ABC текущего месяца/вышедших ABC-отчетов,
         # заказы и сумму заказов — из Orders, рекламные расходы — из отчетов по рекламе.
         month_start = cur_start.replace(day=1)
-        _start("Текущий месяц", f"{month_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / план = факт ВП прошлого месяца", "Текущий месяц", key="current_month", top_menu=True)
+        # If a manually uploaded current-month ABC file runs later than Orders data
+        # (for example ABC 01.05-27.05 while Orders API is available only through 26.05),
+        # page 3 should still show ABC GP through the ABC period end.
+        month_abc_end = cur_actual_end
+        for _abc_nm in ["abc_monthly", "abc_weekly"]:
+            _abc_src = outputs.get(_abc_nm, pd.DataFrame()).copy()
+            if _abc_src is not None and not _abc_src.empty and "period_start" in _abc_src.columns and "period_end" in _abc_src.columns:
+                _abc_src["period_start"] = pd.to_datetime(_abc_src["period_start"], errors="coerce").dt.normalize()
+                _abc_src["period_end"] = pd.to_datetime(_abc_src["period_end"], errors="coerce").dt.normalize()
+                _mtd = _abc_src[(_abc_src["period_start"].eq(month_start)) & (_abc_src["period_end"].dt.month.eq(month_start.month))].copy()
+                if not _mtd.empty:
+                    month_abc_end = max(pd.Timestamp(month_abc_end), pd.Timestamp(_mtd["period_end"].max()))
+        title_end = max(pd.Timestamp(cur_actual_end), pd.Timestamp(month_abc_end))
+        extra_note = "" if pd.Timestamp(title_end) == pd.Timestamp(cur_actual_end) else f"; ВП ABC до {month_abc_end:%d.%m}"
+        _start("Текущий месяц", f"{month_start:%d.%m}-{title_end:%d.%m.%Y} / план = факт ВП прошлого месяца{extra_note}", "Текущий месяц", key="current_month", top_menu=True)
         month_days = calendar.monthrange(month_start.year, month_start.month)[1]
         prev_month_df = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
         # План на май/текущий месяц = факт валовой прибыли за апрель/прошлый закрытый месяц. Без +10%.
         month_plan = max(0.0, _num(prev_month_df["gp_use"].sum()) if prev_month_df is not None and not prev_month_df.empty else 0.0)
-        elapsed = min((cur_actual_end - month_start).days + 1, month_days)
+        elapsed = min((title_end - month_start).days + 1, month_days)
         plan_to_date = month_plan / month_days * elapsed if month_days else 0.0
 
         # Operational facts from Orders and Advertising reports only.
@@ -6327,7 +6377,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
         # Gross profit from ABC only. If a current-month ABC file 01.MM..latest exists,
         # _abc_periods_inside uses it and does not add weekly pieces on top.
-        mtd_abc = _abc_periods_inside(month_start, cur_actual_end, ["subject_disp"])
+        mtd_abc = _abc_periods_inside(month_start, title_end, ["subject_disp"])
         mtd_gp = _num(mtd_abc["gp_abc"].sum()) if mtd_abc is not None and not mtd_abc.empty else 0.0
         pct_plan = mtd_gp / plan_to_date * 100 if plan_to_date else np.nan
         cards = [
@@ -6342,8 +6392,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         rows=[]
         ws = month_start
         prev_week_gp = None
-        while ws <= cur_actual_end:
-            we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), cur_actual_end)
+        while ws <= title_end:
+            we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), title_end)
             wk_orders = _agg_daily(ws, we, ["subject_disp"])
             wk_abc = _abc_periods_inside(ws, we, ["subject_disp"])
             wk_gp_val = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
@@ -6448,12 +6498,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             _link(target, (bx,by,bx+bw,by+44))
         _section_bar(640, "Блок 1. Экономика и продажи")
         cards1 = [
-            (_fmt_money(row.get("sum_use")), "Сумма", _delta(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
+            (_fmt_money(row.get("sum_use")), "Сумма", _delta_abs(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
             (_fmt_num(row.get("orders")), "Заказы", _delta(row.get("orders"), row.get("orders_prev")), "Заказы", ""),
-            (_fmt_money(row.get("gp_use")), "ВП ABC", _delta(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
+            (_fmt_money(row.get("gp_use")), "ВП ABC", _delta_abs(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
             (_fmt_pct(row.get("margin")), "Рентабельность", _delta(row.get("margin"), row.get("margin_prev")), "Рент.", ""),
             (_fmt_pct(row.get("drr")), "ДРР", _delta(row.get("drr"), row.get("drr_prev")), "ДРР", ""),
-            (_fmt_money(row.get("ad_spend")), "Расход РК", _delta(row.get("ad_spend"), row.get("ad_spend_prev")), "Расход РК", ""),
+            (_fmt_money(row.get("ad_spend")), "Расход РК", _delta_abs(row.get("ad_spend"), row.get("ad_spend_prev")), "Расход РК", ""),
             (_fmt_rub1(row.get("cpc")), "CPC", _delta(row.get("cpc"), row.get("cpc_prev")), "CPC", ""),
         ]
         for i, card in enumerate(cards1):
@@ -7261,20 +7311,13 @@ def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
     label = f"{int(latest.day)} {REPORT_MONTH_GENITIVE_RU.get(int(latest.month), latest.strftime('%m'))}"
     prev_label = f"{prev_start:%d.%m}-{prev_end:%d.%m} / средний день"
     lines = [
-        f"📊 TOPFACE — {label}",
-        f"Сравнение: {prev_label}",
+        f"TOPFACE — {label}",
+        f"к среднему дню {prev_label}",
         "",
-        f"💰 Сумма заказов: {_tg_fmt_money(cur['order_sum'])} {_tg_arrow_abs(cur['order_sum'], prev['order_sum'], ' ₽')}",
-        f"🧾 Заказы: {_tg_fmt_num(cur['orders'])} {_tg_arrow_abs(cur['orders'], prev['orders'])}",
-        f"📣 Расход РК: {_tg_fmt_money(cur['ad_spend'])} {_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽')}",
-        f"📉 ДРР: {_tg_fmt_pct(cur['drr'])} {_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True)}",
-        f"🔎 Спрос WB: {_tg_fmt_num(cur['demand'])} {_tg_arrow_pct(cur['demand'], prev['demand'])}",
-        f"📌 % поиска: {_tg_fmt_pct(cur['search_share'])} {_tg_arrow_pct(cur['search_share'], prev['search_share'])}",
-        f"🎯 CTR РК: {_tg_fmt_pct(cur['ad_ctr'])} {_tg_arrow_pct(cur['ad_ctr'], prev['ad_ctr'])}",
-        f"💸 CPC: {_tg_fmt_rub1(cur['cpc'])} {_tg_arrow_pct(cur['cpc'], prev['cpc'], lower_bad=True)}",
+        f"Заказы: {_tg_fmt_num(cur['orders'])} ({_tg_arrow_abs(cur['orders'], prev['orders'])})",
+        f"Расход РК: {_tg_fmt_money(cur['ad_spend'])} ({_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽')})",
+        f"ДРР: {_tg_fmt_pct(cur['drr'])} ({_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True)})",
     ]
-    if ads_source:
-        lines.append(f"Источник РК: {ads_source}")
     return "\n".join(lines)
 
 
@@ -7551,7 +7594,7 @@ def run_smoke_test(root: str = ".") -> None:
     if not pdf_created or not pdf_path.exists() or pdf_path.stat().st_size < 10_000:
         raise RuntimeError(f"SMOKE_TEST failed: PDF не создан или слишком маленький: {pdf_path}")
     tg_preview = build_telegram_daily_summary(outputs)
-    if "Сумма заказов" not in tg_preview or "Расход РК" not in tg_preview:
+    if "Заказы:" not in tg_preview or "Расход РК" not in tg_preview or "ДРР" not in tg_preview:
         raise RuntimeError(f"SMOKE_TEST failed: Telegram daily summary invalid: {tg_preview[:200]}")
     log("SMOKE_TEST_OK: Telegram daily summary built")
     ok_path = local_dir / "SMOKE_TEST_OK.txt"
