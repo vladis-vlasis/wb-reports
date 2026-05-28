@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX6_STABLE_PDF_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX7_MONTHPLAN_ABC_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -5701,11 +5701,18 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         return out
 
     def _abc_periods_inside(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
-        """ABC-only facts for a date range.
+        """ABC gross profit for a period without double counting.
 
-        Used for current-month GP: if ABC for a day/week has not been released,
-        that period contributes nothing to GP and is displayed as blank.
+        Business rule 2026-05-28:
+        - if a Monday-uploaded current-month ABC file exists (for example 01.05-26.05),
+          it is the source of truth for current-month gross profit;
+        - do not add weekly ABC rows on top of that current-month ABC file;
+        - order quantities and order sums for the operational page still come from Orders,
+          not from ABC;
+        - ad spend for the operational page comes from advertising reports, not from ABC.
         """
+        start_n = pd.Timestamp(start).normalize()
+        end_n = pd.Timestamp(end).normalize()
         frames = []
         for nm in ["abc_weekly", "abc_monthly"]:
             src = outputs.get(nm, pd.DataFrame()).copy()
@@ -5713,7 +5720,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 continue
             src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
             src["period_end"] = pd.to_datetime(src["period_end"], errors="coerce").dt.normalize()
-            src = src[(src["period_start"] >= pd.Timestamp(start).normalize()) & (src["period_end"] <= pd.Timestamp(end).normalize())].copy()
+            # Candidate periods fully contained in requested interval.
+            src = src[(src["period_start"] >= start_n) & (src["period_end"] <= end_n)].copy()
             if src.empty:
                 continue
             if "subject_disp" not in src.columns:
@@ -5727,19 +5735,34 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 if c0 not in src.columns:
                     src[c0] = 0.0
                 src[c0] = pd.to_numeric(src[c0], errors="coerce").fillna(0.0)
+            src["_source_bucket"] = nm
             frames.append(src)
         if not frames:
-            return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows"])
+            return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end"])
         x = pd.concat(frames, ignore_index=True)
+        x = _normalize_pdf_merge_keys(x, keys)
+        # Prefer one aggregated ABC report that starts exactly at the requested period start
+        # and reaches the furthest period end. This covers the user's Monday current-month ABC upload.
+        exact_start = x[x["period_start"].eq(start_n)].copy()
+        if not exact_start.empty:
+            max_end = exact_start["period_end"].max()
+            preferred = exact_start[exact_start["period_end"].eq(max_end)].copy()
+            # Use the preferred aggregated report when it covers more than one day or exactly matches the period.
+            # This prevents double-counting weekly + MTD ABC files.
+            if not preferred.empty and (max_end > start_n or (start_n == end_n)):
+                x = preferred
         for k in keys:
             if k not in x.columns:
                 x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
         x["_abc_ad"] = np.where(x["gross_revenue"] > 0, x["gross_revenue"] * x["abc_drr_pct"] / 100.0, 0.0)
         return x.groupby(keys, dropna=False, as_index=False).agg(
             gp_abc=("gross_profit", "sum"),
             revenue_abc=("gross_revenue", "sum"),
             abc_ad_spend=("_abc_ad", "sum"),
             abc_rows=("gross_profit", "size"),
+            abc_period_start=("period_start", "min"),
+            abc_period_end=("period_end", "max"),
         )
 
     cur_cat = _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"])
@@ -6143,39 +6166,48 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _summary_category_page("cur_categories", "Текущая неделя: категории", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор", "Текущая неделя", cur_cat, target_contour=None)
 
     def _current_month_page():
-        # Текущий месяц: общие крупные значения за месяц и по каждой неделе месяца, без разбивки по категориям.
+        # Текущий месяц: ВП берём из ABC текущего месяца/вышедших ABC-отчетов,
+        # заказы и сумму заказов — из Orders, рекламные расходы — из отчетов по рекламе.
         month_start = cur_start.replace(day=1)
-        _start("Текущий месяц", f"{month_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / общая динамика по неделям", "Текущий месяц", key="current_month", top_menu=True)
+        _start("Текущий месяц", f"{month_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / план = факт ВП прошлого месяца", "Текущий месяц", key="current_month", top_menu=True)
         month_days = calendar.monthrange(month_start.year, month_start.month)[1]
         prev_month_df = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
-        month_plan = max(0.0, _num(prev_month_df["gp_use"].sum()) * 1.10) if prev_month_df is not None and not prev_month_df.empty else 0.0
+        # План на май/текущий месяц = факт валовой прибыли за апрель/прошлый закрытый месяц. Без +10%.
+        month_plan = max(0.0, _num(prev_month_df["gp_use"].sum()) if prev_month_df is not None and not prev_month_df.empty else 0.0)
         elapsed = min((cur_actual_end - month_start).days + 1, month_days)
         plan_to_date = month_plan / month_days * elapsed if month_days else 0.0
-        mtd = _metrics_period(month_start, cur_actual_end, closed_start, closed_start + (cur_actual_end-month_start), ["subject_disp"])
-        # ВП МТД: только по вышедшим ABC-периодам. Оперативную модельную ВП за 25.05 и другие дни без ABC не добавляем.
+
+        # Operational facts from Orders and Advertising reports only.
+        mtd_orders = _agg_daily(month_start, cur_actual_end, ["subject_disp"])
+        mtd_orders_qty = _num(mtd_orders["orders"].sum()) if mtd_orders is not None and not mtd_orders.empty else 0.0
+        mtd_order_sum = _num(mtd_orders["order_sum"].sum()) if mtd_orders is not None and not mtd_orders.empty else 0.0
+        mtd_ad = _num(mtd_orders["ad_spend"].sum()) if mtd_orders is not None and not mtd_orders.empty else 0.0
+
+        # Gross profit from ABC only. If a current-month ABC file 01.MM..latest exists,
+        # _abc_periods_inside uses it and does not add weekly pieces on top.
         mtd_abc = _abc_periods_inside(month_start, cur_actual_end, ["subject_disp"])
         mtd_gp = _num(mtd_abc["gp_abc"].sum()) if mtd_abc is not None and not mtd_abc.empty else 0.0
-        mtd_sum = _num(mtd["sum_use"].sum()) if mtd is not None and not mtd.empty else 0.0
-        mtd_ad = _num(mtd["ad_spend"].sum()) if mtd is not None and not mtd.empty else 0.0
         pct_plan = mtd_gp / plan_to_date * 100 if plan_to_date else np.nan
         cards = [
-            (_fmt_money(mtd_gp), "ВП МТД", None, "ВП", ""),
+            (_fmt_money(mtd_gp), "ВП факт ABC", None, "ВП", ""),
             (_fmt_pct(pct_plan), "% плана на дату", None, "% плана", ""),
-            (_fmt_money(mtd_sum), "Сумма МТД", None, "Сумма", ""),
-            (_fmt_money(mtd_ad), "Расход РК МТД", None, "Расход РК", ""),
+            (_fmt_num(mtd_orders_qty), "Заказы, шт", None, "Заказы", ""),
+            (_fmt_money(mtd_order_sum), "Сумма заказов", None, "Сумма", ""),
+            (_fmt_money(mtd_ad), "Расход РК", None, "Расход РК", ""),
         ]
         for i, card in enumerate(cards):
-            _metric_card(95+i*365, 605, 330, 110, *card)
+            _metric_card(65+i*300, 605, 280, 110, *card)
         rows=[]
         ws = month_start
         prev_week_gp = None
         while ws <= cur_actual_end:
             we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), cur_actual_end)
-            wk = _metrics_period(ws, we, ws-pd.Timedelta(days=7), we-pd.Timedelta(days=7), ["subject_disp"])
+            wk_orders = _agg_daily(ws, we, ["subject_disp"])
             wk_abc = _abc_periods_inside(ws, we, ["subject_disp"])
             wk_gp_val = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
-            wk_sum = _num(wk["sum_use"].sum()) if wk is not None and not wk.empty else 0.0
-            wk_ad = _num(wk["ad_spend"].sum()) if wk is not None and not wk.empty else 0.0
+            wk_orders_qty = _num(wk_orders["orders"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
+            wk_sum = _num(wk_orders["order_sum"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
+            wk_ad = _num(wk_orders["ad_spend"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
             elapsed_to_week = min((we - month_start).days + 1, month_days)
             week_plan_to_date = month_plan / month_days * elapsed_to_week if month_days else 0.0
             mtd_to_week_abc = _abc_periods_inside(month_start, we, ["subject_disp"])
@@ -6186,9 +6218,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             else:
                 gp_cell = (_fmt_money(wk_gp_val), _delta_abs(wk_gp_val, prev_week_gp), "ВП")
                 prev_week_gp = wk_gp_val
-            rows.append({"cells":[f"{ws:%d.%m}-{we:%d.%m}", gp_cell, _fmt_pct(pct_to_week), _fmt_money(wk_sum), _fmt_money(wk_ad)]})
+            rows.append({"cells":[f"{ws:%d.%m}-{we:%d.%m}", gp_cell, _fmt_pct(pct_to_week), _fmt_num(wk_orders_qty), _fmt_money(wk_sum), _fmt_money(wk_ad)]})
             ws = we + pd.Timedelta(days=1)
-        _draw_table(120, 230, W-240, ["Неделя", "ВП", "% выполнения плана", "Сумма заказов", "Расход РК"], [240,300,300,300,260], rows, row_h=58, font_size=17, max_rows=8)
+        _draw_table(85, 230, W-170, ["Неделя", "ВП ABC", "% плана", "Заказы", "Сумма заказов", "Расход РК"], [200,260,240,180,280,250], rows, row_h=58, font_size=16, max_rows=8)
 
     def _summary_page():
         _start("Помесячная динамика", f"{closed_start.year} год / ABC по 4 категориям", "Годовая динамика", key="summary", top_menu=True)
