@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX2_20260527
+# VERSION: ORDERS_ONLY_AND_TG_FIX4_PRICEWITHDISC_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -56,6 +56,31 @@ TARGET_SUBJECTS = [
     "Косметические карандаши",
 ]
 
+# Global approved product -> category mapping for all operational reports.
+# This prevents liquid eyeliners / liners (405/406/552) and service/stock-only
+# products from leaking into "Косметические карандаши" through nmId dictionary joins.
+# 158 is a lipstick family and must stay in "Помады".
+VALID_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = {
+    "901": "Кисти косметические",
+    "605": "Косметические карандаши",
+    "611": "Косметические карандаши",
+    "613": "Косметические карандаши",
+    "614": "Косметические карандаши",
+    "617": "Косметические карандаши",
+    "618": "Косметические карандаши",
+    "154": "Помады",
+    "155": "Помады",
+    "156": "Помады",
+    "157": "Помады",
+    "158": "Помады",
+    "206": "Помады",
+    "207": "Блески",
+    "209": "Блески",
+    "210": "Блески",
+    "211": "Блески",
+}
+VALID_PRODUCT_CODES = set(VALID_PRODUCT_CATEGORY_REFERENCE)
+
 EXCLUDE_ARTICLES_UPPER = {
     "CZ420", "CZ420БРОВИ", "CZ420ГЛАЗА", "DE49", "DE49ГЛАЗА", "PT901",
 }
@@ -110,8 +135,8 @@ ALIASES: Dict[str, Sequence[str]] = {
     "buyouts_count": ["buyoutsCount", "Выкупы", "Выкупили, шт", "Выкупили", "Кол-во выкупов"],
     "buyout_sum": ["buyoutsSumRub", "Выкупили, руб", "Сумма выкупов"],
     "cancels_count": ["cancelCount", "cancelsCount", "Отменили, шт", "Отменили", "Отмены", "Отменено"],
-    "finished_price": ["finishedPrice", "Средняя конечная цена", "Средняя цена покупателя", "Цена с учетом всех скидок, кроме суммы по WB Кошельку", "Ср. цена продажи"],
-    "price_with_disc": ["priceWithDisc", "Средняя цена продажи", "Цена со скидкой продавца, в том числе со скидкой WB Клуба"],
+    "finished_price": ["finishedPrice", "Средняя конечная цена", "Средняя цена покупателя", "Цена покупателя", "Цена с учетом всех скидок, кроме суммы по WB Кошельку"],
+    "price_with_disc": ["priceWithDisc", "Цена продажи", "Средняя цена продажи", "Цена со скидкой продавца, в том числе со скидкой WB Клуба"],
     "spp": ["СПП, %", "SPP", "Скидка WB, %", "spp"],
     "spend": ["Расход", "spend", "Продвижение", "Затраты", "Расходы"],
     "impressions": ["Показы", "shows", "views", "impressions"],
@@ -174,6 +199,30 @@ def norm_key(value: Any) -> str:
     text = normalize_text(value).lower().replace("ё", "е")
     text = re.sub(r"[^a-zа-я0-9%]+", " ", text, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", text).strip()
+
+
+SUBJECT_CANON_MAP = {
+    "кисти косметические": "Кисти косметические",
+    "помады": "Помады",
+    "блески": "Блески",
+    "косметические карандаши": "Косметические карандаши",
+}
+
+
+def canonical_subject(value: Any) -> str:
+    key = norm_key(value)
+    return SUBJECT_CANON_MAP.get(key, normalize_text(value))
+
+
+def approved_subject_for_product(product: Any) -> str:
+    code = normalize_text(product).upper().replace(" ", "")
+    return VALID_PRODUCT_CATEGORY_REFERENCE.get(code, "")
+
+
+def is_approved_product_subject(product: Any, subject: Any) -> bool:
+    code = normalize_text(product).upper().replace(" ", "")
+    subj = canonical_subject(subject)
+    return bool(code and VALID_PRODUCT_CATEGORY_REFERENCE.get(code) == subj)
 
 
 def clean_article(value: Any) -> str:
@@ -531,8 +580,11 @@ def classify_ad_type(value: Any) -> str:
 
 
 # ------------------------- business cleanup helpers -------------------------
-EXCLUDE_ARTICLE_PREFIXES = tuple(sorted(EXCLUDE_ARTICLES_UPPER, key=len, reverse=True))
-EXCLUDE_PRODUCT_PREFIXES = ("CZ420", "DE49", "PT901", "FL", "PE")
+# Prefix exclusions are only for real excluded article families.
+# PT901.Fxx are valid brush articles and must not be filtered as the raw PT901 service code.
+EXCLUDE_ARTICLE_PREFIXES = ("CZ420", "DE49")
+EXCLUDE_ARTICLE_EXACT = {"PT901"}
+EXCLUDE_PRODUCT_PREFIXES = ("CZ420", "DE49", "FL", "PE")
 WAREHOUSE_EXCLUDE_KEYWORDS = (
     "ВИРТУАЛ", "АСТАН", "АЛМАТ", "АТАКЕНТ", "КАРАГАНД", "КАЗАХ", "БЕЛАРУС", "МИНСК",
     "ДАЛЬНЕГОРСК", "МАХАЧКАЛА ВИРТ", "ВИРТУАЛЬНЫЙ",
@@ -543,6 +595,8 @@ def is_excluded_article(value: Any) -> bool:
     t = article_upper(value)
     if not t:
         return True
+    if t in EXCLUDE_ARTICLE_EXACT:
+        return True
     return any(t.startswith(prefix) for prefix in EXCLUDE_ARTICLE_PREFIXES)
 
 
@@ -552,12 +606,9 @@ def is_valid_product_code(value: Any) -> bool:
         return False
     if any(t.startswith(prefix) for prefix in EXCLUDE_PRODUCT_PREFIXES):
         return False
-    # Основные товары TOPFACE в этих категориях обычно числовые; F-серия кистей допускается отдельно.
-    if re.match(r"^\d{2,5}$", t):
-        return True
-    if re.match(r"^F\d{1,3}$", t):
-        return True
-    return False
+    # For management reports we keep only product families approved in the global mapping.
+    # This removes 405/406/552/620/622 from target reports unless explicitly added above.
+    return t in VALID_PRODUCT_CODES
 
 
 def canonical_warehouse_name(name: Any) -> str:
@@ -802,7 +853,8 @@ class Loader:
 
         Hard business rule 2026-05-27:
         - order_sum is taken only from the Orders report data; if WB does not export a separate
-          order_sum column, the script uses finishedPrice/priceWithDisc from the same Orders file;
+          order_sum column, the script uses priceWithDisc from the same Orders file as sales/order amount;
+          finishedPrice is buyer price and is not used for order_sum;
         - technical zero cancellation dates like 0001-01-01 are not treated as cancellations;
         - funnel is not allowed to replace orders/order_sum later.
         """
@@ -854,26 +906,30 @@ class Loader:
                 order_sum_col = _source_column_name(df_active, "order_sum")
                 if order_sum_series.isna().all():
                     # Still Orders-only: fallback is from the same WB Orders file, never from Funnel.
-                    fallback_price = finished_price_series.copy()
-                    fallback_col = _source_column_name(df_active, "finished_price")
+                    # Business rule: priceWithDisc is the sale price / order amount.
+                    # finishedPrice is buyer price and must not be used as order_sum.
+                    fallback_price = price_with_disc_series.copy()
+                    fallback_col = _source_column_name(df_active, "price_with_disc")
                     if fallback_price.isna().all():
-                        fallback_price = price_with_disc_series.copy()
-                        fallback_col = _source_column_name(df_active, "price_with_disc")
+                        # Last-resort diagnostic fallback only when WB Orders has no priceWithDisc at all.
+                        fallback_price = finished_price_series.copy()
+                        fallback_col = _source_column_name(df_active, "finished_price")
+                        self.diag.add("WARN", "orders", f"В файле заказов нет priceWithDisc: {key}", "использую finishedPrice только как аварийный fallback; проверь структуру Orders")
                     if not fallback_price.isna().all():
                         order_sum_series = fallback_price * orders_series
-                        order_sum_col = f"{fallback_col or 'finished_price/price_with_disc'} × orders (Orders file)"
+                        order_sum_col = f"{fallback_col or 'price_with_disc'} × orders (Orders file)"
                         self.diag.add("WARN", "orders", f"В файле заказов нет отдельной колонки суммы заказов: {key}", f"использую {order_sum_col}; источник всё равно Orders")
                         log(f"orders: no explicit order_sum in {Path(key).name}; use {order_sum_col}")
                     else:
                         order_sum_col = ""
-                        self.diag.add("ERROR", "orders", f"В файле заказов не распознана ни сумма, ни цена заказа: {key}", "продажи из воронки запрещены")
-                        log(f"orders: ERROR no order_sum/price column recognized in {Path(key).name}; Funnel fallback is forbidden")
+                        self.diag.add("ERROR", "orders", f"В файле заказов не распознана ни сумма, ни цена продажи priceWithDisc: {key}", "продажи из воронки запрещены")
+                        log(f"orders: ERROR no order_sum/priceWithDisc column recognized in {Path(key).name}; Funnel fallback is forbidden")
 
                 out = pd.DataFrame({
                     "day": date_series(get_col(df_active, "day")),
                     "nm_id": num_series(get_col(df_active, "nm_id")),
                     "supplier_article": get_col(df_active, "supplier_article").map(clean_article),
-                    "subject": get_col(df_active, "subject").map(normalize_text),
+                    "subject": get_col(df_active, "subject").map(canonical_subject),
                     "warehouse": get_col(df_active, "warehouse").map(normalize_text),
                     "orders": orders_series,
                     "order_sum": order_sum_series,
@@ -931,7 +987,7 @@ class Loader:
                     "day": day,
                     "nm_id": num_series(get_col(df, "nm_id")),
                     "supplier_article": get_col(df, "supplier_article").map(clean_article),
-                    "subject": get_col(df, "subject").map(normalize_text),
+                    "subject": get_col(df, "subject").map(canonical_subject),
                     "orders": num_series(get_col(df, "orders")),
                     "order_sum": num_series(get_col(df, "order_sum")),
                     "open_cards": num_series(get_col(df, "open_cards")),
@@ -985,7 +1041,7 @@ class Loader:
                         "day": date_series(get_col(df, "day")),
                         "campaign_id": get_col(df, "campaign_id").map(lambda x: str(int(x)) if pd.notna(to_number(x)) else normalize_text(x)),
                         "nm_id": num_series(get_col(df, "nm_id")),
-                        "subject": get_col(df, "subject").map(normalize_text),
+                        "subject": get_col(df, "subject").map(canonical_subject),
                         "impressions": num_series(get_col(df, "impressions")).fillna(0),
                         "clicks": num_series(get_col(df, "clicks")).fillna(0),
                         "orders": num_series(get_col(df, "ad_orders")).fillna(0),
@@ -1002,7 +1058,18 @@ class Loader:
             except Exception as exc:
                 self.diag.add("ERROR", "ads", f"Не прочитана реклама {key}", exc)
         raw = pd.concat(raw_frames, ignore_index=True) if raw_frames else pd.DataFrame()
+        if not raw.empty:
+            before_dedup = len(raw)
+            dedup_cols = [c for c in ["day", "campaign_id", "nm_id", "impressions", "clicks", "orders", "order_sum", "spend"] if c in raw.columns]
+            raw = raw.drop_duplicates(subset=dedup_cols).copy()
+            if len(raw) != before_dedup:
+                log(f"ads: removed duplicated source rows {before_dedup - len(raw):,}; weekly/consolidated overlap")
         campaigns = pd.concat(campaign_frames, ignore_index=True) if campaign_frames else pd.DataFrame(columns=["campaign_id", "nm_id", "subject", "ad_type"])
+        if not campaigns.empty:
+            before_camp_dedup = len(campaigns)
+            campaigns = campaigns.drop_duplicates(["campaign_id", "nm_id", "ad_type", "bid_type_raw"]).copy()
+            if len(campaigns) != before_camp_dedup:
+                log(f"ads: removed duplicated campaign rows {before_camp_dedup - len(campaigns):,}")
         if not raw.empty:
             if not campaigns.empty:
                 cmap = campaigns.drop_duplicates(["campaign_id", "nm_id"])[["campaign_id", "nm_id", "ad_type", "bid_type_raw"]]
@@ -1057,7 +1124,7 @@ class Loader:
                         day = pd.Series([period_end] * len(df), index=df.index)
                     out = pd.DataFrame({
                         "day": day,
-                        "subject": get_col(df, "subject").map(normalize_text),
+                        "subject": get_col(df, "subject").map(canonical_subject),
                         "spend": num_series(get_col(df, "spend")).fillna(0.0),
                         "clicks": num_series(get_col(df, "clicks")).fillna(0.0),
                         "impressions": num_series(get_col(df, "impressions")).fillna(0.0),
@@ -1105,7 +1172,7 @@ class Loader:
                     "day": date_series(get_col(df, "day")),
                     "nm_id": num_series(get_col(df, "nm_id")),
                     "supplier_article": get_col(df, "supplier_article").map(clean_article),
-                    "subject": get_col(df, "subject").map(normalize_text),
+                    "subject": get_col(df, "subject").map(canonical_subject),
                     "search_query": get_col(df, "search_query").map(normalize_text),
                     "filter": get_col(df, "filter").map(normalize_text),
                     "frequency": num_series(get_col(df, "frequency")),
@@ -1168,7 +1235,7 @@ class Loader:
                     "entry_point": get_col(df, "entry_point").map(normalize_text),
                     "nm_id": num_series(get_col(df, "nm_id")),
                     "supplier_article": get_col(df, "supplier_article").map(clean_article),
-                    "subject": get_col(df, "subject").map(normalize_text),
+                    "subject": get_col(df, "subject").map(canonical_subject),
                     "impressions": num_series(get_col(df, "impressions")).fillna(0),
                     "transitions": num_series(get_col(df, "open_cards")).fillna(0),
                     "ctr_pct": num_series(get_col(df, "ctr")),
@@ -1209,7 +1276,7 @@ class Loader:
                     "day": day,
                     "nm_id": num_series(get_col(df, "nm_id")),
                     "supplier_article": get_col(df, "supplier_article").map(clean_article),
-                    "subject": get_col(df, "subject").map(normalize_text),
+                    "subject": get_col(df, "subject").map(canonical_subject),
                     "warehouse": get_col(df, "warehouse").map(normalize_text),
                     "stock": num_series(get_col(df, "stock")).fillna(0),
                     "source_file": key,
@@ -1246,7 +1313,7 @@ class Loader:
                     "month_key": month_key(start),
                     "nm_id": num_series(get_col(df, "nm_id")),
                     "supplier_article": get_col(df, "supplier_article").map(clean_article),
-                    "subject": get_col(df, "subject").map(normalize_text),
+                    "subject": get_col(df, "subject").map(canonical_subject),
                     "gross_profit": num_series(get_col(df, "gross_profit")).fillna(0),
                     "gross_revenue": num_series(get_col(df, "gross_revenue")).fillna(0),
                     "orders": num_series(get_col(df, "orders")).fillna(0),
@@ -1293,7 +1360,7 @@ class Loader:
                     "week_code": get_col(df, "week").map(normalize_text),
                     "nm_id": num_series(get_col(df, "nm_id")),
                     "supplier_article": get_col(df, "supplier_article").map(clean_article),
-                    "subject": get_col(df, "subject").map(normalize_text),
+                    "subject": get_col(df, "subject").map(canonical_subject),
                     "commission_pct": num_series(get_col(df, "commission_pct")),
                     "acquiring_pct": num_series(get_col(df, "acquiring_pct")),
                     "logistics_direct": num_series(get_col(df, "logistics_direct")),
@@ -1386,9 +1453,10 @@ class AnalyticsBuilder:
                 if col not in x.columns:
                     x[col] = "" if col != "nm_id" else np.nan
             x["supplier_article"] = x["supplier_article"].map(clean_article)
-            x["subject"] = x["subject"].map(normalize_text)
+            x["subject"] = x["subject"].map(canonical_subject)
             x["nm_id"] = num_series(x["nm_id"])
             x["product"] = x["supplier_article"].map(product_code).where(x["product"].map(normalize_text).eq(""), x["product"].map(normalize_text))
+            x["product"] = x["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
             x["source"] = name
             frames.append(x[["subject", "product", "supplier_article", "nm_id", "source"]])
         if not frames:
@@ -1398,6 +1466,7 @@ class AnalyticsBuilder:
         d = d[d["supplier_article"].ne("") & d["product"].ne("")]
         d = d[~d["supplier_article"].map(is_excluded_article)]
         d = d[d["product"].map(is_valid_product_code)]
+        d = d[d.apply(lambda r: is_approved_product_subject(r.get("product"), r.get("subject")), axis=1)]
         d = d.drop_duplicates(["supplier_article", "nm_id"])
         log(f"dictionary: rows={len(d):,}, articles={d['supplier_article'].nunique():,}, nm_ids={d['nm_id'].nunique(dropna=True):,}")
         return d
@@ -1447,18 +1516,23 @@ class AnalyticsBuilder:
         # Canonical values are calculated as local Series. Never use direct
         # out["product"] in filters because it can fail when the label is missing
         # or duplicated in rare pandas states.
-        subject_raw = _series(out, "subject").map(normalize_text)
-        subject_dict = _series(out, "subject_dict").map(normalize_text)
+        subject_raw = _series(out, "subject").map(canonical_subject)
+        subject_dict = _series(out, "subject_dict").map(canonical_subject)
         subject_clean = subject_raw.where(subject_raw.ne(""), subject_dict)
 
         article_raw = _series(out, "supplier_article").map(clean_article)
         article_dict = _series(out, "supplier_article_dict").map(clean_article)
         article_clean = article_raw.where(article_raw.ne(""), article_dict)
 
-        product_raw = _series(out, "product").map(normalize_text)
-        product_dict = _series(out, "product_dict").map(normalize_text)
+        product_raw = _series(out, "product").map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        product_dict = _series(out, "product_dict").map(lambda v: normalize_text(v).upper().replace(" ", ""))
         product_clean = product_raw.where(product_raw.ne(""), product_dict)
         product_clean = product_clean.where(product_clean.ne(""), article_clean.map(product_code))
+        product_clean = product_clean.map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        ref_subject = product_clean.map(approved_subject_for_product)
+        # If the source subject is empty, use the approved reference category.
+        # If the source subject is present, it must still match the approved pair below.
+        subject_clean = subject_clean.where(subject_clean.ne(""), ref_subject)
 
         # Drop old canonical/dict columns, including duplicates, and reinsert clean canonical columns.
         drop_cols = [c for c in out.columns if str(c) in {"subject", "product", "supplier_article", "subject_dict", "product_dict", "supplier_article_dict"}]
@@ -1473,6 +1547,7 @@ class AnalyticsBuilder:
             & product_clean.ne("")
             & (~article_clean.map(is_excluded_article))
             & product_clean.map(is_valid_product_code)
+            & product_clean.combine(subject_clean, lambda p, s: VALID_PRODUCT_CATEGORY_REFERENCE.get(str(p)) == s)
         )
         out = out.loc[mask.values].copy()
         return out
@@ -1815,7 +1890,9 @@ class AnalyticsBuilder:
         for c in ["orders", "order_sum", "open_cards", "add_to_cart", "manual_spend", "unified_spend", "unknown_spend"]:
             if c not in out.columns:
                 out[c] = 0
-        out["used_buyout_pct_90"] = out.get("used_buyout_pct_90", np.nan).fillna(1.0)
+        if "used_buyout_pct_90" not in out.columns:
+            out["used_buyout_pct_90"] = 1.0
+        out["used_buyout_pct_90"] = pd.to_numeric(out["used_buyout_pct_90"], errors="coerce").fillna(1.0)
         out["buyout_qty_model"] = out["orders"].fillna(0) * out["used_buyout_pct_90"]
         # Formula: revenue = order_sum * buyout pct. Direct logistics from all orders, others as agreed.
         out["revenue_model"] = out["order_sum"].fillna(0) * out["used_buyout_pct_90"]
@@ -1852,7 +1929,7 @@ class AnalyticsBuilder:
             ("orders", "Заказы в день"), ("order_sum", "Сумма заказов"), ("gross_profit_model", "Валовая прибыль модель"),
             ("open_cards", "Открытия карточки / клики"), ("add_to_cart", "Добавления в корзину"),
             ("cart_conv_pct", "Конверсия в корзину, %"), ("order_conv_pct", "Конверсия в заказ, %"),
-            ("finished_price", "finishedPrice"), ("spp", "СПП, %"),
+            ("price_with_disc", "priceWithDisc / цена продажи"), ("finished_price", "finishedPrice / цена покупателя"), ("spp", "СПП, %"),
             ("manual_impressions", "manual показы"), ("manual_clicks", "manual клики"), ("manual_ctr_pct", "manual CTR, %"), ("manual_cpc", "manual CPC"), ("manual_drr_pct", "manual ДРР, %"),
             ("unified_impressions", "unified показы"), ("unified_clicks", "unified клики"), ("unified_ctr_pct", "unified CTR, %"), ("unified_cpc", "unified CPC"), ("unified_drr_pct", "unified ДРР, %"),
             ("search_frequency", "Спрос / частотность"), ("search_transitions", "Переходы из поиска"), ("search_traffic_capture_pct", "% поискового трафика"), ("total_traffic_capture_pct", "% общего захвата спроса"),
@@ -1899,7 +1976,7 @@ class AnalyticsBuilder:
                 rows.append({
                     "subject": keys[0], "product": keys[1], "supplier_article": keys[2], "nm_id": keys[3],
                     "day": r.get("day"), "orders": r.get("orders"), "order_sum": r.get("order_sum"), "gross_profit_model": r.get("gross_profit_model"),
-                    "finished_price": r.get("finished_price"), "spp": r.get("spp"), "open_cards": r.get("open_cards"), "add_to_cart": r.get("add_to_cart"),
+                    "price_with_disc": r.get("price_with_disc"), "finished_price": r.get("finished_price"), "spp": r.get("spp"), "open_cards": r.get("open_cards"), "add_to_cart": r.get("add_to_cart"),
                     "cart_conv_pct": r.get("cart_conv_pct"), "order_conv_pct": r.get("order_conv_pct"),
                     "manual_ctr_pct": r.get("manual_ctr_pct"), "manual_drr_pct": r.get("manual_drr_pct"),
                     "unified_ctr_pct": r.get("unified_ctr_pct"), "unified_drr_pct": r.get("unified_drr_pct"),
@@ -1910,9 +1987,16 @@ class AnalyticsBuilder:
         return pd.DataFrame(rows)
 
     def price_ranges(self, daily: pd.DataFrame) -> pd.DataFrame:
-        if daily.empty or "finished_price" not in daily.columns:
+        if daily.empty or ("price_with_disc" not in daily.columns and "order_sum" not in daily.columns):
             return pd.DataFrame()
         df = daily.copy()
+        if "price_with_disc" not in df.columns:
+            df["price_with_disc"] = np.nan
+        # priceWithDisc is the seller sale price. When it is absent on aggregated rows,
+        # fallback to Orders-only order_sum / orders; do not use finishedPrice for sale-price ranges.
+        orders_num = pd.to_numeric(df.get("orders", 0), errors="coerce").replace(0, np.nan)
+        order_sum_num = pd.to_numeric(df.get("order_sum", 0), errors="coerce")
+        df["sale_price_for_range"] = pd.to_numeric(df["price_with_disc"], errors="coerce").fillna(order_sum_num / orders_num)
         def bucket(p):
             if pd.isna(p):
                 return "нет цены"
@@ -1920,10 +2004,10 @@ class AnalyticsBuilder:
             lo = math.floor(p / step) * step
             hi = lo + step
             return f"{lo:.0f}-{hi:.0f}"
-        df["price_range"] = df["finished_price"].map(bucket)
+        df["price_range"] = df["sale_price_for_range"].map(bucket)
         g = df.groupby(["subject", "product", "supplier_article", "nm_id", "price_range"], dropna=False, as_index=False).agg(
             days=("day", "nunique"), order_sum=("order_sum", "sum"), orders=("orders", "sum"),
-            avg_finished_price=("finished_price", "mean"), avg_gross_profit=("gross_profit_model", "mean"),
+            avg_finished_price=("finished_price", "mean"), avg_price_with_disc=("sale_price_for_range", "mean"), avg_gross_profit=("gross_profit_model", "mean"),
             avg_drr_manual=("manual_drr_pct", "mean"), avg_drr_unified=("unified_drr_pct", "mean"),
             avg_cart_conv_pct=("cart_conv_pct", "mean"), avg_order_conv_pct=("order_conv_pct", "mean"),
         )
@@ -2016,7 +2100,7 @@ class AnalyticsBuilder:
         factors = [
             ("orders", "Заказы"), ("order_sum", "Сумма заказов"), ("open_cards", "Открытия карточки / клики"),
             ("add_to_cart", "Добавления в корзину"), ("cart_conv_pct", "Конверсия в корзину, %"), ("order_conv_pct", "Конверсия в заказ, %"),
-            ("finished_price", "finishedPrice"), ("spp", "СПП, %"),
+            ("price_with_disc", "priceWithDisc / цена продажи"), ("finished_price", "finishedPrice / цена покупателя"), ("spp", "СПП, %"),
             ("manual_impressions", "Показы manual"), ("manual_clicks", "Клики manual"), ("manual_ctr_pct", "CTR manual, %"), ("manual_drr_pct", "ДРР manual, %"),
             ("unified_impressions", "Показы unified"), ("unified_clicks", "Клики unified"), ("unified_ctr_pct", "CTR unified, %"), ("unified_drr_pct", "ДРР unified, %"),
             ("search_frequency", "Спрос / частотность"), ("search_transitions", "Переходы из поиска"), ("search_traffic_capture_pct", "% поискового трафика"),
@@ -2179,14 +2263,14 @@ COLUMN_RU = {
     "last_full_week_sum": "Сумма за последнюю полную неделю", "gap_to_target_pct": "Отклонение от цели, %", "days_count": "Дней в анализе", "best_days_count": "Лучших дней",
     "orders": "Заказы", "orders_rows": "Строк заказов", "order_sum": "Сумма заказов", "gross_profit_model": "Валовая прибыль модель",
     "open_cards": "Открытия карточки / клики", "add_to_cart": "Добавления в корзину", "cart_conv_pct": "Конверсия в корзину, %", "order_conv_pct": "Конверсия в заказ, %",
-    "finished_price": "finishedPrice", "price_with_disc": "priceWithDisc", "spp": "СПП, %",
+    "finished_price": "finishedPrice / цена покупателя", "price_with_disc": "priceWithDisc / цена продажи", "spp": "СПП, %",
     "manual_impressions": "Показы manual", "manual_clicks": "Клики manual", "manual_orders": "Заказы manual", "manual_order_sum": "Сумма заказов manual", "manual_spend": "Расход manual", "manual_ctr_pct": "CTR manual, %", "manual_cpc": "CPC manual, ₽", "manual_cr_pct": "CR manual, %", "manual_drr_pct": "ДРР manual, %",
     "unified_impressions": "Показы unified", "unified_clicks": "Клики unified", "unified_orders": "Заказы unified", "unified_order_sum": "Сумма заказов unified", "unified_spend": "Расход unified", "unified_ctr_pct": "CTR unified, %", "unified_cpc": "CPC unified, ₽", "unified_cr_pct": "CR unified, %", "unified_drr_pct": "ДРР unified, %",
     "unknown_impressions": "Показы без типа", "unknown_clicks": "Клики без типа", "unknown_orders": "Заказы без типа", "unknown_order_sum": "Сумма заказов без типа", "unknown_spend": "Расход без типа", "unknown_ctr_pct": "CTR без типа, %", "unknown_cpc": "CPC без типа, ₽", "unknown_cr_pct": "CR без типа, %", "unknown_drr_pct": "ДРР без типа, %",
     "search_frequency": "Спрос / частотность", "search_transitions": "Переходы из поиска", "search_add_to_cart": "Добавления из поиска", "search_orders": "Заказы из поиска", "search_traffic_capture_pct": "% поискового трафика", "total_traffic_capture_pct": "% общего захвата спроса",
     "search_avg_position": "Средняя позиция", "search_median_position": "Медианная позиция", "visibility_pct": "Видимость, %", "rating_card": "Рейтинг карточки", "rating_reviews": "Рейтинг отзывов",
     "direct_localization_pct": "Прямая локализация, %", "localization_with_replacements_pct": "Локализация с заменами, %", "localization_status": "Статус локализации", "stock_qty_total": "Остаток всего", "uncovered_warehouses": "Непокрытые склады", "key_warehouses": "Ключевых складов", "stock_day": "Дата остатков",
-    "price_range": "Диапазон finishedPrice", "days": "Дней", "avg_finished_price": "Средний finishedPrice", "avg_gross_profit": "Средняя валовая прибыль", "avg_drr_manual": "Средний ДРР manual, %", "avg_drr_unified": "Средний ДРР unified, %", "avg_cart_conv_pct": "Средняя конверсия в корзину, %", "avg_order_conv_pct": "Средняя конверсия в заказ, %", "is_recommended": "Рекомендуемый диапазон",
+    "price_range": "Диапазон priceWithDisc", "days": "Дней", "avg_finished_price": "Средний finishedPrice / цена покупателя", "avg_price_with_disc": "Средний priceWithDisc / цена продажи", "avg_gross_profit": "Средняя валовая прибыль", "avg_drr_manual": "Средний ДРР manual, %", "avg_drr_unified": "Средний ДРР unified, %", "avg_cart_conv_pct": "Средняя конверсия в корзину, %", "avg_order_conv_pct": "Средняя конверсия в заказ, %", "is_recommended": "Рекомендуемый диапазон",
     "channel": "Канал", "channel_group": "Группа канала", "impressions": "Показы", "clicks": "Клики / переходы", "ctr_pct": "CTR, %", "spend": "Расход", "cpc": "CPC, ₽", "cr_pct": "CR, %", "drr_pct": "ДРР, %", "orders_share_pct": "Доля заказов, %", "estimated_order_sum": "Оценочная сумма заказов", "comment": "Комментарий",
     "entry_section": "Раздел", "entry_point": "Точка входа", "transitions": "Переходы", "frequency": "Частотность", "search_query": "Поисковый запрос", "traffic_capture_pct": "% трафика", "orders_share_pct": "Доля заказов, %", "cum_orders_share_pct": "Накопленная доля заказов, %", "avg_position": "Средняя позиция", "median_position": "Медианная позиция",
     "warehouse": "Склад", "orders_90": "Заказы за 90 дней", "orders_total": "Заказы всего", "warehouse_weight_pct": "Вес склада, %", "cum_weight_pct": "Накопленный вес, %", "avg_daily_orders_wh": "Средние заказы склада в день", "needed_stock_2d": "Нужно остатка на 2 дня", "warehouse_pool": "Региональный пул", "stock_qty": "Остаток", "is_direct_covered": "Покрыт напрямую", "is_covered_with_replacement": "Покрыт с заменой", "pool_stock_qty": "Остаток пула", "pool_need_qty": "Потребность пула", "direct_coverage_weight_pct": "Вклад прямого покрытия, %", "replacement_coverage_weight_pct": "Вклад покрытия с заменой, %",
@@ -2391,7 +2475,7 @@ def export_outputs(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> List[Pa
         ("Средние и целевые значения", "metrics_summary_90d", ["metric", "avg_90d_all_days", "avg_90d_nonzero_days", "target_above_mean_90d", "best_days_avg", "last_full_week_avg", "gap_to_target_pct"]),
         ("Лучшие дни по сумме заказов", "best_days", None),
         ("Факторы лучших дней", "best_day_factors", ["factor", "normal_days_avg", "best_days_avg", "difference_pct", "best_days_count", "conclusion"]),
-        ("Рекомендуемый ценовой диапазон", "price_ranges", ["price_range", "days", "order_sum", "orders", "avg_finished_price", "avg_gross_profit", "avg_drr_manual", "avg_drr_unified", "avg_cart_conv_pct", "avg_order_conv_pct", "is_recommended"]),
+        ("Рекомендуемый ценовой диапазон", "price_ranges", ["price_range", "days", "order_sum", "orders", "avg_price_with_disc", "avg_finished_price", "avg_gross_profit", "avg_drr_manual", "avg_drr_unified", "avg_cart_conv_pct", "avg_order_conv_pct", "is_recommended"]),
         ("Потенциал валовой прибыли по ABC", "gp_potential_90d", ["gross_profit_90d", "avg_gp_per_day", "target_gp_per_day", "best_week_gp_per_day", "prev_month_gross_profit", "plan_month", "current_month_gross_profit", "plan_to_date_completion_pct"]),
     ]
     p = local_dir / POTENTIAL_REPORT_NAME
@@ -3114,24 +3198,7 @@ PDF_CALC_TRACE_NAME = "Лог_расчетов_PDF_TOPFACE.xlsx"
 # Строгий справочник для PDF. Он важнее автоматического product_code():
 # если товар/артикул не подтвержден здесь, в управленческий PDF он не попадает.
 # Так подводки 405/406 не будут попадать в "Карандаши", а случайные товары вроде 552 уйдут в техлист.
-PDF_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = {
-    "901": "Кисти косметические",
-    "605": "Косметические карандаши",
-    "611": "Косметические карандаши",
-    "613": "Косметические карандаши",
-    "614": "Косметические карандаши",
-    "617": "Косметические карандаши",
-    "618": "Косметические карандаши",
-    "154": "Помады",
-    "155": "Помады",
-    "156": "Помады",
-    "157": "Помады",
-    "206": "Помады",
-    "207": "Блески",
-    "209": "Блески",
-    "210": "Блески",
-    "211": "Блески",
-}
+PDF_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = VALID_PRODUCT_CATEGORY_REFERENCE.copy()
 
 PDF_EXCLUDED_PRODUCT_REASONS: Dict[str, str] = {
     "405": "Подводки/лайнеры: не включать в категорию 'Косметические карандаши' для PDF",
@@ -3200,12 +3267,12 @@ def _filter_df_by_pdf_product_reference(df: pd.DataFrame, source_name: str, reje
     canonical_products: List[Any] = []
     rejected_count = 0
     for _, row in out.iterrows():
-        subject_src = normalize_text(row.get("subject", ""))
+        subject_src = canonical_subject(row.get("subject", ""))
         product_src = normalize_text(row.get("product", ""))
         article_src = clean_article(row.get("supplier_article", ""))
         has_product_level = bool(_pdf_product_code_from_value(article_src) or _pdf_product_code_from_value(product_src))
         if not has_product_level:
-            keep = subject_src in TARGET_SUBJECTS
+            keep = canonical_subject(subject_src) in TARGET_SUBJECTS
             keep_mask.append(keep)
             canonical_subjects.append(subject_src)
             canonical_products.append(product_src)
@@ -5457,7 +5524,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             localization_direct=("direct_localization_pct", _safe_mean),
             localization=("localization_with_replacements_pct", _safe_mean),
             rating=("rating_reviews", _safe_mean),
-            # buyer_price is average finishedPrice from Orders; sale price is later overwritten by ABC revenue / ABC qty where available.
+            # buyer_price is average finishedPrice from Orders. sale price is priceWithDisc/order_sum and may later be overwritten by ABC revenue / ABC qty where available.
             buyer_price=("finished_price", _safe_mean),
             price_with_disc_avg=("price_with_disc", _safe_mean),
             spp=("spp", _safe_mean),
