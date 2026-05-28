@@ -1,4 +1,4 @@
-name: Download Torgstat ABC
+name: Download Torgstat ABC FRESH
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       mode:
         description: "auto = daily every run + weekly on Monday; daily/weekly/mtd/custom for manual runs"
         required: true
-        default: "auto"
+        default: "custom"
         type: choice
         options:
           - auto
@@ -20,17 +20,17 @@ on:
         default: "TOPFACE"
         type: string
       date_from:
-        description: "Only for custom/daily manual override: YYYY-MM-DD or DD.MM.YYYY"
+        description: "YYYY-MM-DD or DD.MM.YYYY"
         required: false
-        default: ""
+        default: "2026-05-27"
         type: string
       date_to:
-        description: "Only for custom: YYYY-MM-DD or DD.MM.YYYY"
+        description: "YYYY-MM-DD or DD.MM.YYYY"
         required: false
-        default: ""
+        default: "2026-05-27"
         type: string
       dry_run:
-        description: "Parse cURL and replace dates, but do not download/upload"
+        description: "Parse cURL and replace dates, but do not upload"
         required: true
         default: false
         type: boolean
@@ -38,7 +38,7 @@ on:
     - cron: "30 6 * * *"
 
 jobs:
-  download-abc:
+  download-abc-fresh:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -53,8 +53,11 @@ jobs:
       ABC_FOLDER: "АБС анализ"
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Show this is the fresh workflow
+        shell: bash
+        run: |
+          echo "WORKFLOW_MARKER: TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135"
+          echo "This workflow writes Python to /tmp and does NOT use repository download_torgstat_abc.py"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -62,16 +65,18 @@ jobs:
           python-version: "3.13"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests boto3 openpyxl
-
-      - name: Write current downloader code
         shell: bash
         run: |
           set -euo pipefail
-          cat > download_torgstat_abc.py <<'PYTHON_DOWNLOADER'
-          # VERSION: TORGSTAT_ABC_REPORT_ENV_FIX2_20260528
+          python -m pip install --upgrade pip
+          pip install requests boto3 openpyxl
+
+      - name: Write embedded downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/download_torgstat_abc_fresh.py <<'PYTHON_DOWNLOADER'
+          # VERSION: TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135
           """Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
 
           Repository filename should be: download_torgstat_abc.py
@@ -105,7 +110,7 @@ jobs:
           import requests
           from openpyxl import load_workbook
 
-          VERSION = "TORGSTAT_ABC_REPORT_ENV_FIX2_20260528"
+          VERSION = "TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135"
           DEFAULT_REPORTS_ROOT = "Отчёты"
           DEFAULT_ABC_FOLDER = "АБС анализ"
           DEFAULT_STORE = "TOPFACE"
@@ -829,28 +834,16 @@ jobs:
               raise SystemExit(main())
 
           PYTHON_DOWNLOADER
-          head -n 3 download_torgstat_abc.py
-          grep -q "TORGSTAT_ABC_REPORT_ENV_FIX2_20260528" download_torgstat_abc.py
-          python -m py_compile download_torgstat_abc.py
-          python download_torgstat_abc.py --self-test
+          head -1 /tmp/download_torgstat_abc_fresh.py
+          grep -q "TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135" /tmp/download_torgstat_abc_fresh.py
+          python -m py_compile /tmp/download_torgstat_abc_fresh.py
 
-      - name: Load REPORT_ENV variables
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${REPORT_ENV:-}" ]; then
-            printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
-            echo "REPORT_ENV loaded into GitHub env"
-          else
-            echo "REPORT_ENV is empty"
-          fi
-
-      - name: Download and upload ABC report
+      - name: Run downloader
         shell: bash
         run: |
           set -euo pipefail
           ARGS=(--mode "$MODE" --store "$STORE")
-          if [ -n "$DATE_FROM" ]; then ARGS+=(--date-from "$DATE_FROM"); fi
-          if [ -n "$DATE_TO" ]; then ARGS+=(--date-to "$DATE_TO"); fi
+          if [ -n "${DATE_FROM:-}" ]; then ARGS+=(--date-from "$DATE_FROM"); fi
+          if [ -n "${DATE_TO:-}" ]; then ARGS+=(--date-to "$DATE_TO"); fi
           if [ "$DRY_RUN" = "true" ]; then ARGS+=(--dry-run); fi
-          python download_torgstat_abc.py "${ARGS[@]}"
+          python /tmp/download_torgstat_abc_fresh.py "${ARGS[@]}"
