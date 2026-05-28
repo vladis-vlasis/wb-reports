@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX4_PRICEWITHDISC_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX5_PDF_FILTER_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -3289,9 +3289,9 @@ def _filter_df_by_pdf_product_reference(df: pd.DataFrame, source_name: str, reje
                     "rows": 1,
                 })
             continue
-        canonical_subject, canonical_product, keep, reason = _pdf_resolve_product_category(article_src, product_src)
+        resolved_subject, canonical_product, keep, reason = _pdf_resolve_product_category(article_src, product_src)
         keep_mask.append(keep)
-        canonical_subjects.append(canonical_subject if keep else subject_src)
+        canonical_subjects.append(resolved_subject if keep else subject_src)
         canonical_products.append(canonical_product if keep else product_src)
         if not keep:
             rejected_count += 1
