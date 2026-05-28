@@ -1,4 +1,4 @@
-# VERSION: TORGSTAT_ABC_DIRECT_CURL_TORGSTAT_NAME_20260528
+# VERSION: TORGSTAT_ABC_AUTH_PARSE_FIX_20260528
 """Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
 
 Repository filename should be: download_torgstat_abc.py
@@ -32,7 +32,7 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "TORGSTAT_ABC_DIRECT_CURL_TORGSTAT_NAME_20260528"
+VERSION = "TORGSTAT_ABC_AUTH_PARSE_FIX_20260528"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "АБС анализ"
 DEFAULT_STORE = "TOPFACE"
@@ -114,7 +114,7 @@ def fmt_iso(d: dt.date) -> str:
 
 def today_local() -> dt.date:
     # Avoid timezone dependencies in GitHub runner.
-    return (dt.datetime.utcnow() + dt.timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)).date()
+    return (dt.datetime.now(dt.UTC) + dt.timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)).date()
 
 
 def period_for_mode(mode: str, date_from: Optional[str], date_to: Optional[str]) -> List[Tuple[dt.date, dt.date, str]]:
@@ -157,8 +157,101 @@ def clean_multiline_curl(raw: str) -> str:
     return raw.strip()
 
 
+REQUEST_HEADER_KEYS = {
+    "accept", "accept-language", "authorization", "content-type", "cookie", "origin",
+    "referer", "user-agent", "x-csrf-token", "x-requested-with", "sec-ch-ua",
+    "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-dest", "sec-fetch-mode",
+    "sec-fetch-site", "priority",
+}
+
+
+def parse_devtools_headers_block(raw: str) -> Optional[CurlRequest]:
+    """Parse a manually copied Chrome DevTools Headers block.
+
+    Fallback for cases when the secret contains the visible Headers panel rather
+    than Copy -> Copy as cURL. Russian Chrome shows pairs like:
+      URL запроса\nhttps://...\nМетод запроса\nGET\ncookie\n...
+    """
+    lines = [ln.strip() for ln in (raw or "").replace("\r\n", "\n").split("\n") if ln.strip()]
+    if not lines:
+        return None
+
+    url: Optional[str] = None
+    method = "GET"
+    headers: Dict[str, str] = {}
+    scheme = "https"
+    authority = ""
+    path = ""
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        low = line.lower()
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+
+        if line.startswith(("http://", "https://")):
+            url = line
+            i += 1
+            continue
+
+        if low in {"url запроса", "request url"} and nxt:
+            url = nxt
+            i += 2
+            continue
+        if low in {"метод запроса", "request method"} and nxt:
+            method = nxt.upper()
+            i += 2
+            continue
+
+        if low == ":method" and nxt:
+            method = nxt.upper()
+            i += 2
+            continue
+        if low == ":scheme" and nxt:
+            scheme = nxt
+            i += 2
+            continue
+        if low == ":authority" and nxt:
+            authority = nxt
+            i += 2
+            continue
+        if low == ":path" and nxt:
+            path = nxt
+            i += 2
+            continue
+
+        if low in REQUEST_HEADER_KEYS and nxt:
+            headers[line] = nxt
+            i += 2
+            continue
+
+        i += 1
+
+    if not url and authority and path:
+        url = f"{scheme}://{authority}{path}"
+
+    if not url:
+        return None
+
+    clean_headers: Dict[str, str] = {}
+    for k, v in headers.items():
+        lk = k.lower().strip()
+        if lk in REQUEST_HEADER_KEYS:
+            clean_headers[k] = v
+    return CurlRequest(url=url, method=method, headers=clean_headers, body=None)
+
+
 def parse_curl(raw: str) -> CurlRequest:
+    raw = (raw or "").strip()
+    looks_like_curl = bool(re.match(r"^\s*(curl|curl\.exe)\b", raw, flags=re.I))
+    if not looks_like_curl:
+        parsed = parse_devtools_headers_block(raw)
+        if parsed:
+            log("secret_parse: parsed DevTools Headers block, not cURL")
+            return parsed
+
     text = clean_multiline_curl(raw)
+    text = re.sub(r"\s+[\^`]\s+", " ", text)
     parts = shlex.split(text, posix=True)
     if not parts:
         fail("Copy as cURL не распознан")
@@ -182,6 +275,10 @@ def parse_curl(raw: str) -> CurlRequest:
                 headers[k.strip()] = v.strip()
             i += 2
             continue
+        if p in ("-b", "--cookie", "--cookie-raw") and i + 1 < len(parts):
+            headers["cookie"] = parts[i + 1].strip()
+            i += 2
+            continue
         if p in ("--url",) and i + 1 < len(parts):
             url = parts[i + 1]
             i += 2
@@ -199,13 +296,15 @@ def parse_curl(raw: str) -> CurlRequest:
             url = p
             i += 1
             continue
-        # Ignore other browser flags, e.g. --cookie already usually arrives as -H Cookie.
         i += 1
     if not url:
+        parsed = parse_devtools_headers_block(raw)
+        if parsed:
+            log("secret_parse: parsed DevTools Headers block after cURL parse fallback")
+            return parsed
         fail("В Copy as cURL не найден URL")
     body = "&".join(body_parts).encode("utf-8") if body_parts else None
     return CurlRequest(url=url, method=method, headers=headers, body=body)
-
 
 def norm_key(k: str) -> str:
     return re.sub(r"[^a-z0-9_\[\]]+", "", str(k).lower())
@@ -349,6 +448,17 @@ def request_download(req: CurlRequest) -> bytes:
         lk = k.lower()
         if lk.startswith(":") or lk in {"content-length", "host"}:
             headers.pop(k, None)
+
+    header_names = {k.lower() for k in headers}
+    if "cookie" not in header_names and "authorization" not in header_names:
+        fail(
+            "В TORGSTAT_ABC_CURL нет авторизации: не найден header cookie/authorization. "
+            "Скопируй не URL, а строку Network через: Правой кнопкой по wbapi-report-goods → "
+            "Копировать → Копировать как cURL (bash), либо вставь полный блок Headers с cookie."
+        )
+
+    safe_header_list = ", ".join(sorted(k.lower() for k in headers.keys()))
+    log(f"request_headers: {safe_header_list}")
     session = requests.Session()
     log(f"request: {req.method} {req.url.split('?')[0]}")
     resp = session.request(
@@ -386,7 +496,6 @@ def request_download(req: CurlRequest) -> bytes:
         except Exception as e:
             log(f"response: JSON export parsing skipped: {e}")
     return content
-
 
 def looks_like_xlsx(content: bytes) -> bool:
     return bool(content and content[:2] == b"PK" and len(content) > 1000)
@@ -488,7 +597,7 @@ def output_filename(store: str, start: dt.date, end: dt.date) -> str:
     # IMPORTANT: preserve Torgstat filename family. Existing downstream code parses this pattern.
     # Example from manual downloads:
     # wb_abc_report_goods__27.04.2026-03.05.2026__at_2026-05-19_20-26.xlsx
-    ts = (dt.datetime.utcnow() + dt.timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d_%H-%M")
+    ts = (dt.datetime.now(dt.UTC) + dt.timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d_%H-%M")
     return f"wb_abc_report_goods__{fmt_dmy(start)}-{fmt_dmy(end)}__at_{ts}.xlsx"
 
 
@@ -544,16 +653,39 @@ def run_download(raw_curl: str, store: str, start: dt.date, end: dt.date, report
 
 
 def self_test() -> None:
-    sample = "curl 'https://example.com/export?dateFrom=2026-05-01&dateTo=2026-05-27' -H 'accept: application/json' --data-raw '{\"startDate\":\"2026-05-01\",\"endDate\":\"2026-05-27\"}'"
+    sample = "curl 'https://example.com/export?dateFrom=2026-05-01&dateTo=2026-05-27' -H 'accept: application/json' -H 'cookie: session=abc' --data-raw '{\"startDate\":\"2026-05-01\",\"endDate\":\"2026-05-27\"}'"
     req = parse_curl(sample)
     new = update_request_dates(req, dt.date(2026, 5, 10), dt.date(2026, 5, 11))
     assert "2026-05-10" in new.url and "2026-05-11" in new.url
     assert b"2026-05-10" in (new.body or b"") and b"2026-05-11" in (new.body or b"")
+    assert "cookie" in {k.lower() for k in new.headers}
+
+    raw_headers = """URL запроса
+https://torgstat.ru/api/trpc/wbapi-report-goods?batch=1&input=%7B%220%22%3A%7B%22dateFrom%22%3A%222026-05-01%22%2C%22dateTo%22%3A%222026-05-27%22%7D%7D
+Метод запроса
+GET
+content-type
+application/json
+cookie
+__Secure-next-auth.session-token=test
+referer
+https://torgstat.ru/wb-seller/sales
+user-agent
+Mozilla/5.0
+"""
+    req2 = parse_curl(raw_headers)
+    new2 = update_request_dates(req2, dt.date(2026, 5, 12), dt.date(2026, 5, 13))
+    assert "2026-05-12" in new2.url and "2026-05-13" in new2.url
+    assert "cookie" in {k.lower() for k in new2.headers}
+
+    cmd_curl = 'curl "https://example.com/export?dateFrom=2026-05-01&dateTo=2026-05-27" ^ -H "cookie: session=abc" ^ --compressed'
+    req3 = parse_curl(cmd_curl)
+    assert "cookie" in {k.lower() for k in req3.headers}
+
     fn = output_filename("TOPFACE", dt.date(2026, 5, 1), dt.date(2026, 5, 27))
     assert fn.startswith("wb_abc_report_goods__01.05.2026-27.05.2026__at_")
     assert fn.endswith(".xlsx")
     log("self-test: OK")
-
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Download Torgstat ABC report to S3")
