@@ -50,14 +50,14 @@ jobs:
       DATE_TO: ${{ github.event.inputs.date_to || '' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       REPORTS_ROOT: "Отчёты"
-      ABC_FOLDER: "АБС анализ"
+      ABC_FOLDER: "ABC"
 
     steps:
       - name: Show this is the fresh workflow
         shell: bash
         run: |
-          echo "WORKFLOW_MARKER: TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C"
-          echo "FINAL_7B91C: embedded Python only, repository download_torgstat_abc.py is ignored"
+          echo "WORKFLOW_MARKER: TORGSTAT_ABC_SINGLE_WORKFLOW_ABC_PATH_20260528_2310"
+          echo "FINAL_7B91C_ABC_PATH: embedded Python only, uploads to Отчёты/ABC without TOPFACE subfolder"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > /tmp/download_torgstat_abc_fresh.py <<'PYTHON_DOWNLOADER'
-          # VERSION: TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C
+          # VERSION: TORGSTAT_ABC_SINGLE_WORKFLOW_ABC_PATH_20260528_2310
           """Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
 
           Workflow is self-contained and runs embedded Python from /tmp only
@@ -86,7 +86,7 @@ jobs:
           requested dates, downloads XLSX, validates that it is an ABC report, and uploads
           it with the SAME Torgstat naming pattern that existing report parsing expects:
 
-            Отчёты/АБС анализ/TOPFACE/wb_abc_report_goods__01.05.2026-27.05.2026__at_2026-05-28_21-30.xlsx
+            Отчёты/ABC/wb_abc_report_goods__01.05.2026-27.05.2026__at_2026-05-28_21-30.xlsx
 
           Do not rename this output pattern unless all downstream report code is changed too.
           """
@@ -110,9 +110,9 @@ jobs:
           import requests
           from openpyxl import load_workbook
 
-          VERSION = "TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C"
+          VERSION = "TORGSTAT_ABC_SINGLE_WORKFLOW_ABC_PATH_20260528_2310"
           DEFAULT_REPORTS_ROOT = "Отчёты"
-          DEFAULT_ABC_FOLDER = "АБС анализ"
+          DEFAULT_ABC_FOLDER = "ABC"
           DEFAULT_STORE = "TOPFACE"
           DEFAULT_TZ_OFFSET_HOURS = 3  # Used only for date choice in GitHub Actions.
 
@@ -710,7 +710,7 @@ jobs:
 
 
           def output_key(store: str, start: dt.date, end: dt.date, reports_root: str, abc_folder: str) -> str:
-              return f"{reports_root.rstrip('/')}/{abc_folder.strip('/')}/{store}/{output_filename(store, start, end)}"
+              return f"{reports_root.rstrip('/')}/{abc_folder.strip('/')}/{output_filename(store, start, end)}"
 
 
           def s3_client():
@@ -835,7 +835,7 @@ jobs:
 
           PYTHON_DOWNLOADER
           head -1 /tmp/download_torgstat_abc_fresh.py
-          grep -q "TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C" /tmp/download_torgstat_abc_fresh.py
+          grep -q "TORGSTAT_ABC_SINGLE_WORKFLOW_ABC_PATH_20260528_2310" /tmp/download_torgstat_abc_fresh.py
           python -m py_compile /tmp/download_torgstat_abc_fresh.py
 
       - name: Run downloader
