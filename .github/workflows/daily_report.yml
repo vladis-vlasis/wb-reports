@@ -1,4 +1,4 @@
-# VERSION: DAILY_REPORT_TOPFACE_ORDERS_ONLY_TG_REPORTLAB_FIX3_TELEGRAM_20260527
+# VERSION: DAILY_REPORT_TOPFACE_ORDERS_ONLY_TG_FIX4_REPO_SECRETS_20260528
 name: Daily TOPFACE report
 
 on:
@@ -41,9 +41,11 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       REPORT_SCRIPT: "report_runner.py"
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+      # Repository secrets. These have priority over values inside REPORT_ENV.
+      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
@@ -148,10 +150,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Dedicated GitHub Secrets have priority. REPORT_ENV is only a fallback.
-          SECRET_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-          SECRET_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
-          SECRET_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
+
+          clean_token() {
+            local raw="$1"
+            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
+            raw="${raw%\"}"; raw="${raw#\"}"
+            raw="${raw%\'}"; raw="${raw#\'}"
+            if [[ "$raw" == TELEGRAM_BOT_TOKEN=* ]]; then raw="${raw#TELEGRAM_BOT_TOKEN=}"; fi
+            if [[ "$raw" == telegram_bot_token=* ]]; then raw="${raw#telegram_bot_token=}"; fi
+            if [[ "$raw" =~ ^https?://api\.telegram\.org/bot([^/]+) ]]; then raw="${BASH_REMATCH[1]}"; fi
+            raw="${raw%%/getUpdates*}"
+            raw="${raw%%/sendDocument*}"
+            if [[ "$raw" == bot* ]]; then raw="${raw#bot}"; fi
+            printf '%s' "$raw"
+          }
+
+          clean_chat() {
+            local raw="$1"
+            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
+            raw="${raw%\"}"; raw="${raw#\"}"
+            raw="${raw%\'}"; raw="${raw#\'}"
+            if [[ "$raw" == TELEGRAM_CHAT_ID=* ]]; then raw="${raw#TELEGRAM_CHAT_ID=}"; fi
+            if [[ "$raw" == telegram_chat_id=* ]]; then raw="${raw#telegram_chat_id=}"; fi
+            printf '%s' "$raw"
+          }
+
+          SECRET_TG_TOKEN="${TELEGRAM_BOT_TOKEN_SECRET:-}"
+          SECRET_TG_CHAT="${TELEGRAM_CHAT_ID_SECRET:-}"
+          SECRET_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}"
 
           ENV_TG_TOKEN=""
           ENV_TG_CHAT=""
@@ -172,15 +198,18 @@ jobs:
           if [ -z "$TG_CHAT" ]; then TG_CHAT="$ENV_TG_CHAT"; fi
           if [ -z "$TG_THREAD" ]; then TG_THREAD="$ENV_TG_THREAD"; fi
 
-          TG_TOKEN="$(printf '%s' "$TG_TOKEN" | tr -d '[:space:]')"
-          TG_CHAT="$(printf '%s' "$TG_CHAT" | tr -d '[:space:]')"
-          TG_THREAD="$(printf '%s' "$TG_THREAD" | tr -d '[:space:]')"
-          if [[ "$TG_TOKEN" == bot* ]]; then TG_TOKEN="${TG_TOKEN#bot}"; fi
+          TG_TOKEN="$(clean_token "$TG_TOKEN")"
+          TG_CHAT="$(clean_chat "$TG_CHAT")"
+          TG_THREAD="$(clean_chat "$TG_THREAD")"
 
           test -n "$TG_TOKEN" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing"; exit 1; }
           test -n "$TG_CHAT" || { echo "ERROR: TELEGRAM_CHAT_ID is missing"; exit 1; }
           if ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
-            echo "ERROR: TELEGRAM_BOT_TOKEN has invalid format. Store token like 123456789:AA... without URL and without spaces. Prefix 'bot' is optional and is stripped automatically."
+            echo "ERROR: TELEGRAM_BOT_TOKEN has invalid format after cleanup. Secret value must be only the token like 123456789:AA..."
+            exit 1
+          fi
+          if ! [[ "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
+            echo "ERROR: TELEGRAM_CHAT_ID has invalid format. For your group it must be -1003664843585"
             exit 1
           fi
 
@@ -203,18 +232,35 @@ jobs:
           cat telegram_getme_response.json || true
           echo
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Telegram getMe returned HTTP $HTTP_CODE. Most likely TELEGRAM_BOT_TOKEN is wrong or copied with extra text."
+            echo "ERROR: Telegram getMe returned HTTP $HTTP_CODE. Check TELEGRAM_BOT_TOKEN."
             exit 1
           fi
           python - <<'PY_CHECK_TG'
           import json, pathlib, sys
-          p = pathlib.Path('telegram_getme_response.json')
-          data = json.loads(p.read_text(encoding='utf-8'))
+          data = json.loads(pathlib.Path('telegram_getme_response.json').read_text(encoding='utf-8'))
           if not data.get('ok'):
               print('ERROR: Telegram getMe ok=false:', data)
               sys.exit(1)
           print('Telegram bot validated:', data.get('result', {}).get('username', 'unknown'))
           PY_CHECK_TG
+
+          HTTP_CODE="$(curl -sS -G -w '%{http_code}' -o telegram_getchat_response.json "https://api.telegram.org/bot${TG_TOKEN}/getChat" --data-urlencode "chat_id=${TG_CHAT}" || true)"
+          cat telegram_getchat_response.json || true
+          echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Telegram getChat returned HTTP $HTTP_CODE. Check TELEGRAM_CHAT_ID and make sure the bot is added to the group."
+            exit 1
+          fi
+          python - <<'PY_CHECK_CHAT'
+          import json, pathlib, sys
+          data = json.loads(pathlib.Path('telegram_getchat_response.json').read_text(encoding='utf-8'))
+          if not data.get('ok'):
+              print('ERROR: Telegram getChat ok=false:', data)
+              sys.exit(1)
+          chat = data.get('result', {})
+          print('Telegram chat validated:', chat.get('title') or chat.get('username') or chat.get('id'))
+          PY_CHECK_CHAT
+
       - name: Run current week update
         if: steps.mode.outputs.mode == 'current_week'
         shell: bash
@@ -283,13 +329,13 @@ jobs:
           fi
           python - <<'PY_SEND_TG'
           import json, pathlib, sys
-          p = pathlib.Path('telegram_send_response.json')
-          data = json.loads(p.read_text(encoding='utf-8'))
+          data = json.loads(pathlib.Path('telegram_send_response.json').read_text(encoding='utf-8'))
           if not data.get('ok'):
               print('ERROR: Telegram sendDocument ok=false:', data)
               sys.exit(1)
           print('Telegram: sent successfully')
           PY_SEND_TG
+
       - name: Show generated files
         if: always()
         shell: bash
@@ -301,7 +347,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-report-output-20260527-1058
+          name: topface-report-output-fix4-20260528
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
