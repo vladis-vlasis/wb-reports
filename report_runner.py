@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX10_TG_DAILY_CLEANUP_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX11_TG_RUN_CARD_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -6100,7 +6100,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     def _metric_card(x, y, w, h, value, label, delta=None, metric="", sub=""):
         c.setFillColor(WHITE); c.roundRect(x,y,w,h,14,fill=1,stroke=0)
-        dtext = _arrow(delta, _lower_bad(metric)) if delta is not None else ""
+        # FIX11: карточки с денежной динамикой должны показывать рубли, а не "33495,0%".
+        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК"])
+        dtext = (_arrow_money(delta, _lower_bad(metric)) if money_metric else _arrow(delta, _lower_bad(metric))) if delta is not None else ""
         # Значение крупно по центру, подпись внизу, динамика маленькая справа от подписи.
         _draw_text(str(value), x+10, y+h-50, w-20, F_BLACK, 30, BLACK, align="center")
         label_text = str(label)
@@ -7287,7 +7289,11 @@ def send_telegram_message(text: str) -> bool:
         return False
     import urllib.parse
     import urllib.request
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    fields = {"chat_id": chat_id, "text": text}
+    thread_id = os.getenv("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+    if thread_id:
+        fields["message_thread_id"] = thread_id
+    data = urllib.parse.urlencode(fields).encode("utf-8")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
