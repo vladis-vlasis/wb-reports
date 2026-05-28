@@ -1,4 +1,4 @@
-# VERSION: DAILY_REPORT_TOPFACE_ORDERS_ONLY_TG_REPORTLAB_FIX2_20260527
+# VERSION: DAILY_REPORT_TOPFACE_ORDERS_ONLY_TG_REPORTLAB_FIX3_TELEGRAM_20260527
 name: Daily TOPFACE report
 
 on:
@@ -143,26 +143,78 @@ jobs:
           test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
-      - name: Check Telegram settings
+      - name: Prepare and validate Telegram settings
         if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          PRE_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-          PRE_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
-          PRE_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
+          # Dedicated GitHub Secrets have priority. REPORT_ENV is only a fallback.
+          SECRET_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+          SECRET_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
+          SECRET_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
+
+          ENV_TG_TOKEN=""
+          ENV_TG_CHAT=""
+          ENV_TG_THREAD=""
           if [ -f ./.env ]; then
             set -a
             source ./.env
             set +a
+            ENV_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+            ENV_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
+            ENV_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
           fi
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$PRE_TG_TOKEN" ]; then export TELEGRAM_BOT_TOKEN="$PRE_TG_TOKEN"; fi
-          if [ -z "${TELEGRAM_CHAT_ID:-}" ] && [ -n "$PRE_TG_CHAT" ]; then export TELEGRAM_CHAT_ID="$PRE_TG_CHAT"; fi
-          if [ -z "${TELEGRAM_MESSAGE_THREAD_ID:-}" ] && [ -n "$PRE_TG_THREAD" ]; then export TELEGRAM_MESSAGE_THREAD_ID="$PRE_TG_THREAD"; fi
-          test -n "${TELEGRAM_BOT_TOKEN:-}" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing"; exit 1; }
-          test -n "${TELEGRAM_CHAT_ID:-}" || { echo "ERROR: TELEGRAM_CHAT_ID is missing"; exit 1; }
-          echo "Telegram settings OK"
 
+          TG_TOKEN="$SECRET_TG_TOKEN"
+          TG_CHAT="$SECRET_TG_CHAT"
+          TG_THREAD="$SECRET_TG_THREAD"
+          if [ -z "$TG_TOKEN" ]; then TG_TOKEN="$ENV_TG_TOKEN"; fi
+          if [ -z "$TG_CHAT" ]; then TG_CHAT="$ENV_TG_CHAT"; fi
+          if [ -z "$TG_THREAD" ]; then TG_THREAD="$ENV_TG_THREAD"; fi
+
+          TG_TOKEN="$(printf '%s' "$TG_TOKEN" | tr -d '[:space:]')"
+          TG_CHAT="$(printf '%s' "$TG_CHAT" | tr -d '[:space:]')"
+          TG_THREAD="$(printf '%s' "$TG_THREAD" | tr -d '[:space:]')"
+          if [[ "$TG_TOKEN" == bot* ]]; then TG_TOKEN="${TG_TOKEN#bot}"; fi
+
+          test -n "$TG_TOKEN" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing"; exit 1; }
+          test -n "$TG_CHAT" || { echo "ERROR: TELEGRAM_CHAT_ID is missing"; exit 1; }
+          if ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
+            echo "ERROR: TELEGRAM_BOT_TOKEN has invalid format. Store token like 123456789:AA... without URL and without spaces. Prefix 'bot' is optional and is stripped automatically."
+            exit 1
+          fi
+
+          export TG_TOKEN TG_CHAT TG_THREAD
+          python - <<'PY_WRITE_TG'
+          import os, pathlib, shlex
+          p = pathlib.Path('.telegram.env')
+          with p.open('w', encoding='utf-8') as f:
+              print('TELEGRAM_BOT_TOKEN=' + shlex.quote(os.environ['TG_TOKEN']), file=f)
+              print('TELEGRAM_CHAT_ID=' + shlex.quote(os.environ['TG_CHAT']), file=f)
+              print('TELEGRAM_MESSAGE_THREAD_ID=' + shlex.quote(os.environ.get('TG_THREAD', '')), file=f)
+          p.chmod(0o600)
+          PY_WRITE_TG
+
+          echo "Telegram token prefix: ${TG_TOKEN:0:6}***"
+          echo "Telegram chat id: $TG_CHAT"
+          if [ -n "$TG_THREAD" ]; then echo "Telegram thread id: $TG_THREAD"; fi
+
+          HTTP_CODE="$(curl -sS -w '%{http_code}' -o telegram_getme_response.json "https://api.telegram.org/bot${TG_TOKEN}/getMe" || true)"
+          cat telegram_getme_response.json || true
+          echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Telegram getMe returned HTTP $HTTP_CODE. Most likely TELEGRAM_BOT_TOKEN is wrong or copied with extra text."
+            exit 1
+          fi
+          python - <<'PY_CHECK_TG'
+          import json, pathlib, sys
+          p = pathlib.Path('telegram_getme_response.json')
+          data = json.loads(p.read_text(encoding='utf-8'))
+          if not data.get('ok'):
+              print('ERROR: Telegram getMe ok=false:', data)
+              sys.exit(1)
+          print('Telegram bot validated:', data.get('result', {}).get('username', 'unknown'))
+          PY_CHECK_TG
       - name: Run current week update
         if: steps.mode.outputs.mode == 'current_week'
         shell: bash
@@ -188,30 +240,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PRE_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-          PRE_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
-          PRE_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
-          if [ -f ./.env ]; then
-            set -a
-            source ./.env
-            set +a
-          fi
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "$PRE_TG_TOKEN" ]; then export TELEGRAM_BOT_TOKEN="$PRE_TG_TOKEN"; fi
-          if [ -z "${TELEGRAM_CHAT_ID:-}" ] && [ -n "$PRE_TG_CHAT" ]; then export TELEGRAM_CHAT_ID="$PRE_TG_CHAT"; fi
-          if [ -z "${TELEGRAM_MESSAGE_THREAD_ID:-}" ] && [ -n "$PRE_TG_THREAD" ]; then export TELEGRAM_MESSAGE_THREAD_ID="$PRE_TG_THREAD"; fi
+          test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
+          set -a
+          source ./.telegram.env
+          set +a
 
           REPORT_DIR="Отчёты/Объединенный отчет/TOPFACE"
-          PDF_FILE="$(find "$REPORT_DIR" -maxdepth 1 -type f -name 'Отчет по продажам Влад *.pdf' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
-          if [ -z "$PDF_FILE" ]; then
-            PDF_FILE="$(find "$REPORT_DIR" -maxdepth 1 -type f -name '*.pdf' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
-          fi
+          export REPORT_DIR
+          PDF_FILE="$(python - <<'PY_FIND_PDF'
+          import os
+          from pathlib import Path
+          report_dir = Path(os.environ['REPORT_DIR'])
+          files = sorted(report_dir.glob('Отчет по продажам Влад *.pdf'), key=lambda p: p.stat().st_mtime, reverse=True)
+          if not files:
+              files = sorted(report_dir.glob('*.pdf'), key=lambda p: p.stat().st_mtime, reverse=True)
+          print(files[0] if files else '')
+          PY_FIND_PDF
+          )"
           test -n "$PDF_FILE" || { echo "ERROR: PDF file not found in $REPORT_DIR"; exit 1; }
           test -s "$PDF_FILE" || { echo "ERROR: PDF file is empty: $PDF_FILE"; exit 1; }
 
           CAPTION="$(basename "$PDF_FILE" .pdf)"
           echo "Telegram: sending file: $PDF_FILE"
           CURL_ARGS=(
-            -sS -f
+            -sS
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
             -F "chat_id=${TELEGRAM_CHAT_ID}"
             -F "caption=${CAPTION}"
@@ -220,10 +272,24 @@ jobs:
           if [ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]; then
             CURL_ARGS+=(-F "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
           fi
-          curl "${CURL_ARGS[@]}"
+          HTTP_CODE="$(curl "${CURL_ARGS[@]}" -w '%{http_code}' -o telegram_send_response.json || true)"
+          cat telegram_send_response.json || true
           echo
-          echo "Telegram: sent successfully"
-
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Telegram sendDocument returned HTTP $HTTP_CODE"
+            echo "If HTTP is 400, check TELEGRAM_CHAT_ID / TELEGRAM_MESSAGE_THREAD_ID and make sure the bot has access to the chat/topic."
+            echo "If HTTP is 404, check TELEGRAM_BOT_TOKEN."
+            exit 1
+          fi
+          python - <<'PY_SEND_TG'
+          import json, pathlib, sys
+          p = pathlib.Path('telegram_send_response.json')
+          data = json.loads(p.read_text(encoding='utf-8'))
+          if not data.get('ok'):
+              print('ERROR: Telegram sendDocument ok=false:', data)
+              sys.exit(1)
+          print('Telegram: sent successfully')
+          PY_SEND_TG
       - name: Show generated files
         if: always()
         shell: bash
