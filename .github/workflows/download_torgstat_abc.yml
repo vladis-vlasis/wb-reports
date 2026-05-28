@@ -35,7 +35,7 @@ on:
         default: false
         type: boolean
   schedule:
-    # GitHub cron is UTC. This is 09:30 Moscow time in winter/summer for MSK UTC+3.
+    # GitHub cron is UTC. 06:30 UTC = 09:30 MSK.
     # The script itself uses yesterday as the target date.
     - cron: "30 6 * * *"
 
@@ -77,7 +77,7 @@ jobs:
           set -euo pipefail
           test -f download_torgstat_abc.py
           head -n 1 download_torgstat_abc.py
-          grep -q "TORGSTAT_ABC_DIRECT_CURL_TORGSTAT_NAME_20260528" download_torgstat_abc.py
+          grep -q "TORGSTAT_ABC_AUTH_PARSE_FIX_20260528" download_torgstat_abc.py
           python -m py_compile download_torgstat_abc.py
           python download_torgstat_abc.py --self-test
 
