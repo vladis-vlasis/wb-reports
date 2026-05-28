@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX9_WEEK_AVG_DYNAMICS_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX10_TG_DAILY_CLEANUP_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -687,6 +687,8 @@ class Storage:
         raise NotImplementedError
     def write_bytes(self, key: str, data: bytes) -> None:
         raise NotImplementedError
+    def delete_file(self, key: str) -> None:
+        raise NotImplementedError
     def exists(self, key: str) -> bool:
         raise NotImplementedError
 
@@ -715,6 +717,13 @@ class LocalStorage(Storage):
         p = self._full(key)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(data)
+    def delete_file(self, key: str) -> None:
+        p = self._full(key)
+        try:
+            if p.exists() and p.is_file():
+                p.unlink()
+        except Exception as exc:
+            log(f"WARN cleanup local delete failed: {key}: {exc}")
     def exists(self, key: str) -> bool:
         return self._full(key).exists()
 
@@ -749,6 +758,8 @@ class S3Storage(Storage):
         return self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
     def write_bytes(self, key: str, data: bytes) -> None:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
+    def delete_file(self, key: str) -> None:
+        self.client.delete_object(Bucket=self.bucket, Key=key)
     def exists(self, key: str) -> bool:
         try:
             self.client.head_object(Bucket=self.bucket, Key=key)
@@ -7011,6 +7022,350 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     log(f"PDF v11 three-contour report created: pages={page_num}")
     return path
 
+
+# ------------------------- Telegram daily summary + S3 report retention -------------------------
+TELEGRAM_REPORT_MONTHS_RU = {v: k for k, v in REPORT_MONTH_GENITIVE_RU.items()}
+
+
+def _tg_fmt_money(x: Any) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{int(round(float(v))):,} ₽".replace(",", " ")
+
+
+def _tg_fmt_num(x: Any) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{int(round(float(v))):,}".replace(",", " ")
+
+
+def _tg_fmt_pct(x: Any, digits: int = 1) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{float(v):.{digits}f}%".replace(".", ",")
+
+
+def _tg_fmt_rub1(x: Any) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{float(v):.1f} ₽".replace(".", ",")
+
+
+def _tg_delta_pct(cur: Any, prev: Any) -> Optional[float]:
+    cur_v = to_number(cur)
+    prev_v = to_number(prev)
+    if pd.isna(cur_v) or pd.isna(prev_v) or abs(float(prev_v)) < 1e-9 or float(prev_v) < 0:
+        return None
+    d = (float(cur_v) / float(prev_v) - 1.0) * 100.0
+    if abs(d) > 999.0:
+        return None
+    return d
+
+
+def _tg_arrow_pct(cur: Any, prev: Any, lower_bad: bool = False) -> str:
+    d = _tg_delta_pct(cur, prev)
+    if d is None or abs(d) < 0.05:
+        return "→ 0,0%"
+    return ("↑ " if d > 0 else "↓ ") + f"{abs(d):.1f}%".replace(".", ",")
+
+
+def _tg_arrow_abs(cur: Any, prev: Any, suffix: str = "") -> str:
+    cur_v = to_number(cur)
+    prev_v = to_number(prev)
+    if pd.isna(cur_v) or pd.isna(prev_v):
+        return "→ 0" + suffix
+    d = float(cur_v) - float(prev_v)
+    if abs(d) < 0.5:
+        return "→ 0" + suffix
+    val = f"{int(round(abs(d))):,}".replace(",", " ")
+    return ("↑ +" if d > 0 else "↓ -") + val + suffix
+
+
+def _tg_subject_disp(value: Any) -> str:
+    subj = canonical_subject(value)
+    mp = {
+        "Кисти косметические": "Кисти",
+        "Косметические карандаши": "Карандаши",
+        "Карандаши": "Карандаши",
+        "Кисти": "Кисти",
+        "Помады": "Помады",
+        "Блески": "Блески",
+    }
+    return mp.get(subj, normalize_text(value))
+
+
+def _tg_prepare_daily(outputs: Dict[str, Any]) -> pd.DataFrame:
+    daily = outputs.get("article_day_fact", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(daily, pd.DataFrame) or daily.empty:
+        return pd.DataFrame()
+    rejects: List[Dict[str, Any]] = []
+    daily = _filter_df_by_pdf_product_reference(daily, "telegram_article_day_fact", rejects)
+    if daily.empty:
+        return pd.DataFrame()
+    daily = daily.copy()
+    daily["day"] = pd.to_datetime(daily.get("day"), errors="coerce").dt.normalize()
+    daily["subject_disp"] = daily.get("subject", "").map(_tg_subject_disp) if "subject" in daily.columns else daily.get("subject_disp", "").map(_tg_subject_disp)
+    daily = daily[daily["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+    for col in ["order_sum", "orders", "open_cards", "search_frequency", "ad_spend_total", "ad_clicks_total", "ad_impressions_total", "manual_spend", "unified_spend", "unknown_spend", "manual_clicks", "unified_clicks", "unknown_clicks", "manual_impressions", "unified_impressions", "unknown_impressions"]:
+        if col not in daily.columns:
+            daily[col] = 0.0
+        daily[col] = pd.to_numeric(daily[col], errors="coerce").fillna(0.0)
+    if "ad_spend_total" not in daily.columns or daily["ad_spend_total"].abs().sum() < 1e-9:
+        daily["ad_spend_total"] = daily[[c for c in ["manual_spend", "unified_spend", "unknown_spend"] if c in daily.columns]].sum(axis=1)
+    if "ad_clicks_total" not in daily.columns or daily["ad_clicks_total"].abs().sum() < 1e-9:
+        daily["ad_clicks_total"] = daily[[c for c in ["manual_clicks", "unified_clicks", "unknown_clicks"] if c in daily.columns]].sum(axis=1)
+    if "ad_impressions_total" not in daily.columns or daily["ad_impressions_total"].abs().sum() < 1e-9:
+        daily["ad_impressions_total"] = daily[[c for c in ["manual_impressions", "unified_impressions", "unknown_impressions"] if c in daily.columns]].sum(axis=1)
+    return daily
+
+
+def _tg_prepare_ads_truth(outputs: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
+    source_name = ""
+    ads = pd.DataFrame()
+    for nm in ["ads_category_source", "ads_raw_source", "ads_daily_source"]:
+        cand = outputs.get(nm, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        if isinstance(cand, pd.DataFrame) and not cand.empty:
+            ads = cand.copy()
+            source_name = nm
+            break
+    if ads.empty:
+        return pd.DataFrame(), ""
+    if "subject" not in ads.columns:
+        if "subject_disp" in ads.columns:
+            rev = {"Кисти": "Кисти косметические", "Карандаши": "Косметические карандаши", "Помады": "Помады", "Блески": "Блески"}
+            ads["subject"] = ads["subject_disp"].map(lambda x: rev.get(normalize_text(x), normalize_text(x)))
+        else:
+            ads["subject"] = ""
+    for col in ["product", "supplier_article", "nm_id"]:
+        if col not in ads.columns:
+            ads[col] = "" if col != "nm_id" else np.nan
+    rejects: List[Dict[str, Any]] = []
+    ads = _filter_df_by_pdf_product_reference(ads, f"telegram_{source_name}", rejects)
+    if ads.empty:
+        return pd.DataFrame(), source_name
+    ads["day"] = pd.to_datetime(ads.get("day"), errors="coerce").dt.normalize()
+    ads["subject_disp"] = ads.get("subject", "").map(_tg_subject_disp)
+    ads = ads[ads["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+    # Normalize names from different ad-report sheets.
+    rename_candidates = {
+        "ad_spend_total": "spend",
+        "ad_clicks_total": "clicks",
+        "ad_impressions_total": "impressions",
+        "shows": "impressions",
+        "views": "impressions",
+    }
+    for old, new in rename_candidates.items():
+        if new not in ads.columns and old in ads.columns:
+            ads[new] = ads[old]
+    for col in ["spend", "clicks", "impressions"]:
+        if col not in ads.columns:
+            ads[col] = 0.0
+        ads[col] = pd.to_numeric(ads[col], errors="coerce").fillna(0.0)
+    return ads, source_name
+
+
+def _tg_prepare_unique_demand(outputs: Dict[str, Any]) -> pd.DataFrame:
+    df = outputs.get("search_unique_demand", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    x["day"] = pd.to_datetime(x.get("day"), errors="coerce").dt.normalize()
+    if "level" in x.columns:
+        x = x[x["level"].astype(str).str.lower().eq("category")].copy()
+    if "subject_disp" in x.columns:
+        x["subject_disp"] = x["subject_disp"].map(_tg_subject_disp)
+    elif "subject" in x.columns:
+        x["subject_disp"] = x["subject"].map(_tg_subject_disp)
+    else:
+        x["subject_disp"] = ""
+    x = x[x["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+    if "unique_search_frequency" not in x.columns:
+        x["unique_search_frequency"] = 0.0
+    x["unique_search_frequency"] = pd.to_numeric(x["unique_search_frequency"], errors="coerce").fillna(0.0)
+    return x
+
+
+def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, float]:
+    start = pd.Timestamp(start).normalize(); end = pd.Timestamp(end).normalize()
+    d = daily[(daily["day"] >= start) & (daily["day"] <= end)].copy() if not daily.empty else pd.DataFrame()
+    a = ads[(ads["day"] >= start) & (ads["day"] <= end)].copy() if not ads.empty else pd.DataFrame()
+    q = demand_df[(demand_df["day"] >= start) & (demand_df["day"] <= end)].copy() if not demand_df.empty else pd.DataFrame()
+    order_sum = float(pd.to_numeric(d.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    orders = float(pd.to_numeric(d.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    opens = float(pd.to_numeric(d.get("open_cards", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    fallback_demand = float(pd.to_numeric(d.get("search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    demand = float(pd.to_numeric(q.get("unique_search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not q.empty else fallback_demand
+    if not a.empty:
+        spend = float(pd.to_numeric(a.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        clicks = float(pd.to_numeric(a.get("clicks", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        impressions = float(pd.to_numeric(a.get("impressions", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    else:
+        spend = float(pd.to_numeric(d.get("ad_spend_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+        clicks = float(pd.to_numeric(d.get("ad_clicks_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+        impressions = float(pd.to_numeric(d.get("ad_impressions_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    return {
+        "order_sum": order_sum,
+        "orders": orders,
+        "ad_spend": spend,
+        "clicks": clicks,
+        "impressions": impressions,
+        "demand": demand,
+        "opens": opens,
+        "drr": spend / order_sum * 100.0 if order_sum else 0.0,
+        "cpc": spend / clicks if clicks else np.nan,
+        "ad_ctr": clicks / impressions * 100.0 if impressions else np.nan,
+        "search_share": opens / demand * 100.0 if demand else np.nan,
+    }
+
+
+def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
+    """Build the Telegram text block matching PDF sheet 1, but for the latest concrete day."""
+    daily = _tg_prepare_daily(outputs)
+    if daily.empty or "day" not in daily.columns:
+        return "TOPFACE: дневная сводка не сформирована — нет article_day_fact."
+    meaningful = daily.copy()
+    metric_cols = [c for c in ["order_sum", "orders", "open_cards", "ad_spend_total", "search_frequency"] if c in meaningful.columns]
+    if metric_cols:
+        m = meaningful[metric_cols].apply(pd.to_numeric, errors="coerce").fillna(0).abs().sum(axis=1) > 0
+        meaningful = meaningful[m].copy()
+    if meaningful.empty:
+        return "TOPFACE: дневная сводка не сформирована — нет фактических строк за последний день."
+    latest = pd.to_datetime(meaningful["day"], errors="coerce").dropna().max().normalize()
+    cur_week_start = latest - pd.Timedelta(days=int(latest.weekday()))
+    prev_start = cur_week_start - pd.Timedelta(days=7)
+    prev_end = cur_week_start - pd.Timedelta(days=1)
+    ads, ads_source = _tg_prepare_ads_truth(outputs)
+    demand_df = _tg_prepare_unique_demand(outputs)
+    cur = _tg_sum_period(daily, ads, demand_df, latest, latest)
+    prev_total = _tg_sum_period(daily, ads, demand_df, prev_start, prev_end)
+    prev_days = 7.0
+    prev = {
+        "order_sum": prev_total["order_sum"] / prev_days,
+        "orders": prev_total["orders"] / prev_days,
+        "ad_spend": prev_total["ad_spend"] / prev_days,
+        "clicks": prev_total["clicks"] / prev_days,
+        "impressions": prev_total["impressions"] / prev_days,
+        "demand": prev_total["demand"] / prev_days,
+        "opens": prev_total["opens"] / prev_days,
+    }
+    prev["drr"] = prev["ad_spend"] / prev["order_sum"] * 100.0 if prev["order_sum"] else 0.0
+    prev["cpc"] = prev["ad_spend"] / prev["clicks"] if prev["clicks"] else np.nan
+    prev["ad_ctr"] = prev["clicks"] / prev["impressions"] * 100.0 if prev["impressions"] else np.nan
+    prev["search_share"] = prev["opens"] / prev["demand"] * 100.0 if prev["demand"] else np.nan
+    label = f"{int(latest.day)} {REPORT_MONTH_GENITIVE_RU.get(int(latest.month), latest.strftime('%m'))}"
+    prev_label = f"{prev_start:%d.%m}-{prev_end:%d.%m} / средний день"
+    lines = [
+        f"📊 TOPFACE — {label}",
+        f"Сравнение: {prev_label}",
+        "",
+        f"💰 Сумма заказов: {_tg_fmt_money(cur['order_sum'])} {_tg_arrow_abs(cur['order_sum'], prev['order_sum'], ' ₽')}",
+        f"🧾 Заказы: {_tg_fmt_num(cur['orders'])} {_tg_arrow_abs(cur['orders'], prev['orders'])}",
+        f"📣 Расход РК: {_tg_fmt_money(cur['ad_spend'])} {_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽')}",
+        f"📉 ДРР: {_tg_fmt_pct(cur['drr'])} {_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True)}",
+        f"🔎 Спрос WB: {_tg_fmt_num(cur['demand'])} {_tg_arrow_pct(cur['demand'], prev['demand'])}",
+        f"📌 % поиска: {_tg_fmt_pct(cur['search_share'])} {_tg_arrow_pct(cur['search_share'], prev['search_share'])}",
+        f"🎯 CTR РК: {_tg_fmt_pct(cur['ad_ctr'])} {_tg_arrow_pct(cur['ad_ctr'], prev['ad_ctr'])}",
+        f"💸 CPC: {_tg_fmt_rub1(cur['cpc'])} {_tg_arrow_pct(cur['cpc'], prev['cpc'], lower_bad=True)}",
+    ]
+    if ads_source:
+        lines.append(f"Источник РК: {ads_source}")
+    return "\n".join(lines)
+
+
+def send_telegram_message(text: str) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        log("Telegram: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы, текстовая сводка пропущена")
+        return False
+    if not text:
+        log("Telegram: пустая текстовая сводка, отправка пропущена")
+        return False
+    import urllib.parse
+    import urllib.request
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body_resp = resp.read().decode("utf-8", errors="replace")[:500]
+            ok = 200 <= resp.status < 300
+            log(f"Telegram: daily summary {'sent' if ok else 'failed'} status={resp.status} response={body_resp}")
+            return ok
+    except Exception as exc:
+        log(f"Telegram: ошибка отправки текстовой сводки: {exc}")
+        return False
+
+
+def _parse_sales_pdf_report_date(file_name: str, latest_day: pd.Timestamp) -> Optional[pd.Timestamp]:
+    m = re.match(r"^Отчет по продажам Влад\s+(\d{1,2})\s+([а-яА-ЯёЁ]+)\.pdf$", file_name.strip())
+    if not m:
+        return None
+    day = int(m.group(1))
+    month = TELEGRAM_REPORT_MONTHS_RU.get(m.group(2).lower())
+    if not month:
+        return None
+    year = int(pd.Timestamp(latest_day).year)
+    try:
+        d = pd.Timestamp(date(year, month, day)).normalize()
+        # Around New Year, keep date inference sane.
+        if d > pd.Timestamp(latest_day).normalize() + pd.Timedelta(days=31):
+            d = pd.Timestamp(date(year - 1, month, day)).normalize()
+        return d
+    except Exception:
+        return None
+
+
+def cleanup_non_monday_sales_pdfs(storage: Storage, outputs: Dict[str, Any], keep_current_file_name: str) -> None:
+    """Delete old daily PDF reports from OUT_DIR, preserving Monday reports and the current PDF."""
+    enabled = os.getenv("WB_KEEP_ONLY_MONDAY_REPORTS", "1").strip().lower() in {"1", "true", "yes", "y"}
+    if not enabled:
+        log("cleanup: WB_KEEP_ONLY_MONDAY_REPORTS=0, старые PDF не удаляются")
+        return
+    if not getattr(storage, "is_s3", False):
+        log("cleanup: local mode, S3 PDF cleanup skipped")
+        return
+    latest_day = _max_report_day_from_outputs(outputs)
+    deleted = 0
+    kept_monday = 0
+    kept_current = 0
+    for key in storage.list_files(OUT_DIR):
+        name = Path(key).name
+        if not name.startswith("Отчет по продажам Влад ") or not name.endswith(".pdf"):
+            continue
+        if name == keep_current_file_name:
+            kept_current += 1
+            continue
+        d = _parse_sales_pdf_report_date(name, latest_day)
+        if d is None:
+            continue
+        if d.weekday() == 0:
+            kept_monday += 1
+            continue
+        # Do not touch reports that look newer than the current report date.
+        if d > pd.Timestamp(latest_day).normalize():
+            continue
+        try:
+            storage.delete_file(key)
+            deleted += 1
+            log(f"cleanup: deleted non-Monday daily PDF: {key}")
+        except Exception as exc:
+            log(f"WARN cleanup: не удалось удалить {key}: {exc}")
+    log(f"cleanup: done, deleted={deleted}, kept_monday={kept_monday}, kept_current={kept_current}")
+
+
+def send_telegram_report(outputs: Dict[str, Any], pdf_path: Path, caption: str = "", storage: Optional[Storage] = None) -> bool:
+    msg_ok = send_telegram_message(build_telegram_daily_summary(outputs))
+    doc_ok = send_telegram_document(pdf_path, caption)
+    if doc_ok and storage is not None:
+        cleanup_non_monday_sales_pdfs(storage, outputs, pdf_path.name)
+    strict_msg = os.getenv("WB_TELEGRAM_STRICT_MESSAGE", "0").strip().lower() in {"1", "true", "yes", "y"}
+    return bool(doc_ok and (msg_ok or not strict_msg))
+
 def send_telegram_document(file_path: Path, caption: str = "") -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -7189,6 +7544,10 @@ def run_smoke_test(root: str = ".") -> None:
     pdf_created = generate_management_pdf(outputs, pdf_path)
     if not pdf_created or not pdf_path.exists() or pdf_path.stat().st_size < 10_000:
         raise RuntimeError(f"SMOKE_TEST failed: PDF не создан или слишком маленький: {pdf_path}")
+    tg_preview = build_telegram_daily_summary(outputs)
+    if "Сумма заказов" not in tg_preview or "Расход РК" not in tg_preview:
+        raise RuntimeError(f"SMOKE_TEST failed: Telegram daily summary invalid: {tg_preview[:200]}")
+    log("SMOKE_TEST_OK: Telegram daily summary built")
     ok_path = local_dir / "SMOKE_TEST_OK.txt"
     ok_path.write_text(
         "SMOKE_TEST_OK\n"
@@ -7268,8 +7627,8 @@ def main() -> None:
                 log(f"Saved: {OUT_DIR}/{trace_path.name}")
         if args.send_telegram:
             caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
-            if not send_telegram_document(pdf_path, caption):
-                raise RuntimeError("Telegram: PDF не отправлен")
+            if not send_telegram_report(outputs, pdf_path, caption, storage=storage):
+                raise RuntimeError("Telegram: отчет не отправлен")
         log("Done")
         return
     if args.pdf_only:
@@ -7295,8 +7654,8 @@ def main() -> None:
                 log(f"Saved: {OUT_DIR}/{trace_path.name}")
         if args.send_telegram:
             caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
-            if not send_telegram_document(pdf_path, caption):
-                raise RuntimeError("Telegram: PDF не отправлен")
+            if not send_telegram_report(outputs, pdf_path, caption, storage=storage):
+                raise RuntimeError("Telegram: отчет не отправлен")
         log("Done")
         return
     loader = Loader(storage, args.reports_root, args.store, diagnostics)
@@ -7346,8 +7705,8 @@ def main() -> None:
             log(f"Saved: {OUT_DIR}/{p.name}")
     if args.send_telegram and pdf_path.exists():
         caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
-        if not send_telegram_document(pdf_path, caption):
-            raise RuntimeError("Telegram: PDF не отправлен")
+        if not send_telegram_report(outputs, pdf_path, caption, storage=storage):
+            raise RuntimeError("Telegram: отчет не отправлен")
     log("Done")
 
 
