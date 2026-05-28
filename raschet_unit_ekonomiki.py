@@ -1,4 +1,4 @@
-# VERSION: TORGSTAT_ABC_AUTH_PARSE_FIX_20260528
+# VERSION: TORGSTAT_ABC_REPORT_ENV_FIX2_20260528
 """Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
 
 Repository filename should be: download_torgstat_abc.py
@@ -32,7 +32,7 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "TORGSTAT_ABC_AUTH_PARSE_FIX_20260528"
+VERSION = "TORGSTAT_ABC_REPORT_ENV_FIX2_20260528"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "АБС анализ"
 DEFAULT_STORE = "TOPFACE"
@@ -75,25 +75,53 @@ def fail(msg: str, code: int = 1) -> None:
 
 
 def load_report_env() -> None:
-    """Load KEY=VALUE lines from REPORT_ENV into os.environ if missing."""
+    """Load KEY=VALUE lines from REPORT_ENV into os.environ if missing/empty.
+
+    GitHub Actions passes absent secrets as empty strings if they are listed in env.
+    This loader therefore treats an existing empty env var as missing and fills it
+    from REPORT_ENV. It also tolerates CRLF and pasted literal \n sequences.
+    """
     raw = os.environ.get("REPORT_ENV", "") or ""
     if not raw.strip():
+        log("report_env: REPORT_ENV is empty/not passed")
         return
-    for line in raw.splitlines():
+
+    # Some copies end up with literal \n instead of real newlines.
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if "\n" not in normalized and "\\n" in normalized:
+        normalized = normalized.replace("\\n", "\n")
+
+    loaded: List[str] = []
+    skipped_existing: List[str] = []
+    bad_lines = 0
+    for line in normalized.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[len("export ") :].strip()
         if "=" not in line:
+            bad_lines += 1
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
+        key = key.strip().lstrip("\ufeff")
         value = value.strip().strip('"').strip("'")
-        # GitHub Actions creates env vars with an empty string when the secret is absent.
-        # In that case REPORT_ENV must still be able to fill the value.
-        if key and not (os.environ.get(key) or "").strip():
-            os.environ[key] = value
+        if not key:
+            bad_lines += 1
+            continue
+        if (os.environ.get(key) or "").strip():
+            skipped_existing.append(key)
+            continue
+        os.environ[key] = value
+        loaded.append(key)
+
+    interesting = [
+        "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY", "YC_BUCKET_NAME", "YC_ENDPOINT_URL",
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "S3_BUCKET", "S3_ENDPOINT_URL",
+    ]
+    state = ", ".join(f"{k}={'set' if (os.environ.get(k) or '').strip() else 'empty'}" for k in interesting)
+    log(f"report_env: present=yes, loaded_keys={loaded}, skipped_existing={skipped_existing}, bad_lines={bad_lines}")
+    log(f"env_state: {state}")
 
 
 def parse_date(s: str) -> dt.date:
