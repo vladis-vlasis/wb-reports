@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX5_PDF_FILTER_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX6_STABLE_PDF_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -4446,6 +4446,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 search_unique_demand["product_code"] = ""
         if "supplier_article" in search_unique_demand.columns:
             search_unique_demand["supplier_article"] = search_unique_demand["supplier_article"].map(_clean_article_local)
+        search_unique_demand = _normalize_pdf_merge_keys(search_unique_demand, ["subject_disp", "product_code", "supplier_article", "nm_id"])
         for _c in ["unique_search_frequency", "unique_search_queries", "duplicate_query_rows_removed", "raw_query_rows"]:
             if _c not in search_unique_demand.columns:
                 search_unique_demand[_c] = 0
@@ -5159,6 +5160,31 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def _prod(x):
         return _pdf_product_code_from_value(x)
 
+    def _normalize_pdf_merge_keys(df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+        """Normalize PDF grouping/merge keys so int/string nm_id cannot break late PDF generation.
+
+        The source tables come from different Excel sheets: article_day_fact often keeps nm_id
+        as numeric, while ads/search/ABC can return it as text after Excel round-trips. Pandas
+        refuses to merge int64 and object keys, so every PDF-side key is normalized before
+        groupby/merge.
+        """
+        if df is None:
+            return pd.DataFrame(columns=keys)
+        out = df.copy()
+        for k in keys:
+            if k not in out.columns:
+                out[k] = ""
+            if k == "nm_id":
+                vals = pd.to_numeric(out[k], errors="coerce")
+                # WB nm_id is an integer identifier; keep empty for missing values.
+                out[k] = vals.round().astype("Int64").astype(str).replace("<NA>", "")
+                out[k] = out[k].replace({"nan": "", "None": ""})
+            elif k == "supplier_article":
+                out[k] = out[k].map(_clean_article_local)
+            else:
+                out[k] = out[k].map(normalize_text)
+        return out
+
     def _fmt_money(x):
         x = _num(x, 0)
         sign = "-" if x < 0 else ""
@@ -5268,6 +5294,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     daily["product_code"] = daily.apply(lambda r: _prod(r.get("product")) or _prod(r.get("supplier_article")), axis=1)
     # Keep approved products. 405/406 are removed by _filter_outputs_by_pdf_product_reference.
     daily = daily[daily["subject_disp"].isin(CATEGORY_ORDER)].copy()
+    daily = _normalize_pdf_merge_keys(daily, ["subject_disp", "product_code", "supplier_article", "nm_id"])
 
     # Уникальный спрос WB для PDF: считаем по уникальным поисковым запросам,
     # а не суммой спроса по артикулам. Если листа нет в старом техфайле,
@@ -5349,6 +5376,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             ads_truth["product_code"] = ads_truth.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
         if "supplier_article" in ads_truth.columns:
             ads_truth["supplier_article"] = ads_truth["supplier_article"].map(_clean_article_local)
+        ads_truth = _normalize_pdf_merge_keys(ads_truth, ["subject_disp", "product_code", "supplier_article", "nm_id"])
         for _c in ["spend", "clicks", "impressions"]:
             if _c not in ads_truth.columns:
                 ads_truth[_c] = 0.0
@@ -5397,6 +5425,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             x["product_code"] = x.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
         if "supplier_article" in x.columns:
             x["supplier_article"] = x["supplier_article"].map(_clean_article_local)
+        x = _normalize_pdf_merge_keys(x, ["subject_disp", "product_code", "supplier_article", "nm_id"])
         for col in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct", "abc_margin_pct", "abc_commission_amount", "abc_acquiring_amount"]:
             if col not in x.columns:
                 x[col] = 0.0
@@ -5415,6 +5444,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         for k in keys:
             if k not in x.columns:
                 x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
         x["_abc_ad"] = np.where(x["gross_revenue"] > 0, x["gross_revenue"] * x["abc_drr_pct"] / 100.0, 0.0)
         # Рентабельность берем из ABC-отчета, если колонка есть. Для агрегата считаем
         # weighted-average по ABC-выручке, а не пересчитываем как ВП/сумма, потому что
@@ -5475,6 +5505,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         for k in keys:
             if k not in x.columns:
                 x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
         g = x.groupby(keys, dropna=False, as_index=False).agg(
             demand_unique=("unique_search_frequency", "sum"),
             unique_queries=("unique_search_queries", "sum"),
@@ -5493,6 +5524,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         for k in keys:
             if k not in x.columns:
                 x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
         g = x.groupby(keys, dropna=False, as_index=False).agg(
             ad_spend_truth=("spend", "sum"),
             clicks_truth=("clicks", "sum"),
@@ -5506,6 +5538,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         for k in keys:
             if k not in x.columns:
                 x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
         if x.empty:
             return pd.DataFrame(columns=keys)
         g = x.groupby(keys, dropna=False, as_index=False).agg(
@@ -5537,6 +5570,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         )
         at = _ads_truth_period(start, end, keys)
         if at is not None and not at.empty:
+            g = _normalize_pdf_merge_keys(g, keys)
+            at = _normalize_pdf_merge_keys(at, keys)
             g = g.merge(at, on=keys, how="left")
             mask = pd.to_numeric(g.get("ad_truth_rows"), errors="coerce").fillna(0) > 0
             g["ad_spend_source"] = np.where(mask, ads_truth_source_name or "ads_truth", "article_day_fact")
@@ -5552,6 +5587,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # Fallback: old article_day_fact sum only when the new search_unique_demand sheet is absent.
         du = _unique_demand_period(start, end, keys)
         if du is not None and not du.empty:
+            g = _normalize_pdf_merge_keys(g, keys)
+            du = _normalize_pdf_merge_keys(du, keys)
             g = g.merge(du, on=keys, how="left")
             g["demand_source"] = np.where(pd.to_numeric(g.get("demand_unique"), errors="coerce").fillna(0) > 0, "unique_queries", "daily_fallback")
             g["demand"] = np.where(pd.to_numeric(g.get("demand_unique"), errors="coerce").fillna(0) > 0, pd.to_numeric(g.get("demand_unique"), errors="coerce").fillna(0), g["demand"])
@@ -5583,14 +5620,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         return g
 
     def _metrics_period(start: pd.Timestamp, end: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
-        cur = _agg_daily(start, end, keys)
-        prev = _agg_daily(prev_s, prev_e, keys)
+        cur = _normalize_pdf_merge_keys(_agg_daily(start, end, keys), keys)
+        prev = _normalize_pdf_merge_keys(_agg_daily(prev_s, prev_e, keys), keys)
         out = cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev"))
-        abc = _abc_exact(start, end, keys)
-        abc_prev = _abc_exact(prev_s, prev_e, keys)
-        out = out.merge(abc, on=keys, how="left")
+        abc = _normalize_pdf_merge_keys(_abc_exact(start, end, keys), keys)
+        abc_prev = _normalize_pdf_merge_keys(_abc_exact(prev_s, prev_e, keys), keys)
+        out = _normalize_pdf_merge_keys(out, keys).merge(abc, on=keys, how="left")
         abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
-        out = out.merge(abc_prev, on=keys, how="left")
+        out = _normalize_pdf_merge_keys(out, keys).merge(_normalize_pdf_merge_keys(abc_prev, keys), on=keys, how="left")
         # fill numeric values
         for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
             if col not in out.columns: out[col] = 0.0
@@ -7110,6 +7147,15 @@ def main() -> None:
     factor_path = local_dir / FACTOR_REPORT_NAME
     write_factor_report(factor_path, factor_outputs)
     paths.append(factor_path)
+
+    # Save heavy Excel outputs before PDF generation. If the PDF block fails, the 20-minute
+    # source refresh is not lost and a follow-up --pdf-only/current-week run can reuse the cache.
+    pre_pdf_paths = list(paths)
+    if storage.is_s3:
+        for p in pre_pdf_paths:
+            storage.write_bytes(f"{OUT_DIR}/{p.name}", p.read_bytes())
+            log(f"Saved pre-PDF: {OUT_DIR}/{p.name}")
+
     pdf_path = local_dir / sales_pdf_report_name(outputs)
     if not args.no_pdf:
         global builder_global_for_pdf
@@ -7124,9 +7170,12 @@ def main() -> None:
             if trace_path.exists():
                 paths.append(trace_path)
     log(f"Saved local copies: {local_dir}")
-    # Always save to S3 too when S3 is active. In local mode this overwrites same local files safely.
+    # Save PDF/audit/trace after PDF generation; Excel files were already saved pre-PDF.
     if storage.is_s3:
+        already_saved = {str(p.resolve()) for p in pre_pdf_paths}
         for p in paths:
+            if str(p.resolve()) in already_saved:
+                continue
             storage.write_bytes(f"{OUT_DIR}/{p.name}", p.read_bytes())
             log(f"Saved: {OUT_DIR}/{p.name}")
     if args.send_telegram and pdf_path.exists():
