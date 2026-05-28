@@ -1,4 +1,4 @@
-name: Download Torgstat ABC FRESH
+name: Torgstat ABC FINAL 7B91C
 
 on:
   workflow_dispatch:
@@ -56,8 +56,8 @@ jobs:
       - name: Show this is the fresh workflow
         shell: bash
         run: |
-          echo "WORKFLOW_MARKER: TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135"
-          echo "This workflow writes Python to /tmp and does NOT use repository download_torgstat_abc.py"
+          echo "WORKFLOW_MARKER: TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C"
+          echo "FINAL_7B91C: embedded Python only, repository download_torgstat_abc.py is ignored"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -76,10 +76,10 @@ jobs:
         run: |
           set -euo pipefail
           cat > /tmp/download_torgstat_abc_fresh.py <<'PYTHON_DOWNLOADER'
-          # VERSION: TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135
+          # VERSION: TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C
           """Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
 
-          Repository filename should be: download_torgstat_abc.py
+          Workflow is self-contained and runs embedded Python from /tmp only
 
           Primary mode: replay a browser "Copy as cURL" export request stored in secret
           TORGSTAT_ABC_CURL. The script tries to replace the period in URL/body with the
@@ -110,7 +110,7 @@ jobs:
           import requests
           from openpyxl import load_workbook
 
-          VERSION = "TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135"
+          VERSION = "TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C"
           DEFAULT_REPORTS_ROOT = "Отчёты"
           DEFAULT_ABC_FOLDER = "АБС анализ"
           DEFAULT_STORE = "TOPFACE"
@@ -835,7 +835,7 @@ jobs:
 
           PYTHON_DOWNLOADER
           head -1 /tmp/download_torgstat_abc_fresh.py
-          grep -q "TORGSTAT_ABC_FRESH_EMBEDDED_20260528_2135" /tmp/download_torgstat_abc_fresh.py
+          grep -q "TORGSTAT_ABC_SINGLE_WORKFLOW_20260528_2229_7B91C" /tmp/download_torgstat_abc_fresh.py
           python -m py_compile /tmp/download_torgstat_abc_fresh.py
 
       - name: Run downloader
