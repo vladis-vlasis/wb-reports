@@ -72,12 +72,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests boto3 openpyxl
 
+      - name: Load REPORT_ENV variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${REPORT_ENV:-}" ]; then
+            printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
+            echo "REPORT_ENV loaded into GitHub env"
+          else
+            echo "REPORT_ENV is empty"
+          fi
+
       - name: Verify downloader version
         run: |
           set -euo pipefail
           test -f download_torgstat_abc.py
           head -n 1 download_torgstat_abc.py
-          grep -q "TORGSTAT_ABC_AUTH_PARSE_FIX_20260528" download_torgstat_abc.py
+          grep -q "TORGSTAT_ABC_REPORT_ENV_FIX2_20260528" download_torgstat_abc.py
           python -m py_compile download_torgstat_abc.py
           python download_torgstat_abc.py --self-test
 
