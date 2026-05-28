@@ -1,4 +1,4 @@
-# VERSION: DAILY_REPORT_TOPFACE_TG_RUN_CARD_FIX13_20260528
+# VERSION: DAILY_REPORT_TOPFACE_TG_SIMPLE_ABC_MTD_FIX14_20260528
 name: Daily TOPFACE report
 
 on:
@@ -93,7 +93,7 @@ jobs:
           test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
           echo "Using report script: $REPORT_SCRIPT"
           head -5 "$REPORT_SCRIPT"
-          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX11_TG_RUN_CARD_20260528" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX11_TG_RUN_CARD_20260528"; exit 1; }
+          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX12_TG_SIMPLE_ABC_MTD_20260528" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX12_TG_SIMPLE_ABC_MTD_20260528"; exit 1; }
           if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
             echo "ERROR: workflow/shell text was pasted into the Python report script"
             exit 1
