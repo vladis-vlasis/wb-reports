@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX12_TG_SIMPLE_ABC_MTD_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX14_VAT_PLAN_PARTIAL_ABC_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -6344,9 +6344,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _summary_category_page("cur_categories", "Текущая неделя: категории", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор", "Текущая неделя", cur_cat, target_contour=None)
 
     def _current_month_page():
-        # Текущий месяц: ВП берём из ABC текущего месяца/вышедших ABC-отчетов,
-        # заказы и сумму заказов — из Orders, рекламные расходы — из отчетов по рекламе.
+        # Текущий месяц:
+        # - ВП берём из ABC текущего месяца/недельных ABC-отчетов;
+        # - заказы и сумму заказов — из Orders;
+        # - расход РК — из отчетов по рекламе;
+        # - план = ВП прошлого месяца минус расчетный НДС 7% с учетом СПП.
         month_start = cur_start.replace(day=1)
+
         # If a manually uploaded current-month ABC file runs later than Orders data
         # (for example ABC 01.05-27.05 while Orders API is available only through 26.05),
         # page 3 should still show ABC GP through the ABC period end.
@@ -6359,13 +6363,109 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 _mtd = _abc_src[(_abc_src["period_start"].eq(month_start)) & (_abc_src["period_end"].dt.month.eq(month_start.month))].copy()
                 if not _mtd.empty:
                     month_abc_end = max(pd.Timestamp(month_abc_end), pd.Timestamp(_mtd["period_end"].max()))
+
         title_end = max(pd.Timestamp(cur_actual_end), pd.Timestamp(month_abc_end))
+
+        def _orders_spp_rate(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
+            """Weighted SPP for VAT base.
+
+            priceWithDisc / order_sum is seller sale amount.
+            finishedPrice is buyer amount after SPP.
+            VAT base = seller sale amount - SPP = buyer amount.
+            """
+            x = daily[(daily["day"] >= pd.Timestamp(start_dt).normalize()) & (daily["day"] <= pd.Timestamp(end_dt).normalize())].copy()
+            if x.empty:
+                return np.nan
+            sale_total = pd.to_numeric(x.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+            orders_total = pd.to_numeric(x.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0)
+            buyer_price = pd.to_numeric(x.get("finished_price", pd.Series(dtype=float)), errors="coerce")
+            buyer_total = (buyer_price.fillna(0) * orders_total.fillna(0)).sum()
+            # Fallback when the cached technical file has no buyer total.
+            if sale_total > 0 and buyer_total <= 0 and "spp" in x.columns:
+                spp_pct = pd.to_numeric(x.get("spp"), errors="coerce")
+                weights = pd.to_numeric(x.get("order_sum"), errors="coerce").fillna(0)
+                valid = spp_pct.notna() & (weights > 0)
+                if valid.any():
+                    buyer_total = sale_total * (1.0 - float(np.average(spp_pct[valid], weights=weights[valid])) / 100.0)
+            if sale_total <= 0 or buyer_total <= 0:
+                return np.nan
+            rate = max(0.0, min(0.95, 1.0 - float(buyer_total) / float(sale_total)))
+            return rate
+
+        def _abc_weekly_overlap_alloc(start_dt: pd.Timestamp, end_dt: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+            """Allocate overlapping weekly ABC by calendar days.
+
+            Example: for 01.05-03.05 use 3/7 of ABC week 27.04-03.05.
+            This is used only for page 3 weekly rows where exact in-month ABC is absent.
+            """
+            start_n = pd.Timestamp(start_dt).normalize()
+            end_n = pd.Timestamp(end_dt).normalize()
+            src = outputs.get("abc_weekly", pd.DataFrame()).copy()
+            if src is None or src.empty or "period_start" not in src.columns or "period_end" not in src.columns:
+                return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end", "allocated_from_overlap"])
+            src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
+            src["period_end"] = pd.to_datetime(src["period_end"], errors="coerce").dt.normalize()
+            src = src[(src["period_start"] <= end_n) & (src["period_end"] >= start_n)].copy()
+            if src.empty:
+                return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end", "allocated_from_overlap"])
+            if "subject_disp" not in src.columns:
+                src["subject_disp"] = src.get("subject", "").map(_subject_disp) if "subject" in src.columns else ""
+            if "product_code" not in src.columns:
+                src["product_code"] = src.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+            if "supplier_article" in src.columns:
+                src["supplier_article"] = src["supplier_article"].map(_clean_article_local)
+            src = src[src["subject_disp"].isin(CATEGORY_ORDER)].copy()
+            for c0 in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct"]:
+                if c0 not in src.columns:
+                    src[c0] = 0.0
+                src[c0] = pd.to_numeric(src[c0], errors="coerce").fillna(0.0)
+            src["_period_days"] = (src["period_end"] - src["period_start"]).dt.days + 1
+            src["_overlap_start"] = src["period_start"].map(lambda v: max(pd.Timestamp(v), start_n))
+            src["_overlap_end"] = src["period_end"].map(lambda v: min(pd.Timestamp(v), end_n))
+            src["_overlap_days"] = (src["_overlap_end"] - src["_overlap_start"]).dt.days + 1
+            src = src[(src["_period_days"] > 0) & (src["_overlap_days"] > 0)].copy()
+            if src.empty:
+                return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end", "allocated_from_overlap"])
+            src["_coef"] = src["_overlap_days"] / src["_period_days"]
+            src["_gp_alloc"] = src["gross_profit"] * src["_coef"]
+            src["_revenue_alloc"] = src["gross_revenue"] * src["_coef"]
+            src["_abc_ad_alloc"] = np.where(src["gross_revenue"] > 0, src["gross_revenue"] * src["abc_drr_pct"] / 100.0, 0.0) * src["_coef"]
+            for k in keys:
+                if k not in src.columns:
+                    src[k] = ""
+            src = _normalize_pdf_merge_keys(src, keys)
+            out = src.groupby(keys, dropna=False, as_index=False).agg(
+                gp_abc=("_gp_alloc", "sum"),
+                revenue_abc=("_revenue_alloc", "sum"),
+                abc_ad_spend=("_abc_ad_alloc", "sum"),
+                abc_rows=("_gp_alloc", "size"),
+                abc_period_start=("period_start", "min"),
+                abc_period_end=("period_end", "max"),
+            )
+            out["allocated_from_overlap"] = True
+            return out
+
         extra_note = "" if pd.Timestamp(title_end) == pd.Timestamp(cur_actual_end) else f"; ВП ABC до {month_abc_end:%d.%m}"
-        _start("Текущий месяц", f"{month_start:%d.%m}-{title_end:%d.%m.%Y} / план = факт ВП прошлого месяца{extra_note}", "Текущий месяц", key="current_month", top_menu=True)
+        _start("Текущий месяц", f"{month_start:%d.%m}-{title_end:%d.%m.%Y} / план = ВП прошлого месяца после НДС 7% с учетом СПП{extra_note}", "Текущий месяц", key="current_month", top_menu=True)
+
         month_days = calendar.monthrange(month_start.year, month_start.month)[1]
         prev_month_df = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
-        # План на май/текущий месяц = факт валовой прибыли за апрель/прошлый закрытый месяц. Без +10%.
-        month_plan = max(0.0, _num(prev_month_df["gp_use"].sum()) if prev_month_df is not None and not prev_month_df.empty else 0.0)
+
+        # Base plan before VAT: fact GP of the previous closed month.
+        plan_gp_before_vat = max(0.0, _num(prev_month_df["gp_use"].sum()) if prev_month_df is not None and not prev_month_df.empty else 0.0)
+        prev_month_revenue = max(0.0, _num(prev_month_df["sum_use"].sum()) if prev_month_df is not None and not prev_month_df.empty and "sum_use" in prev_month_df.columns else 0.0)
+
+        # Estimate VAT base using current-month SPP from Orders. If current month has no Orders yet,
+        # fallback to previous closed month Orders.
+        spp_rate_for_plan = _orders_spp_rate(month_start, min(pd.Timestamp(cur_actual_end), pd.Timestamp(title_end)))
+        if pd.isna(spp_rate_for_plan):
+            spp_rate_for_plan = _orders_spp_rate(closed_start, closed_end)
+        if pd.isna(spp_rate_for_plan):
+            spp_rate_for_plan = 0.0
+        vat_base_for_plan = prev_month_revenue * (1.0 - float(spp_rate_for_plan))
+        vat_amount_for_plan = vat_base_for_plan * 7.0 / 107.0 if vat_base_for_plan > 0 else 0.0
+        month_plan = max(0.0, plan_gp_before_vat - vat_amount_for_plan)
+
         elapsed = min((title_end - month_start).days + 1, month_days)
         plan_to_date = month_plan / month_days * elapsed if month_days else 0.0
 
@@ -6379,40 +6479,88 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # _abc_periods_inside uses it and does not add weekly pieces on top.
         mtd_abc = _abc_periods_inside(month_start, title_end, ["subject_disp"])
         mtd_gp = _num(mtd_abc["gp_abc"].sum()) if mtd_abc is not None and not mtd_abc.empty else 0.0
+        has_month_mtd_abc = False
+        if mtd_abc is not None and not mtd_abc.empty and "abc_period_start" in mtd_abc.columns and "abc_period_end" in mtd_abc.columns:
+            _aps = pd.to_datetime(mtd_abc["abc_period_start"], errors="coerce").dt.normalize()
+            _ape = pd.to_datetime(mtd_abc["abc_period_end"], errors="coerce").dt.normalize()
+            has_month_mtd_abc = bool((_aps.eq(month_start) & (_ape >= title_end)).any())
         pct_plan = mtd_gp / plan_to_date * 100 if plan_to_date else np.nan
+
         cards = [
             (_fmt_money(mtd_gp), "ВП факт ABC", None, "ВП", ""),
             (_fmt_pct(pct_plan), "% плана на дату", None, "% плана", ""),
+            (_fmt_money(month_plan), "План мес. после НДС", None, "План", ""),
             (_fmt_num(mtd_orders_qty), "Заказы, шт", None, "Заказы", ""),
             (_fmt_money(mtd_order_sum), "Сумма заказов", None, "Сумма", ""),
-            (_fmt_money(mtd_ad), "Расход РК", None, "Расход РК", ""),
         ]
         for i, card in enumerate(cards):
             _metric_card(65+i*300, 605, 280, 110, *card)
-        rows=[]
+
+        # Weekly rows:
+        # 1) exact in-month ABC when available;
+        # 2) for partial month rows like 01.05-03.05, allocate overlapping weekly ABC by days;
+        # 3) if the current-month MTD ABC has residual, allocate it to remaining rows without ABC.
+        periods = []
         ws = month_start
-        prev_week_gp = None
         while ws <= title_end:
             we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), title_end)
             wk_orders = _agg_daily(ws, we, ["subject_disp"])
             wk_abc = _abc_periods_inside(ws, we, ["subject_disp"])
-            wk_gp_val = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
+            exact_gp = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
+            source_note = "exact" if not pd.isna(exact_gp) else ""
+            if pd.isna(exact_gp):
+                overlap_abc = _abc_weekly_overlap_alloc(ws, we, ["subject_disp"])
+                overlap_gp = _num(overlap_abc["gp_abc"].sum()) if overlap_abc is not None and not overlap_abc.empty else np.nan
+                if not pd.isna(overlap_gp) and abs(overlap_gp) > 0.5:
+                    exact_gp = overlap_gp
+                    source_note = "overlap"
             wk_orders_qty = _num(wk_orders["orders"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
             wk_sum = _num(wk_orders["order_sum"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
             wk_ad = _num(wk_orders["ad_spend"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
-            elapsed_to_week = min((we - month_start).days + 1, month_days)
-            week_plan_to_date = month_plan / month_days * elapsed_to_week if month_days else 0.0
-            mtd_to_week_abc = _abc_periods_inside(month_start, we, ["subject_disp"])
-            gp_to_week = _num(mtd_to_week_abc["gp_abc"].sum()) if mtd_to_week_abc is not None and not mtd_to_week_abc.empty else 0.0
-            pct_to_week = gp_to_week / week_plan_to_date * 100 if week_plan_to_date else np.nan
+            periods.append({"ws": ws, "we": we, "exact_gp": exact_gp, "orders_qty": wk_orders_qty, "sum": wk_sum, "ad": wk_ad, "source_note": source_note})
+            ws = we + pd.Timedelta(days=1)
+
+        exact_sum = sum(_num(p["exact_gp"]) for p in periods if not pd.isna(p["exact_gp"]))
+        residual_gp = mtd_gp - exact_sum
+        missing = [p for p in periods if pd.isna(p["exact_gp"])]
+        if has_month_mtd_abc and missing and abs(residual_gp) > 0.5:
+            weight_total = sum(max(0.0, _num(p["sum"])) for p in missing)
+            equal_weight = 1.0 / len(missing) if missing else 0.0
+            for p in missing:
+                if weight_total > 0:
+                    p["allocated_gp"] = residual_gp * max(0.0, _num(p["sum"])) / weight_total
+                else:
+                    p["allocated_gp"] = residual_gp * equal_weight
+                p["gp_allocated_from_mtd"] = True
+        else:
+            for p in missing:
+                p["allocated_gp"] = np.nan
+                p["gp_allocated_from_mtd"] = False
+
+        rows = []
+        prev_week_gp = None
+        for p in periods:
+            ws, we = p["ws"], p["we"]
+            wk_gp_val = p["exact_gp"] if not pd.isna(p["exact_gp"]) else p.get("allocated_gp", np.nan)
+
+            # Weekly plan is not cumulative: plan_month / days_in_month * days_in_this_week_part.
+            week_days = min((we - ws).days + 1, month_days)
+            week_plan = month_plan / month_days * week_days if month_days else 0.0
+            pct_week = wk_gp_val / week_plan * 100 if week_plan and not pd.isna(wk_gp_val) else np.nan
+
             if pd.isna(wk_gp_val):
                 gp_cell = "—"
             else:
-                gp_cell = (_fmt_money(wk_gp_val), _delta_abs(wk_gp_val, prev_week_gp), "ВП")
+                if p.get("gp_allocated_from_mtd", False):
+                    gp_label = "ВП*"
+                elif p.get("source_note") == "overlap":
+                    gp_label = "ВП~"
+                else:
+                    gp_label = "ВП"
+                gp_cell = (_fmt_money(wk_gp_val), _delta_abs(wk_gp_val, prev_week_gp), gp_label)
                 prev_week_gp = wk_gp_val
-            rows.append({"cells":[f"{ws:%d.%m}-{we:%d.%m}", gp_cell, _fmt_pct(pct_to_week), _fmt_num(wk_orders_qty), _fmt_money(wk_sum), _fmt_money(wk_ad)]})
-            ws = we + pd.Timedelta(days=1)
-        _draw_table(85, 230, W-170, ["Неделя", "ВП ABC", "% плана", "Заказы", "Сумма заказов", "Расход РК"], [200,260,240,180,280,250], rows, row_h=58, font_size=16, max_rows=8)
+            rows.append({"cells": [f"{ws:%d.%m}-{we:%d.%m}", gp_cell, _fmt_pct(pct_week), _fmt_num(p["orders_qty"]), _fmt_money(p["sum"]), _fmt_money(p["ad"])]})
+        _draw_table(85, 230, W-170, ["Неделя", "ВП ABC", "% плана недели", "Заказы", "Сумма заказов", "Расход РК"], [200,260,240,180,280,250], rows, row_h=58, font_size=16, max_rows=8)
 
     def _summary_page():
         _start("Помесячная динамика", f"{closed_start.year} год / ABC по 4 категориям", "Годовая динамика", key="summary", top_menu=True)
@@ -7118,22 +7266,27 @@ def _tg_delta_pct(cur: Any, prev: Any) -> Optional[float]:
     return d
 
 
-def _tg_arrow_pct(cur: Any, prev: Any, lower_bad: bool = False) -> str:
+def _tg_arrow_pct(cur: Any, prev: Any, lower_bad: bool = False, colored: bool = False) -> str:
     d = _tg_delta_pct(cur, prev)
     if d is None or abs(d) < 0.05:
-        return "→ 0,0%"
-    return ("↑ " if d > 0 else "↓ ") + f"{abs(d):.1f}%".replace(".", ",")
+        return "⚪ → 0,0%" if colored else "→ 0,0%"
+    prefix = "🟢 ↑ +" if d > 0 else "🔴 ↓ -"
+    plain_prefix = "↑ " if d > 0 else "↓ "
+    body = f"{abs(d):.1f}%".replace(".", ",")
+    return (prefix + body) if colored else (plain_prefix + body)
 
 
-def _tg_arrow_abs(cur: Any, prev: Any, suffix: str = "") -> str:
+def _tg_arrow_abs(cur: Any, prev: Any, suffix: str = "", colored: bool = False) -> str:
     cur_v = to_number(cur)
     prev_v = to_number(prev)
     if pd.isna(cur_v) or pd.isna(prev_v):
-        return "→ 0" + suffix
+        return ("⚪ → 0" if colored else "→ 0") + suffix
     d = float(cur_v) - float(prev_v)
     if abs(d) < 0.5:
-        return "→ 0" + suffix
+        return ("⚪ → 0" if colored else "→ 0") + suffix
     val = f"{int(round(abs(d))):,}".replace(",", " ")
+    if colored:
+        return ("🟢 ↑ +" if d > 0 else "🔴 ↓ -") + val + suffix
     return ("↑ +" if d > 0 else "↓ -") + val + suffix
 
 
@@ -7312,11 +7465,11 @@ def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
     prev_label = f"{prev_start:%d.%m}-{prev_end:%d.%m} / средний день"
     lines = [
         f"TOPFACE — {label}",
-        f"к среднему дню {prev_label}",
+        f"сравнение: средний день {prev_label}",
         "",
-        f"Заказы: {_tg_fmt_num(cur['orders'])} ({_tg_arrow_abs(cur['orders'], prev['orders'])})",
-        f"Расход РК: {_tg_fmt_money(cur['ad_spend'])} ({_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽')})",
-        f"ДРР: {_tg_fmt_pct(cur['drr'])} ({_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True)})",
+        f"💰 Сумма заказов: {_tg_fmt_money(cur['order_sum'])}  {_tg_arrow_abs(cur['order_sum'], prev['order_sum'], ' ₽', colored=True)}",
+        f"📣 Расход РК: {_tg_fmt_money(cur['ad_spend'])}  {_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽', colored=True)}",
+        f"📊 ДРР: {_tg_fmt_pct(cur['drr'])}  {_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True, colored=True)}",
     ]
     return "\n".join(lines)
 
@@ -7594,7 +7747,7 @@ def run_smoke_test(root: str = ".") -> None:
     if not pdf_created or not pdf_path.exists() or pdf_path.stat().st_size < 10_000:
         raise RuntimeError(f"SMOKE_TEST failed: PDF не создан или слишком маленький: {pdf_path}")
     tg_preview = build_telegram_daily_summary(outputs)
-    if "Заказы:" not in tg_preview or "Расход РК" not in tg_preview or "ДРР" not in tg_preview:
+    if "Сумма заказов" not in tg_preview or "Расход РК" not in tg_preview or "ДРР" not in tg_preview:
         raise RuntimeError(f"SMOKE_TEST failed: Telegram daily summary invalid: {tg_preview[:200]}")
     log("SMOKE_TEST_OK: Telegram daily summary built")
     ok_path = local_dir / "SMOKE_TEST_OK.txt"
