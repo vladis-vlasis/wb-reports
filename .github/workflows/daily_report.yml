@@ -1,4 +1,4 @@
-# VERSION: DAILY_REPORT_TOPFACE_TG_DAILY_CLEANUP_FIX12_20260528
+# VERSION: DAILY_REPORT_TOPFACE_TG_RUN_CARD_FIX13_20260528
 name: Daily TOPFACE report
 
 on:
@@ -93,7 +93,7 @@ jobs:
           test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
           echo "Using report script: $REPORT_SCRIPT"
           head -5 "$REPORT_SCRIPT"
-          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX10_TG_DAILY_CLEANUP_20260528" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX10_TG_DAILY_CLEANUP_20260528"; exit 1; }
+          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX11_TG_RUN_CARD_20260528" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX11_TG_RUN_CARD_20260528"; exit 1; }
           if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
             echo "ERROR: workflow/shell text was pasted into the Python report script"
             exit 1
@@ -270,7 +270,15 @@ jobs:
           set -a
           source ./.env
           set +a
-          python "$REPORT_SCRIPT" --root . --current-week-only
+          SEND_ARG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
+            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
+            set -a
+            source ./.telegram.env
+            set +a
+            SEND_ARG="--send-telegram"
+          fi
+          python "$REPORT_SCRIPT" --root . --current-week-only $SEND_ARG
 
       - name: Run full refresh
         if: steps.mode.outputs.mode == 'full_refresh'
@@ -280,62 +288,15 @@ jobs:
           set -a
           source ./.env
           set +a
-          python "$REPORT_SCRIPT" --root . --full-refresh
-
-      - name: Send PDF to Telegram
-        if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
-          set -a
-          source ./.telegram.env
-          set +a
-
-          REPORT_DIR="Отчёты/Объединенный отчет/TOPFACE"
-          export REPORT_DIR
-          PDF_FILE="$(python - <<'PY_FIND_PDF'
-          import os
-          from pathlib import Path
-          report_dir = Path(os.environ['REPORT_DIR'])
-          files = sorted(report_dir.glob('Отчет по продажам Влад *.pdf'), key=lambda p: p.stat().st_mtime, reverse=True)
-          if not files:
-              files = sorted(report_dir.glob('*.pdf'), key=lambda p: p.stat().st_mtime, reverse=True)
-          print(files[0] if files else '')
-          PY_FIND_PDF
-          )"
-          test -n "$PDF_FILE" || { echo "ERROR: PDF file not found in $REPORT_DIR"; exit 1; }
-          test -s "$PDF_FILE" || { echo "ERROR: PDF file is empty: $PDF_FILE"; exit 1; }
-
-          CAPTION="$(basename "$PDF_FILE" .pdf)"
-          echo "Telegram: sending file: $PDF_FILE"
-          CURL_ARGS=(
-            -sS
-            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument"
-            -F "chat_id=${TELEGRAM_CHAT_ID}"
-            -F "caption=${CAPTION}"
-            -F "document=@${PDF_FILE}"
-          )
-          if [ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]; then
-            CURL_ARGS+=(-F "message_thread_id=${TELEGRAM_MESSAGE_THREAD_ID}")
+          SEND_ARG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
+            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
+            set -a
+            source ./.telegram.env
+            set +a
+            SEND_ARG="--send-telegram"
           fi
-          HTTP_CODE="$(curl "${CURL_ARGS[@]}" -w '%{http_code}' -o telegram_send_response.json || true)"
-          cat telegram_send_response.json || true
-          echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Telegram sendDocument returned HTTP $HTTP_CODE"
-            echo "If HTTP is 400, check TELEGRAM_CHAT_ID / TELEGRAM_MESSAGE_THREAD_ID and make sure the bot has access to the chat/topic."
-            echo "If HTTP is 404, check TELEGRAM_BOT_TOKEN."
-            exit 1
-          fi
-          python - <<'PY_SEND_TG'
-          import json, pathlib, sys
-          data = json.loads(pathlib.Path('telegram_send_response.json').read_text(encoding='utf-8'))
-          if not data.get('ok'):
-              print('ERROR: Telegram sendDocument ok=false:', data)
-              sys.exit(1)
-          print('Telegram: sent successfully')
-          PY_SEND_TG
+          python "$REPORT_SCRIPT" --root . --full-refresh $SEND_ARG
 
       - name: Show generated files
         if: always()
@@ -348,7 +309,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-report-output-fix4-20260528
+          name: topface-report-output-fix13-20260528
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
