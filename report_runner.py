@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX7_MONTHPLAN_ABC_20260528
+# VERSION: ORDERS_ONLY_AND_TG_FIX9_WEEK_AVG_DYNAMICS_20260528
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -5611,6 +5611,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         g["search_share"] = np.where(g["demand"] > 0, g["opens"] / g["demand"] * 100, np.nan)
         g["drr_model"] = np.where(g["order_sum"] > 0, g["ad_spend"] / g["order_sum"] * 100, 0.0)
         g["cpc"] = np.where(g["clicks"] > 0, g["ad_spend"] / g["clicks"], np.nan)
+        # CTR РК = все клики рекламных кампаний / все показы рекламных кампаний.
+        g["ad_ctr"] = np.where(g["impressions"] > 0, g["clicks"] / g["impressions"] * 100, np.nan)
         # CPC is kept as calculated from the available ad spend/click source.
         # Do not hide low CPC values: shelf-type ads can legitimately produce CPC below bid floor.
         g["cart_conv"] = np.where(g["opens"] > 0, g["carts"] / g["opens"] * 100, 0.0)
@@ -5629,7 +5631,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
         out = _normalize_pdf_merge_keys(out, keys).merge(_normalize_pdf_merge_keys(abc_prev, keys), on=keys, how="left")
         # fill numeric values
-        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
+        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "ad_ctr", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
             if col not in out.columns: out[col] = 0.0
             if col + "_prev" not in out.columns: out[col + "_prev"] = 0.0
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
@@ -5670,10 +5672,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         out["sum_prev_use"] = np.where(out["has_abc_prev"] & (abc_rev_prev.abs() > 1e-9), abc_rev_prev, out["order_sum_prev"])
         out["gp_use"] = np.where(out["has_abc"], abc_gp, out["gp_model"])
         out["gp_prev_use"] = np.where(out["has_abc_prev"], abc_gp_prev, out["gp_model_prev"])
-        out["orders"] = np.where(out["has_abc"] & (abc_orders.abs() > 1e-9), abc_orders, out["orders"])
-        out["orders_prev"] = np.where(out["has_abc_prev"] & (abc_orders_prev.abs() > 1e-9), abc_orders_prev, out["orders_prev"])
-        out["price_sale"] = np.where(out["orders"].astype(float).abs() > 1e-9, out["sum_use"] / out["orders"].replace(0, np.nan), out.get("buyer_price", np.nan))
-        out["price_sale_prev"] = np.where(out["orders_prev"].astype(float).abs() > 1e-9, out["sum_prev_use"] / out["orders_prev"].replace(0, np.nan), out.get("buyer_price_prev", np.nan))
+        # Заказы в PDF всегда берём из отчёта WB Заказы после исключения отмен,
+        # даже когда ВП/выручка для закрытого периода пришли из ABC.
+        out["orders"] = pd.to_numeric(out["orders"], errors="coerce").fillna(0.0)
+        out["orders_prev"] = pd.to_numeric(out["orders_prev"], errors="coerce").fillna(0.0)
+        out["price_sale"] = np.where(pd.to_numeric(out["orders"], errors="coerce").fillna(0).abs() > 1e-9, out["sum_use"] / out["orders"].replace(0, np.nan), out.get("buyer_price", np.nan))
+        out["price_sale_prev"] = np.where(pd.to_numeric(out["orders_prev"], errors="coerce").fillna(0).abs() > 1e-9, out["sum_prev_use"] / out["orders_prev"].replace(0, np.nan), out.get("buyer_price_prev", np.nan))
 
         # Расход РК для ABC-периода считаем только из ABC: Валовая выручка × ДРР ABC.
         out["ad_spend"] = np.where(out["has_abc"], abc_ad, out["ad_spend"])
@@ -5688,6 +5692,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         out["margin_prev"] = np.where(out["has_abc_prev"] & abc_margin_prev_col.notna(), abc_margin_prev_col, margin_prev_calc)
         out["cpc"] = np.where(out["clicks"] > 0, out["ad_spend"] / out["clicks"], np.nan)
         out["cpc_prev"] = np.where(out["clicks_prev"] > 0, out["ad_spend_prev"] / out["clicks_prev"], np.nan)
+        out["ad_ctr"] = np.where(out["impressions"] > 0, out["clicks"] / out["impressions"] * 100, np.nan)
+        out["ad_ctr_prev"] = np.where(out["impressions_prev"] > 0, out["clicks_prev"] / out["impressions_prev"] * 100, np.nan)
         # CPC is kept as calculated. Low CPC is not a data error by itself
         # because shelf-type ad formats may have much lower average CPC.
 
@@ -5699,6 +5705,120 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         for _c in ["commission_pct", "commission_pct_prev", "acquiring_pct", "acquiring_pct_prev"]:
             out[_c] = pd.to_numeric(out[_c], errors="coerce").fillna(0.0)
         return out
+
+    def _current_week_prev_avg_comparison(current_df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+        """Replace current-week previous-period columns with previous-week daily average × elapsed days.
+
+        Business rule 2026-05-28:
+        - лист «Текущая неделя» is an operational partial-week report;
+        - if only N days have passed in the current week, compare current fact with
+          previous full week's average per day multiplied by N;
+        - order quantity and order sum are from WB Orders, ad spend/clicks/impressions are
+          from advertising reports;
+        - do not compare 2 current days with a full previous week and do not use ABC
+          revenue as the previous value for order-sum dynamics.
+        """
+        if current_df is None or current_df.empty:
+            return current_df
+
+        elapsed_days = int((pd.Timestamp(cur_actual_end).normalize() - pd.Timestamp(cur_start).normalize()).days) + 1
+        prev_days = int((pd.Timestamp(prev_end).normalize() - pd.Timestamp(prev_start).normalize()).days) + 1
+        elapsed_days = max(1, elapsed_days)
+        prev_days = max(1, prev_days)
+        scale = elapsed_days / prev_days
+
+        prev_full = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, keys)
+        if prev_full is None or prev_full.empty:
+            return current_df
+
+        prev_full = _normalize_pdf_merge_keys(prev_full.copy(), keys)
+        cur = _normalize_pdf_merge_keys(current_df.copy(), keys)
+
+        prev_value_cols = [
+            "order_sum", "sum_use", "orders", "gp_model", "gp_use", "ad_spend",
+            "clicks", "impressions", "opens", "carts", "demand", "demand_daily_sum",
+            "unique_queries", "duplicate_query_rows_removed", "raw_query_rows",
+        ]
+        prev_avg_cols = [
+            "search_share", "localization_direct", "localization", "rating",
+            "price_sale", "buyer_price", "price_with_disc_avg", "spp",
+            "commission_pct_model", "acquiring_pct_model",
+            "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit",
+        ]
+
+        keep_cols = list(dict.fromkeys(keys + [c for c in prev_value_cols + prev_avg_cols if c in prev_full.columns]))
+        prev = prev_full[keep_cols].copy()
+        rename_map = {c: f"__prev_avg_{c}" for c in keep_cols if c not in keys}
+        prev = prev.rename(columns=rename_map)
+        cur = cur.merge(prev, on=keys, how="left")
+
+        def _series(name: str, default: float = 0.0) -> pd.Series:
+            if name in cur.columns:
+                return pd.to_numeric(cur[name], errors="coerce").fillna(default)
+            return pd.Series(default, index=cur.index, dtype="float64")
+
+        # Absolute previous-period values = previous full week / 7 × elapsed current days.
+        scale_map = {
+            "order_sum": "order_sum_prev",
+            "orders": "orders_prev",
+            "gp_model": "gp_model_prev",
+            "gp_use": "gp_prev_use",
+            "ad_spend": "ad_spend_prev",
+            "clicks": "clicks_prev",
+            "impressions": "impressions_prev",
+            "opens": "opens_prev",
+            "carts": "carts_prev",
+            "demand": "demand_prev",
+            "demand_daily_sum": "demand_daily_sum_prev",
+            "unique_queries": "unique_queries_prev",
+            "duplicate_query_rows_removed": "duplicate_query_rows_removed_prev",
+            "raw_query_rows": "raw_query_rows_prev",
+        }
+        for src_col, dst_col in scale_map.items():
+            avg_col = f"__prev_avg_{src_col}"
+            if avg_col in cur.columns:
+                cur[dst_col] = _series(avg_col) * scale
+
+        # For current-week dynamics, «Сумма заказов» must stay tied to Orders priceWithDisc, not ABC revenue.
+        cur["sum_prev_use"] = _series("order_sum_prev")
+
+        # Non-absolute daily averages keep previous-week average levels for tooltip/secondary metrics.
+        for src_col in prev_avg_cols:
+            avg_col = f"__prev_avg_{src_col}"
+            dst_col = f"{src_col}_prev"
+            if avg_col in cur.columns:
+                cur[dst_col] = _series(avg_col, np.nan)
+
+        # Recalculate ratios from the scaled numerators/denominators.
+        cur["drr_prev"] = np.where(_series("sum_prev_use").abs() > 1e-9, _series("ad_spend_prev") / _series("sum_prev_use") * 100, 0.0)
+        cur["cpc_prev"] = np.where(_series("clicks_prev") > 0, _series("ad_spend_prev") / _series("clicks_prev"), np.nan)
+        cur["ad_ctr_prev"] = np.where(_series("impressions_prev") > 0, _series("clicks_prev") / _series("impressions_prev") * 100, np.nan)
+        cur["search_share_prev"] = np.where(_series("demand_prev") > 0, _series("opens_prev") / _series("demand_prev") * 100, np.nan)
+        cur["cart_conv_prev"] = np.where(_series("opens_prev") > 0, _series("carts_prev") / _series("opens_prev") * 100, np.nan)
+        cur["order_conv_prev"] = np.where(_series("carts_prev") > 0, _series("orders_prev") / _series("carts_prev") * 100, np.nan)
+        cur["order_from_open_conv_prev"] = np.where(_series("opens_prev") > 0, _series("orders_prev") / _series("opens_prev") * 100, np.nan)
+        cur["price_sale_prev"] = np.where(_series("orders_prev") > 0, _series("sum_prev_use") / _series("orders_prev"), _series("price_sale_prev", np.nan))
+
+        helper_cols = [c for c in cur.columns if c.startswith("__prev_avg_")]
+        if helper_cols:
+            cur = cur.drop(columns=helper_cols)
+        cur["prev_compare_mode"] = f"prev_week_daily_avg_x_{elapsed_days}_days"
+        cur["prev_compare_days"] = elapsed_days
+        return cur
+
+    def _prev_week_daily_average_totals(keys: List[str]) -> Dict[str, float]:
+        """Totals of previous full week divided by number of days, for day-row deltas on sheet 1."""
+        prev_full = _agg_daily(prev_start, prev_end, keys)
+        prev_days = int((pd.Timestamp(prev_end).normalize() - pd.Timestamp(prev_start).normalize()).days) + 1
+        prev_days = max(1, prev_days)
+        if prev_full is None or prev_full.empty:
+            return {"order_sum": 0.0, "ad_spend": 0.0, "demand": 0.0, "opens": 0.0}
+        return {
+            "order_sum": _num(prev_full.get("order_sum", pd.Series(dtype="float64")).sum()) / prev_days,
+            "ad_spend": _num(prev_full.get("ad_spend", pd.Series(dtype="float64")).sum()) / prev_days,
+            "demand": _num(prev_full.get("demand", pd.Series(dtype="float64")).sum()) / prev_days,
+            "opens": _num(prev_full.get("opens", pd.Series(dtype="float64")).sum()) / prev_days,
+        }
 
     def _abc_periods_inside(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
         """ABC gross profit for a period without double counting.
@@ -5765,7 +5885,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             abc_period_end=("period_end", "max"),
         )
 
-    cur_cat = _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"])
+    cur_cat = _current_week_prev_avg_comparison(
+        _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"]),
+        ["subject_disp"],
+    )
     prev_cat = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp"])
     closed_cat = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
     current_month_cat = _metrics_period(cur_start.replace(day=1), cur_actual_end, (cur_start.replace(day=1)-pd.offsets.MonthBegin(1)).normalize(), cur_start.replace(day=1)-pd.Timedelta(days=1), ["subject_disp"])
@@ -6115,7 +6238,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["gp_use"]), _delta_abs(t["gp_use"], t["gp_prev_use"]), "ВП"), (_fmt_pct(t["margin"]), _delta(t["margin"], t["margin_prev"]), "Рент."), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), (_fmt_rub1(t["cpc"]), _delta(t["cpc"], t["cpc_prev"]), "CPC"), (_fmt_num(t["demand"]), _delta(t["demand"], t["demand_prev"]), "Спрос"), (_fmt_pct(t["search_share"]), _delta(t["search_share"], t["search_share_prev"]), "% поиска")]})
         _draw_table(75, 315, W-150, ["Категория", "Сумма", "ВП", "Рент.", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [190,170,160,125,170,115,100,170,140], rows, row_h=68, font_size=14)
     def _current_week_overview():
-        _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / оперативный обзор без детализации", "Текущая неделя", key="cur_overview", top_menu=True)
+        _elapsed_compare_days = int((pd.Timestamp(cur_actual_end).normalize() - pd.Timestamp(cur_start).normalize()).days) + 1
+        _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / факт за {_elapsed_compare_days} дн.; сравнение = средний день прошлой недели × {_elapsed_compare_days}", "Текущая неделя", key="cur_overview", top_menu=True)
         total = cur_cat.copy()
         total_sum = total["sum_use"].sum(); total_prev = total["sum_prev_use"].sum()
         total_ad = total["ad_spend"].sum(); total_ad_prev = total["ad_spend_prev"].sum()
@@ -6134,19 +6258,24 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         ]
         for i, card in enumerate(cards):
             _metric_card(75+i*295, 590, 270, 105, *card)
-        # Daily overview by day, not deep category navigation.
+        # Daily overview by day: deltas compare each factual day with previous full week's average day.
         dates = pd.date_range(cur_start, cur_end)
         rows=[]
+        prev_avg = _prev_week_daily_average_totals(["subject_disp"])
+        psum = prev_avg.get("order_sum", 0.0)
+        pad = prev_avg.get("ad_spend", 0.0)
+        pdemand = prev_avg.get("demand", 0.0)
+        opens_prev = prev_avg.get("opens", 0.0)
+        pss = opens_prev/pdemand*100 if pdemand else np.nan
+        pdrr = pad/psum*100 if psum else 0
         for dt in dates:
             cur = _agg_daily(dt, dt, ["subject_disp"])
-            prev = _agg_daily(dt-pd.Timedelta(days=7), dt-pd.Timedelta(days=7), ["subject_disp"])
-            osum = cur["order_sum"].sum() if not cur.empty else 0; psum = prev["order_sum"].sum() if not prev.empty else 0
-            ad = cur["ad_spend"].sum() if not cur.empty else 0; pad = prev["ad_spend"].sum() if not prev.empty else 0
-            ddemand = cur["demand"].sum() if not cur.empty else 0; pdemand = prev["demand"].sum() if not prev.empty else 0
-            opens = cur["opens"].sum() if not cur.empty else 0; opens_prev = prev["opens"].sum() if not prev.empty else 0
+            osum = cur["order_sum"].sum() if not cur.empty else 0
+            ad = cur["ad_spend"].sum() if not cur.empty else 0
+            ddemand = cur["demand"].sum() if not cur.empty else 0
+            opens = cur["opens"].sum() if not cur.empty else 0
             ss = opens/ddemand*100 if ddemand else np.nan
-            pss = opens_prev/pdemand*100 if pdemand else np.nan
-            d = ad/osum*100 if osum else 0; pdrr = pad/psum*100 if psum else 0
+            d = ad/osum*100 if osum else 0
             # Будущие/пустые дни не показываем как падение на 100%.
             if dt > cur_actual_end or (abs(osum) < 1e-9 and abs(ad) < 1e-9 and abs(ddemand) < 1e-9):
                 rows.append({"cells": [dt.strftime("%a %d.%m"), "—", "—", "—", "—", "—"]})
@@ -6307,6 +6436,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _section_bar(640, "Блок 1. Экономика и продажи")
         cards1 = [
             (_fmt_money(row.get("sum_use")), "Сумма", _delta(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
+            (_fmt_num(row.get("orders")), "Заказы", _delta(row.get("orders"), row.get("orders_prev")), "Заказы", ""),
             (_fmt_money(row.get("gp_use")), "ВП ABC", _delta(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
             (_fmt_pct(row.get("margin")), "Рентабельность", _delta(row.get("margin"), row.get("margin_prev")), "Рент.", ""),
             (_fmt_pct(row.get("drr")), "ДРР", _delta(row.get("drr"), row.get("drr_prev")), "ДРР", ""),
@@ -6314,18 +6444,19 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             (_fmt_rub1(row.get("cpc")), "CPC", _delta(row.get("cpc"), row.get("cpc_prev")), "CPC", ""),
         ]
         for i, card in enumerate(cards1):
-            _metric_card(85+i*245, 520, 225, 95, *card)
-        _section_bar(450, "Блок 2. Спрос, точки входа и конверсии")
+            _metric_card(65+i*215, 520, 200, 95, *card)
+        _section_bar(450, "Блок 2. Реклама, спрос и конверсии")
         cards2 = [
             (_fmt_num(row.get("demand")), "Спрос WB", _delta(row.get("demand"), row.get("demand_prev")), "Спрос", ""),
             (_fmt_pct(row.get("search_share")), "% поиска", _delta(row.get("search_share"), row.get("search_share_prev")), "% поиска", ""),
+            (_fmt_pct(row.get("ad_ctr")), "CTR РК", _delta(row.get("ad_ctr"), row.get("ad_ctr_prev")), "CTR РК", ""),
             (_fmt_num(row.get("opens")), "Открытия", _delta(row.get("opens"), row.get("opens_prev")), "Открытия", ""),
             (_fmt_num(row.get("orders")), "Заказы", _delta(row.get("orders"), row.get("orders_prev")), "Заказы", ""),
             (_fmt_pct(row.get("order_from_open_conv")), "Конв. в заказ", _delta(row.get("order_from_open_conv"), row.get("order_from_open_conv_prev")), "Конверсия", ""),
             (_fmt_pct(row.get("order_conv")), "Корзина→заказ", _delta(row.get("order_conv"), row.get("order_conv_prev")), "Конверсия", ""),
         ]
         for i, card in enumerate(cards2):
-            _metric_card(75+i*245, 330, 225, 95, *card)
+            _metric_card(65+i*215, 330, 200, 95, *card)
         _section_bar(260, "Блок 3. Расходы на единицу / доля расходов")
         cards3 = [
             (_fmt_pct(row.get("commission_pct")), "Комиссия, %", _delta(row.get("commission_pct"), row.get("commission_pct_prev")), "Комиссия", ""),
@@ -6580,6 +6711,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             if metric == "CPC":
                 spend_src = "ABC ad_spend" if has else "daily ad_spend_total"
                 return "mixed allowed", "ABC/daily + article_day_fact", f"{spend_src}; clicks=article_day_fact.ad_clicks_total", False, "CPC = Расход РК выбранного источника / клики рекламы"
+            if metric == "CTR РК":
+                return "ads reports", "Отчёты/Реклама → ads_truth", "clicks_truth / impressions_truth * 100", False, "CTR РК = все клики РК / все показы РК"
             if metric in ["Спрос WB", "% поиска"]:
                 ds = str(row.get("demand_source" + suffix, row.get("demand_source", "")))
                 if ds == "unique_queries":
@@ -6597,11 +6730,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 "Расход РК": ("ad_spend", "ad_spend_prev", "Расход РК = ABC promotion/ABC revenue*drr если ABC, иначе SUM(ad_spend_total)", "₽"),
                 "ДРР": ("drr", "drr_prev", "ДРР = Расход РК / Сумма * 100", "%"),
                 "CPC": ("cpc", "cpc_prev", "CPC = Расход РК / Клики РК", "₽"),
+                "CTR РК": ("ad_ctr", "ad_ctr_prev", "CTR РК = Клики РК / Показы РК * 100", "%"),
                 "Спрос WB": ("demand", "demand_prev", "Спрос WB = SUM(unique_search_frequency) по уникальным запросам; fallback=SUM(search_frequency)", "шт"),
                 "% поиска": ("search_share", "search_share_prev", "% поиска = Открытия карточки / Спрос WB * 100", "%"),
                 "Открытия": ("opens", "opens_prev", "Открытия = SUM(open_cards)", "шт"),
                 "Конв. в заказ": ("order_from_open_conv", "order_from_open_conv_prev", "Конв. в заказ = Заказы / Открытия карточки * 100", "%"),
-                "Заказы": ("orders", "orders_prev", "Заказы = ABC orders если exact ABC найден, иначе SUM(orders)", "шт"),
+                "Заказы": ("orders", "orders_prev", "Заказы = SUM(orders) из отчёта WB Заказы после исключения отмен", "шт"),
                 "Комиссия, %": ("commission_pct", "commission_pct_prev", "Комиссия, % = ABC commission / ABC revenue * 100 если ABC, иначе commission_%", "%"),
                 "Эквайринг, %": ("acquiring_pct", "acquiring_pct_prev", "Эквайринг, % = ABC acquiring / ABC revenue * 100 если ABC, иначе acquiring_%", "%"),
                 "Логистика/шт": ("logistics_per_unit", "logistics_per_unit_prev", "Логистика/шт = среднее logistics_direct из daily", "₽/шт"),
@@ -6614,8 +6748,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             return row.get(cur_col, np.nan), row.get(prev_col, np.nan), formula, unit
 
         metrics_for_trace = [
-            "Сумма", "ВП ABC", "Рентабельность", "Расход РК", "ДРР", "CPC",
-            "Спрос WB", "% поиска", "Открытия", "Конв. в заказ", "Заказы",
+            "Сумма", "Заказы", "ВП ABC", "Рентабельность", "Расход РК", "ДРР", "CPC",
+            "Спрос WB", "% поиска", "CTR РК", "Открытия", "Конв. в заказ", "Заказы",
             "Комиссия, %", "Эквайринг, %", "Логистика/шт", "Хранение/шт", "Себест./шт", "Прочие/шт", "СПП",
         ]
 
