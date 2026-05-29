@@ -1,0 +1,163 @@
+name: Расчет поставки WB
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим расчета"
+        required: true
+        default: "warehouse"
+        type: choice
+        options:
+          - warehouse
+          - supplier
+      run_date:
+        description: "Дата расчета YYYY-MM-DD. Если пусто — сегодня"
+        required: false
+        default: ""
+        type: string
+      season_coeff:
+        description: "Коэффициент сезонности для warehouse-режима"
+        required: false
+        default: "1.0"
+        type: string
+      strategy_mode:
+        description: "Стратегия распределения для warehouse-режима"
+        required: false
+        default: "default"
+        type: choice
+        options:
+          - default
+          - economy
+      send_telegram:
+        description: "Отправлять результат в Telegram"
+        required: true
+        default: true
+        type: boolean
+      supplier_default_coeff:
+        description: "Коэффициент по умолчанию для supplier-режима"
+        required: false
+        default: "1.0"
+        type: string
+      supplier_lead_days:
+        description: "Срок приезда заказа от производителя, дней"
+        required: false
+        default: "80"
+        type: string
+      supplier_coverage_days:
+        description: "Покрытие после приезда, дней"
+        required: false
+        default: "60"
+        type: string
+      abc_target_month:
+        description: "Месяц ABC YYYY-MM"
+        required: false
+        default: "2026-03"
+        type: string
+
+jobs:
+  run:
+    name: Запустить расчет поставки WB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Скачать репозиторий
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Загрузить переменные из REPORT_ENV и отдельных secrets
+        env:
+          REPORT_ENV: ${{ secrets.REPORT_ENV }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
+          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+        run: |
+          if [ -z "$REPORT_ENV" ]; then
+            echo "::error::Не задан secret REPORT_ENV"
+            exit 1
+          fi
+
+          # REPORT_ENV должен быть в формате NAME=value, каждая переменная с новой строки
+          printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
+
+          # Отдельные secrets из твоего репозитория
+          echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
+          echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
+          echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
+          echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
+
+          # Базовые настройки скрипта
+          echo "WB_STORE=TOPFACE" >> "$GITHUB_ENV"
+          echo "WB_OUTPUT_DIR=output" >> "$GITHUB_ENV"
+          echo "WB_SEND_TELEGRAM=${{ inputs.send_telegram }}" >> "$GITHUB_ENV"
+
+      - name: Проверить обязательные переменные
+        run: |
+          missing=0
+
+          for var in YC_ACCESS_KEY_ID YC_SECRET_ACCESS_KEY YC_BUCKET_NAME; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Не найдена переменная $var. Проверь secret REPORT_ENV"
+              missing=1
+            fi
+          done
+
+          if [ "${WB_SEND_TELEGRAM}" = "true" ]; then
+            for var in TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
+              if [ -z "${!var}" ]; then
+                echo "::error::Не найдена переменная $var. Она нужна для отправки в Telegram"
+                missing=1
+              fi
+            done
+          fi
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Найти файл скрипта
+        run: |
+          if [ -f "wb_supply_calculator.py" ]; then
+            echo "SUPPLY_SCRIPT=wb_supply_calculator.py" >> "$GITHUB_ENV"
+          elif [ -f "wb_supply_calculator (4).py" ]; then
+            echo "SUPPLY_SCRIPT=wb_supply_calculator (4).py" >> "$GITHUB_ENV"
+          else
+            echo "::error::Не найден файл wb_supply_calculator.py или wb_supply_calculator (4).py в корне репозитория"
+            exit 1
+          fi
+
+      - name: Запустить расчет поставки WB
+        run: |
+          ARGS=()
+
+          ARGS+=(--mode "${{ inputs.mode }}")
+          ARGS+=(--season-coeff "${{ inputs.season_coeff }}")
+          ARGS+=(--strategy-mode "${{ inputs.strategy_mode }}")
+          ARGS+=(--supplier-default-coeff "${{ inputs.supplier_default_coeff }}")
+          ARGS+=(--supplier-lead-days "${{ inputs.supplier_lead_days }}")
+          ARGS+=(--supplier-coverage-days "${{ inputs.supplier_coverage_days }}")
+          ARGS+=(--abc-target-month "${{ inputs.abc_target_month }}")
+
+          if [ -n "${{ inputs.run_date }}" ]; then
+            ARGS+=(--run-date "${{ inputs.run_date }}")
+          fi
+
+          python "$SUPPLY_SCRIPT" "${ARGS[@]}"
+
+      - name: Сохранить результат как artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rezultat-rascheta-postavki-wb
+          path: output/
+          if-no-files-found: ignore
