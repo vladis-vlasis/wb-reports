@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX20_DAILY_TRUTH_ADS_DEMAND_20260529
+# VERSION: ORDERS_ONLY_AND_TG_FIX21_MISSING_ADS_DEMAND_SAFE_20260529
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -6394,6 +6394,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         cur_day = _pdf_truth_sum_period(yday, yday)
         prev_day_sum = _pdf_truth_sum_period(prev_day, prev_day)
 
+        def _known_money(v):
+            return "—" if v is None or pd.isna(v) else _fmt_money(v)
+        def _known_num(v):
+            return "—" if v is None or pd.isna(v) else _fmt_num(v)
+        def _known_pct(v):
+            return "—" if v is None or pd.isna(v) else _fmt_pct(v)
+        def _known_delta(cur_v, prev_v, money=False):
+            if cur_v is None or prev_v is None or pd.isna(cur_v) or pd.isna(prev_v):
+                return None
+            return _delta_abs(cur_v, prev_v) if money else _delta(cur_v, prev_v)
+
         # Yesterday gross profit comes from real daily Torgstat ABC.
         # Plan dynamics = yesterday fact - (monthly GP plan / days in month).
         gp_plan_month = _num(os.getenv("WB_MONTH_GP_PLAN", "1800000"), 1_800_000.0)
@@ -6405,12 +6416,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         prev_gp = _num(prev_abc["gp_abc"].sum()) if prev_abc is not None and not prev_abc.empty else 0.0
         yday_plan_delta = yday_gp - gp_plan_day if gp_plan_day and abs(yday_gp) > 0.5 else None
 
+        ads_sub = "нет данных РК" if cur_day.get("ads_missing") else ""
+        demand_sub = "нет данных" if cur_day.get("demand_missing") else ""
         cards = [
             (_fmt_money(cur_day.get("order_sum")), "Сумма заказов", _delta_abs(cur_day.get("order_sum"), prev_day_sum.get("order_sum")), "Сумма", ""),
             (_fmt_money(yday_gp), "Валовая прибыль", yday_plan_delta, "ВП", f"план/день {_fmt_money(gp_plan_day)}"),
-            (_fmt_money(cur_day.get("ad_spend")), "Расход РК", _delta_abs(cur_day.get("ad_spend"), prev_day_sum.get("ad_spend")), "Расход РК", ""),
-            (_fmt_pct(cur_day.get("drr")), "ДРР", _delta(cur_day.get("drr"), prev_day_sum.get("drr")), "ДРР", ""),
-            (_fmt_num(cur_day.get("demand")), "Спрос WB", _delta(cur_day.get("demand"), prev_day_sum.get("demand")), "Спрос", ""),
+            (_known_money(cur_day.get("ad_spend")), "Расход РК", _known_delta(cur_day.get("ad_spend"), prev_day_sum.get("ad_spend"), money=True), "Расход РК", ads_sub),
+            (_known_pct(cur_day.get("drr")), "ДРР", _known_delta(cur_day.get("drr"), prev_day_sum.get("drr"), money=False), "ДРР", ads_sub),
+            (_known_num(cur_day.get("demand")), "Спрос WB", _known_delta(cur_day.get("demand"), prev_day_sum.get("demand"), money=False), "Спрос", demand_sub),
         ]
         for i, card in enumerate(cards):
             _metric_card(65+i*300, 590, 280, 105, *card)
@@ -6429,25 +6442,29 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         for dt in dates:
             cur = _pdf_truth_sum_period(dt, dt)
             osum = _num(cur.get("order_sum"))
-            ad = _num(cur.get("ad_spend"))
-            ddemand = _num(cur.get("demand"))
+            ad_raw = cur.get("ad_spend")
+            demand_raw = cur.get("demand")
+            ad_known = not (ad_raw is None or pd.isna(ad_raw))
+            demand_known = not (demand_raw is None or pd.isna(demand_raw))
+            ad = _num(ad_raw) if ad_known else np.nan
+            ddemand = _num(demand_raw) if demand_known else np.nan
             opens = _num(cur.get("opens"))
-            ss = opens/ddemand*100 if ddemand else np.nan
-            d = ad/osum*100 if osum else 0
+            ss = opens/ddemand*100 if demand_known and ddemand else np.nan
+            d = ad/osum*100 if osum and ad_known else np.nan
             day_abc = _abc_periods_inside(dt, dt, ["day", "subject_disp"])
             day_gp = _num(day_abc["gp_abc"].sum()) if day_abc is not None and not day_abc.empty else 0.0
             # Будущие/пустые дни не показываем как падение на 100%.
-            if dt > cur_actual_end or (abs(osum) < 1e-9 and abs(ad) < 1e-9 and abs(ddemand) < 1e-9 and abs(day_gp) < 1e-9):
+            if dt > cur_actual_end or (abs(osum) < 1e-9 and (not ad_known or abs(_num(ad)) < 1e-9) and (not demand_known or abs(_num(ddemand)) < 1e-9) and abs(day_gp) < 1e-9):
                 rows.append({"cells": [dt.strftime("%a %d.%m"), "—", "—", "—", "—", "—", "—"]})
             else:
                 rows.append({"cells": [
                     dt.strftime("%a %d.%m"),
                     (_fmt_money(osum), _delta_abs(osum, psum), "Сумма"),
                     (_fmt_money(day_gp), day_gp - gp_plan_day if gp_plan_day and abs(day_gp) > 0.5 else None, "ВП"),
-                    (_fmt_money(ad), _delta_abs(ad, pad), "Расход РК"),
-                    (_fmt_pct(d), _delta(d, pdrr), "ДРР"),
-                    (_fmt_num(ddemand), _delta(ddemand, pdemand), "Спрос"),
-                    (_fmt_pct(ss), _delta(ss, pss), "% поиска"),
+                    (_known_money(ad), _known_delta(ad, pad, money=True), "Расход РК") if ad_known else ("—", None, "Расход РК"),
+                    (_known_pct(d), _known_delta(d, pdrr, money=False), "ДРР") if ad_known else ("—", None, "ДРР"),
+                    (_known_num(ddemand), _known_delta(ddemand, pdemand, money=False), "Спрос") if demand_known else ("—", None, "Спрос"),
+                    (_known_pct(ss), _known_delta(ss, pss, money=False), "% поиска") if demand_known else ("—", None, "% поиска"),
                 ]})
         widths=[150,235,210,205,135,205,180]
         _draw_table(80, 155, W-160, ["День", "Сумма заказов", "ВП", "Расход РК", "ДРР", "Спрос WB", "% поиска"], widths, rows, row_h=48, font_size=11)
@@ -7564,16 +7581,37 @@ def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFra
     order_sum = float(pd.to_numeric(d.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
     orders = float(pd.to_numeric(d.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
     opens = float(pd.to_numeric(d.get("open_cards", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
-    fallback_demand = float(pd.to_numeric(d.get("search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
-    demand = float(pd.to_numeric(q.get("unique_search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not q.empty else fallback_demand
-    if not a.empty:
-        spend = float(pd.to_numeric(a.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        clicks = float(pd.to_numeric(a.get("clicks", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        impressions = float(pd.to_numeric(a.get("impressions", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+
+    # Если отдельный truth-source есть, но в нем нет нужной даты, это не 0,
+    # а «данные еще не обновились». Не подставляем article_day_fact/search_frequency,
+    # чтобы в Telegram/PDF не появлялись ложные 0 ₽, 0 спроса и 0,0% ДРР.
+    demand_missing = False
+    if not demand_df.empty:
+        if not q.empty:
+            demand = float(pd.to_numeric(q.get("unique_search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        else:
+            demand = np.nan
+            demand_missing = True
+    else:
+        demand = float(pd.to_numeric(d.get("search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+
+    ads_missing = False
+    if not ads.empty:
+        if not a.empty:
+            spend = float(pd.to_numeric(a.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+            clicks = float(pd.to_numeric(a.get("clicks", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+            impressions = float(pd.to_numeric(a.get("impressions", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        else:
+            spend = np.nan
+            clicks = np.nan
+            impressions = np.nan
+            ads_missing = True
     else:
         spend = float(pd.to_numeric(d.get("ad_spend_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
         clicks = float(pd.to_numeric(d.get("ad_clicks_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
         impressions = float(pd.to_numeric(d.get("ad_impressions_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+
+    drr = spend / order_sum * 100.0 if order_sum and not pd.isna(spend) else np.nan
     return {
         "order_sum": order_sum,
         "orders": orders,
@@ -7582,10 +7620,12 @@ def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFra
         "impressions": impressions,
         "demand": demand,
         "opens": opens,
-        "drr": spend / order_sum * 100.0 if order_sum else 0.0,
-        "cpc": spend / clicks if clicks else np.nan,
-        "ad_ctr": clicks / impressions * 100.0 if impressions else np.nan,
-        "search_share": opens / demand * 100.0 if demand else np.nan,
+        "drr": drr,
+        "cpc": spend / clicks if clicks and not pd.isna(spend) and not pd.isna(clicks) else np.nan,
+        "ad_ctr": clicks / impressions * 100.0 if impressions and not pd.isna(clicks) and not pd.isna(impressions) else np.nan,
+        "search_share": opens / demand * 100.0 if demand and not pd.isna(demand) else np.nan,
+        "ads_missing": ads_missing,
+        "demand_missing": demand_missing,
     }
 
 
@@ -7636,13 +7676,36 @@ def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
     cur_gp = _tg_daily_abc_gross_profit(outputs, latest)
     prev_gp = _tg_daily_abc_gross_profit(outputs, prev_day)
     label = f"{int(latest.day)} {REPORT_MONTH_GENITIVE_RU.get(int(latest.month), latest.strftime('%m'))}"
+
+    def _max_day(df):
+        try:
+            if df is None or df.empty or "day" not in df.columns:
+                return "—"
+            m = pd.to_datetime(df["day"], errors="coerce").dropna().max()
+            return "—" if pd.isna(m) else f"{int(m.day):02d}.{int(m.month):02d}"
+        except Exception:
+            return "—"
+
+    if cur.get("ads_missing"):
+        ads_line = f"📣 Расход РК: нет данных за {label} (последняя дата РК: {_max_day(ads)})"
+        drr_line = "📊 ДРР: нет данных"
+    else:
+        ads_line = f"📣 Расход РК: {_tg_fmt_money(cur['ad_spend'])}  {_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽', colored=True)}"
+        drr_line = f"📊 ДРР: {_tg_fmt_pct(cur['drr'])}  {_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True, colored=True)}"
+
+    if cur.get("demand_missing"):
+        demand_line = f"🔎 Спрос WB: нет данных за {label} (последняя дата спроса: {_max_day(demand_df)})"
+    else:
+        demand_line = f"🔎 Спрос WB: {_tg_fmt_num(cur['demand'])}  {_tg_arrow_pct(cur['demand'], prev['demand'], lower_bad=False, colored=True)}"
+
     lines = [
         f"TOPFACE — {label}",
         "",
         f"💰 Сумма заказов: {_tg_fmt_money(cur['order_sum'])}  {_tg_arrow_abs(cur['order_sum'], prev['order_sum'], ' ₽', colored=True)}",
         f"💼 Валовая прибыль: {_tg_fmt_money(cur_gp)}  {_tg_arrow_abs(cur_gp, prev_gp, ' ₽', colored=True)}",
-        f"📣 Расход РК: {_tg_fmt_money(cur['ad_spend'])}  {_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽', colored=True)}",
-        f"📊 ДРР: {_tg_fmt_pct(cur['drr'])}  {_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True, colored=True)}",
+        ads_line,
+        drr_line,
+        demand_line,
     ]
     return "\n".join(lines)
 
