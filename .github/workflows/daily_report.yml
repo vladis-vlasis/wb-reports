@@ -1,4 +1,4 @@
-# VERSION: DAILY_REPORT_TOPFACE_FIX20_DAILY_TRUTH_ADS_DEMAND_20260529
+# VERSION: DAILY_REPORT_TOPFACE_FIX21_1820MSK_MISSING_DATA_20260529
 name: Daily TOPFACE report
 
 on:
@@ -19,11 +19,10 @@ on:
         default: true
         type: boolean
   schedule:
-    # Tue-Sun 12:00 MSK = 09:00 UTC: current-week update.
-    - cron: "0 9 * * 2-6"
-    - cron: "0 9 * * 0"
-    # Monday 18:00 MSK = 15:00 UTC: full refresh after weekly data is available.
-    - cron: "0 15 * * 1"
+    # Ежедневно 18:20 МСК = 15:20 UTC.
+    # ABC-загрузчик Torgstat стартует в 18:00 МСК; отчет запускаем через 20 минут,
+    # чтобы не было гонки за свежий дневной ABC-файл.
+    - cron: "20 15 * * *"
 
 permissions:
   contents: read
@@ -94,7 +93,7 @@ jobs:
           test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
           echo "Using report script: $REPORT_SCRIPT"
           head -5 "$REPORT_SCRIPT"
-          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX20_DAILY_TRUTH_ADS_DEMAND_20260529" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX20_DAILY_TRUTH_ADS_DEMAND_20260529"; exit 1; }
+          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX21_MISSING_ADS_DEMAND_SAFE_20260529" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX21_MISSING_ADS_DEMAND_SAFE_20260529"; exit 1; }
           if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
             echo "ERROR: workflow/shell text was pasted into the Python report script"
             exit 1
@@ -113,11 +112,14 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${INPUT_MODE:-current_week}"
             SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
-          elif [ "${{ github.event.schedule }}" = "0 15 * * 1" ]; then
-            MODE="full_refresh"
-            SEND_TELEGRAM="true"
           else
-            MODE="current_week"
+            # Scheduled run is 18:20 MSK daily. On Monday do full refresh, other days current week only.
+            DOW_MSK="$(TZ=Europe/Moscow date +%u)"
+            if [ "$DOW_MSK" = "1" ]; then
+              MODE="full_refresh"
+            else
+              MODE="current_week"
+            fi
             SEND_TELEGRAM="true"
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
@@ -310,7 +312,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-report-output-fix13-20260528
+          name: topface-report-output-fix21-20260529
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
