@@ -3,8 +3,8 @@ name: Расчет юнит-экономики
 on:
   workflow_dispatch:
   schedule:
-    # 12:00 МСК = 09:00 UTC
-    - cron: "0 9 * * *"
+    # 10:00 МСК = 07:00 UTC
+    - cron: "0 7 * * *"
 
 jobs:
   run:
@@ -29,18 +29,28 @@ jobs:
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не задан secret REPORT_ENV"
             exit 1
           fi
 
-          # Все строки вида NAME=value из REPORT_ENV добавляем в окружение job
-          printf '%s\n' "$REPORT_ENV" >> "$GITHUB_ENV"
+          printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
 
-          # WB-ключ у тебя заведён отдельным secret, поэтому добавляем его отдельно
           if [ -n "$WB_PROMO_KEY_TOPFACE" ]; then
             echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$TELEGRAM_CHAT_ID" ]; then
+            echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$TORGSTAT_ABC_URL" ]; then
+            echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
           fi
 
       - name: Запустить расчет юнит-экономики
