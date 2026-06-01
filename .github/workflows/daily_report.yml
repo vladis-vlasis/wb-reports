@@ -183,6 +183,16 @@ jobs:
           echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
           echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
 
+      - name: Preflight real data date check
+        if: env.MODE == 'full_refresh' || env.MODE == 'current_week'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Preflight before long report run"
+          echo "MODE=$MODE"
+          echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
+          python report_runner.py --root . --preflight-date-check
+
       - name: Run report
         shell: bash
         run: |
