@@ -1,4 +1,4 @@
-# VERSION: PDF_ONLY_NO_TG_CLOSED_WEEK_ABC_FIX_20260601
+# VERSION: PDF_ONLY_NO_TG_CLOSED_WEEK_ABC_PREFLIGHT_20260601
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -6793,6 +6793,134 @@ def run_smoke_test(root: str = ".") -> None:
     )
     log(f"SMOKE_TEST_OK: PDF={pdf_path} size={pdf_path.stat().st_size:,} bytes")
 
+
+def _collect_preflight_active_days(frames: Sequence[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+    """Collect active source days for a fast preflight check.
+
+    This intentionally checks only primary operational sources used to build
+    article_day_fact. Stock/ABC can have 31.05, but without orders/funnel for
+    31.05 the PDF top cards would still go out as 30.05. The goal is to fail
+    before the heavy search/entry/stock/ABC stages.
+    """
+    rows: List[Dict[str, Any]] = []
+    for source_name, df in frames:
+        if df is None or df.empty or "day" not in df.columns:
+            continue
+        x = df.copy()
+        x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+        activity_cols = [c for c in ["orders", "order_sum", "open_cards", "add_to_cart", "spend"] if c in x.columns]
+        if activity_cols:
+            activity = pd.Series(0.0, index=x.index)
+            for col in activity_cols:
+                activity = activity + pd.to_numeric(x[col], errors="coerce").fillna(0).abs()
+            x = x.loc[activity > 0].copy()
+        x = x[x["day"].notna()].copy()
+        if x.empty:
+            continue
+        by_day = x.groupby("day", as_index=False).size().rename(columns={"size": "rows"})
+        by_day["source"] = source_name
+        rows.extend(by_day[["source", "day", "rows"]].to_dict("records"))
+    return pd.DataFrame(rows, columns=["source", "day", "rows"])
+
+
+def _preflight_abc_period_exists(storage: Storage, reports_root: str, required: pd.Timestamp) -> None:
+    if not _env_flag("REPORT_REQUIRE_ABC_PERIOD", False):
+        return
+    period_end = pd.Timestamp(required).normalize()
+    period_start = period_end - pd.Timedelta(days=int(period_end.weekday()))
+    expected_prefix = f"wb_abc_report_goods__{period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}__at_"
+    prefixes = [
+        f"{reports_root.strip('/')}/ABC",
+        f"{reports_root.strip('/')}/АБС анализ/TOPFACE",
+    ]
+    found_keys: List[str] = []
+    for prefix in prefixes:
+        try:
+            keys = storage.list_files(prefix)
+        except Exception as exc:
+            log(f"preflight ABC: WARN cannot list {prefix}: {exc}")
+            continue
+        for key in keys:
+            name = Path(key).name
+            if name.startswith(expected_prefix) and name.lower().endswith((".xlsx", ".xlsm", ".zip")):
+                found_keys.append(key)
+    if not found_keys:
+        raise RuntimeError(
+            f"preflight: нет точного ABC/АБС файла за закрытую неделю "
+            f"{period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}. "
+            f"Ожидал файл {expected_prefix}*.xlsx в Отчёты/ABC. "
+            f"Full refresh не запускаю, чтобы не ждать долгий пересчёт."
+        )
+    log(f"preflight ABC: OK exact period {period_start:%Y-%m-%d}..{period_end:%Y-%m-%d}; key={found_keys[0]}")
+
+
+def run_preflight_date_check(root: str, reports_root: str, store: str) -> None:
+    """Fast real-data check before expensive full_refresh/current_week runs.
+
+    It reads only current-week orders/funnel/ads files and verifies that the
+    required report date is present in primary operational sources. This catches
+    the common situation where ABC/stock already has Sunday, but orders/funnel
+    still end on Saturday, before the script spends 20-30 minutes parsing heavy
+    search, entry point and stock reports.
+    """
+    required = _env_date("REPORT_REQUIRE_DATA_DATE")
+    if required is None:
+        log("preflight: REPORT_REQUIRE_DATA_DATE is empty; skip")
+        return
+
+    diagnostics = Diagnostics()
+    storage = make_storage(root)
+
+    # Force current-week source filtering for preflight speed and correctness.
+    os.environ["WB_CURRENT_WEEK_ONLY"] = "1"
+    os.environ["WB_DAILY_TARGET_DATE"] = f"{required:%Y-%m-%d}"
+
+    loader = Loader(storage, reports_root, store, diagnostics)
+    log(f"preflight: required_date={required:%Y-%m-%d}, store={store}; reading only current-week primary files")
+    orders = loader.load_orders()
+    funnel = loader.load_funnel()
+    ads_raw, ads_daily, campaigns = loader.load_ads()
+
+    day_stats = _collect_preflight_active_days([
+        ("orders", orders),
+        ("funnel", funnel),
+        ("ads_daily", ads_daily),
+    ])
+    if day_stats.empty:
+        raise RuntimeError(
+            f"preflight: нет активных дат в orders/funnel/ads для проверки {required:%d.%m.%Y}. "
+            f"Full refresh не запускаю."
+        )
+
+    summary = (
+        day_stats.groupby("source", as_index=False)
+        .agg(min_day=("day", "min"), max_day=("day", "max"), total_rows=("rows", "sum"))
+    )
+    for _, r in summary.iterrows():
+        log(
+            f"preflight source {r['source']}: dates={pd.Timestamp(r['min_day']).date()}.."
+            f"{pd.Timestamp(r['max_day']).date()}, rows={int(r['total_rows']):,}"
+        )
+
+    primary = day_stats[day_stats["source"].isin(["orders", "funnel"])]
+    has_required_primary = False
+    if not primary.empty:
+        has_required_primary = (pd.to_datetime(primary["day"], errors="coerce").dt.normalize() == required).any()
+        latest_primary = pd.to_datetime(primary["day"], errors="coerce").max().normalize()
+    else:
+        latest_primary = pd.NaT
+
+    if not has_required_primary:
+        latest_text = "-" if pd.isna(latest_primary) else f"{pd.Timestamp(latest_primary):%d.%m.%Y}"
+        raise RuntimeError(
+            f"preflight: нет orders/funnel данных за нужную дату {required:%d.%m.%Y}. "
+            f"Последняя активная дата в orders/funnel: {latest_text}. "
+            f"Full refresh не запускаю, чтобы не ждать долгий пересчёт и не отправить старый день."
+        )
+
+    _preflight_abc_period_exists(storage, reports_root, required)
+    log(f"preflight: OK required_date={required:%Y-%m-%d}; можно запускать основной отчёт")
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".", help="Local root used for local copies and local mode")
@@ -6804,9 +6932,13 @@ def main() -> None:
     parser.add_argument("--full-refresh", action="store_true", help="Явный полный пересчет всех источников; синоним обычного запуска")
     parser.add_argument("--send-telegram", action="store_true", help="Отправить PDF в Telegram через TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
     parser.add_argument("--smoke-test", action="store_true", help="Быстрый синтетический тест PDF/кода без S3 и тяжелых Excel; должен занимать секунды")
+    parser.add_argument("--preflight-date-check", action="store_true", help="Быстрая проверка реальных данных за нужную дату перед долгим full_refresh")
     args = parser.parse_args()
     if args.smoke_test:
         run_smoke_test(args.root)
+        return
+    if args.preflight_date_check:
+        run_preflight_date_check(args.root, args.reports_root, args.store)
         return
     diagnostics = Diagnostics()
     storage = make_storage(args.root)
