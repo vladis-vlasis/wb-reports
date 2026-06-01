@@ -1,34 +1,40 @@
-# VERSION: DAILY_REPORT_TOPFACE_FIX25_ADS_RAW_UNENRICHED_1800_20260601
 name: Daily TOPFACE report
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "smoke / current_week / full_refresh"
+        description: "smoke / current_week / pdf_only / full_refresh"
         required: true
-        default: "current_week"
+        default: "pdf_only"
         type: choice
         options:
           - smoke
           - current_week
+          - pdf_only
           - full_refresh
       send_telegram:
         description: "Send generated PDF to Telegram"
         required: true
         default: true
         type: boolean
+      as_of_date:
+        description: "Дата отчёта YYYY-MM-DD. Для full_refresh пусто = последнее воскресенье по МСК"
+        required: false
+        default: ""
+        type: string
   schedule:
-    # Ежедневно 18:20 МСК = 15:20 UTC.
-    # ABC-загрузчик Torgstat стартует в 18:00 МСК; отчет запускаем через 20 минут,
-    # чтобы не было гонки за свежий дневной ABC-файл.
-    - cron: "0 15 * * *"
+    # Tue-Sun 13:50 MSK = 10:50 UTC: обновляем только блок текущей недели.
+    - cron: "50 10 * * 2-6"
+    - cron: "50 10 * * 0"
+    # Monday 13:50 MSK = 10:50 UTC: полный пересчёт закрытой прошлой недели после ABC.
+    - cron: "50 10 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: wb-report-topface-daily
+  group: wb-report-topface
   cancel-in-progress: false
 
 jobs:
@@ -39,24 +45,25 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
-      REPORT_SCRIPT: "report_runner.py"
-      WB_KEEP_ONLY_MONDAY_REPORTS: "1"
-      WB_MONTH_GP_PLAN: "1800000"
+      TZ: Europe/Moscow
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
-      # Repository secrets. These have priority over values inside REPORT_ENV.
-      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-
+      # Полный режим: ограничиваем самые тяжелые недельные источники.
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
       WB_MAX_STOCK_FILES: "5"
 
+      # PDF policy: спрос WB только через уникальные запросы, без задваивающего fallback.
       PDF_FAIL_ON_MISSING_DEMAND: "0"
       PDF_ALLOW_DEMAND_FALLBACK: "0"
+
+      # Детализация: товар детализируется от 10% ВП категории, внутри товара показываются все артикулы.
       PDF_PRODUCT_DETAIL_MIN_GP_SHARE: "10"
       PDF_FORCE_DETAIL_PRODUCTS: "901,614,617,618,154,155,156,157,158"
       PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
+
       PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
       PDF_TRACE_SAMPLE_PRODUCT: "901"
       PDF_TRACE_SAMPLE_ARTICLE: "901/2"
@@ -83,22 +90,17 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install reportlab
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          pip install requests boto3 openpyxl pandas numpy reportlab
 
-      - name: Validate report script file
+      - name: Compile check
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
-          echo "Using report script: $REPORT_SCRIPT"
-          head -5 "$REPORT_SCRIPT"
-          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX25_ADS_RAW_UNENRICHED_1800_20260601" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX25_ADS_RAW_UNENRICHED_1800_20260601"; exit 1; }
-          if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
-            echo "ERROR: workflow/shell text was pasted into the Python report script"
-            exit 1
-          fi
-          python -m py_compile "$REPORT_SCRIPT"
+          test -f report_runner.py || { echo "ERROR: report_runner.py is missing"; exit 1; }
+          python -m py_compile report_runner.py
           echo "Compile OK"
 
       - name: Decide mode
@@ -107,30 +109,30 @@ jobs:
         env:
           INPUT_MODE: ${{ github.event.inputs.mode }}
           INPUT_SEND_TELEGRAM: ${{ github.event.inputs.send_telegram }}
+          INPUT_AS_OF_DATE: ${{ github.event.inputs.as_of_date }}
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${INPUT_MODE:-current_week}"
+            MODE="${INPUT_MODE:-pdf_only}"
             SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
+          elif [ "${{ github.event.schedule }}" = "50 10 * * 1" ]; then
+            MODE="full_refresh"
+            SEND_TELEGRAM="true"
           else
-            # Scheduled run is 18:20 MSK daily. On Monday do full refresh, other days current week only.
-            DOW_MSK="$(TZ=Europe/Moscow date +%u)"
-            if [ "$DOW_MSK" = "1" ]; then
-              MODE="full_refresh"
-            else
-              MODE="current_week"
-            fi
+            MODE="current_week"
             SEND_TELEGRAM="true"
           fi
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           echo "send_telegram=$SEND_TELEGRAM" >> "$GITHUB_OUTPUT"
+          echo "as_of_date=${INPUT_AS_OF_DATE:-}" >> "$GITHUB_OUTPUT"
           echo "Selected mode: $MODE"
           echo "Send Telegram: $SEND_TELEGRAM"
+          echo "Manual as_of_date: ${INPUT_AS_OF_DATE:-}"
 
       - name: Run smoke test
         if: steps.mode.outputs.mode == 'smoke'
         shell: bash
-        run: python "$REPORT_SCRIPT" --root . --smoke-test
+        run: python report_runner.py --root . --smoke-test
 
       - name: Load REPORT_ENV
         if: steps.mode.outputs.mode != 'smoke'
@@ -149,122 +151,6 @@ jobs:
           test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
-      - name: Prepare and validate Telegram settings
-        if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          clean_token() {
-            local raw="$1"
-            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
-            raw="${raw%\"}"; raw="${raw#\"}"
-            raw="${raw%\'}"; raw="${raw#\'}"
-            if [[ "$raw" == TELEGRAM_BOT_TOKEN=* ]]; then raw="${raw#TELEGRAM_BOT_TOKEN=}"; fi
-            if [[ "$raw" == telegram_bot_token=* ]]; then raw="${raw#telegram_bot_token=}"; fi
-            if [[ "$raw" =~ ^https?://api\.telegram\.org/bot([^/]+) ]]; then raw="${BASH_REMATCH[1]}"; fi
-            raw="${raw%%/getUpdates*}"
-            raw="${raw%%/sendDocument*}"
-            if [[ "$raw" == bot* ]]; then raw="${raw#bot}"; fi
-            printf '%s' "$raw"
-          }
-
-          clean_chat() {
-            local raw="$1"
-            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
-            raw="${raw%\"}"; raw="${raw#\"}"
-            raw="${raw%\'}"; raw="${raw#\'}"
-            if [[ "$raw" == TELEGRAM_CHAT_ID=* ]]; then raw="${raw#TELEGRAM_CHAT_ID=}"; fi
-            if [[ "$raw" == telegram_chat_id=* ]]; then raw="${raw#telegram_chat_id=}"; fi
-            printf '%s' "$raw"
-          }
-
-          SECRET_TG_TOKEN="${TELEGRAM_BOT_TOKEN_SECRET:-}"
-          SECRET_TG_CHAT="${TELEGRAM_CHAT_ID_SECRET:-}"
-          SECRET_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}"
-
-          ENV_TG_TOKEN=""
-          ENV_TG_CHAT=""
-          ENV_TG_THREAD=""
-          if [ -f ./.env ]; then
-            set -a
-            source ./.env
-            set +a
-            ENV_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
-            ENV_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
-            ENV_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
-          fi
-
-          TG_TOKEN="$SECRET_TG_TOKEN"
-          TG_CHAT="$SECRET_TG_CHAT"
-          TG_THREAD="$SECRET_TG_THREAD"
-          if [ -z "$TG_TOKEN" ]; then TG_TOKEN="$ENV_TG_TOKEN"; fi
-          if [ -z "$TG_CHAT" ]; then TG_CHAT="$ENV_TG_CHAT"; fi
-          if [ -z "$TG_THREAD" ]; then TG_THREAD="$ENV_TG_THREAD"; fi
-
-          TG_TOKEN="$(clean_token "$TG_TOKEN")"
-          TG_CHAT="$(clean_chat "$TG_CHAT")"
-          TG_THREAD="$(clean_chat "$TG_THREAD")"
-
-          test -n "$TG_TOKEN" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing"; exit 1; }
-          test -n "$TG_CHAT" || { echo "ERROR: TELEGRAM_CHAT_ID is missing"; exit 1; }
-          if ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
-            echo "ERROR: TELEGRAM_BOT_TOKEN has invalid format after cleanup. Secret value must be only the token like 123456789:AA..."
-            exit 1
-          fi
-          if ! [[ "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
-            echo "ERROR: TELEGRAM_CHAT_ID has invalid format. For your group it must be -1003664843585"
-            exit 1
-          fi
-
-          export TG_TOKEN TG_CHAT TG_THREAD
-          python - <<'PY_WRITE_TG'
-          import os, pathlib, shlex
-          p = pathlib.Path('.telegram.env')
-          with p.open('w', encoding='utf-8') as f:
-              print('TELEGRAM_BOT_TOKEN=' + shlex.quote(os.environ['TG_TOKEN']), file=f)
-              print('TELEGRAM_CHAT_ID=' + shlex.quote(os.environ['TG_CHAT']), file=f)
-              print('TELEGRAM_MESSAGE_THREAD_ID=' + shlex.quote(os.environ.get('TG_THREAD', '')), file=f)
-          p.chmod(0o600)
-          PY_WRITE_TG
-
-          echo "Telegram token prefix: ${TG_TOKEN:0:6}***"
-          echo "Telegram chat id: $TG_CHAT"
-          if [ -n "$TG_THREAD" ]; then echo "Telegram thread id: $TG_THREAD"; fi
-
-          HTTP_CODE="$(curl -sS -w '%{http_code}' -o telegram_getme_response.json "https://api.telegram.org/bot${TG_TOKEN}/getMe" || true)"
-          cat telegram_getme_response.json || true
-          echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Telegram getMe returned HTTP $HTTP_CODE. Check TELEGRAM_BOT_TOKEN."
-            exit 1
-          fi
-          python - <<'PY_CHECK_TG'
-          import json, pathlib, sys
-          data = json.loads(pathlib.Path('telegram_getme_response.json').read_text(encoding='utf-8'))
-          if not data.get('ok'):
-              print('ERROR: Telegram getMe ok=false:', data)
-              sys.exit(1)
-          print('Telegram bot validated:', data.get('result', {}).get('username', 'unknown'))
-          PY_CHECK_TG
-
-          HTTP_CODE="$(curl -sS -G -w '%{http_code}' -o telegram_getchat_response.json "https://api.telegram.org/bot${TG_TOKEN}/getChat" --data-urlencode "chat_id=${TG_CHAT}" || true)"
-          cat telegram_getchat_response.json || true
-          echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Telegram getChat returned HTTP $HTTP_CODE. Check TELEGRAM_CHAT_ID and make sure the bot is added to the group."
-            exit 1
-          fi
-          python - <<'PY_CHECK_CHAT'
-          import json, pathlib, sys
-          data = json.loads(pathlib.Path('telegram_getchat_response.json').read_text(encoding='utf-8'))
-          if not data.get('ok'):
-              print('ERROR: Telegram getChat ok=false:', data)
-              sys.exit(1)
-          chat = data.get('result', {})
-          print('Telegram chat validated:', chat.get('title') or chat.get('username') or chat.get('id'))
-          PY_CHECK_CHAT
-
       - name: Run current week update
         if: steps.mode.outputs.mode == 'current_week'
         shell: bash
@@ -273,15 +159,21 @@ jobs:
           set -a
           source ./.env
           set +a
-          SEND_ARG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
-            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
-            set -a
-            source ./.telegram.env
-            set +a
-            SEND_ARG="--send-telegram"
-          fi
-          python "$REPORT_SCRIPT" --root . --current-week-only $SEND_ARG
+          TG_FLAG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
+          python report_runner.py --root . --current-week-only $TG_FLAG
+
+      - name: Run PDF only
+        if: steps.mode.outputs.mode == 'pdf_only'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source ./.env
+          set +a
+          TG_FLAG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
+          python report_runner.py --root . --pdf-only $TG_FLAG
 
       - name: Run full refresh
         if: steps.mode.outputs.mode == 'full_refresh'
@@ -291,15 +183,30 @@ jobs:
           set -a
           source ./.env
           set +a
-          SEND_ARG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
-            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
-            set -a
-            source ./.telegram.env
-            set +a
-            SEND_ARG="--send-telegram"
+          TG_FLAG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
+
+          # Понедельничный полный отчёт: берём последнюю закрытую неделю.
+          # Пример: запуск 2026-06-01 => REPORT_AS_OF_DATE=2026-05-31 => неделя 25.05-31.05.
+          INPUT_AS_OF_DATE="${{ steps.mode.outputs.as_of_date }}"
+          if [ -n "${INPUT_AS_OF_DATE:-}" ]; then
+            REPORT_AS_OF_DATE="$INPUT_AS_OF_DATE"
+          else
+            REPORT_AS_OF_DATE="$(TZ=Europe/Moscow date -d 'last sunday' +%F)"
           fi
-          python "$REPORT_SCRIPT" --root . --full-refresh $SEND_ARG
+
+          REPORT_REQUIRE_DATA_DATE="$REPORT_AS_OF_DATE"
+          REPORT_CLOSED_WEEK_AS_PREVIOUS="1"
+
+          export REPORT_AS_OF_DATE
+          export REPORT_REQUIRE_DATA_DATE
+          export REPORT_CLOSED_WEEK_AS_PREVIOUS
+
+          echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
+          echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
+          echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
+
+          python report_runner.py --root . --full-refresh $TG_FLAG
 
       - name: Show generated files
         if: always()
@@ -312,7 +219,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-report-output-fix22-20260530
+          name: topface-report-output
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
