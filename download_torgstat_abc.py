@@ -1,4 +1,4 @@
-# VERSION: TORGSTAT_ABC_REPORT_ENV_FIX2_20260528
+# VERSION: TORGSTAT_ABC_REPORT_FINAL_20260601
 """Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
 
 Repository filename should be: download_torgstat_abc.py
@@ -8,9 +8,9 @@ TORGSTAT_ABC_CURL. The script tries to replace the period in URL/body with the
 requested dates, downloads XLSX, validates that it is an ABC report, and uploads
 it with the SAME Torgstat naming pattern that existing report parsing expects:
 
-  Отчёты/АБС анализ/TOPFACE/wb_abc_report_goods__01.05.2026-27.05.2026__at_2026-05-28_21-30.xlsx
+  Отчёты/ABC/wb_abc_report_goods__01.05.2026-27.05.2026__at_2026-05-28_21-30.xlsx
 
-Do not rename this output pattern unless all downstream report code is changed too.
+Downstream report_runner.py reads ABC reports from exactly Отчёты/ABC/.
 """
 from __future__ import annotations
 
@@ -32,9 +32,9 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "TORGSTAT_ABC_REPORT_ENV_FIX2_20260528"
+VERSION = "TORGSTAT_ABC_REPORT_FINAL_20260601"
 DEFAULT_REPORTS_ROOT = "Отчёты"
-DEFAULT_ABC_FOLDER = "АБС анализ"
+DEFAULT_ABC_FOLDER = "ABC"
 DEFAULT_STORE = "TOPFACE"
 DEFAULT_TZ_OFFSET_HOURS = 3  # Used only for date choice in GitHub Actions.
 
@@ -151,6 +151,18 @@ def period_for_mode(mode: str, date_from: Optional[str], date_to: Optional[str])
     mode = (mode or "auto").lower().strip()
     today = today_local()
     yesterday = today - dt.timedelta(days=1)
+
+    def dedupe_periods(periods: List[Tuple[dt.date, dt.date, str]]) -> List[Tuple[dt.date, dt.date, str]]:
+        seen = set()
+        out: List[Tuple[dt.date, dt.date, str]] = []
+        for start, end, label in periods:
+            key = (start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((start, end, label))
+        return out
+
     if mode == "custom":
         if not date_from or not date_to:
             fail("mode=custom требует --date-from и --date-to")
@@ -168,12 +180,17 @@ def period_for_mode(mode: str, date_from: Optional[str], date_to: Optional[str])
         start = yesterday.replace(day=1)
         return [(start, yesterday, "mtd")]
     if mode == "auto":
-        periods = [(yesterday, yesterday, "daily")]
+        # Daily file is useful for point checks; MTD/full-month file is required for the current-month PDF block.
+        # On Mondays we additionally export the closed Monday-Sunday week for exact ABC gross profit.
+        periods = [
+            (yesterday, yesterday, "daily"),
+            (yesterday.replace(day=1), yesterday, "mtd"),
+        ]
         if today.weekday() == 0:  # Monday
             last_sunday = today - dt.timedelta(days=1)
             start = last_sunday - dt.timedelta(days=6)
             periods.append((start, last_sunday, "weekly"))
-        return periods
+        return dedupe_periods(periods)
     fail(f"Неизвестный mode={mode}. Допустимо: auto, daily, weekly, mtd, custom")
 
 
@@ -632,7 +649,18 @@ def output_filename(store: str, start: dt.date, end: dt.date) -> str:
 
 
 def output_key(store: str, start: dt.date, end: dt.date, reports_root: str, abc_folder: str) -> str:
-    return f"{reports_root.rstrip('/')}/{abc_folder.strip('/')}/{store}/{output_filename(store, start, end)}"
+    """Return the exact Object Storage key expected by report_runner.py.
+
+    ABC reports must be stored directly under:
+        Отчёты/ABC/
+
+    There must be no store-level folder and no weekly/monthly subfolder here.
+    """
+    folder = abc_folder.strip("/") or DEFAULT_ABC_FOLDER
+    if folder.replace("\\", "/").strip("/") != "ABC":
+        log(f"WARN: abc_folder={folder!r}; downstream report expects 'ABC'. Using 'ABC'.")
+        folder = "ABC"
+    return f"{reports_root.rstrip('/')}/{folder}/{output_filename(store, start, end)}"
 
 
 def s3_client():
