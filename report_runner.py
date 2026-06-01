@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX21_MISSING_ADS_DEMAND_SAFE_20260529
+# VERSION: ORDERS_ONLY_AND_TG_FIX25_ADS_RAW_UNENRICHED_1800_20260601
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -1077,11 +1077,33 @@ class Loader:
         return out
 
     def load_ads(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        files = self.list_reports("Реклама", self.store, "Недельные")
+        # Реклама часто лежит в разных вариантах пути на S3:
+        # 1) Отчёты/Реклама/TOPFACE/Недельные/Реклама_2026-W22.xlsx
+        # 2) Отчёты/Реклама/TOPFACE/Реклама_2026-W22.xlsx
+        # 3) Отчёты/Реклама/Реклама_2026-W22.xlsx
+        # Раньше читался только вариант (1). Из-за этого свежий файл с 28.05 мог лежать на диске,
+        # но отчет видел старый источник до 26.05 и писал «нет данных РК».
+        files: List[str] = []
+        for parts in [
+            ("Реклама", self.store, "Недельные"),
+            ("Реклама", self.store),
+            ("Реклама", "Недельные", self.store),
+            ("Реклама",),
+        ]:
+            try:
+                files += self.list_reports(*parts)
+            except Exception as exc:
+                self.diag.add("WARN", "ads", f"Не удалось просканировать путь {'/'.join(parts)}", exc)
         consolidated = self.path("Реклама", self.store, "Анализ рекламы.xlsx")
         if self.storage.exists(consolidated):
             files.append(consolidated)
-        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=1)
+        # Убираем явные временные/архивные файлы и дубли ключей. Broad scan оставляем только для текущей недели.
+        files = sorted(set(f for f in files if f and not Path(f).name.startswith("~$")))
+        if files:
+            log(f"ads_scan: candidates before current-week filter={len(files)}; sample=" + "; ".join(Path(x).name for x in files[-8:]))
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=6)
+        if files:
+            log(f"ads_scan: selected files={len(files)}; " + "; ".join(files))
         raw_frames, campaign_frames = [], []
         for key, data in self._read_candidates(files):
             try:
@@ -2320,7 +2342,7 @@ class AnalyticsBuilder:
             # Raw ad source for PDF current-week advertising truth.
             # article_day_fact can repeat campaign spend across articles; this source is grouped from the ad report itself.
             "ads_category_source": self.pack.ads_category.copy() if getattr(self.pack, "ads_category", pd.DataFrame()) is not None else pd.DataFrame(),
-            "ads_raw_source": self.enrich(self.pack.ads_raw, "ads_raw"),
+            "ads_raw_source": self.pack.ads_raw.copy() if getattr(self.pack, "ads_raw", pd.DataFrame()) is not None else pd.DataFrame(),
             "ads_daily_source": self.enrich(self.pack.ads_daily, "ads_daily"),
             "search_daily_summary": search_summary,
             "core_queries_80": core_queries,
@@ -5438,18 +5460,22 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             if col in daily.columns:
                 daily["ad_impressions_total"] += pd.to_numeric(daily[col], errors="coerce").fillna(0)
 
-    # Advertising truth source. For current/incomplete periods do NOT trust repeated article_day_fact spend
-    # when the raw ad report is available. It is grouped directly from Отчёты/Реклама/...
-    ads_truth = outputs.get("ads_category_source", pd.DataFrame()).copy()
-    ads_truth_source_name = "ads_category_source" if ads_truth is not None and not ads_truth.empty else ""
-    if ads_truth is None or ads_truth.empty:
-        ads_truth = outputs.get("ads_raw_source", pd.DataFrame()).copy()
-        ads_truth_source_name = "ads_raw_source" if ads_truth is not None and not ads_truth.empty else ""
-    if ads_truth is None or ads_truth.empty:
-        ads_truth = outputs.get("ads_daily_source", pd.DataFrame()).copy()
-        ads_truth_source_name = "ads_daily_source" if ads_truth is not None and not ads_truth.empty else ""
-    if ads_truth is None:
-        ads_truth = pd.DataFrame()
+    # Advertising truth source. Use the same freshest-source selector as Telegram.
+    # This prevents stale ads_category_source through 26.05 from hiding a fresh raw WB ad file through 28.05.
+    try:
+        ads_truth, ads_truth_source_name = _tg_prepare_ads_truth(outputs)
+    except Exception as exc:
+        log(f"PDF WARN: fresh ads truth selector failed, fallback to direct outputs: {exc}")
+        ads_truth = outputs.get("ads_category_source", pd.DataFrame()).copy()
+        ads_truth_source_name = "ads_category_source" if ads_truth is not None and not ads_truth.empty else ""
+        if ads_truth is None or ads_truth.empty:
+            ads_truth = outputs.get("ads_raw_source", pd.DataFrame()).copy()
+            ads_truth_source_name = "ads_raw_source" if ads_truth is not None and not ads_truth.empty else ""
+        if ads_truth is None or ads_truth.empty:
+            ads_truth = outputs.get("ads_daily_source", pd.DataFrame()).copy()
+            ads_truth_source_name = "ads_daily_source" if ads_truth is not None and not ads_truth.empty else ""
+        if ads_truth is None:
+            ads_truth = pd.DataFrame()
     if not ads_truth.empty:
         if "day" in ads_truth.columns:
             ads_truth["day"] = pd.to_datetime(ads_truth["day"], errors="coerce").dt.normalize()
@@ -7073,6 +7099,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             has = bool(row.get("has_abc" if current else "has_abc_prev", False))
             suffix = "" if current else "_prev"
             if metric in ["Сумма", "ВП ABC", "Рентабельность", "Расход РК", "ДРР", "Комиссия, %", "Эквайринг, %"]:
+                ad_src = str(row.get("ad_spend_source" + suffix, row.get("ad_spend_source", "")))
+                if metric in ["Расход РК", "ДРР"] and ad_src and ad_src != "article_day_fact":
+                    return "ads reports", f"Отчёты/Реклама → {ad_src}", "spend / order_sum", False, "расход рекламы взят из свежего рекламного отчета, не из article_day_fact"
                 if has:
                     col_map = {
                         "Сумма": "gross_revenue / revenue_abc",
@@ -7508,49 +7537,143 @@ def _tg_prepare_daily(outputs: Dict[str, Any]) -> pd.DataFrame:
 
 
 def _tg_prepare_ads_truth(outputs: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
-    source_name = ""
-    ads = pd.DataFrame()
-    for nm in ["ads_category_source", "ads_raw_source", "ads_daily_source"]:
-        cand = outputs.get(nm, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-        if isinstance(cand, pd.DataFrame) and not cand.empty:
-            ads = cand.copy()
-            source_name = nm
-            break
-    if ads.empty:
-        return pd.DataFrame(), ""
-    if "subject" not in ads.columns:
-        if "subject_disp" in ads.columns:
-            rev = {"Кисти": "Кисти косметические", "Карандаши": "Косметические карандаши", "Помады": "Помады", "Блески": "Блески"}
-            ads["subject"] = ads["subject_disp"].map(lambda x: rev.get(normalize_text(x), normalize_text(x)))
-        else:
-            ads["subject"] = ""
-    for col in ["product", "supplier_article", "nm_id"]:
-        if col not in ads.columns:
-            ads[col] = "" if col != "nm_id" else np.nan
-    rejects: List[Dict[str, Any]] = []
-    ads = _filter_df_by_pdf_product_reference(ads, f"telegram_{source_name}", rejects)
-    if ads.empty:
-        return pd.DataFrame(), source_name
-    ads["day"] = pd.to_datetime(ads.get("day"), errors="coerce").dt.normalize()
-    ads["subject_disp"] = ads.get("subject", "").map(_tg_subject_disp)
-    ads = ads[ads["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
-    # Normalize names from different ad-report sheets.
-    rename_candidates = {
-        "ad_spend_total": "spend",
-        "ad_clicks_total": "clicks",
-        "ad_impressions_total": "impressions",
-        "shows": "impressions",
-        "views": "impressions",
-    }
-    for old, new in rename_candidates.items():
-        if new not in ads.columns and old in ads.columns:
-            ads[new] = ads[old]
-    for col in ["spend", "clicks", "impressions"]:
-        if col not in ads.columns:
-            ads[col] = 0.0
-        ads[col] = pd.to_numeric(ads[col], errors="coerce").fillna(0.0)
-    return ads, source_name
+    """Pick the freshest advertising truth source for Telegram/PDF day totals.
 
+    FIX25: raw WB advertising files already contain a reliable subject column
+    ("Название предмета" -> subject). Do NOT require product/reference enrichment for
+    daily Telegram/category totals: product reference filtering must not drop raw ad rows even
+    when the subject/date/spend are valid. We filter raw ads by subject directly and only
+    try reference enrichment when a candidate has no usable subject at all.
+    """
+    if not isinstance(outputs, dict):
+        return pd.DataFrame(), ""
+
+    TARGET_DISP = ["Кисти", "Карандаши", "Помады", "Блески"]
+
+    def _ensure_numeric(ads: pd.DataFrame) -> pd.DataFrame:
+        rename_candidates = {
+            "ad_spend_total": "spend",
+            "ad_clicks_total": "clicks",
+            "ad_impressions_total": "impressions",
+            "shows": "impressions",
+            "views": "impressions",
+        }
+        for old, new in rename_candidates.items():
+            if new not in ads.columns and old in ads.columns:
+                ads[new] = ads[old]
+        for col in ["spend", "clicks", "impressions"]:
+            if col not in ads.columns:
+                ads[col] = 0.0
+            ads[col] = pd.to_numeric(ads[col], errors="coerce").fillna(0.0)
+        return ads
+
+    def _apply_subject_disp(ads: pd.DataFrame) -> pd.DataFrame:
+        if "subject_disp" in ads.columns:
+            ads["subject_disp"] = ads["subject_disp"].map(_tg_subject_disp)
+        elif "subject" in ads.columns:
+            ads["subject_disp"] = ads["subject"].map(_tg_subject_disp)
+        else:
+            ads["subject_disp"] = ""
+        return ads
+
+    def _normalize_ads_candidate(cand: pd.DataFrame, source_name: str) -> pd.DataFrame:
+        ads = cand.copy()
+        if ads.empty:
+            return pd.DataFrame()
+
+        ads["day"] = pd.to_datetime(ads.get("day"), errors="coerce").dt.normalize()
+        ads = ads[ads["day"].notna()].copy()
+        if ads.empty:
+            return pd.DataFrame()
+
+        ads = _ensure_numeric(ads)
+        ads = _apply_subject_disp(ads)
+
+        # Primary path: raw/category ads already have a subject. Use it directly.
+        by_subject = ads[ads["subject_disp"].isin(TARGET_DISP)].copy()
+
+        # Fallback only when subject is absent/unusable: enrich by nm_id/product reference.
+        if by_subject.empty:
+            try:
+                enriched = ads.copy()
+                if "subject" not in enriched.columns:
+                    enriched["subject"] = ""
+                for col in ["product", "supplier_article", "nm_id"]:
+                    if col not in enriched.columns:
+                        enriched[col] = "" if col != "nm_id" else np.nan
+                rejects: List[Dict[str, Any]] = []
+                enriched = _filter_df_by_pdf_product_reference(enriched, f"telegram_{source_name}", rejects)
+                if enriched is not None and not enriched.empty:
+                    enriched = _ensure_numeric(enriched)
+                    enriched = _apply_subject_disp(enriched)
+                    by_subject = enriched[enriched["subject_disp"].isin(TARGET_DISP)].copy()
+            except Exception as exc:
+                log(f"telegram_ads_truth WARN: subject fallback enrichment failed for {source_name}: {exc}")
+
+        if by_subject.empty:
+            try:
+                mx0 = pd.to_datetime(ads["day"], errors="coerce").dropna().max()
+                raw_subjects = sorted(set(map(str, ads.get("subject", pd.Series(dtype=str)).dropna().astype(str).head(20))))
+                log(f"telegram_ads_truth_candidate_rejected: {source_name}; max_day={mx0.date() if pd.notna(mx0) else '-'}; rows={len(ads):,}; subjects_sample={raw_subjects[:8]}")
+            except Exception:
+                pass
+            return pd.DataFrame()
+
+        # Keep fields useful for PDF/category, product and article fallback joins.
+        if "subject" not in by_subject.columns:
+            by_subject["subject"] = by_subject["subject_disp"].map({
+                "Кисти": "Кисти косметические",
+                "Карандаши": "Косметические карандаши",
+                "Помады": "Помады",
+                "Блески": "Блески",
+            })
+        for col in ["product", "supplier_article", "nm_id"]:
+            if col not in by_subject.columns:
+                by_subject[col] = "" if col != "nm_id" else np.nan
+
+        return by_subject
+
+    # Tie priority: when sources are equally fresh, category source is safer for category totals.
+    priority = {"ads_category_source": 3, "ads_raw_source": 2, "ads_daily_source": 1}
+    best_df = pd.DataFrame()
+    best_name = ""
+    best_day = pd.NaT
+    best_priority = -1
+
+    for nm in ["ads_category_source", "ads_raw_source", "ads_daily_source"]:
+        cand = outputs.get(nm, pd.DataFrame())
+        if not isinstance(cand, pd.DataFrame) or cand.empty:
+            continue
+        prepared = _normalize_ads_candidate(cand, nm)
+        if prepared.empty:
+            continue
+        mx = pd.to_datetime(prepared["day"], errors="coerce").dropna().max()
+        pr = priority.get(nm, 0)
+        if pd.isna(mx):
+            continue
+        if (best_name == "") or (mx > best_day) or (mx == best_day and pr > best_priority):
+            best_df = prepared
+            best_name = nm
+            best_day = mx
+            best_priority = pr
+
+    if best_name and not best_df.empty:
+        try:
+            mn = pd.to_datetime(best_df["day"], errors="coerce").dropna().min()
+            mx = pd.to_datetime(best_df["day"], errors="coerce").dropna().max()
+            spend_total = pd.to_numeric(best_df.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+            by_day = (
+                best_df.assign(_day=pd.to_datetime(best_df["day"], errors="coerce").dt.strftime("%Y-%m-%d"))
+                .groupby("_day")["spend"].sum().tail(5).to_dict()
+            )
+            log(
+                f"telegram_ads_truth: selected {best_name}; "
+                f"dates={mn.date() if pd.notna(mn) else '-'}..{mx.date() if pd.notna(mx) else '-'}; "
+                f"rows={len(best_df):,}; spend={spend_total:.2f}; by_day_tail={by_day}"
+            )
+        except Exception:
+            pass
+    return best_df, best_name
 
 def _tg_prepare_unique_demand(outputs: Dict[str, Any]) -> pd.DataFrame:
     df = outputs.get("search_unique_demand", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
@@ -7687,6 +7810,7 @@ def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
             return "—"
 
     if cur.get("ads_missing"):
+        log(f"telegram_ads_truth_missing: report_day={latest.date()}; selected_source={ads_source or '-'}; last_ads_day={_max_day(ads)}; ads_rows={len(ads) if isinstance(ads, pd.DataFrame) else 0}")
         ads_line = f"📣 Расход РК: нет данных за {label} (последняя дата РК: {_max_day(ads)})"
         drr_line = "📊 ДРР: нет данных"
     else:
