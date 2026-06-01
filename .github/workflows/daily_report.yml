@@ -1,229 +1,207 @@
-name: Daily TOPFACE report
+name: TOPFACE daily report
 
 on:
+  schedule:
+    # Понедельник 13:50 МСК / 10:50 UTC: полный пересчет закрытой недели.
+    - cron: "50 10 * * 1"
+    # Вторник-суббота 13:50 МСК / 10:50 UTC: быстрый текущий блок.
+    - cron: "50 10 * * 2-6"
+    # Воскресенье 13:50 МСК / 10:50 UTC: быстрый текущий блок.
+    - cron: "50 10 * * 0"
   workflow_dispatch:
     inputs:
       mode:
-        description: "smoke / current_week / pdf_only / full_refresh"
+        description: "Режим отчета"
         required: true
-        default: "pdf_only"
+        default: "auto"
         type: choice
         options:
-          - smoke
+          - auto
+          - full_refresh
           - current_week
           - pdf_only
-          - full_refresh
+          - smoke_test
       send_telegram:
-        description: "Send generated PDF to Telegram"
-        required: true
+        description: "Отправить PDF в Telegram"
+        required: false
         default: true
         type: boolean
-      as_of_date:
-        description: "Дата отчёта YYYY-MM-DD. Для full_refresh пусто = последнее воскресенье по МСК"
+      report_as_of_date:
+        description: "Принудительная дата отчета YYYY-MM-DD. Пусто = авто"
         required: false
         default: ""
-        type: string
-  schedule:
-    # Tue-Sun 13:50 MSK = 10:50 UTC: обновляем только блок текущей недели.
-    - cron: "50 10 * * 2-6"
-    - cron: "50 10 * * 0"
-    # Monday 13:50 MSK = 10:50 UTC: полный пересчёт закрытой прошлой недели после ABC.
-    - cron: "50 10 * * 1"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: wb-report-topface
-  cancel-in-progress: false
+      require_data_date:
+        description: "Дата, которая обязана быть в данных YYYY-MM-DD. Пусто = как report_as_of_date/авто"
+        required: false
+        default: ""
+      require_abc_period:
+        description: "Требовать точный ABC за закрытую неделю"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  build-report:
+  report:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
-
+    timeout-minutes: 45
     env:
-      PYTHONUNBUFFERED: "1"
-      PYTHONIOENCODING: "utf-8"
-      TZ: Europe/Moscow
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-
-      # Полный режим: ограничиваем самые тяжелые недельные источники.
-      WB_MAX_SEARCH_QUERY_FILES: "4"
-      WB_MAX_ENTRY_POINT_FILES: "4"
-      WB_MAX_STOCK_FILES: "5"
-
-      # PDF policy: спрос WB только через уникальные запросы, без задваивающего fallback.
-      PDF_FAIL_ON_MISSING_DEMAND: "0"
-      PDF_ALLOW_DEMAND_FALLBACK: "0"
-
-      # Детализация: товар детализируется от 10% ВП категории, внутри товара показываются все артикулы.
-      PDF_PRODUCT_DETAIL_MIN_GP_SHARE: "10"
-      PDF_FORCE_DETAIL_PRODUCTS: "901,614,617,618,154,155,156,157,158"
-      PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
-
-      PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
-      PDF_TRACE_SAMPLE_PRODUCT: "901"
-      PDF_TRACE_SAMPLE_ARTICLE: "901/2"
+      AWS_DEFAULT_REGION: ru-central1
+      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install system packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y fonts-dejavu-core
+          python-version: "3.13"
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          pip install requests boto3 openpyxl pandas numpy reportlab
+          python -m pip install pandas numpy openpyxl boto3 requests reportlab
 
-      - name: Compile check
+      - name: Load REPORT_ENV fallback
         shell: bash
         run: |
           set -euo pipefail
-          test -f report_runner.py || { echo "ERROR: report_runner.py is missing"; exit 1; }
-          python -m py_compile report_runner.py
-          echo "Compile OK"
+          python - <<'PY'
+          import os
+          from pathlib import Path
 
-      - name: Decide mode
-        id: mode
+          raw = os.environ.get("REPORT_ENV", "") or ""
+          if not raw.strip():
+              print("REPORT_ENV is empty; using direct GitHub secrets only")
+              raise SystemExit(0)
+
+          normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+          if "\n" not in normalized and "\\n" in normalized:
+              normalized = normalized.replace("\\n", "\n")
+
+          out = Path(os.environ["GITHUB_ENV"])
+          loaded = []
+          with out.open("a", encoding="utf-8") as fh:
+              for line in normalized.splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  if line.startswith("export "):
+                      line = line[len("export "):].strip()
+                  if "=" not in line:
+                      continue
+                  key, value = line.split("=", 1)
+                  key = key.strip().lstrip("\ufeff")
+                  value = value.strip().strip('"').strip("'")
+                  if not key:
+                      continue
+                  if (os.environ.get(key) or "").strip():
+                      continue
+                  fh.write(f"{key}={value}\n")
+                  loaded.append(key)
+          print("REPORT_ENV loaded keys:", loaded)
+          PY
+
+      - name: Decide report mode and dates
         shell: bash
-        env:
-          INPUT_MODE: ${{ github.event.inputs.mode }}
-          INPUT_SEND_TELEGRAM: ${{ github.event.inputs.send_telegram }}
-          INPUT_AS_OF_DATE: ${{ github.event.inputs.as_of_date }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            MODE="${INPUT_MODE:-pdf_only}"
-            SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
-          elif [ "${{ github.event.schedule }}" = "50 10 * * 1" ]; then
-            MODE="full_refresh"
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
             SEND_TELEGRAM="true"
+            if [ "${{ github.event.schedule }}" = "50 10 * * 1" ]; then
+              MODE="full_refresh"
+            else
+              MODE="current_week"
+            fi
           else
-            MODE="current_week"
-            SEND_TELEGRAM="true"
+            MODE="${{ github.event.inputs.mode || 'auto' }}"
+            SEND_TELEGRAM="${{ github.event.inputs.send_telegram || 'true' }}"
+            if [ "$MODE" = "auto" ]; then
+              # Ручной auto повторяет календарную логику schedule.
+              DOW="$(TZ=Europe/Moscow date +%u)"
+              if [ "$DOW" = "1" ]; then
+                MODE="full_refresh"
+              else
+                MODE="current_week"
+              fi
+            fi
           fi
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "send_telegram=$SEND_TELEGRAM" >> "$GITHUB_OUTPUT"
-          echo "as_of_date=${INPUT_AS_OF_DATE:-}" >> "$GITHUB_OUTPUT"
-          echo "Selected mode: $MODE"
-          echo "Send Telegram: $SEND_TELEGRAM"
-          echo "Manual as_of_date: ${INPUT_AS_OF_DATE:-}"
 
-      - name: Run smoke test
-        if: steps.mode.outputs.mode == 'smoke'
-        shell: bash
-        run: python report_runner.py --root . --smoke-test
+          INPUT_AS_OF="${{ github.event.inputs.report_as_of_date || '' }}"
+          INPUT_REQUIRE="${{ github.event.inputs.require_data_date || '' }}"
+          INPUT_REQUIRE_ABC="${{ github.event.inputs.require_abc_period || 'false' }}"
 
-      - name: Load REPORT_ENV
-        if: steps.mode.outputs.mode != 'smoke'
-        shell: bash
-        env:
-          REPORT_ENV: ${{ secrets.REPORT_ENV }}
-        run: |
-          set -euo pipefail
-          test -n "${REPORT_ENV:-}" || { echo "ERROR: secret REPORT_ENV is empty or missing"; exit 1; }
-          umask 077
-          printf '%s\n' "$REPORT_ENV" > .env
-          set -a
-          source ./.env
-          set +a
-          test -n "${YC_ACCESS_KEY_ID:-}" || { echo "ERROR: YC_ACCESS_KEY_ID is missing in REPORT_ENV"; exit 1; }
-          test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
-          test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
-
-      - name: Run current week update
-        if: steps.mode.outputs.mode == 'current_week'
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -a
-          source ./.env
-          set +a
-          TG_FLAG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
-          python report_runner.py --root . --current-week-only $TG_FLAG
-
-      - name: Run PDF only
-        if: steps.mode.outputs.mode == 'pdf_only'
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -a
-          source ./.env
-          set +a
-          TG_FLAG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
-          python report_runner.py --root . --pdf-only $TG_FLAG
-
-      - name: Run full refresh
-        if: steps.mode.outputs.mode == 'full_refresh'
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -a
-          source ./.env
-          set +a
-          TG_FLAG=""
-          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then TG_FLAG="--send-telegram"; fi
-
-          # Понедельничный полный отчёт: берём последнюю закрытую неделю.
-          # Пример: запуск 2026-06-01 => REPORT_AS_OF_DATE=2026-05-31 => неделя 25.05-31.05.
-          INPUT_AS_OF_DATE="${{ steps.mode.outputs.as_of_date }}"
-          if [ -n "${INPUT_AS_OF_DATE:-}" ]; then
-            REPORT_AS_OF_DATE="$INPUT_AS_OF_DATE"
-          else
+          if [ -n "$INPUT_AS_OF" ]; then
+            REPORT_AS_OF_DATE="$INPUT_AS_OF"
+          elif [ "$MODE" = "full_refresh" ]; then
             REPORT_AS_OF_DATE="$(TZ=Europe/Moscow date -d 'last sunday' +%F)"
+          else
+            REPORT_AS_OF_DATE="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
           fi
 
-          REPORT_REQUIRE_DATA_DATE="$REPORT_AS_OF_DATE"
-          REPORT_CLOSED_WEEK_AS_PREVIOUS="1"
+          if [ -n "$INPUT_REQUIRE" ]; then
+            REPORT_REQUIRE_DATA_DATE="$INPUT_REQUIRE"
+          else
+            REPORT_REQUIRE_DATA_DATE="$REPORT_AS_OF_DATE"
+          fi
 
-          export REPORT_AS_OF_DATE
-          export REPORT_REQUIRE_DATA_DATE
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS
+          if [ "$MODE" = "full_refresh" ]; then
+            REPORT_CLOSED_WEEK_AS_PREVIOUS="1"
+            REPORT_REQUIRE_ABC_PERIOD="1"
+          else
+            REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
+            REPORT_REQUIRE_ABC_PERIOD="0"
+          fi
 
+          if [ "$INPUT_REQUIRE_ABC" = "true" ]; then
+            REPORT_REQUIRE_ABC_PERIOD="1"
+          fi
+
+          {
+            echo "MODE=$MODE"
+            echo "SEND_TELEGRAM=$SEND_TELEGRAM"
+            echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
+            echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
+            echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
+            echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
+          } >> "$GITHUB_ENV"
+
+          echo "MODE=$MODE"
+          echo "SEND_TELEGRAM=$SEND_TELEGRAM"
           echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
           echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
           echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
+          echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
 
-          python report_runner.py --root . --full-refresh $TG_FLAG
-
-      - name: Show generated files
-        if: always()
+      - name: Run report
         shell: bash
         run: |
           set -euo pipefail
-          find "Отчёты" -maxdepth 5 -type f -print 2>/dev/null || true
 
-      - name: Upload report artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: topface-report-output
-          path: |
-            Отчёты/**/*.xlsx
-            Отчёты/**/*.pdf
-            Отчёты/**/*.json
-            Отчёты/**/*.txt
-          if-no-files-found: warn
-          retention-days: 30
+          TG_FLAG=""
+          if [ "${SEND_TELEGRAM}" = "true" ]; then
+            TG_FLAG="--send-telegram"
+          fi
+
+          if [ "$MODE" = "smoke_test" ]; then
+            python report_runner.py --root . --smoke-test
+          elif [ "$MODE" = "full_refresh" ]; then
+            python report_runner.py --root . --full-refresh $TG_FLAG
+          elif [ "$MODE" = "current_week" ]; then
+            python report_runner.py --root . --current-week-only $TG_FLAG
+          elif [ "$MODE" = "pdf_only" ]; then
+            python report_runner.py --root . --pdf-only $TG_FLAG
+          else
+            echo "Unknown MODE=$MODE"
+            exit 1
+          fi
