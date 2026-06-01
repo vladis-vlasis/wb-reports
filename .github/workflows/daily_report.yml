@@ -1,8 +1,3 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX25_ADS_RAW_UNENRICHED_1800_20260601
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
 WB TOPFACE analytics report.
 
 Main goals:
