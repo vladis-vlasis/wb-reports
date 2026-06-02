@@ -22,13 +22,18 @@ on:
           - "true"
           - "false"
       report_as_of_date:
-        description: "YYYY-MM-DD только для ручного full_refresh. Пусто = последняя закрытая неделя"
+        description: "YYYY-MM-DD только для ручного full_refresh. Пусто = последнее закрытое воскресенье"
+        required: false
+        default: ""
+        type: string
+      require_data_date:
+        description: "YYYY-MM-DD только для ручного full_refresh. Пусто = report_as_of_date"
         required: false
         default: ""
         type: string
 
   schedule:
-    - cron: "50 10 * * *"   # каждый день 13:50 МСК
+    - cron: "50 10 * * *"   # 13:50 МСК каждый день
 
 permissions:
   contents: read
@@ -51,8 +56,6 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
 
-      # Если эти secrets есть отдельно — они будут использованы.
-      # Если их нет отдельно — они будут взяты из secrets.REPORT_ENV через .env.
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
@@ -62,12 +65,10 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
-      # Ограничения для скорости чтения тяжёлых источников.
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
       WB_MAX_STOCK_FILES: "5"
 
-      # Настройки PDF-отчёта.
       PDF_FAIL_ON_MISSING_DEMAND: "0"
       PDF_ALLOW_DEMAND_FALLBACK: "0"
       PDF_PRODUCT_DETAIL_MIN_GP_SHARE: "10"
@@ -138,29 +139,26 @@ jobs:
           : > .env
 
           if [ -n "${REPORT_ENV:-}" ]; then
-            printf '%s\n' "$REPORT_ENV" > .env
+            printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' > .env
             echo "REPORT_ENV written to .env"
           else
             echo "REPORT_ENV is empty; will use separate GitHub secrets if they exist"
           fi
 
       - name: Decide mode and dates
+        id: decide
         shell: bash
         env:
           INPUT_MODE: ${{ github.event.inputs.mode }}
           INPUT_SEND_TELEGRAM: ${{ github.event.inputs.send_telegram }}
           INPUT_REPORT_AS_OF_DATE: ${{ github.event.inputs.report_as_of_date }}
+          INPUT_REQUIRE_DATA_DATE: ${{ github.event.inputs.require_data_date }}
         run: |
           set -euo pipefail
 
           if [ "${{ github.event_name }}" = "schedule" ]; then
             SEND_TELEGRAM="true"
-            MSK_DOW="$(python - <<'PY'
-from datetime import datetime
-from zoneinfo import ZoneInfo
-print(datetime.now(ZoneInfo('Europe/Moscow')).isoweekday())
-PY
-)"
+            MSK_DOW="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo("Europe/Moscow")).isoweekday())')"
 
             if [ "$MSK_DOW" = "1" ]; then
               MODE="full_refresh"
@@ -172,12 +170,7 @@ PY
             SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
 
             if [ "$MODE" = "auto" ]; then
-              MSK_DOW="$(python - <<'PY'
-from datetime import datetime
-from zoneinfo import ZoneInfo
-print(datetime.now(ZoneInfo('Europe/Moscow')).isoweekday())
-PY
-)"
+              MSK_DOW="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo("Europe/Moscow")).isoweekday())')"
 
               if [ "$MSK_DOW" = "1" ]; then
                 MODE="full_refresh"
@@ -191,22 +184,21 @@ PY
             if [ -n "${INPUT_REPORT_AS_OF_DATE:-}" ]; then
               AS_OF_DATE="$INPUT_REPORT_AS_OF_DATE"
             else
-              AS_OF_DATE="$(python - <<'PY'
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-today = datetime.now(ZoneInfo('Europe/Moscow')).date()
-last_sunday = today - timedelta(days=today.isoweekday())
-print(last_sunday.isoformat())
-PY
-)"
+              AS_OF_DATE="$(python -c 'from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; today = datetime.now(ZoneInfo("Europe/Moscow")).date(); print((today - timedelta(days=today.isoweekday())).isoformat())')"
+            fi
+
+            if [ -n "${INPUT_REQUIRE_DATA_DATE:-}" ]; then
+              REQUIRE_DATE="$INPUT_REQUIRE_DATA_DATE"
+            else
+              REQUIRE_DATE="$AS_OF_DATE"
             fi
 
             REPORT_CLOSED_WEEK_AS_PREVIOUS="1"
             REPORT_REQUIRE_ABC_PERIOD="1"
             REPORT_AUTO_COMPLETE_DATE="0"
             REPORT_AS_OF_DATE="$AS_OF_DATE"
-            REPORT_REQUIRE_DATA_DATE="$AS_OF_DATE"
-            REPORT_REQUIRE_ADS_DATE="$AS_OF_DATE"
+            REPORT_REQUIRE_DATA_DATE="$REQUIRE_DATE"
+            REPORT_REQUIRE_ADS_DATE="$REQUIRE_DATE"
             WB_DAILY_TARGET_DATE="$AS_OF_DATE"
           elif [ "$MODE" = "current_week" ]; then
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
@@ -242,6 +234,11 @@ PY
             echo "WB_DAILY_TARGET_DATE=$WB_DAILY_TARGET_DATE"
           } >> "$GITHUB_ENV"
 
+          {
+            echo "mode=$MODE"
+            echo "send_telegram=$SEND_TELEGRAM"
+          } >> "$GITHUB_OUTPUT"
+
           echo "MODE=$MODE"
           echo "SEND_TELEGRAM=$SEND_TELEGRAM"
           echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
@@ -250,7 +247,7 @@ PY
           echo "REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
 
       - name: Validate storage env
-        if: env.MODE != 'smoke'
+        if: steps.decide.outputs.mode != 'smoke'
         shell: bash
         run: |
           set -euo pipefail
@@ -268,14 +265,14 @@ PY
           echo "YC_ENDPOINT_URL=${YC_ENDPOINT_URL:-default}"
 
       - name: Smoke test
-        if: env.MODE == 'smoke'
+        if: steps.decide.outputs.mode == 'smoke'
         shell: bash
         run: |
           set -euo pipefail
           python "$REPORT_SCRIPT" --root . --smoke-test
 
       - name: Preflight before full refresh
-        if: env.MODE == 'full_refresh'
+        if: steps.decide.outputs.mode == 'full_refresh'
         shell: bash
         run: |
           set -euo pipefail
@@ -293,7 +290,7 @@ PY
           python "$REPORT_SCRIPT" --root . --store TOPFACE --preflight-date-check
 
       - name: Run full refresh report
-        if: env.MODE == 'full_refresh'
+        if: steps.decide.outputs.mode == 'full_refresh'
         shell: bash
         run: |
           set -euo pipefail
@@ -304,14 +301,14 @@ PY
 
           ARGS="--root . --full-refresh --store TOPFACE"
 
-          if [ "${SEND_TELEGRAM}" = "true" ]; then
+          if [ "$SEND_TELEGRAM" = "true" ]; then
             ARGS="$ARGS --send-telegram"
           fi
 
           python "$REPORT_SCRIPT" $ARGS
 
       - name: Run current week report
-        if: env.MODE == 'current_week'
+        if: steps.decide.outputs.mode == 'current_week'
         shell: bash
         run: |
           set -euo pipefail
@@ -322,7 +319,7 @@ PY
 
           ARGS="--root . --current-week-only --store TOPFACE"
 
-          if [ "${SEND_TELEGRAM}" = "true" ]; then
+          if [ "$SEND_TELEGRAM" = "true" ]; then
             ARGS="$ARGS --send-telegram"
           fi
 
