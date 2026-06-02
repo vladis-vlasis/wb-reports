@@ -1,4 +1,5 @@
 # VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
+# CALC_REPAIR: 2026-06-02 nmId canonical article + May closed month + orders-rub card
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -1642,8 +1643,41 @@ class AnalyticsBuilder:
         d = d[~d["supplier_article"].map(is_excluded_article)]
         d = d[d["product"].map(is_valid_product_code)]
         d = d[d.apply(lambda r: is_approved_product_subject(r.get("product"), r.get("subject")), axis=1)]
-        d = d.drop_duplicates(["supplier_article", "nm_id"])
-        log(f"dictionary: rows={len(d):,}, articles={d['supplier_article'].nunique():,}, nm_ids={d['nm_id'].nunique(dropna=True):,}")
+
+        # FIX 2026-06-02: one WB nmId must have one canonical seller article across ALL sources.
+        # WB files can disagree on article spelling: e.g. the same nmId is seen as
+        # 901/20 in Orders and as 901_/20 in ads/economics/ABC. If we keep both labels,
+        # sales and GP fall into 901/20 while ad spend/economics fall into 901_/20,
+        # producing impossible rows with 0 ₽ ads and 100% margin.
+        # Prefer the clean business label without underscore; tie-break by source priority.
+        source_priority = {
+            "orders": 0, "funnel": 1, "abc_weekly": 2, "abc_monthly": 3,
+            "ads_raw": 4, "search_queries": 5, "entry_points": 6,
+            "stock": 7, "economics": 8,
+        }
+        d["_source_priority"] = d["source"].map(source_priority).fillna(99).astype(int)
+        d["_has_underscore"] = d["supplier_article"].astype(str).str.contains("_", regex=False).astype(int)
+        d["_is_pt"] = d["supplier_article"].astype(str).str.upper().str.startswith("PT").astype(int)
+        d["_article_len"] = d["supplier_article"].astype(str).str.len()
+
+        with_nm = d[d["nm_id"].notna()].copy()
+        without_nm = d[d["nm_id"].isna()].copy()
+        if not with_nm.empty:
+            with_nm = with_nm.sort_values(
+                ["nm_id", "_has_underscore", "_is_pt", "_source_priority", "_article_len", "supplier_article"],
+                ascending=[True, True, True, True, True, True],
+                na_position="last",
+            ).drop_duplicates("nm_id", keep="first")
+        if not without_nm.empty:
+            without_nm = without_nm.sort_values(
+                ["supplier_article", "_has_underscore", "_is_pt", "_source_priority", "_article_len"],
+                ascending=[True, True, True, True, True],
+                na_position="last",
+            ).drop_duplicates(["supplier_article", "subject", "product"], keep="first")
+
+        d = pd.concat([with_nm, without_nm], ignore_index=True, sort=False)
+        d = d.drop(columns=["_source_priority", "_has_underscore", "_is_pt", "_article_len"], errors="ignore")
+        log(f"dictionary: rows={len(d):,}, articles={d['supplier_article'].nunique():,}, nm_ids={d['nm_id'].nunique(dropna=True):,}; canonicalized by nmId")
         return d
 
     def enrich(self, df: pd.DataFrame, source: str = "") -> pd.DataFrame:
@@ -1693,15 +1727,19 @@ class AnalyticsBuilder:
         # or duplicated in rare pandas states.
         subject_raw = _series(out, "subject").map(canonical_subject)
         subject_dict = _series(out, "subject_dict").map(canonical_subject)
-        subject_clean = subject_raw.where(subject_raw.ne(""), subject_dict)
+        # Prefer dictionary values by nmId. This keeps category/product stable when
+        # different source files use different seller-article spellings for the same nmId.
+        subject_clean = subject_dict.where(subject_dict.ne(""), subject_raw)
 
         article_raw = _series(out, "supplier_article").map(clean_article)
         article_dict = _series(out, "supplier_article_dict").map(clean_article)
-        article_clean = article_raw.where(article_raw.ne(""), article_dict)
+        # Main FIX: canonical seller article comes from nmId dictionary when available.
+        # Raw article is used only when nmId is absent from the dictionary.
+        article_clean = article_dict.where(article_dict.ne(""), article_raw)
 
         product_raw = _series(out, "product").map(lambda v: normalize_text(v).upper().replace(" ", ""))
         product_dict = _series(out, "product_dict").map(lambda v: normalize_text(v).upper().replace(" ", ""))
-        product_clean = product_raw.where(product_raw.ne(""), product_dict)
+        product_clean = product_dict.where(product_dict.ne(""), product_raw)
         product_clean = product_clean.where(product_clean.ne(""), article_clean.map(product_code))
         product_clean = product_clean.map(lambda v: normalize_text(v).upper().replace(" ", ""))
         ref_subject = product_clean.map(approved_subject_for_product)
@@ -5938,7 +5976,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         prev_end = cur_start - pd.Timedelta(days=1)
         prev2_start = cur_start - pd.Timedelta(days=14)
         prev2_end = cur_start - pd.Timedelta(days=8)
-    closed_end = cur_start.replace(day=1) - pd.Timedelta(days=1)
+    # Last closed month. In a Monday full-refresh for a week that ended on the last day
+    # of the month (example: report anchor 2026-05-31, run date 2026-06-02),
+    # the closed month is that just-finished month, not April.
+    latest_month_last_day = calendar.monthrange(int(latest.year), int(latest.month))[1]
+    if int(latest.day) == latest_month_last_day:
+        closed_end = pd.Timestamp(latest).normalize()
+    else:
+        closed_end = cur_start.replace(day=1) - pd.Timedelta(days=1)
     closed_start = closed_end.replace(day=1)
     closed_prev_end = closed_start - pd.Timedelta(days=1)
     closed_prev_start = closed_prev_end.replace(day=1)
@@ -7278,7 +7323,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _section_bar(640, "Блок 1. Экономика и продажи")
         cards1 = [
             (_fmt_money(row.get("sum_use")), "Сумма", _delta_abs(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
-            (_fmt_num(row.get("orders")), "Заказы", _delta(row.get("orders"), row.get("orders_prev")), "Заказы", ""),
+            (_fmt_money(row.get("order_sum")), "Заказы за неделю", _delta_abs(row.get("order_sum"), row.get("order_sum_prev")), "Заказы за неделю", ""),
             (_fmt_money(row.get("gp_use")), "ВП ABC", _delta_abs(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
             (_fmt_pct(row.get("margin")), "Рентабельность", _delta(row.get("margin"), row.get("margin_prev")), "Рент.", ""),
             (_fmt_pct(row.get("drr")), "ДРР", _delta(row.get("drr"), row.get("drr_prev")), "ДРР", ""),
@@ -8680,8 +8725,10 @@ def main() -> None:
     pack = loader.load_all()
     builder = AnalyticsBuilder(pack)
     outputs = builder.build_all()
-    outputs["abc_weekly"] = builder.pack.abc_weekly
-    outputs["abc_monthly"] = builder.pack.abc_monthly
+    # Store ABC in the same canonical nmId/article contour as daily rows.
+    # Otherwise PDF exact ABC joins can split one WB article into 901/20 and 901_/20.
+    outputs["abc_weekly"] = builder.enrich(builder.pack.abc_weekly, "abc_weekly")
+    outputs["abc_monthly"] = builder.enrich(builder.pack.abc_monthly, "abc_monthly")
     factor_outputs = build_factor_outputs(builder, outputs)
     outputs.update(factor_outputs)
     _require_report_data_available(outputs, "full_refresh")
