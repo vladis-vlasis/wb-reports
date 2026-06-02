@@ -1,4 +1,4 @@
-# VERSION: PDF_ONLY_NO_TG_CLOSED_WEEK_ABC_PREFLIGHT_20260601
+# VERSION: PDF_ONLY_NO_TG_CLOSED_WEEK_PREFLIGHT_STABLE_CONTOUR_20260602
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -5508,6 +5508,35 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         out["acquiring_pct_prev"] = np.where(out["has_abc_prev"], pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", np.nan), errors="coerce"), out["acquiring_pct_prev"])
         for _c in ["commission_pct", "commission_pct_prev", "acquiring_pct", "acquiring_pct_prev"]:
             out[_c] = pd.to_numeric(out[_c], errors="coerce").fillna(0.0)
+
+        # STABLE REPORT CONTOUR (2026-06-02): ABC must NOT replace operational sales/ad spend.
+        # The bad 31.05 report used exact ABC as the source for the whole financial contour:
+        # revenue, ad spend, DRR, commission/acquiring. That made page totals disagree with the
+        # daily operational rows and with the 30.05 report. Default is now operational contour:
+        #   - Сумма = WB orders/order_sum;
+        #   - Расход РК and ДРР = WB ads/raw spend;
+        #   - ABC is used only for ВП when the exact period exists.
+        # If the old full-ABC behaviour is ever needed for diagnostics, set
+        # PDF_USE_ABC_FULL_FINANCIAL_CONTOUR=1 explicitly.
+        if not _env_flag("PDF_USE_ABC_FULL_FINANCIAL_CONTOUR", False):
+            out["sum_use"] = out["order_sum"]
+            out["sum_prev_use"] = out["order_sum_prev"]
+            out["gp_use"] = np.where(out["has_abc"], abc_gp, out["gp_model"])
+            out["gp_prev_use"] = np.where(out["has_abc_prev"], abc_gp_prev, out["gp_model_prev"])
+            out["drr"] = np.where(out["sum_use"].abs() > 1e-9, out["ad_spend"] / out["sum_use"] * 100, 0.0)
+            out["drr_prev"] = np.where(out["sum_prev_use"].abs() > 1e-9, out["ad_spend_prev"] / out["sum_prev_use"] * 100, 0.0)
+            out["margin"] = np.where(out["sum_use"].abs() > 1e-9, out["gp_use"] / out["sum_use"] * 100, 0.0)
+            out["margin_prev"] = np.where(out["sum_prev_use"].abs() > 1e-9, out["gp_prev_use"] / out["sum_prev_use"] * 100, 0.0)
+            out["cpc"] = np.where(out["clicks"] > 0, out["ad_spend"] / out["clicks"], np.nan)
+            out["cpc_prev"] = np.where(out["clicks_prev"] > 0, out["ad_spend_prev"] / out["clicks_prev"], np.nan)
+            # Leave unit economics/commission/acquiring from operational model unless explicitly using full ABC contour.
+            out["commission_pct"] = out["commission_pct_model"]
+            out["commission_pct_prev"] = out["commission_pct_model_prev"]
+            out["acquiring_pct"] = out["acquiring_pct_model"]
+            out["acquiring_pct_prev"] = out["acquiring_pct_model_prev"]
+            out["financial_contour"] = "operational_orders_ads__abc_gp_only"
+        else:
+            out["financial_contour"] = "abc_full_contour"
         return out
 
     cur_cat = _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"])
@@ -5860,52 +5889,63 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["gp_use"]), _delta_abs(t["gp_use"], t["gp_prev_use"]), "ВП"), (_fmt_pct(t["margin"]), _delta(t["margin"], t["margin_prev"]), "Рент."), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), (_fmt_rub1(t["cpc"]), _delta(t["cpc"], t["cpc_prev"]), "CPC"), (_fmt_num(t["demand"]), _delta(t["demand"], t["demand_prev"]), "Спрос"), (_fmt_pct(t["search_share"]), _delta(t["search_share"], t["search_share_prev"]), "% поиска")]})
         _draw_table(75, 315, W-150, ["Категория", "Сумма", "ВП", "Рент.", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [190,170,160,125,170,115,100,170,140], rows, row_h=68, font_size=14)
     def _current_week_overview():
-        _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / оперативный обзор без детализации", "Текущая неделя", key="cur_overview", top_menu=True)
-        total = cur_cat.copy()
-        total_sum = total["sum_use"].sum(); total_prev = total["sum_prev_use"].sum()
-        total_ad = total["ad_spend"].sum(); total_ad_prev = total["ad_spend_prev"].sum()
-        drr = total_ad/total_sum*100 if total_sum else 0; drr_prev = total_ad_prev/total_prev*100 if total_prev else 0
-        demand = total["demand"].sum(); demand_prev = total["demand_prev"].sum()
-        opens_total = total["opens"].sum() if "opens" in total.columns else 0
-        opens_prev_total = total["opens_prev"].sum() if "opens_prev" in total.columns else 0
-        search_share = opens_total / demand * 100 if demand else np.nan
-        search_prev = opens_prev_total / demand_prev * 100 if demand_prev else np.nan
+        # Operational overview, same approach as the more accurate 30.05 report:
+        # top cards show the last closed day; the table shows the whole calendar week by days.
+        _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / верхние карточки = последний закрытый день {cur_actual_end:%d.%m}; таблица = дни недели", "Текущая неделя", key="cur_overview", top_menu=True)
+
+        last_cur = _agg_daily(cur_actual_end, cur_actual_end, ["subject_disp"])
+        last_prev = _agg_daily(cur_actual_end - pd.Timedelta(days=7), cur_actual_end - pd.Timedelta(days=7), ["subject_disp"])
+
+        def _sum_col(df, col):
+            if df is None or df.empty or col not in df.columns:
+                return 0.0
+            return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+
+        osum = _sum_col(last_cur, "order_sum"); psum = _sum_col(last_prev, "order_sum")
+        gp = _sum_col(last_cur, "gp_model"); pgp = _sum_col(last_prev, "gp_model")
+        ad = _sum_col(last_cur, "ad_spend"); pad = _sum_col(last_prev, "ad_spend")
+        ddemand = _sum_col(last_cur, "demand"); pdemand = _sum_col(last_prev, "demand")
+        opens = _sum_col(last_cur, "opens"); opens_prev = _sum_col(last_prev, "opens")
+        drr = ad / osum * 100 if osum else 0.0
+        pdrr = pad / psum * 100 if psum else 0.0
         cards = [
-            (_fmt_money(total_sum), "Сумма заказов", _delta_abs(total_sum,total_prev), "Сумма", ""),
-            (_fmt_money(total_ad), "Расход РК", _delta_abs(total_ad,total_ad_prev), "Расход РК", ""),
-            (_fmt_pct(drr), "ДРР", _delta(drr,drr_prev), "ДРР", ""),
-            (_fmt_num(demand), "Спрос WB", _delta(demand,demand_prev), "Спрос", ""),
-            (_fmt_pct(search_share), "% поискового трафика", _delta(search_share,search_prev), "% поиска", ""),
+            (_fmt_money(osum), "Сумма заказов", _delta_abs(osum, psum), "Сумма", ""),
+            (_fmt_money(gp), "Валовая прибыль", _delta_abs(gp, pgp), "ВП", ""),
+            (_fmt_money(ad), "Расход РК", _delta_abs(ad, pad), "Расход РК", ""),
+            (_fmt_pct(drr), "ДРР", _delta(drr, pdrr), "ДРР", ""),
+            (_fmt_num(ddemand), "Спрос WB", _delta(ddemand, pdemand), "Спрос", ""),
         ]
         for i, card in enumerate(cards):
-            _metric_card(75+i*295, 590, 270, 105, *card)
-        # Daily overview by day, not deep category navigation.
+            _metric_card(75 + i * 295, 590, 270, 105, *card)
+
         dates = pd.date_range(cur_start, cur_end)
         rows=[]
         for dt in dates:
             cur = _agg_daily(dt, dt, ["subject_disp"])
-            prev = _agg_daily(dt-pd.Timedelta(days=7), dt-pd.Timedelta(days=7), ["subject_disp"])
-            osum = cur["order_sum"].sum() if not cur.empty else 0; psum = prev["order_sum"].sum() if not prev.empty else 0
-            ad = cur["ad_spend"].sum() if not cur.empty else 0; pad = prev["ad_spend"].sum() if not prev.empty else 0
-            ddemand = cur["demand"].sum() if not cur.empty else 0; pdemand = prev["demand"].sum() if not prev.empty else 0
-            opens = cur["opens"].sum() if not cur.empty else 0; opens_prev = prev["opens"].sum() if not prev.empty else 0
-            ss = opens/ddemand*100 if ddemand else np.nan
-            pss = opens_prev/pdemand*100 if pdemand else np.nan
-            d = ad/osum*100 if osum else 0; pdrr = pad/psum*100 if psum else 0
-            # Будущие/пустые дни не показываем как падение на 100%.
+            prev = _agg_daily(dt - pd.Timedelta(days=7), dt - pd.Timedelta(days=7), ["subject_disp"])
+            osum = _sum_col(cur, "order_sum"); psum = _sum_col(prev, "order_sum")
+            gp = _sum_col(cur, "gp_model"); pgp = _sum_col(prev, "gp_model")
+            ad = _sum_col(cur, "ad_spend"); pad = _sum_col(prev, "ad_spend")
+            ddemand = _sum_col(cur, "demand"); pdemand = _sum_col(prev, "demand")
+            opens = _sum_col(cur, "opens"); opens_prev = _sum_col(prev, "opens")
+            ss = opens / ddemand * 100 if ddemand else np.nan
+            pss = opens_prev / pdemand * 100 if pdemand else np.nan
+            d = ad / osum * 100 if osum else 0.0
+            pdrr = pad / psum * 100 if psum else 0.0
             if dt > cur_actual_end or (abs(osum) < 1e-9 and abs(ad) < 1e-9 and abs(ddemand) < 1e-9):
-                rows.append({"cells": [dt.strftime("%a %d.%m"), "—", "—", "—", "—", "—"]})
+                rows.append({"cells": [dt.strftime("%a %d.%m"), "—", "—", "—", "—", "—", "—"]})
             else:
                 rows.append({"cells": [
                     dt.strftime("%a %d.%m"),
                     (_fmt_money(osum), _delta_abs(osum, psum), "Сумма"),
+                    (_fmt_money(gp), _delta_abs(gp, pgp), "ВП"),
                     (_fmt_money(ad), _delta_abs(ad, pad), "Расход РК"),
                     (_fmt_pct(d), _delta(d, pdrr), "ДРР"),
                     (_fmt_num(ddemand), _delta(ddemand, pdemand), "Спрос"),
                     (_fmt_pct(ss), _delta(ss, pss), "% поиска"),
                 ]})
-        widths=[180,250,230,180,250,230]
-        _draw_table(120, 170, W-240, ["День", "Сумма заказов", "Расход РК", "ДРР", "Спрос WB", "% поиска"], widths, rows, row_h=48, font_size=13)
+        widths=[165,220,210,210,155,220,200]
+        _draw_table(80, 145, W-160, ["День", "Сумма заказов", "ВП", "Расход РК", "ДРР", "Спрос WB", "% поиска"], widths, rows, row_h=48, font_size=12)
 
     def _current_week_categories():
         _summary_category_page("cur_categories", "Текущая неделя: категории", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор", "Текущая неделя", cur_cat, target_contour=None)
