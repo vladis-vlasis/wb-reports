@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX25_WEEKLY_FULL_DAILY_LIGHT_20260602
+# VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -385,20 +385,77 @@ def parse_abc_source_timestamp(name: Any) -> pd.Timestamp:
 
 
 def dedupe_abc_period_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep latest Torgstat ABC export for identical period + SKU rows."""
+    """Keep one valid Torgstat ABC export per analytical period and SKU.
+
+    Important business rule:
+    S3 may contain several ABC files for the same month, for example:
+    01.05-25.05, 01.05-26.05, ..., 01.05-31.05.
+    These files are cumulative MTD exports and must NOT be summed together.
+    For a month we keep only the latest period_end per SKU/month.
+    For the same exact period we keep the latest re-export by __at_ timestamp.
+    Daily ABC files remain daily facts; weekly ABC files remain weekly facts.
+    """
     if df is None or df.empty:
         return df
     out = df.copy()
-    for col in ["period_start", "period_end", "nm_id", "supplier_article", "subject", "product"]:
+
+    for col in ["period_start", "period_end", "nm_id", "supplier_article", "subject", "product", "source_file"]:
         if col not in out.columns:
-            out[col] = "" if col not in {"period_start", "period_end"} else pd.NaT
+            if col in {"period_start", "period_end"}:
+                out[col] = pd.NaT
+            elif col == "nm_id":
+                out[col] = np.nan
+            else:
+                out[col] = ""
+
+    out["period_start"] = pd.to_datetime(out["period_start"], errors="coerce").dt.normalize()
+    out["period_end"] = pd.to_datetime(out["period_end"], errors="coerce").dt.normalize()
+    out = out[out["period_start"].notna() & out["period_end"].notna()].copy()
+    if out.empty:
+        return out.drop(columns=[c for c in ["_abc_source_ts", "_abc_period_days", "_abc_is_month_family"] if c in out.columns], errors="ignore")
+
+    out["supplier_article"] = out["supplier_article"].map(clean_article)
+    out["subject"] = out["subject"].map(canonical_subject)
+    out["product"] = out["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+    out["nm_id"] = num_series(out["nm_id"])
+    out["month_key"] = out["period_start"].dt.strftime("%Y-%m")
     out["_abc_source_ts"] = out.get("source_file", "").map(parse_abc_source_timestamp)
-    out = out.sort_values(["period_start", "period_end", "supplier_article", "nm_id", "_abc_source_ts", "source_file"], na_position="first")
-    before = len(out)
-    out = out.drop_duplicates(["period_start", "period_end", "supplier_article", "nm_id", "subject", "product"], keep="last")
-    out = out.drop(columns=["_abc_source_ts"], errors="ignore")
-    if before != len(out):
-        log(f"abc_dedupe: rows {before:,} -> {len(out):,}; kept latest __at_ export for duplicate periods")
+    out["_abc_period_days"] = (out["period_end"] - out["period_start"]).dt.days + 1
+    out["_abc_is_month_family"] = (
+        out["period_start"].dt.day.eq(1)
+        & out["period_start"].dt.year.eq(out["period_end"].dt.year)
+        & out["period_start"].dt.month.eq(out["period_end"].dt.month)
+    )
+
+    # 1) Exact same period + SKU can be re-exported several times. Keep latest export only.
+    exact_key = ["period_start", "period_end", "supplier_article", "nm_id", "subject", "product"]
+    out = out.sort_values(exact_key + ["_abc_source_ts", "source_file"], na_position="first")
+    before_exact = len(out)
+    out = out.drop_duplicates(exact_key, keep="last").copy()
+
+    # 2) Monthly / MTD files are cumulative. Keep only the latest period_end per month + SKU.
+    month_key_cols = ["month_key", "supplier_article", "nm_id", "subject", "product"]
+    month_part = out[out["_abc_is_month_family"]].copy()
+    other_part = out[~out["_abc_is_month_family"]].copy()
+    before_month = len(month_part)
+    if not month_part.empty:
+        month_part = month_part.sort_values(
+            month_key_cols + ["period_end", "_abc_source_ts", "source_file"],
+            na_position="first",
+        )
+        month_part = month_part.drop_duplicates(month_key_cols, keep="last").copy()
+
+    out = pd.concat([other_part, month_part], ignore_index=True) if not month_part.empty else other_part
+
+    removed_exact = before_exact - (len(other_part) + before_month)
+    removed_month = before_month - len(month_part)
+    if removed_exact or removed_month:
+        log(
+            "abc_dedupe: removed exact_duplicates=%s, cumulative_month_duplicates=%s; "
+            "monthly MTD files are not summed" % (removed_exact, removed_month)
+        )
+
+    out = out.drop(columns=["_abc_source_ts", "_abc_period_days", "_abc_is_month_family"], errors="ignore")
     return out
 
 
@@ -1231,15 +1288,27 @@ class Loader:
                 self.diag.add("ERROR", "ads_category", f"Не прочитан категорийный лист рекламы {key}", exc)
         out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if not out.empty:
-            out = out.groupby(["day", "subject"], dropna=False, as_index=False).agg(
+            # First sum rows only inside the same physical source. Then if the same day/category
+            # exists in several files (weekly file + consolidated "Анализ рекламы.xlsx"), do NOT
+            # sum the files together; keep the latest/most authoritative source.
+            out["_source_priority"] = out["source_file"].map(lambda s: 3 if "Анализ рекламы.xlsx" in str(s) else 2)
+            out["_source_ts"] = out["source_file"].map(parse_abc_source_timestamp)
+            src_group = out.groupby(["source_file", "source_sheet", "day", "subject"], dropna=False, as_index=False).agg(
                 spend=("spend", "sum"),
                 clicks=("clicks", "sum"),
                 impressions=("impressions", "sum"),
                 orders=("orders", "sum"),
                 order_sum=("order_sum", "sum"),
-                source_file=("source_file", lambda s: "; ".join(sorted(set(map(str, s)))[:3])),
-                source_sheet=("source_sheet", lambda s: "; ".join(sorted(set(map(str, s)))[:3])),
+                _source_priority=("_source_priority", "max"),
+                _source_ts=("_source_ts", "max"),
             )
+            before_ads_cat = len(src_group)
+            src_group = src_group.sort_values(["day", "subject", "_source_priority", "_source_ts", "source_file"], na_position="first")
+            out = src_group.drop_duplicates(["day", "subject"], keep="last").copy()
+            removed_ads_cat = before_ads_cat - len(out)
+            if removed_ads_cat:
+                log(f"ads_category: removed duplicated day/category rows from overlapping files: {removed_ads_cat:,}")
+            out = out.drop(columns=["_source_priority", "_source_ts"], errors="ignore")
         self._log("ads_category", out, "day")
         return out
 
@@ -1517,12 +1586,13 @@ class Loader:
                 if pd.notna(mx):
                     candidates.append(pd.Timestamp(mx).normalize())
         latest_day = max(candidates) if candidates else preliminary_latest_day
-        if self.current_week_only:
-            abc_weekly, abc_monthly = pd.DataFrame(), pd.DataFrame()
-        else:
-            abc_weekly, abc_monthly = self.load_abc(latest_day.year)
-            if not abc_weekly.empty:
-                latest_day = max(latest_day, pd.to_datetime(abc_weekly["period_end"], errors="coerce").max())
+        # ABC is needed even in current_week mode: daily ВП comes from daily ABC,
+        # and the comparison base is the average daily ВП of the last closed month.
+        abc_weekly, abc_monthly = self.load_abc(latest_day.year)
+        if not abc_weekly.empty:
+            _mx_abc_weekly = pd.to_datetime(abc_weekly["period_end"], errors="coerce").max()
+            if pd.notna(_mx_abc_weekly) and not self.current_week_only:
+                latest_day = max(latest_day, _mx_abc_weekly)
         return DataPack(
             orders=orders, funnel=funnel, ads_daily=ads_daily, ads_raw=ads_raw, ads_category=ads_category, campaigns=campaigns,
             search_queries=search_queries, entry_points=entry_points, stock=stock, abc_weekly=abc_weekly,
@@ -5824,6 +5894,29 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     if latest != latest_before_override:
         log(f"REPORT_AS_OF_DATE override: latest_day {latest_before_override.date()} -> {latest.date()}")
     latest = pd.Timestamp(latest).normalize()
+    # In daily/current-week mode do not jump to a new day until the full contour exists.
+    # Example: orders/funnel for 01.06 are present, but advertising is only up to 31.05.
+    # Then the operational report must stay on 31.05 instead of showing "нет данных РК".
+    if _env_date("REPORT_AS_OF_DATE") is None:
+        _complete_limits = []
+        try:
+            _ads_days = _active_days_from_source(ads_truth, ["spend", "clicks", "impressions"]) if isinstance(ads_truth, pd.DataFrame) else pd.Series(dtype="datetime64[ns]")
+            if not _ads_days.empty:
+                _complete_limits.append(pd.Timestamp(_ads_days.max()).normalize())
+        except Exception:
+            pass
+        try:
+            _demand_src = outputs.get("search_unique_demand", pd.DataFrame())
+            _demand_days = _active_days_from_source(_demand_src, ["unique_search_frequency", "frequency", "search_frequency"]) if isinstance(_demand_src, pd.DataFrame) else pd.Series(dtype="datetime64[ns]")
+            if not _demand_days.empty:
+                _complete_limits.append(pd.Timestamp(_demand_days.max()).normalize())
+        except Exception:
+            pass
+        if _complete_limits:
+            _complete_latest = min([latest] + _complete_limits)
+            if _complete_latest < latest:
+                log(f"complete-day guard: latest_day {latest.date()} -> {_complete_latest.date()} because ads/demand are not complete")
+                latest = _complete_latest
     cur_start = latest - pd.Timedelta(days=int(latest.weekday()))
     cur_end = cur_start + pd.Timedelta(days=6)
     cur_actual_end = latest
@@ -6766,10 +6859,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             return _delta_abs(cur_v, prev_v) if money else _delta(cur_v, prev_v)
 
         # Yesterday gross profit comes from real daily Torgstat ABC.
-        # Plan dynamics = yesterday fact - (monthly GP plan / days in month).
-        gp_plan_month = _num(os.getenv("WB_MONTH_GP_PLAN", "1800000"), 1_800_000.0)
-        days_in_cur_month = calendar.monthrange(int(latest.year), int(latest.month))[1]
-        gp_plan_day = gp_plan_month / days_in_cur_month if days_in_cur_month else 0.0
+        # Comparison base = average daily gross profit of the last closed month from ABC.
+        closed_month_abc = _abc_exact(closed_start, closed_end, ["subject_disp"])
+        closed_month_gp = _num(closed_month_abc["gp_abc"].sum()) if closed_month_abc is not None and not closed_month_abc.empty else 0.0
+        closed_month_days = max(1, int((pd.Timestamp(closed_end).normalize() - pd.Timestamp(closed_start).normalize()).days) + 1)
+        gp_plan_day = closed_month_gp / closed_month_days if closed_month_gp else 0.0
+        gp_plan_caption = f"ср.день закр.мес {_fmt_money(gp_plan_day)}" if gp_plan_day else "ср.день закр.мес —"
         yday_abc = _abc_periods_inside(yday, yday, ["day", "subject_disp"])
         yday_gp = _num(yday_abc["gp_abc"].sum()) if yday_abc is not None and not yday_abc.empty else 0.0
         prev_abc = _abc_periods_inside(prev_day, prev_day, ["day", "subject_disp"])
@@ -6780,7 +6875,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         demand_sub = "нет данных" if cur_day.get("demand_missing") else ""
         cards = [
             (_fmt_money(cur_day.get("order_sum")), "Сумма заказов", _delta_abs(cur_day.get("order_sum"), prev_day_sum.get("order_sum")), "Сумма", ""),
-            (_fmt_money(yday_gp), "Валовая прибыль", yday_plan_delta, "ВП", f"план/день {_fmt_money(gp_plan_day)}"),
+            (_fmt_money(yday_gp), "Валовая прибыль", yday_plan_delta, "ВП", gp_plan_caption),
             (_known_money(cur_day.get("ad_spend")), "Расход РК", _known_delta(cur_day.get("ad_spend"), prev_day_sum.get("ad_spend"), money=True), "Расход РК", ads_sub),
             (_known_pct(cur_day.get("drr")), "ДРР", _known_delta(cur_day.get("drr"), prev_day_sum.get("drr"), money=False), "ДРР", ads_sub),
             (_known_num(cur_day.get("demand")), "Спрос WB", _known_delta(cur_day.get("demand"), prev_day_sum.get("demand"), money=False), "Спрос", demand_sub),
@@ -8125,9 +8220,29 @@ def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
     if meaningful.empty:
         return "TOPFACE: дневная сводка не сформирована — нет фактических строк за последний день."
     latest = pd.to_datetime(meaningful["day"], errors="coerce").dropna().max().normalize()
-    prev_day = latest - pd.Timedelta(days=1)
     ads, ads_source = _tg_prepare_ads_truth(outputs)
     demand_df = _tg_prepare_unique_demand(outputs)
+    complete_limits = []
+    try:
+        if isinstance(ads, pd.DataFrame) and not ads.empty and "day" in ads.columns:
+            mx_ads = pd.to_datetime(ads["day"], errors="coerce").dropna().max()
+            if pd.notna(mx_ads):
+                complete_limits.append(pd.Timestamp(mx_ads).normalize())
+    except Exception:
+        pass
+    try:
+        if isinstance(demand_df, pd.DataFrame) and not demand_df.empty and "day" in demand_df.columns:
+            mx_demand = pd.to_datetime(demand_df["day"], errors="coerce").dropna().max()
+            if pd.notna(mx_demand):
+                complete_limits.append(pd.Timestamp(mx_demand).normalize())
+    except Exception:
+        pass
+    if complete_limits:
+        complete_latest = min([latest] + complete_limits)
+        if complete_latest < latest:
+            log(f"telegram complete-day guard: latest_day {latest.date()} -> {complete_latest.date()} because ads/demand are not complete")
+            latest = complete_latest
+    prev_day = latest - pd.Timedelta(days=1)
     cur = _tg_sum_period(daily, ads, demand_df, latest, latest)
     prev = _tg_sum_period(daily, ads, demand_df, prev_day, prev_day)
     cur_gp = _tg_daily_abc_gross_profit(outputs, latest)
