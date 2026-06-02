@@ -1,156 +1,146 @@
-name: TOPFACE daily report
+# VERSION: DAILY_REPORT_TOPFACE_1350_CLOSED_WEEK_PRIORITY_20260602
+name: Daily TOPFACE report
 
 on:
-  schedule:
-    # Понедельник 13:50 МСК / 10:50 UTC: полный пересчет закрытой недели.
-    - cron: "50 10 * * 1"
-    # Вторник-суббота 13:50 МСК / 10:50 UTC: быстрый текущий блок.
-    - cron: "50 10 * * 2-6"
-    # Воскресенье 13:50 МСК / 10:50 UTC: быстрый текущий блок.
-    - cron: "50 10 * * 0"
   workflow_dispatch:
     inputs:
       mode:
-        description: "Режим отчета"
+        description: "smoke / current_week / full_refresh; full_refresh = прошлую закрытую неделю"
         required: true
-        default: "auto"
+        default: "full_refresh"
         type: choice
         options:
-          - auto
-          - full_refresh
+          - smoke
           - current_week
-          - pdf_only
-          - smoke_test
+          - full_refresh
       send_telegram:
-        description: "Отправить PDF в Telegram"
-        required: false
+        description: "Send generated PDF to Telegram"
+        required: true
         default: true
         type: boolean
       report_as_of_date:
-        description: "Принудительная дата отчета YYYY-MM-DD. Пусто = авто"
+        description: "YYYY-MM-DD; пусто = авто: для full_refresh последняя полностью закрытая неделя, для current_week вчера"
         required: false
         default: ""
+        type: string
       require_data_date:
-        description: "Дата, которая обязана быть в данных YYYY-MM-DD. Пусто = как report_as_of_date/авто"
+        description: "YYYY-MM-DD; пусто = как report_as_of_date"
         required: false
         default: ""
-      require_abc_period:
-        description: "Требовать точный ABC за закрытую неделю"
-        required: false
-        default: false
-        type: boolean
+        type: string
+  schedule:
+    # Ежедневно 13:50 МСК = 10:50 UTC.
+    - cron: "50 10 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wb-report-topface-daily
+  cancel-in-progress: false
 
 jobs:
-  report:
+  build-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
+
     env:
-      REPORT_ENV: ${{ secrets.REPORT_ENV }}
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      AWS_DEFAULT_REGION: ru-central1
       PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+      REPORT_SCRIPT: "report_runner.py"
+      WB_KEEP_ONLY_MONDAY_REPORTS: "1"
+      WB_MONTH_GP_PLAN: "1800000"
+
+      # Repository secrets. These have priority over values inside REPORT_ENV.
+      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+      WB_MAX_SEARCH_QUERY_FILES: "4"
+      WB_MAX_ENTRY_POINT_FILES: "4"
+      WB_MAX_STOCK_FILES: "5"
+
+      PDF_FAIL_ON_MISSING_DEMAND: "0"
+      PDF_ALLOW_DEMAND_FALLBACK: "0"
+      PDF_PRODUCT_DETAIL_MIN_GP_SHARE: "10"
+      PDF_FORCE_DETAIL_PRODUCTS: "901,614,617,618,154,155,156,157,158"
+      PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
+      PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
+      PDF_TRACE_SAMPLE_PRODUCT: "901"
+      PDF_TRACE_SAMPLE_ARTICLE: "901/2"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install system packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fonts-dejavu-core
 
       - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install pandas numpy openpyxl boto3 requests reportlab
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install reportlab
 
-      - name: Load REPORT_ENV fallback
+      - name: Validate report script file
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import os
-          from pathlib import Path
+          test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
+          echo "Using report script: $REPORT_SCRIPT"
+          head -5 "$REPORT_SCRIPT"
+          grep -q "# VERSION: ORDERS_ONLY_AND_TG_FIX25_CLOSED_WEEK_PRIORITY_1350_20260602" "$REPORT_SCRIPT" || { echo "ERROR: wrong report script version. Expected ORDERS_ONLY_AND_TG_FIX25_CLOSED_WEEK_PRIORITY_1350_20260602"; exit 1; }
+          if grep -nE "^(umask|set -euo pipefail|name: TOPFACE|on:)" "$REPORT_SCRIPT"; then
+            echo "ERROR: workflow/shell text was pasted into the Python report script"
+            exit 1
+          fi
+          python -m py_compile "$REPORT_SCRIPT"
+          echo "Compile OK"
 
-          raw = os.environ.get("REPORT_ENV", "") or ""
-          if not raw.strip():
-              print("REPORT_ENV is empty; using direct GitHub secrets only")
-              raise SystemExit(0)
-
-          normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
-          if "\n" not in normalized and "\\n" in normalized:
-              normalized = normalized.replace("\\n", "\n")
-
-          out = Path(os.environ["GITHUB_ENV"])
-          loaded = []
-          with out.open("a", encoding="utf-8") as fh:
-              for line in normalized.splitlines():
-                  line = line.strip()
-                  if not line or line.startswith("#"):
-                      continue
-                  if line.startswith("export "):
-                      line = line[len("export "):].strip()
-                  if "=" not in line:
-                      continue
-                  key, value = line.split("=", 1)
-                  key = key.strip().lstrip("\ufeff")
-                  value = value.strip().strip('"').strip("'")
-                  if not key:
-                      continue
-                  if (os.environ.get(key) or "").strip():
-                      continue
-                  fh.write(f"{key}={value}\n")
-                  loaded.append(key)
-          print("REPORT_ENV loaded keys:", loaded)
-          PY
-
-      - name: Decide report mode and dates
+      - name: Decide mode
+        id: mode
         shell: bash
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_SEND_TELEGRAM: ${{ github.event.inputs.send_telegram }}
+          INPUT_AS_OF_DATE: ${{ github.event.inputs.report_as_of_date }}
+          INPUT_REQUIRE_DATA_DATE: ${{ github.event.inputs.require_data_date }}
         run: |
           set -euo pipefail
-
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            SEND_TELEGRAM="true"
-            if [ "${{ github.event.schedule }}" = "50 10 * * 1" ]; then
-              MODE="full_refresh"
-            else
-              MODE="current_week"
-            fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            MODE="${INPUT_MODE:-full_refresh}"
+            SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
           else
-            MODE="${{ github.event.inputs.mode || 'auto' }}"
-            SEND_TELEGRAM="${{ github.event.inputs.send_telegram || 'true' }}"
-            if [ "$MODE" = "auto" ]; then
-              # Ручной auto повторяет календарную логику schedule.
-              DOW="$(TZ=Europe/Moscow date +%u)"
-              if [ "$DOW" = "1" ]; then
-                MODE="full_refresh"
-              else
-                MODE="current_week"
-              fi
-            fi
+            # Приоритет — отчёт за последнюю полностью закрытую неделю.
+            # Не пытаемся брать 01.06 и любой новый день, пока по нему нет полного контура.
+            MODE="full_refresh"
+            SEND_TELEGRAM="true"
           fi
 
-          INPUT_AS_OF="${{ github.event.inputs.report_as_of_date || '' }}"
-          INPUT_REQUIRE="${{ github.event.inputs.require_data_date || '' }}"
-          INPUT_REQUIRE_ABC="${{ github.event.inputs.require_abc_period || 'false' }}"
-
-          if [ -n "$INPUT_AS_OF" ]; then
-            REPORT_AS_OF_DATE="$INPUT_AS_OF"
+          if [ -n "${INPUT_AS_OF_DATE:-}" ]; then
+            REPORT_AS_OF_DATE="$INPUT_AS_OF_DATE"
           elif [ "$MODE" = "full_refresh" ]; then
-            REPORT_AS_OF_DATE="$(TZ=Europe/Moscow date -d 'last sunday' +%F)"
+            # Последнее полностью закрытое воскресенье по МСК:
+            # Пн -> вчера, Вт-Сб -> воскресенье этой прошедшей недели, Вс -> предыдущее воскресенье.
+            REPORT_AS_OF_DATE="$(python -c 'from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; today = datetime.now(ZoneInfo("Europe/Moscow")).date(); print((today - timedelta(days=today.weekday() + 1)).isoformat())')"
           else
             REPORT_AS_OF_DATE="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
           fi
 
-          if [ -n "$INPUT_REQUIRE" ]; then
-            REPORT_REQUIRE_DATA_DATE="$INPUT_REQUIRE"
+          if [ -n "${INPUT_REQUIRE_DATA_DATE:-}" ]; then
+            REPORT_REQUIRE_DATA_DATE="$INPUT_REQUIRE_DATA_DATE"
           else
             REPORT_REQUIRE_DATA_DATE="$REPORT_AS_OF_DATE"
           fi
@@ -162,56 +152,230 @@ jobs:
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
             REPORT_REQUIRE_ABC_PERIOD="0"
           fi
+          REPORT_REQUIRE_ADS_DATE="$REPORT_REQUIRE_DATA_DATE"
+          WB_DAILY_TARGET_DATE="$REPORT_AS_OF_DATE"
 
-          if [ "$INPUT_REQUIRE_ABC" = "true" ]; then
-            REPORT_REQUIRE_ABC_PERIOD="1"
-          fi
-
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "send_telegram=$SEND_TELEGRAM" >> "$GITHUB_OUTPUT"
           {
-            echo "MODE=$MODE"
-            echo "SEND_TELEGRAM=$SEND_TELEGRAM"
             echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
             echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
+            echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
             echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
             echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
+            echo "WB_DAILY_TARGET_DATE=$WB_DAILY_TARGET_DATE"
           } >> "$GITHUB_ENV"
-
-          echo "MODE=$MODE"
-          echo "SEND_TELEGRAM=$SEND_TELEGRAM"
+          echo "Selected mode: $MODE"
+          echo "Closed-week priority: scheduled run ignores incomplete current-week days"
+          echo "Send Telegram: $SEND_TELEGRAM"
           echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
           echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
-          echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
-          echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
+          echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
+
+      - name: Run smoke test
+        if: steps.mode.outputs.mode == 'smoke'
+        shell: bash
+        run: python "$REPORT_SCRIPT" --root . --smoke-test
+
+      - name: Load REPORT_ENV
+        if: steps.mode.outputs.mode != 'smoke'
+        shell: bash
+        env:
+          REPORT_ENV: ${{ secrets.REPORT_ENV }}
+        run: |
+          set -euo pipefail
+          test -n "${REPORT_ENV:-}" || { echo "ERROR: secret REPORT_ENV is empty or missing"; exit 1; }
+          umask 077
+          printf '%s\n' "$REPORT_ENV" > .env
+          set -a
+          source ./.env
+          set +a
+          test -n "${YC_ACCESS_KEY_ID:-}" || { echo "ERROR: YC_ACCESS_KEY_ID is missing in REPORT_ENV"; exit 1; }
+          test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing in REPORT_ENV"; exit 1; }
+          test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
       - name: Preflight real data date check
-        if: env.MODE == 'full_refresh' || env.MODE == 'current_week'
+        if: steps.mode.outputs.mode == 'current_week' || steps.mode.outputs.mode == 'full_refresh'
         shell: bash
         run: |
           set -euo pipefail
+          set -a
+          source ./.env
+          set +a
           echo "Preflight before long report run"
-          echo "MODE=$MODE"
+          echo "MODE=${{ steps.mode.outputs.mode }}"
           echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
-          python report_runner.py --root . --preflight-date-check
+          echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
+          python "$REPORT_SCRIPT" --root . --preflight-date-check
 
-      - name: Run report
+      - name: Prepare and validate Telegram settings
+        if: ${{ steps.mode.outputs.mode != 'smoke' && steps.mode.outputs.send_telegram == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
 
-          TG_FLAG=""
-          if [ "${SEND_TELEGRAM}" = "true" ]; then
-            TG_FLAG="--send-telegram"
+          clean_token() {
+            local raw="$1"
+            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
+            raw="${raw%\"}"; raw="${raw#\"}"
+            raw="${raw%\'}"; raw="${raw#\'}"
+            if [[ "$raw" == TELEGRAM_BOT_TOKEN=* ]]; then raw="${raw#TELEGRAM_BOT_TOKEN=}"; fi
+            if [[ "$raw" == telegram_bot_token=* ]]; then raw="${raw#telegram_bot_token=}"; fi
+            if [[ "$raw" =~ ^https?://api\.telegram\.org/bot([^/]+) ]]; then raw="${BASH_REMATCH[1]}"; fi
+            raw="${raw%%/getUpdates*}"
+            raw="${raw%%/sendDocument*}"
+            if [[ "$raw" == bot* ]]; then raw="${raw#bot}"; fi
+            printf '%s' "$raw"
+          }
+
+          clean_chat() {
+            local raw="$1"
+            raw="$(printf '%s' "$raw" | tr -d '\r\n\t ')"
+            raw="${raw%\"}"; raw="${raw#\"}"
+            raw="${raw%\'}"; raw="${raw#\'}"
+            if [[ "$raw" == TELEGRAM_CHAT_ID=* ]]; then raw="${raw#TELEGRAM_CHAT_ID=}"; fi
+            if [[ "$raw" == telegram_chat_id=* ]]; then raw="${raw#telegram_chat_id=}"; fi
+            printf '%s' "$raw"
+          }
+
+          SECRET_TG_TOKEN="${TELEGRAM_BOT_TOKEN_SECRET:-}"
+          SECRET_TG_CHAT="${TELEGRAM_CHAT_ID_SECRET:-}"
+          SECRET_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}"
+
+          ENV_TG_TOKEN=""
+          ENV_TG_CHAT=""
+          ENV_TG_THREAD=""
+          if [ -f ./.env ]; then
+            set -a
+            source ./.env
+            set +a
+            ENV_TG_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+            ENV_TG_CHAT="${TELEGRAM_CHAT_ID:-}"
+            ENV_TG_THREAD="${TELEGRAM_MESSAGE_THREAD_ID:-}"
           fi
 
-          if [ "$MODE" = "smoke_test" ]; then
-            python report_runner.py --root . --smoke-test
-          elif [ "$MODE" = "full_refresh" ]; then
-            python report_runner.py --root . --full-refresh $TG_FLAG
-          elif [ "$MODE" = "current_week" ]; then
-            python report_runner.py --root . --current-week-only $TG_FLAG
-          elif [ "$MODE" = "pdf_only" ]; then
-            python report_runner.py --root . --pdf-only $TG_FLAG
-          else
-            echo "Unknown MODE=$MODE"
+          TG_TOKEN="$SECRET_TG_TOKEN"
+          TG_CHAT="$SECRET_TG_CHAT"
+          TG_THREAD="$SECRET_TG_THREAD"
+          if [ -z "$TG_TOKEN" ]; then TG_TOKEN="$ENV_TG_TOKEN"; fi
+          if [ -z "$TG_CHAT" ]; then TG_CHAT="$ENV_TG_CHAT"; fi
+          if [ -z "$TG_THREAD" ]; then TG_THREAD="$ENV_TG_THREAD"; fi
+
+          TG_TOKEN="$(clean_token "$TG_TOKEN")"
+          TG_CHAT="$(clean_chat "$TG_CHAT")"
+          TG_THREAD="$(clean_chat "$TG_THREAD")"
+
+          test -n "$TG_TOKEN" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing"; exit 1; }
+          test -n "$TG_CHAT" || { echo "ERROR: TELEGRAM_CHAT_ID is missing"; exit 1; }
+          if ! [[ "$TG_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{30,}$ ]]; then
+            echo "ERROR: TELEGRAM_BOT_TOKEN has invalid format after cleanup. Secret value must be only the token like 123456789:AA..."
             exit 1
           fi
+          if ! [[ "$TG_CHAT" =~ ^-?[0-9]+$ ]]; then
+            echo "ERROR: TELEGRAM_CHAT_ID has invalid format. For your group it must be -1003664843585"
+            exit 1
+          fi
+
+          export TG_TOKEN TG_CHAT TG_THREAD
+          python - <<'PY_WRITE_TG'
+          import os, pathlib, shlex
+          p = pathlib.Path('.telegram.env')
+          with p.open('w', encoding='utf-8') as f:
+              print('TELEGRAM_BOT_TOKEN=' + shlex.quote(os.environ['TG_TOKEN']), file=f)
+              print('TELEGRAM_CHAT_ID=' + shlex.quote(os.environ['TG_CHAT']), file=f)
+              print('TELEGRAM_MESSAGE_THREAD_ID=' + shlex.quote(os.environ.get('TG_THREAD', '')), file=f)
+          p.chmod(0o600)
+          PY_WRITE_TG
+
+          echo "Telegram token prefix: ${TG_TOKEN:0:6}***"
+          echo "Telegram chat id: $TG_CHAT"
+          if [ -n "$TG_THREAD" ]; then echo "Telegram thread id: $TG_THREAD"; fi
+
+          HTTP_CODE="$(curl -sS -w '%{http_code}' -o telegram_getme_response.json "https://api.telegram.org/bot${TG_TOKEN}/getMe" || true)"
+          cat telegram_getme_response.json || true
+          echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Telegram getMe returned HTTP $HTTP_CODE. Check TELEGRAM_BOT_TOKEN."
+            exit 1
+          fi
+          python - <<'PY_CHECK_TG'
+          import json, pathlib, sys
+          data = json.loads(pathlib.Path('telegram_getme_response.json').read_text(encoding='utf-8'))
+          if not data.get('ok'):
+              print('ERROR: Telegram getMe ok=false:', data)
+              sys.exit(1)
+          print('Telegram bot validated:', data.get('result', {}).get('username', 'unknown'))
+          PY_CHECK_TG
+
+          HTTP_CODE="$(curl -sS -G -w '%{http_code}' -o telegram_getchat_response.json "https://api.telegram.org/bot${TG_TOKEN}/getChat" --data-urlencode "chat_id=${TG_CHAT}" || true)"
+          cat telegram_getchat_response.json || true
+          echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Telegram getChat returned HTTP $HTTP_CODE. Check TELEGRAM_CHAT_ID and make sure the bot is added to the group."
+            exit 1
+          fi
+          python - <<'PY_CHECK_CHAT'
+          import json, pathlib, sys
+          data = json.loads(pathlib.Path('telegram_getchat_response.json').read_text(encoding='utf-8'))
+          if not data.get('ok'):
+              print('ERROR: Telegram getChat ok=false:', data)
+              sys.exit(1)
+          chat = data.get('result', {})
+          print('Telegram chat validated:', chat.get('title') or chat.get('username') or chat.get('id'))
+          PY_CHECK_CHAT
+
+      - name: Run current week update
+        if: steps.mode.outputs.mode == 'current_week'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source ./.env
+          set +a
+          SEND_ARG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
+            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
+            set -a
+            source ./.telegram.env
+            set +a
+            SEND_ARG="--send-telegram"
+          fi
+          python "$REPORT_SCRIPT" --root . --current-week-only $SEND_ARG
+
+      - name: Run full refresh
+        if: steps.mode.outputs.mode == 'full_refresh'
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -a
+          source ./.env
+          set +a
+          SEND_ARG=""
+          if [ "${{ steps.mode.outputs.send_telegram }}" = "true" ]; then
+            test -f .telegram.env || { echo "ERROR: .telegram.env not found. Telegram validation step did not run."; exit 1; }
+            set -a
+            source ./.telegram.env
+            set +a
+            SEND_ARG="--send-telegram"
+          fi
+          python "$REPORT_SCRIPT" --root . --full-refresh $SEND_ARG
+
+      - name: Show generated files
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          find "Отчёты" -maxdepth 5 -type f -print 2>/dev/null || true
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: topface-report-output-fix22-20260530
+          path: |
+            Отчёты/**/*.xlsx
+            Отчёты/**/*.pdf
+            Отчёты/**/*.json
+            Отчёты/**/*.txt
+          if-no-files-found: warn
+          retention-days: 30
