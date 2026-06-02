@@ -1,17 +1,16 @@
-# VERSION: DAILY_REPORT_TOPFACE_1350_CLOSED_WEEK_PRIORITY_20260602
-name: Daily TOPFACE report
+# VERSION: DAILY_REPORT_TOPFACE_CLOSED_WEEK_ONLY_UNIQUE_NAMES_20260602
+name: Daily TOPFACE report CLOSED WEEK ONLY 20260602
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "smoke / current_week / full_refresh; full_refresh = прошлую закрытую неделю"
+        description: "smoke / full_refresh; full_refresh = прошлую закрытую неделю 25.05-31.05, current_week отключен"
         required: true
         default: "full_refresh"
         type: choice
         options:
           - smoke
-          - current_week
           - full_refresh
       send_telegram:
         description: "Send generated PDF to Telegram"
@@ -19,7 +18,7 @@ on:
         default: true
         type: boolean
       report_as_of_date:
-        description: "YYYY-MM-DD; пусто = авто: для full_refresh последняя полностью закрытая неделя, для current_week вчера"
+        description: "YYYY-MM-DD; пусто = авто: последнее полностью закрытое воскресенье"
         required: false
         default: ""
         type: string
@@ -47,7 +46,7 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
-      REPORT_SCRIPT: "report_runner.py"
+      REPORT_SCRIPT: "report_runner__CLOSED_WEEK_ONLY_FINAL_20260602.py"
       WB_KEEP_ONLY_MONDAY_REPORTS: "1"
       WB_MONTH_GP_PLAN: "1800000"
 
@@ -122,6 +121,10 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             MODE="${INPUT_MODE:-full_refresh}"
             SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
+            # current_week отключён: при любом ручном запуске, кроме smoke, строим прошлую закрытую неделю.
+            if [ "$MODE" != "smoke" ]; then
+              MODE="full_refresh"
+            fi
           else
             # Приоритет — отчёт за последнюю полностью закрытую неделю.
             # Не пытаемся брать 01.06 и любой новый день, пока по нему нет полного контура.
@@ -195,7 +198,7 @@ jobs:
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing in REPORT_ENV"; exit 1; }
 
       - name: Preflight real data date check
-        if: steps.mode.outputs.mode == 'current_week' || steps.mode.outputs.mode == 'full_refresh'
+        if: steps.mode.outputs.mode == 'full_refresh'
         shell: bash
         run: |
           set -euo pipefail
@@ -371,7 +374,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-report-output-fix22-20260530
+          name: topface-report-output-closed-week-only-20260602
           path: |
             Отчёты/**/*.xlsx
             Отчёты/**/*.pdf
