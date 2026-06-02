@@ -1794,13 +1794,37 @@ class AnalyticsBuilder:
         orders = orders[(orders["day"] >= self.cutoff_90) & (orders["day"] <= self.latest_day)].copy()
         if "order_sum" not in orders.columns:
             orders["order_sum"] = 0.0
+        # Prices and SPP must come from WB Orders, not from ABC revenue allocation.
+        # In WB Orders a row is normally one ordered item, but keep weights for safety.
+        for _c in ["orders", "order_sum", "finished_price", "price_with_disc", "spp"]:
+            if _c not in orders.columns:
+                orders[_c] = np.nan
+            orders[_c] = pd.to_numeric(orders[_c], errors="coerce")
+        orders["orders"] = orders["orders"].fillna(1.0)
+        _w_qty = orders["orders"].where(orders["orders"] > 0, 1.0).fillna(1.0)
+        _w_money = orders["order_sum"].where(orders["order_sum"] > 0, _w_qty).fillna(_w_qty)
+        orders["_price_with_disc_num"] = orders["price_with_disc"].where(orders["price_with_disc"].notna(), np.nan) * _w_qty
+        orders["_price_with_disc_den"] = np.where(orders["price_with_disc"].notna(), _w_qty, 0.0)
+        orders["_finished_price_num"] = orders["finished_price"].where(orders["finished_price"].notna(), np.nan) * _w_qty
+        orders["_finished_price_den"] = np.where(orders["finished_price"].notna(), _w_qty, 0.0)
+        # СПП is a discount percentage; average it by order money when available.
+        orders["_spp_num"] = orders["spp"].where(orders["spp"].notna(), np.nan) * _w_money
+        orders["_spp_den"] = np.where(orders["spp"].notna(), _w_money, 0.0)
         g = orders.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
             orders=("orders", "sum"),
             orders_rows=("orders", "sum"),
             order_sum=("order_sum", "sum"),
-            finished_price=("finished_price", "mean"), price_with_disc=("price_with_disc", "mean"), spp=("spp", "mean"),
+            _price_with_disc_num=("_price_with_disc_num", "sum"),
+            _price_with_disc_den=("_price_with_disc_den", "sum"),
+            _finished_price_num=("_finished_price_num", "sum"),
+            _finished_price_den=("_finished_price_den", "sum"),
+            _spp_num=("_spp_num", "sum"),
+            _spp_den=("_spp_den", "sum"),
         )
-        return g
+        g["price_with_disc"] = np.where(g["_price_with_disc_den"] > 0, g["_price_with_disc_num"] / g["_price_with_disc_den"], np.nan)
+        g["finished_price"] = np.where(g["_finished_price_den"] > 0, g["_finished_price_num"] / g["_finished_price_den"], np.nan)
+        g["spp"] = np.where(g["_spp_den"] > 0, g["_spp_num"] / g["_spp_den"], np.nan)
+        return g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
 
     def funnel_daily(self) -> pd.DataFrame:
         f = self.enrich(self.pack.funnel, "funnel")
@@ -1938,6 +1962,49 @@ class AnalyticsBuilder:
         ]
         out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         return out
+
+    def search_query_gp_position(self, daily: pd.DataFrame) -> pd.DataFrame:
+        """Raw query rows with estimated GP contribution for PDF metric:
+        average position for search queries that generate 80% of gross profit.
+
+        Query files contain query-level orders/positions, but not ABC GP by query.
+        We allocate article-day gross profit to queries proportionally through query orders:
+        query_gp_est = query_orders × (article_day_gross_profit_model / article_day_orders).
+        The metric is used as a ranking/diagnostic signal, not as accounting GP.
+        """
+        q = self.enrich(self.pack.search_queries, "search_queries")
+        if q.empty or daily is None or daily.empty:
+            return pd.DataFrame()
+        q = q[(q["day"] >= self.cutoff_90) & (q["day"] <= self.latest_day)].copy()
+        if q.empty:
+            return pd.DataFrame()
+        base_cols = ["day", "subject", "product", "supplier_article", "nm_id", "orders", "gross_profit_model", "order_sum"]
+        base = daily[[c for c in base_cols if c in daily.columns]].copy()
+        for c in base_cols:
+            if c not in base.columns:
+                base[c] = 0.0 if c in {"orders", "gross_profit_model", "order_sum"} else ""
+        base["orders"] = pd.to_numeric(base["orders"], errors="coerce").fillna(0.0)
+        base["gross_profit_model"] = pd.to_numeric(base["gross_profit_model"], errors="coerce").fillna(0.0)
+        base["order_sum"] = pd.to_numeric(base["order_sum"], errors="coerce").fillna(0.0)
+        base = base.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            article_orders=("orders", "sum"),
+            article_gp=("gross_profit_model", "sum"),
+            article_order_sum=("order_sum", "sum"),
+        )
+        base["gp_per_order"] = np.where(base["article_orders"] > 0, base["article_gp"] / base["article_orders"], 0.0)
+        use_cols = ["day", "subject", "product", "supplier_article", "nm_id", "gp_per_order"]
+        q = q.merge(base[use_cols], on=["day", "subject", "product", "supplier_article", "nm_id"], how="left")
+        for c in ["orders", "frequency", "transitions", "avg_position", "median_position"]:
+            if c not in q.columns:
+                q[c] = np.nan
+            q[c] = pd.to_numeric(q[c], errors="coerce")
+        q["orders"] = q["orders"].fillna(0.0)
+        q["frequency"] = q["frequency"].fillna(0.0)
+        q["transitions"] = q["transitions"].fillna(0.0)
+        q["gp_per_order"] = pd.to_numeric(q["gp_per_order"], errors="coerce").fillna(0.0)
+        q["query_gp_est"] = q["orders"] * q["gp_per_order"]
+        keep = ["day", "subject", "product", "supplier_article", "nm_id", "search_query", "frequency", "transitions", "orders", "query_gp_est", "avg_position", "median_position"]
+        return q[[c for c in keep if c in q.columns]].copy()
 
     def entry_points_summary(self) -> pd.DataFrame:
         e = self.enrich(self.pack.entry_points, "entry_points")
@@ -2435,6 +2502,7 @@ class AnalyticsBuilder:
         price = self.price_ranges(daily)
         channel = self.channel_summary(daily)
         search_summary, core_queries = self.search_daily_summary()
+        search_query_gp_position = self.search_query_gp_position(daily)
         search_unique_demand = self.search_unique_demand()
         entry = self.entry_points_summary()
         loc_detail, loc_summary = self.localization()
@@ -2455,6 +2523,7 @@ class AnalyticsBuilder:
             "ads_daily_source": self.enrich(self.pack.ads_daily, "ads_daily"),
             "search_daily_summary": search_summary,
             "core_queries_80": core_queries,
+            "search_query_gp_position": search_query_gp_position,
             "search_unique_demand": search_unique_demand,
             "entry_points_summary": entry,
             "localization_detail": loc_detail,
@@ -2668,7 +2737,7 @@ def export_outputs(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> List[Pa
     # Technical report
     wb = Workbook()
     wb.remove(wb.active)
-    for name in ["article_day_fact", "metrics_summary_90d", "best_days", "best_day_factors", "price_ranges", "channel_summary", "ads_category_source", "ads_raw_source", "ads_daily_source", "core_queries_80", "search_unique_demand", "entry_points_summary", "localization_summary", "localization_detail", "gp_potential_90d", "buyout_validation", "dictionary", "diagnostics"]:
+    for name in ["article_day_fact", "metrics_summary_90d", "best_days", "best_day_factors", "price_ranges", "channel_summary", "ads_category_source", "ads_raw_source", "ads_daily_source", "core_queries_80", "search_query_gp_position", "search_unique_demand", "entry_points_summary", "localization_summary", "localization_detail", "gp_potential_90d", "buyout_validation", "dictionary", "diagnostics"]:
         write_df_sheet(wb, name[:31], outputs.get(name, pd.DataFrame()))
     p = local_dir / TECH_REPORT_NAME
     wb.save(p)
@@ -4979,6 +5048,24 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 search_unique_demand[_c] = 0
             search_unique_demand[_c] = pd.to_numeric(search_unique_demand[_c], errors="coerce").fillna(0)
 
+    search_query_gp_position = outputs.get("search_query_gp_position", pd.DataFrame()).copy()
+    if search_query_gp_position is None:
+        search_query_gp_position = pd.DataFrame()
+    if not search_query_gp_position.empty:
+        if "day" in search_query_gp_position.columns:
+            search_query_gp_position["day"] = pd.to_datetime(search_query_gp_position["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in search_query_gp_position.columns:
+            search_query_gp_position["subject_disp"] = search_query_gp_position.get("subject", "").map(_subject_disp) if "subject" in search_query_gp_position.columns else ""
+        if "product_code" not in search_query_gp_position.columns:
+            search_query_gp_position["product_code"] = search_query_gp_position.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in search_query_gp_position.columns:
+            search_query_gp_position["supplier_article"] = search_query_gp_position["supplier_article"].map(_clean_article_local)
+        search_query_gp_position = _normalize_pdf_merge_keys(search_query_gp_position, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        for _c in ["frequency", "transitions", "orders", "query_gp_est", "avg_position", "median_position"]:
+            if _c not in search_query_gp_position.columns:
+                search_query_gp_position[_c] = np.nan
+            search_query_gp_position[_c] = pd.to_numeric(search_query_gp_position[_c], errors="coerce")
+
     trace_rows: List[Dict[str, Any]] = []
     log(f"PDF_DEBUG: article_day_fact rows={len(daily):,}, period={daily['day'].min().date() if not daily.empty else '-'}..{daily['day'].max().date() if not daily.empty else '-'}, cols={len(daily.columns):,}")
     log(f"PDF_DEBUG: abc_weekly rows={len(outputs.get('abc_weekly', pd.DataFrame())):,}, abc_monthly rows={len(outputs.get('abc_monthly', pd.DataFrame())):,}")
@@ -5788,7 +5875,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             return None
         return d
 
-    LOWER_BAD = {"ДРР", "CPC", "Расход РК", "Комиссия", "Эквайринг", "Логистика", "Хранение", "Себест", "Прочие", "СПП"}
+    LOWER_BAD = {"ДРР", "CPC", "Расход РК", "Комиссия", "Эквайринг", "Логистика", "Хранение", "Себест", "Прочие", "СПП", "Позиция"}
     def _lower_bad(metric: str) -> bool:
         s = str(metric).lower()
         return any(k.lower() in s for k in LOWER_BAD)
@@ -5848,6 +5935,24 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             if _c not in search_unique_demand.columns:
                 search_unique_demand[_c] = 0
             search_unique_demand[_c] = pd.to_numeric(search_unique_demand[_c], errors="coerce").fillna(0)
+
+    search_query_gp_position = outputs.get("search_query_gp_position", pd.DataFrame()).copy()
+    if search_query_gp_position is None:
+        search_query_gp_position = pd.DataFrame()
+    if not search_query_gp_position.empty:
+        if "day" in search_query_gp_position.columns:
+            search_query_gp_position["day"] = pd.to_datetime(search_query_gp_position["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in search_query_gp_position.columns:
+            search_query_gp_position["subject_disp"] = search_query_gp_position.get("subject", "").map(_subject_disp) if "subject" in search_query_gp_position.columns else ""
+        if "product_code" not in search_query_gp_position.columns:
+            search_query_gp_position["product_code"] = search_query_gp_position.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in search_query_gp_position.columns:
+            search_query_gp_position["supplier_article"] = search_query_gp_position["supplier_article"].map(_clean_article_local)
+        search_query_gp_position = _normalize_pdf_merge_keys(search_query_gp_position, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        for _c in ["frequency", "transitions", "orders", "query_gp_est", "avg_position", "median_position"]:
+            if _c not in search_query_gp_position.columns:
+                search_query_gp_position[_c] = np.nan
+            search_query_gp_position[_c] = pd.to_numeric(search_query_gp_position[_c], errors="coerce")
 
     # Strict mode: the user explicitly rejected duplicated demand from article_day_fact.
     # Therefore a PDF with fallback demand is not a valid управленческий отчет.
@@ -6123,6 +6228,53 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         )
         return g
 
+    def _search_gp80_position_period(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        if search_query_gp_position is None or search_query_gp_position.empty:
+            return pd.DataFrame()
+        level = _level_for_keys(keys)
+        if not level:
+            return pd.DataFrame()
+        x = search_query_gp_position[(search_query_gp_position["day"] >= pd.Timestamp(start).normalize()) & (search_query_gp_position["day"] <= pd.Timestamp(end).normalize())].copy()
+        if x.empty:
+            return pd.DataFrame()
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        rows = []
+        for keyvals, part in x.groupby(keys, dropna=False):
+            if not isinstance(keyvals, tuple):
+                keyvals = (keyvals,)
+            q = part.groupby("search_query", dropna=False, as_index=False).agg(
+                query_gp_est=("query_gp_est", "sum"),
+                orders=("orders", "sum"),
+                frequency=("frequency", "sum"),
+                transitions=("transitions", "sum"),
+                avg_position=("avg_position", lambda s: weighted_mean(s, part.loc[s.index, "query_gp_est"].clip(lower=0).fillna(0) + part.loc[s.index, "orders"].fillna(0) + part.loc[s.index, "frequency"].fillna(0) / 1000)),
+            )
+            q["query_gp_est"] = pd.to_numeric(q["query_gp_est"], errors="coerce").fillna(0.0)
+            q["_rank_gp"] = q["query_gp_est"].clip(lower=0)
+            q = q.sort_values(["_rank_gp", "orders", "frequency"], ascending=[False, False, False]).copy()
+            total_gp = float(q["_rank_gp"].sum())
+            if total_gp > 0:
+                q["cum_gp_share"] = q["_rank_gp"].cumsum() / total_gp
+                top = q[(q["cum_gp_share"] <= 0.80) | (q["_rank_gp"] == q["_rank_gp"].max())].copy()
+                crossing = q[q["cum_gp_share"] > 0.80].head(1)
+                top = pd.concat([top, crossing], ignore_index=True).drop_duplicates("search_query")
+                weight = top["_rank_gp"].replace(0, np.nan)
+                gp_share = float(top["_rank_gp"].sum() / total_gp * 100.0) if total_gp else np.nan
+            else:
+                top = q.head(10).copy()
+                weight = (top["orders"].fillna(0) + top["frequency"].fillna(0) / 1000).replace(0, np.nan)
+                gp_share = np.nan
+            rec = dict(zip(keys, keyvals))
+            rec["search_gp80_avg_position"] = weighted_mean(top["avg_position"], weight) if not top.empty else np.nan
+            rec["search_gp80_queries"] = int(top["search_query"].astype(str).replace("", np.nan).dropna().nunique()) if not top.empty else 0
+            rec["search_gp80_gp_share"] = gp_share
+            rec["search_gp80_gp_est"] = float(top["_rank_gp"].sum()) if "_rank_gp" in top.columns else 0.0
+            rows.append(rec)
+        return pd.DataFrame(rows)
+
     def _ads_truth_period(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
         if ads_truth is None or ads_truth.empty:
             return pd.DataFrame()
@@ -6150,6 +6302,22 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         x = _normalize_pdf_merge_keys(x, keys)
         if x.empty:
             return pd.DataFrame(columns=keys)
+        # Weighted values from WB Orders report.
+        # Do not average article/day averages equally: category/product cards must be weighted by real orders/money.
+        _orders_w = pd.to_numeric(x.get("orders", 0), errors="coerce").fillna(0.0)
+        _orders_w = _orders_w.where(_orders_w > 0, 0.0)
+        _money_w = pd.to_numeric(x.get("order_sum", 0), errors="coerce").fillna(0.0)
+        _money_w = _money_w.where(_money_w > 0, _orders_w)
+        for _c in ["price_with_disc", "finished_price", "spp"]:
+            if _c not in x.columns:
+                x[_c] = np.nan
+            x[_c] = pd.to_numeric(x[_c], errors="coerce")
+        x["_price_with_disc_num"] = x["price_with_disc"] * _orders_w
+        x["_price_with_disc_den"] = np.where(x["price_with_disc"].notna(), _orders_w, 0.0)
+        x["_finished_price_num"] = x["finished_price"] * _orders_w
+        x["_finished_price_den"] = np.where(x["finished_price"].notna(), _orders_w, 0.0)
+        x["_spp_num"] = x["spp"] * _money_w
+        x["_spp_den"] = np.where(x["spp"].notna(), _money_w, 0.0)
         g = x.groupby(keys, dropna=False, as_index=False).agg(
             daily_rows=("order_sum", "size"),
             active_days=("day", "nunique"),
@@ -6166,10 +6334,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             localization_direct=("direct_localization_pct", _safe_mean),
             localization=("localization_with_replacements_pct", _safe_mean),
             rating=("rating_reviews", _safe_mean),
-            # buyer_price is average finishedPrice from Orders. sale price is priceWithDisc/order_sum and may later be overwritten by ABC revenue / ABC qty where available.
-            buyer_price=("finished_price", _safe_mean),
-            price_with_disc_avg=("price_with_disc", _safe_mean),
-            spp=("spp", _safe_mean),
+            _price_with_disc_num=("_price_with_disc_num", "sum"),
+            _price_with_disc_den=("_price_with_disc_den", "sum"),
+            _finished_price_num=("_finished_price_num", "sum"),
+            _finished_price_den=("_finished_price_den", "sum"),
+            _spp_num=("_spp_num", "sum"),
+            _spp_den=("_spp_den", "sum"),
             commission_pct_model=("commission_%", _safe_mean),
             acquiring_pct_model=("acquiring_%", _safe_mean),
             logistics_per_unit=("logistics_direct", _safe_mean),
@@ -6177,6 +6347,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             other_per_unit=("other_costs", _safe_mean),
             cost_per_unit=("cost", _safe_mean),
         )
+        g["buyer_price"] = np.where(g["_finished_price_den"] > 0, g["_finished_price_num"] / g["_finished_price_den"], np.nan)
+        g["price_with_disc_avg"] = np.where(g["_price_with_disc_den"] > 0, g["_price_with_disc_num"] / g["_price_with_disc_den"], np.nan)
+        g["spp"] = np.where(g["_spp_den"] > 0, g["_spp_num"] / g["_spp_den"], np.nan)
+        g = g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
         at = _ads_truth_period(start, end, keys)
         if at is not None and not at.empty:
             g = _normalize_pdf_merge_keys(g, keys)
@@ -6234,13 +6408,20 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         cur = _normalize_pdf_merge_keys(_agg_daily(start, end, keys), keys)
         prev = _normalize_pdf_merge_keys(_agg_daily(prev_s, prev_e, keys), keys)
         out = cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev"))
+        pos80 = _normalize_pdf_merge_keys(_search_gp80_position_period(start, end, keys), keys)
+        pos80_prev = _normalize_pdf_merge_keys(_search_gp80_position_period(prev_s, prev_e, keys), keys)
+        if pos80 is not None and not pos80.empty:
+            out = _normalize_pdf_merge_keys(out, keys).merge(pos80, on=keys, how="left")
+        if pos80_prev is not None and not pos80_prev.empty:
+            pos80_prev = pos80_prev.rename(columns={c: c + "_prev" for c in pos80_prev.columns if c not in keys})
+            out = _normalize_pdf_merge_keys(out, keys).merge(_normalize_pdf_merge_keys(pos80_prev, keys), on=keys, how="left")
         abc = _normalize_pdf_merge_keys(_abc_exact(start, end, keys), keys)
         abc_prev = _normalize_pdf_merge_keys(_abc_exact(prev_s, prev_e, keys), keys)
         out = _normalize_pdf_merge_keys(out, keys).merge(abc, on=keys, how="left")
         abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
         out = _normalize_pdf_merge_keys(out, keys).merge(_normalize_pdf_merge_keys(abc_prev, keys), on=keys, how="left")
         # fill numeric values
-        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "ad_ctr", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "spp", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
+        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "ad_ctr", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "price_with_disc_avg", "spp", "search_gp80_avg_position", "search_gp80_queries", "search_gp80_gp_share", "search_gp80_gp_est", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
             if col not in out.columns: out[col] = 0.0
             if col + "_prev" not in out.columns: out[col + "_prev"] = 0.0
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
@@ -6285,8 +6466,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # даже когда ВП/выручка для закрытого периода пришли из ABC.
         out["orders"] = pd.to_numeric(out["orders"], errors="coerce").fillna(0.0)
         out["orders_prev"] = pd.to_numeric(out["orders_prev"], errors="coerce").fillna(0.0)
-        out["price_sale"] = np.where(pd.to_numeric(out["orders"], errors="coerce").fillna(0).abs() > 1e-9, out["sum_use"] / out["orders"].replace(0, np.nan), out.get("buyer_price", np.nan))
-        out["price_sale_prev"] = np.where(pd.to_numeric(out["orders_prev"], errors="coerce").fillna(0).abs() > 1e-9, out["sum_prev_use"] / out["orders_prev"].replace(0, np.nan), out.get("buyer_price_prev", np.nan))
+        # Prices in detail cards must come from WB Orders report:
+        # priceWithDisc = seller sale price, finishedPrice = buyer price after SPP.
+        # Do not recalculate sale price from ABC revenue, otherwise price changes when ABC is used.
+        _orders_price_sale = np.where(out["orders"].abs() > 1e-9, out["order_sum"] / out["orders"].replace(0, np.nan), np.nan)
+        _orders_price_sale_prev = np.where(out["orders_prev"].abs() > 1e-9, out["order_sum_prev"] / out["orders_prev"].replace(0, np.nan), np.nan)
+        out["price_sale"] = pd.to_numeric(out.get("price_with_disc_avg", np.nan), errors="coerce")
+        out["price_sale"] = out["price_sale"].where(out["price_sale"].abs() > 1e-9, _orders_price_sale)
+        out["price_sale_prev"] = pd.to_numeric(out.get("price_with_disc_avg_prev", np.nan), errors="coerce")
+        out["price_sale_prev"] = out["price_sale_prev"].where(out["price_sale_prev"].abs() > 1e-9, _orders_price_sale_prev)
 
         # Расход РК для ABC-периода считаем только из ABC: Валовая выручка × ДРР ABC.
         out["ad_spend"] = np.where(out["has_abc"], abc_ad, out["ad_spend"])
@@ -6350,7 +6538,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         ]
         prev_avg_cols = [
             "search_share", "localization_direct", "localization", "rating",
-            "price_sale", "buyer_price", "price_with_disc_avg", "spp",
+            "price_sale", "buyer_price", "price_with_disc_avg", "spp", "search_gp80_avg_position",
             "commission_pct_model", "acquiring_pct_model",
             "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit",
         ]
@@ -7327,7 +7515,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _section_bar(640, "Блок 1. Экономика и продажи")
         cards1 = [
             (_fmt_money(row.get("sum_use")), "Сумма", _delta_abs(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
-            (_fmt_money(row.get("order_sum")), "Заказы за неделю", _delta_abs(row.get("order_sum"), row.get("order_sum_prev")), "Сумма", ""),
+            (_fmt_loc_pair(row.get("localization_direct"), row.get("localization")), "Локализация", _delta(row.get("localization"), row.get("localization_prev")), "Локализация", ""),
             (_fmt_money(row.get("gp_use")), "ВП ABC", _delta_abs(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
             (_fmt_pct(row.get("margin")), "Рентабельность", _delta(row.get("margin"), row.get("margin_prev")), "Рент.", ""),
             (_fmt_pct(row.get("drr")), "ДРР", _delta(row.get("drr"), row.get("drr_prev")), "ДРР", ""),
@@ -7340,9 +7528,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         cards2 = [
             (_fmt_num(row.get("demand")), "Спрос WB", _delta(row.get("demand"), row.get("demand_prev")), "Спрос", ""),
             (_fmt_pct(row.get("search_share")), "% поиска", _delta(row.get("search_share"), row.get("search_share_prev")), "% поиска", ""),
+            (_fmt_num(row.get("search_gp80_avg_position")), "CORE запросы", _delta(row.get("search_gp80_avg_position"), row.get("search_gp80_avg_position_prev")), "Позиция", ""),
             (_fmt_pct(row.get("ad_ctr")), "CTR РК", _delta(row.get("ad_ctr"), row.get("ad_ctr_prev")), "CTR РК", ""),
             (_fmt_num(row.get("opens")), "Открытия", _delta(row.get("opens"), row.get("opens_prev")), "Открытия", ""),
-            (_fmt_num(row.get("orders")), "Заказы", _delta(row.get("orders"), row.get("orders_prev")), "Заказы", ""),
             (_fmt_pct(row.get("order_from_open_conv")), "Конв. в заказ", _delta(row.get("order_from_open_conv"), row.get("order_from_open_conv_prev")), "Конверсия", ""),
             (_fmt_pct(row.get("order_conv")), "Корзина→заказ", _delta(row.get("order_conv"), row.get("order_conv_prev")), "Конверсия", ""),
         ]
@@ -7356,7 +7544,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             (_fmt_rub1(row.get("cost_per_unit")), "Себест./шт", _delta(row.get("cost_per_unit"), row.get("cost_per_unit_prev")), "Себест", ""),
             (_fmt_rub1(row.get("price_sale")), "Цена продажи", _delta(row.get("price_sale"), row.get("price_sale_prev")), "Цена", ""),
             (_fmt_rub1(row.get("buyer_price")), "Цена покупателя", _delta(row.get("buyer_price"), row.get("buyer_price_prev")), "Цена", ""),
-            (_fmt_loc_pair(row.get("localization_direct"), row.get("localization")), "Локализация", _delta(row.get("localization"), row.get("localization_prev")), "Локализация", ""),
+            (_fmt_pct(row.get("spp")), "Среднее СПП", _delta(row.get("spp"), row.get("spp_prev")), "СПП", ""),
         ]
         for i, card in enumerate(cards3):
             _metric_card(65+i*215, 140, 200, 95, *card)
