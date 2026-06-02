@@ -1,5 +1,6 @@
 # VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
 # CALC_REPAIR: 2026-06-02 nmId canonical article + May closed month + orders-rub card
+# FIX27: weekly page-1 cards + demand fallback for missing day + money dynamics for orders-rub cards
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -6704,7 +6705,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def _metric_card(x, y, w, h, value, label, delta=None, metric="", sub=""):
         c.setFillColor(WHITE); c.roundRect(x,y,w,h,14,fill=1,stroke=0)
         # FIX11: карточки с денежной динамикой должны показывать рубли, а не "33495,0%".
-        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК"])
+        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК", "Заказы за неделю", "Заказы, ₽"])
         dtext = (_arrow_money(delta, _lower_bad(metric)) if money_metric else _arrow(delta, _lower_bad(metric))) if delta is not None else ""
         # Значение крупно по центру, подпись внизу, динамика маленькая справа от подписи.
         _draw_text(str(value), x+10, y+h-50, w-20, F_BLACK, 30, BLACK, align="center")
@@ -6725,7 +6726,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     def _draw_cell_value(x, y, w, value, delta=None, metric="", size=12, align="left"):
         txt = str(value)
         val_size = size + 1
-        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК"])
+        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК", "Заказы за неделю", "Заказы, ₽"])
         # Keep dynamic arrow next to the value, not at the far edge of the cell.
         if align == "center":
             _draw_text(txt, x, y, w*0.62 if delta is not None else w, F_BOLD, val_size, BLACK, align="center")
@@ -6882,15 +6883,23 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             opens = _num(ag.get("opens", pd.Series(dtype=float)).sum())
             return {"order_sum": order_sum, "orders": _num(ag.get("orders", pd.Series(dtype=float)).sum()), "ad_spend": ad_spend, "clicks": clicks, "impressions": impressions, "demand": demand, "opens": opens, "drr": ad_spend/order_sum*100 if order_sum else 0.0, "cpc": ad_spend/clicks if clicks else np.nan, "ad_ctr": clicks/impressions*100 if impressions else np.nan, "search_share": opens/demand*100 if demand else np.nan, "source": "fallback"}
     def _current_week_overview():
-        _elapsed_compare_days = int((pd.Timestamp(cur_actual_end).normalize() - pd.Timestamp(cur_start).normalize()).days) + 1
-        yday = pd.Timestamp(latest).normalize()
-        prev_day = yday - pd.Timedelta(days=1)
-        _start("Текущая неделя", f"{_period_label(cur_start, cur_end)} / верхние карточки = последний закрытый день {yday:%d.%m}; таблица = дни недели", "Текущая неделя", key="cur_overview", top_menu=True)
+        top_start = pd.Timestamp(cur_start).normalize()
+        top_end = pd.Timestamp(cur_actual_end).normalize()
+        top_days = max(1, int((top_end - top_start).days) + 1)
+        top_prev_end = top_start - pd.Timedelta(days=1)
+        top_prev_start = top_prev_end - pd.Timedelta(days=top_days - 1)
+        _start(
+            "Текущая неделя",
+            f"{_period_label(top_start, top_end)} / верхние карточки = сумма за неделю; таблица = дни недели",
+            "Текущая неделя",
+            key="cur_overview",
+            top_menu=True,
+        )
 
-        # Top cards must match Telegram: they are daily, not WTD.
-        # This fixes the previous duplicate ad spend on page 1.
-        cur_day = _pdf_truth_sum_period(yday, yday)
-        prev_day_sum = _pdf_truth_sum_period(prev_day, prev_day)
+        # FIX27: top cards are WEEK totals, not the last day.
+        # Dynamics compare the same-length previous period: for 25.05-31.05 it is 18.05-24.05.
+        cur_week = _pdf_truth_sum_period(top_start, top_end)
+        prev_week = _pdf_truth_sum_period(top_prev_start, top_prev_end)
 
         def _known_money(v):
             return "—" if v is None or pd.isna(v) else _fmt_money(v)
@@ -6903,32 +6912,27 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 return None
             return _delta_abs(cur_v, prev_v) if money else _delta(cur_v, prev_v)
 
-        # Yesterday gross profit comes from real daily Torgstat ABC.
-        # Comparison base = average daily gross profit of the last closed month from ABC.
-        closed_month_abc = _abc_exact(closed_start, closed_end, ["subject_disp"])
-        closed_month_gp = _num(closed_month_abc["gp_abc"].sum()) if closed_month_abc is not None and not closed_month_abc.empty else 0.0
-        closed_month_days = max(1, int((pd.Timestamp(closed_end).normalize() - pd.Timestamp(closed_start).normalize()).days) + 1)
-        gp_plan_day = closed_month_gp / closed_month_days if closed_month_gp else 0.0
-        gp_plan_caption = f"ср.день закр.мес {_fmt_money(gp_plan_day)}" if gp_plan_day else "ср.день закр.мес —"
-        yday_abc = _abc_periods_inside(yday, yday, ["day", "subject_disp"])
-        yday_gp = _num(yday_abc["gp_abc"].sum()) if yday_abc is not None and not yday_abc.empty else 0.0
-        prev_abc = _abc_periods_inside(prev_day, prev_day, ["day", "subject_disp"])
-        prev_gp = _num(prev_abc["gp_abc"].sum()) if prev_abc is not None and not prev_abc.empty else 0.0
-        yday_plan_delta = yday_gp - gp_plan_day if gp_plan_day and abs(yday_gp) > 0.5 else None
+        # Weekly gross profit comes from ABC for the exact/contained week; fallback to model only if ABC is absent.
+        week_abc = _abc_periods_inside(top_start, top_end, ["subject_disp"])
+        prev_week_abc = _abc_periods_inside(top_prev_start, top_prev_end, ["subject_disp"])
+        week_gp = _num(week_abc["gp_abc"].sum()) if week_abc is not None and not week_abc.empty else _num(cur_week.get("gross_profit_model"), 0.0)
+        prev_week_gp = _num(prev_week_abc["gp_abc"].sum()) if prev_week_abc is not None and not prev_week_abc.empty else 0.0
 
-        ads_sub = "нет данных РК" if cur_day.get("ads_missing") else ""
-        demand_sub = "нет данных" if cur_day.get("demand_missing") else ""
+        ads_sub = "нет данных РК" if cur_week.get("ads_missing") else ""
+        demand_sub = "нет данных" if cur_week.get("demand_missing") else ""
         cards = [
-            (_fmt_money(cur_day.get("order_sum")), "Сумма заказов", _delta_abs(cur_day.get("order_sum"), prev_day_sum.get("order_sum")), "Сумма", ""),
-            (_fmt_money(yday_gp), "Валовая прибыль", yday_plan_delta, "ВП", gp_plan_caption),
-            (_known_money(cur_day.get("ad_spend")), "Расход РК", _known_delta(cur_day.get("ad_spend"), prev_day_sum.get("ad_spend"), money=True), "Расход РК", ads_sub),
-            (_known_pct(cur_day.get("drr")), "ДРР", _known_delta(cur_day.get("drr"), prev_day_sum.get("drr"), money=False), "ДРР", ads_sub),
-            (_known_num(cur_day.get("demand")), "Спрос WB", _known_delta(cur_day.get("demand"), prev_day_sum.get("demand"), money=False), "Спрос", demand_sub),
+            (_fmt_money(cur_week.get("order_sum")), "Сумма заказов", _known_delta(cur_week.get("order_sum"), prev_week.get("order_sum"), money=True), "Сумма", ""),
+            (_fmt_money(week_gp), "Валовая прибыль", _known_delta(week_gp, prev_week_gp, money=True), "ВП", ""),
+            (_known_money(cur_week.get("ad_spend")), "Расход РК", _known_delta(cur_week.get("ad_spend"), prev_week.get("ad_spend"), money=True), "Расход РК", ads_sub),
+            (_known_pct(cur_week.get("drr")), "ДРР", _known_delta(cur_week.get("drr"), prev_week.get("drr"), money=False), "ДРР", ads_sub),
+            (_known_num(cur_week.get("demand")), "Спрос WB", _known_delta(cur_week.get("demand"), prev_week.get("demand"), money=False), "Спрос", demand_sub),
         ]
         for i, card in enumerate(cards):
             _metric_card(65+i*300, 590, 280, 105, *card)
 
-        # Daily overview by day: deltas compare each factual day with previous full week's average day.
+        prev_gp_day_avg = prev_week_gp / top_days if top_days else 0.0
+
+        # Daily overview by day: deltas compare each factual day with previous period average day.
         dates = pd.date_range(cur_start, cur_end)
         rows=[]
         prev_week_truth = _pdf_truth_sum_period(prev_start, prev_end)
@@ -6960,7 +6964,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 rows.append({"cells": [
                     dt.strftime("%a %d.%m"),
                     (_fmt_money(osum), _delta_abs(osum, psum), "Сумма"),
-                    (_fmt_money(day_gp), day_gp - gp_plan_day if gp_plan_day and abs(day_gp) > 0.5 else None, "ВП"),
+                    (_fmt_money(day_gp), day_gp - prev_gp_day_avg if abs(day_gp) > 0.5 or abs(prev_gp_day_avg) > 0.5 else None, "ВП"),
                     (_known_money(ad), _known_delta(ad, pad, money=True), "Расход РК") if ad_known else ("—", None, "Расход РК"),
                     (_known_pct(d), _known_delta(d, pdrr, money=False), "ДРР") if ad_known else ("—", None, "ДРР"),
                     (_known_num(ddemand), _known_delta(ddemand, pdemand, money=False), "Спрос") if demand_known else ("—", None, "Спрос"),
@@ -7323,7 +7327,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _section_bar(640, "Блок 1. Экономика и продажи")
         cards1 = [
             (_fmt_money(row.get("sum_use")), "Сумма", _delta_abs(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
-            (_fmt_money(row.get("order_sum")), "Заказы за неделю", _delta_abs(row.get("order_sum"), row.get("order_sum_prev")), "Заказы за неделю", ""),
+            (_fmt_money(row.get("order_sum")), "Заказы за неделю", _delta_abs(row.get("order_sum"), row.get("order_sum_prev")), "Сумма", ""),
             (_fmt_money(row.get("gp_use")), "ВП ABC", _delta_abs(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
             (_fmt_pct(row.get("margin")), "Рентабельность", _delta(row.get("margin"), row.get("margin_prev")), "Рент.", ""),
             (_fmt_pct(row.get("drr")), "ДРР", _delta(row.get("drr"), row.get("drr_prev")), "ДРР", ""),
@@ -8187,8 +8191,12 @@ def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFra
         if not q.empty:
             demand = float(pd.to_numeric(q.get("unique_search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
         else:
-            demand = np.nan
-            demand_missing = True
+            # FIX27: if unique demand is missing for one specific closed day, do not render blank.
+            # Use the operational article_day_fact demand as a fallback for the day row / weekly top cards.
+            # This keeps 31.05 visible instead of "—" while preserving unique-demand rows when they exist.
+            fallback_demand = float(pd.to_numeric(d.get("search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+            demand = fallback_demand if abs(fallback_demand) > 1e-9 else np.nan
+            demand_missing = pd.isna(demand)
     else:
         demand = float(pd.to_numeric(d.get("search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
 
