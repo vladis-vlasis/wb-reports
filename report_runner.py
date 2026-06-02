@@ -1,4 +1,4 @@
-# VERSION: ORDERS_ONLY_AND_TG_FIX25_CLOSED_WEEK_PRIORITY_1350_20260602
+# VERSION: ORDERS_ONLY_AND_TG_FIX25_WEEKLY_FULL_DAILY_LIGHT_20260602
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -2817,6 +2817,78 @@ def _collect_preflight_active_days(frames: Sequence[Tuple[str, pd.DataFrame]]) -
         rows.extend(by_day[["source", "day", "rows"]].to_dict("records"))
     return pd.DataFrame(rows, columns=["source", "day", "rows"])
 
+
+
+def _latest_complete_operational_day(outputs: Dict[str, Any]) -> Optional[pd.Timestamp]:
+    """Return latest day that has both operational sales/funnel/search activity and ads activity.
+
+    Daily lightweight runs must not force yesterday. WB ad files often lag orders by a day.
+    If orders/funnel already have 01.06 but ads end at 31.05, the report must anchor on
+    31.05 and skip 01.06 instead of showing zero ad spend / wrong DRR.
+    """
+    if not isinstance(outputs, dict):
+        return None
+
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    op_days = _active_days_from_source(
+        daily,
+        ["order_sum", "orders", "open_cards", "search_frequency", "gross_profit_model", "gross_profit_abc"],
+    )
+    if op_days.empty:
+        return None
+
+    ads_day_parts: List[pd.Series] = []
+    for source_name in ["ads_daily_source", "ads_raw_source", "ads_category_source"]:
+        src = outputs.get(source_name, pd.DataFrame())
+        days_ads = _active_days_from_source(
+            src,
+            ["spend", "clicks", "impressions", "ad_spend_total", "manual_spend", "unified_spend", "unknown_spend"],
+        )
+        if not days_ads.empty:
+            ads_day_parts.append(days_ads)
+
+    if not ads_day_parts:
+        return None
+
+    op_set = {pd.Timestamp(x).normalize() for x in pd.to_datetime(op_days, errors="coerce").dropna()}
+    ads_all = pd.concat([pd.Series(x) for x in ads_day_parts], ignore_index=True)
+    ads_set = {pd.Timestamp(x).normalize() for x in pd.to_datetime(ads_all, errors="coerce").dropna()}
+    common = sorted(op_set & ads_set)
+    if not common:
+        return None
+
+    chosen = pd.Timestamp(common[-1]).normalize()
+    log(
+        "auto_complete_date: latest operational=%s, latest ads=%s, chosen=%s" % (
+            max(op_set).date() if op_set else "-",
+            max(ads_set).date() if ads_set else "-",
+            chosen.date(),
+        )
+    )
+    return chosen
+
+
+def _apply_auto_complete_report_date(outputs: Dict[str, Any], context: str = "") -> None:
+    """For lightweight daily mode, anchor report on the latest fully available day.
+
+    This deliberately clears strict date checks: missing newer days are skipped, not treated
+    as fatal. Weekly full_refresh still uses exact REPORT_REQUIRE_* checks.
+    """
+    if not _env_flag("REPORT_AUTO_COMPLETE_DATE", False):
+        return
+    chosen = _latest_complete_operational_day(outputs)
+    if chosen is None:
+        log(f"auto_complete_date: WARN no common orders/funnel/ads day found; context={context}; keep existing REPORT_AS_OF_DATE")
+        return
+    prev = os.environ.get("REPORT_AS_OF_DATE", "")
+    os.environ["REPORT_AS_OF_DATE"] = f"{chosen:%Y-%m-%d}"
+    os.environ["WB_DAILY_TARGET_DATE"] = f"{chosen:%Y-%m-%d}"
+    os.environ.pop("REPORT_REQUIRE_DATA_DATE", None)
+    os.environ.pop("REPORT_REQUIRE_ADS_DATE", None)
+    log(
+        f"auto_complete_date: REPORT_AS_OF_DATE={chosen:%Y-%m-%d}; "
+        f"previous={prev or 'empty'}; incomplete newer days are skipped; context={context}"
+    )
 
 def _preflight_abc_period_exists(storage: Storage, reports_root: str, required: pd.Timestamp) -> None:
     if not _env_flag("REPORT_REQUIRE_ABC_PERIOD", False):
@@ -8441,6 +8513,7 @@ def main() -> None:
                 log("current_week_only: WARN no refreshed article_day_fact rows; PDF will be rebuilt from existing cache only")
         except Exception as exc:
             log(f"current_week_only: WARN limited refresh failed, using existing cache only: {exc}")
+        _apply_auto_complete_report_date(outputs, "current_week_only")
         _require_report_data_available(outputs, "current_week_only")
         pdf_path = local_dir / sales_pdf_report_name(outputs)
         pdf_created = generate_management_pdf(outputs, pdf_path)
