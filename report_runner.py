@@ -1,4 +1,5 @@
 # VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
+# INTERNAL_FIX: FIX30_STRICT_1330_NO_MTD_WEEKLY_DAILY_GP_20260604
 # CALC_REPAIR: 2026-06-02 nmId canonical article + May closed month + orders-rub card
 # FIX27: weekly page-1 cards + demand fallback for missing day + money dynamics for orders-rub cards
 
@@ -423,8 +424,11 @@ def dedupe_abc_period_rows(df: pd.DataFrame) -> pd.DataFrame:
     out["month_key"] = out["period_start"].dt.strftime("%Y-%m")
     out["_abc_source_ts"] = out.get("source_file", "").map(parse_abc_source_timestamp)
     out["_abc_period_days"] = (out["period_end"] - out["period_start"]).dt.days + 1
+    # Cumulative monthly-family files are only multi-day periods that start at day 1.
+    # A real daily ABC for the 1st day of a month must remain a daily fact.
     out["_abc_is_month_family"] = (
-        out["period_start"].dt.day.eq(1)
+        out["_abc_period_days"].gt(1)
+        & out["period_start"].dt.day.eq(1)
         & out["period_start"].dt.year.eq(out["period_end"].dt.year)
         & out["period_start"].dt.month.eq(out["period_end"].dt.month)
     )
@@ -1503,12 +1507,41 @@ class Loader:
                     "cell_drr_pct": [_source_cell_ref(df, "drr", i) for i in df.index],
                 })
                 out["product"] = out["supplier_article"].map(product_code)
-                # Full closed months and current-month partial accumulated ABC (1..N days) are monthly facts.
-                # Weekly ABC remains weekly when the period does not start on day 1.
-                is_monthly_or_mtd = (start.year == current_year and start.day == 1 and start.month == end.month)
-                if is_monthly_or_mtd:
+
+                # STRICT RULE 2026-06-04:
+                # Do not use cumulative MTD ABC files like 01.MM-факт день.
+                # Current-month gross profit is built from exact weekly ABC + daily ABC for an incomplete week.
+                # Monthly bucket is only for fully closed calendar months.
+                period_days = (pd.Timestamp(end).normalize() - pd.Timestamp(start).normalize()).days + 1
+                month_last_day = calendar.monthrange(int(start.year), int(start.month))[1] if start is not None else 31
+                is_daily_abc = bool(pd.Timestamp(start).normalize() == pd.Timestamp(end).normalize())
+                is_full_closed_month = (
+                    period_days > 1
+                    and int(start.day) == 1
+                    and int(start.month) == int(end.month)
+                    and int(start.year) == int(end.year)
+                    and int(end.day) == int(month_last_day)
+                )
+                is_partial_mtd = (
+                    period_days > 1
+                    and int(start.day) == 1
+                    and int(start.month) == int(end.month)
+                    and int(start.year) == int(end.year)
+                    and not is_full_closed_month
+                )
+
+                if is_full_closed_month:
                     monthly_frames.append(out)
+                elif is_partial_mtd:
+                    self.diag.add(
+                        "WARN",
+                        "abc",
+                        "Пропущен накопительный MTD ABC 01.MM-факт день",
+                        f"{Path(key).name}: {start:%d.%m.%Y}-{end:%d.%m.%Y}",
+                    )
+                    continue
                 else:
+                    # Includes normal weekly ABC and real daily ABC, including the 1st day of a month.
                     weekly_frames.append(out)
             except Exception as exc:
                 self.diag.add("ERROR", "abc", f"Не прочитан ABC {key}", exc)
@@ -6617,21 +6650,19 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             "opens": _num(prev_full.get("opens", pd.Series(dtype="float64")).sum()) / prev_days,
         }
 
-    def _abc_periods_inside(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+    def _abc_periods_inside(start: pd.Timestamp, end: pd.Timestamp, keys: List[str], sources: Optional[List[str]] = None) -> pd.DataFrame:
         """ABC gross profit for a period without double counting.
 
-        Business rule 2026-05-28:
-        - if a Monday-uploaded current-month ABC file exists (for example 01.05-26.05),
-          it is the source of truth for current-month gross profit;
-        - do not add weekly ABC rows on top of that current-month ABC file;
-        - order quantities and order sums for the operational page still come from Orders,
-          not from ABC;
-        - ad spend for the operational page comes from advertising reports, not from ABC.
+        Default mode uses weekly/daily ABC plus full-month ABC when appropriate.
+        For current-month page use sources=["abc_weekly"] to enforce the rule:
+        current month = closed weekly ABC reports + daily ABC for an incomplete week,
+        never cumulative MTD files 01.MM-факт день.
         """
         start_n = pd.Timestamp(start).normalize()
         end_n = pd.Timestamp(end).normalize()
         frames = []
-        for nm in ["abc_weekly", "abc_monthly"]:
+        source_names = sources or ["abc_weekly", "abc_monthly"]
+        for nm in source_names:
             src = outputs.get(nm, pd.DataFrame()).copy()
             if src is None or src.empty or "period_start" not in src.columns or "period_end" not in src.columns:
                 continue
@@ -7166,36 +7197,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     def _current_month_page():
         # Текущий месяц:
-        # - ВП берём из ABC текущего месяца/недельных ABC-отчетов;
-        # - заказы и сумму заказов — из Orders;
+        # - ВП считаем строго из недельных ABC-отчетов + дневных ABC за неполную неделю;
+        # - накопительные ABC 01.MM-факт день не используем;
+        # - заказы и сумму заказов берём из Orders;
         # - расход РК — из отчетов по рекламе;
         # - план = ВП прошлого месяца минус расчетный НДС 7% с учетом СПП.
         month_start = cur_start.replace(day=1)
 
-        # Current-month ABC is not invented from daily data.
-        # On Mondays the manager uploads an MTD ABC file with period_start = 1st day of month
-        # and period_end = latest closed day in that file, for example 01.05-24.05.
-        # Page 3 must use exactly the latest such MTD ABC period. Weekly ABC is used only for
-        # exact weekly rows and for the 01-03 partial row via overlap allocation.
-        month_abc_end = pd.Timestamp(cur_actual_end).normalize()
-        has_current_month_mtd_file = False
-        _abc_m_src = outputs.get("abc_monthly", pd.DataFrame()).copy()
-        if _abc_m_src is not None and not _abc_m_src.empty and "period_start" in _abc_m_src.columns and "period_end" in _abc_m_src.columns:
-            _abc_m_src["period_start"] = pd.to_datetime(_abc_m_src["period_start"], errors="coerce").dt.normalize()
-            _abc_m_src["period_end"] = pd.to_datetime(_abc_m_src["period_end"], errors="coerce").dt.normalize()
-            _mtd = _abc_m_src[
-                (_abc_m_src["period_start"].eq(month_start))
-                & (_abc_m_src["period_end"].dt.month.eq(month_start.month))
-                & (_abc_m_src["period_end"].dt.year.eq(month_start.year))
-            ].copy()
-            if not _mtd.empty:
-                month_abc_end = pd.Timestamp(_mtd["period_end"].max()).normalize()
-                has_current_month_mtd_file = True
-
-        # If MTD ABC exists, it defines the current-month accounting cutoff for page 3.
-        # Orders/ad facts on this page are clipped to the same cutoff to keep ВП, orders and ad spend comparable.
-        title_end = pd.Timestamp(month_abc_end if has_current_month_mtd_file else cur_actual_end).normalize()
-        month_fact_end = min(pd.Timestamp(cur_actual_end).normalize(), pd.Timestamp(title_end).normalize())
+        title_end = pd.Timestamp(cur_actual_end).normalize()
+        month_fact_end = pd.Timestamp(cur_actual_end).normalize()
 
         def _orders_spp_rate(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
             """Weighted SPP for VAT base.
@@ -7301,7 +7311,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             out["allocated_from_overlap"] = True
             return out
 
-        extra_note = f"; ВП ABC до {month_abc_end:%d.%m}" if has_current_month_mtd_file else "; MTD ABC не найден"
+        extra_note = "; ВП ABC = недели + дневные без MTD"
         _start("Текущий месяц", f"{month_start:%d.%m}-{title_end:%d.%m.%Y} / факт и план после НДС 7% с учетом СПП{extra_note}", "Текущий месяц", key="current_month", top_menu=True)
 
         month_days = calendar.monthrange(month_start.year, month_start.month)[1]
@@ -7331,15 +7341,42 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         mtd_order_sum = _num(mtd_orders["order_sum"].sum()) if mtd_orders is not None and not mtd_orders.empty else 0.0
         mtd_ad = _num(_pdf_truth_sum_period(month_start, month_fact_end).get("ad_spend", 0.0))
 
-        # Gross profit from ABC only. If a current-month ABC file 01.MM..latest exists,
-        # _abc_periods_inside uses it and does not add weekly pieces on top.
-        mtd_abc = _abc_periods_inside(month_start, title_end, ["subject_disp"])
-        mtd_gp = _num(mtd_abc["gp_abc"].sum()) if mtd_abc is not None and not mtd_abc.empty else 0.0
-        has_month_mtd_abc = False
-        if mtd_abc is not None and not mtd_abc.empty and "abc_period_start" in mtd_abc.columns and "abc_period_end" in mtd_abc.columns:
-            _aps = pd.to_datetime(mtd_abc["abc_period_start"], errors="coerce").dt.normalize()
-            _ape = pd.to_datetime(mtd_abc["abc_period_end"], errors="coerce").dt.normalize()
-            has_month_mtd_abc = bool((_aps.eq(month_start) & (_ape >= title_end)).any())
+        # Gross profit from ABC only, but never from cumulative MTD files.
+        # Current month = exact weekly ABC + daily ABC for an incomplete week.
+        def _current_month_gp_weekly_daily_total(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
+            total_gp = 0.0
+            has_any = False
+            _ws = pd.Timestamp(start_dt).normalize()
+            _end = pd.Timestamp(end_dt).normalize()
+            while _ws <= _end:
+                _we = min(_ws + pd.Timedelta(days=6-int(_ws.weekday())), _end)
+                _seg_abc = _abc_periods_inside(_ws, _we, ["subject_disp"], sources=["abc_weekly"])
+                _seg_gp = _num(_seg_abc["gp_abc"].sum()) if _seg_abc is not None and not _seg_abc.empty else np.nan
+                if pd.isna(_seg_gp) or abs(_seg_gp) <= 0.5:
+                    _day_frames = []
+                    _d = _ws
+                    while _d <= _we:
+                        _day_abc = _abc_periods_inside(_d, _d, ["day", "subject_disp"], sources=["abc_weekly"])
+                        if _day_abc is not None and not _day_abc.empty:
+                            _day_frames.append(_day_abc)
+                        _d = _d + pd.Timedelta(days=1)
+                    if _day_frames:
+                        _daily_abc = pd.concat(_day_frames, ignore_index=True)
+                        _daily_gp = _num(_daily_abc["gp_abc"].sum()) if "gp_abc" in _daily_abc.columns else np.nan
+                        if not pd.isna(_daily_gp) and abs(_daily_gp) > 0.5:
+                            _seg_gp = _daily_gp
+                if pd.isna(_seg_gp) or abs(_seg_gp) <= 0.5:
+                    _overlap_abc = _abc_weekly_overlap_alloc(_ws, _we, ["subject_disp"])
+                    _overlap_gp = _num(_overlap_abc["gp_abc"].sum()) if _overlap_abc is not None and not _overlap_abc.empty else np.nan
+                    if not pd.isna(_overlap_gp) and abs(_overlap_gp) > 0.5:
+                        _seg_gp = _overlap_gp
+                if not pd.isna(_seg_gp):
+                    total_gp += float(_seg_gp)
+                    has_any = True
+                _ws = _we + pd.Timedelta(days=1)
+            return total_gp if has_any else 0.0
+
+        mtd_gp = _current_month_gp_weekly_daily_total(month_start, title_end)
         # Compare like with like: plan is after VAT, so fact GP must also be after VAT.
         # ABC gross profit itself stays pre-VAT; VAT is deducted using Orders buyer amount
         # (priceWithDisc - SPP = finishedPrice).
@@ -7367,7 +7404,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         while ws <= title_end:
             we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), title_end)
             wk_orders = _agg_daily(ws, we, ["subject_disp"])
-            wk_abc = _abc_periods_inside(ws, we, ["subject_disp"])
+            wk_abc = _abc_periods_inside(ws, we, ["subject_disp"], sources=["abc_weekly"])
             exact_gp = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
             source_note = "exact" if not pd.isna(exact_gp) else ""
             if pd.isna(exact_gp):
@@ -7375,7 +7412,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 day_frames = []
                 _d = ws
                 while _d <= we:
-                    _day_abc = _abc_periods_inside(_d, _d, ["day", "subject_disp"])
+                    _day_abc = _abc_periods_inside(_d, _d, ["day", "subject_disp"], sources=["abc_weekly"])
                     if _day_abc is not None and not _day_abc.empty:
                         day_frames.append(_day_abc)
                     _d = _d + pd.Timedelta(days=1)
@@ -8041,7 +8078,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             {"source": "article_day_fact", "file_sheet": "Технические_расчеты_TOPFACE.xlsx / article_day_fact", "used_for": "оперативная сумма, реклама, клики, открытия, корзины, конверсии, daily fallback", "risk": "не использовать как финансы закрытого периода при наличии ABC"},
             {"source": "search_unique_demand", "file_sheet": "Технические_расчеты_TOPFACE.xlsx / search_unique_demand", "used_for": "Спрос WB на уровнях категория/товар/артикул", "risk": "если лист отсутствует, PDF падает в fallback и спрос может быть задвоен"},
             {"source": "abc_weekly", "file_sheet": "ABC weekly/daily from Object Storage", "used_for": "закрытая неделя и дневной fallback: выручка, ВП, рентабельность, ДРР, комиссия, эквайринг", "risk": "для дневного fallback используются только файлы period_start=period_end"},
-            {"source": "abc_monthly", "file_sheet": "ABC monthly from Object Storage", "used_for": "закрытый месяц: выручка, ВП, рентабельность, ДРР, комиссия, эквайринг", "risk": "должен быть exact month"},
+            {"source": "abc_monthly", "file_sheet": "ABC monthly from Object Storage", "used_for": "только полностью закрытый календарный месяц; текущий месяц считается по abc_weekly/daily", "risk": "частичные MTD 01.MM-факт день игнорируются"},
             {"source": "entry_points_bridge", "file_sheet": "Факторный_мост_ВП_TOPFACE.xlsx / entry_points_bridge", "used_for": "точки входа на странице артикула 2/2", "risk": "пока недельный контур"},
         ])
 
