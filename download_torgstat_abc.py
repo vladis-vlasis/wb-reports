@@ -1,4 +1,4 @@
-# VERSION: TORGSTAT_ABC_REPORT_FINAL_20260601
+# VERSION: TORGSTAT_ABC_NO_MTD_DAILY_WEEKLY_1330_20260604
 """Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
 
 Repository filename should be: download_torgstat_abc.py
@@ -6,7 +6,10 @@ Repository filename should be: download_torgstat_abc.py
 Primary mode: replay a browser "Copy as cURL" export request stored in secret
 TORGSTAT_ABC_CURL. The script tries to replace the period in URL/body with the
 requested dates, downloads XLSX, validates that it is an ABC report, and uploads
-it with the SAME Torgstat naming pattern that existing report parsing expects:
+it with the SAME Torgstat naming pattern that existing report parsing expects.
+
+Important: auto mode no longer exports cumulative MTD periods like 01.MM-факт день.
+It downloads only daily ABC, and on Mondays additionally the last closed Mon-Sun week:
 
   Отчёты/ABC/wb_abc_report_goods__01.05.2026-27.05.2026__at_2026-05-28_21-30.xlsx
 
@@ -32,7 +35,7 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "TORGSTAT_ABC_REPORT_FINAL_20260601"
+VERSION = "TORGSTAT_ABC_NO_MTD_DAILY_WEEKLY_1330_20260604"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "ABC"
 DEFAULT_STORE = "TOPFACE"
@@ -176,22 +179,20 @@ def period_for_mode(mode: str, date_from: Optional[str], date_to: Optional[str])
         last_sunday = today - dt.timedelta(days=today.weekday() + 1)
         start = last_sunday - dt.timedelta(days=6)
         return [(start, last_sunday, "weekly")]
-    if mode == "mtd":
-        start = yesterday.replace(day=1)
-        return [(start, yesterday, "mtd")]
     if mode == "auto":
-        # Daily file is useful for point checks; MTD/full-month file is required for the current-month PDF block.
-        # On Mondays we additionally export the closed Monday-Sunday week for exact ABC gross profit.
+        # STRICT RULE 2026-06-04:
+        # Do NOT download cumulative MTD ABC files like 01.MM-факт день.
+        # They make current-month gross profit unstable and duplicate weekly/daily facts.
+        # Current month GP is built downstream from weekly ABC + daily ABC for an incomplete week.
         periods = [
             (yesterday, yesterday, "daily"),
-            (yesterday.replace(day=1), yesterday, "mtd"),
         ]
-        if today.weekday() == 0:  # Monday
+        if today.weekday() == 0:  # Monday: also export the last closed Monday-Sunday week.
             last_sunday = today - dt.timedelta(days=1)
             start = last_sunday - dt.timedelta(days=6)
             periods.append((start, last_sunday, "weekly"))
         return dedupe_periods(periods)
-    fail(f"Неизвестный mode={mode}. Допустимо: auto, daily, weekly, mtd, custom")
+    fail(f"Неизвестный mode={mode}. Допустимо: auto, daily, weekly, custom")
 
 
 def clean_multiline_curl(raw: str) -> str:
@@ -747,7 +748,7 @@ Mozilla/5.0
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Download Torgstat ABC report to S3")
-    parser.add_argument("--mode", default="auto", choices=["auto", "daily", "weekly", "mtd", "custom"])
+    parser.add_argument("--mode", default="auto", choices=["auto", "daily", "weekly", "custom"])
     parser.add_argument("--store", default=DEFAULT_STORE)
     parser.add_argument("--date-from", default="")
     parser.add_argument("--date-to", default="")
