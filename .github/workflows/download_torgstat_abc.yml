@@ -3,7 +3,7 @@ name: TOPFACE download Torgstat ABC
 on:
   schedule:
     # Каждый день в 13:30 по Москве / 10:30 UTC.
-    # В режиме auto: daily + MTD, а по понедельникам дополнительно закрытая неделя Mon-Sun.
+    # В режиме auto: только daily; по понедельникам дополнительно закрытая неделя Mon-Sun. MTD 01.MM-факт день больше не выгружаем.
     - cron: "30 10 * * *"
   workflow_dispatch:
     inputs:
@@ -16,7 +16,6 @@ on:
           - auto
           - daily
           - weekly
-          - mtd
           - custom
       date_from:
         description: "Дата начала для custom/daily: YYYY-MM-DD"
@@ -61,6 +60,14 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install requests boto3 openpyxl
+
+      - name: Show planned schedule time
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+          echo "Workflow cron must be 30 10 * * * = 13:30 MSK"
 
       - name: Download and upload ABC
         shell: bash
