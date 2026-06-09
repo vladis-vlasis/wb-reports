@@ -1,58 +1,180 @@
-name: Управление рекламой
+name: TOPFACE WB Ads Manager
 
 on:
   workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "Что запустить вручную"
+        required: true
+        default: "main"
+        type: choice
+        options:
+          - main
+          - night_start
+          - night_end
+      dry_run:
+        description: "Dry-run: рассчитать без отправки в WB"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
   schedule:
-    # 10:00 МСК = 07:00 UTC
-    - cron: "0 7 * * *"
+    # GitHub Actions cron работает в UTC.
+    # МСК = UTC+3.
+    - cron: "0 22 * * *"  # 01:00 МСК — ночные эксперименты: минимальные ставки + pause combined с ДРР > 15%
+    - cron: "0 2 * * *"   # 05:00 МСК — ночные эксперименты: вернуть paused combined после окна
+    - cron: "0 9 * * *"   # 12:00 МСК — основной дневной запуск алгоритма
 
 jobs:
-  run:
-    name: Запустить управление рекламой
+  run-topface-ads-manager:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      PYTHONUNBUFFERED: "1"
+      TZ: "Europe/Moscow"
 
     steps:
-      - name: Скачать репозиторий
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Установить Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Установить зависимости
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
 
-      - name: Загрузить переменные из REPORT_ENV и отдельные secrets
-        env:
-          REPORT_ENV: ${{ secrets.REPORT_ENV }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
+      - name: Verify required secrets
         run: |
-          if [ -z "$REPORT_ENV" ]; then
-            echo "::error::Не задан secret REPORT_ENV"
+          python - <<'PY'
+          import os
+
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+          ]
+          missing = [name for name in required if not os.getenv(name)]
+          if missing:
+              raise SystemExit("Missing secrets: " + ", ".join(missing))
+          print("All required secrets are present.")
+          PY
+
+      - name: Verify correct assistant_wb_ads_manager.py
+        run: |
+          echo "=== Current directory ==="
+          pwd
+          echo "=== Repository files ==="
+          ls -la
+          echo "=== Script version marker ==="
+          grep -n "SCRIPT_VERSION" assistant_wb_ads_manager.py || true
+          echo "=== Old dayfirst bug check ==="
+          if grep -q "dayfirst=True" assistant_wb_ads_manager.py; then
+            echo "ERROR: В репозитории всё ещё старая версия assistant_wb_ads_manager.py с dayfirst=True"
             exit 1
           fi
+          if ! grep -q "strict-drr-v29-night-experiment-only-yml-2026-06-09" assistant_wb_ads_manager.py; then
+            echo "ERROR: В assistant_wb_ads_manager.py нет маркера v29"
+            exit 1
+          fi
+          echo "=== Script SHA256 ==="
+          sha256sum assistant_wb_ads_manager.py
 
-          printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
-
-          if [ -n "$WB_PROMO_KEY_TOPFACE" ]; then
-            echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
-          fi
-          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
-            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
-          fi
-          if [ -n "$TELEGRAM_CHAT_ID" ]; then
-            echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
-          fi
-          if [ -n "$TORGSTAT_ABC_URL" ]; then
-            echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
-          fi
-
-      - name: Запустить управление рекламой
+      - name: Compile Python script
         run: |
-          python upravlenie_reklamoy.py run
+          python -m py_compile assistant_wb_ads_manager.py
+
+      - name: Run TOPFACE WB Ads Manager
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
+          INPUT_RUN_SLOT: ${{ github.event.inputs.run_slot || 'main' }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          CMD="python assistant_wb_ads_manager.py run --skip-price"
+          SLOT="main"
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            case "$SCHEDULE_CRON" in
+              "0 22 * * *")
+                SLOT="night_start"
+                CMD="$CMD --night-experiment-only --apply-pause"
+                ;;
+              "0 2 * * *")
+                SLOT="night_end"
+                CMD="$CMD --night-experiment-only --apply-start"
+                ;;
+              "0 9 * * *")
+                SLOT="main"
+                ;;
+              *)
+                echo "ERROR: неизвестное расписание: $SCHEDULE_CRON"
+                exit 1
+                ;;
+            esac
+          else
+            case "$INPUT_RUN_SLOT" in
+              "night_start")
+                SLOT="night_start"
+                CMD="$CMD --night-experiment-only --apply-pause"
+                ;;
+              "night_end")
+                SLOT="night_end"
+                CMD="$CMD --night-experiment-only --apply-start"
+                ;;
+              "main"|"")
+                SLOT="main"
+                ;;
+              *)
+                echo "ERROR: неизвестный run_slot: $INPUT_RUN_SLOT"
+                exit 1
+                ;;
+            esac
+          fi
+
+          if [ "$INPUT_DRY_RUN" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
+          echo "Event: $EVENT_NAME"
+          echo "Schedule cron: $SCHEDULE_CRON"
+          echo "Resolved slot: $SLOT"
+          echo "Running: $CMD"
+          eval "$CMD"
+
+      - name: Show local result files
+        if: always()
+        run: |
+          echo "=== Local XLSX/JSON files after run ==="
+          find . -maxdepth 3 -type f \( -name "*.xlsx" -o -name "*.json" \) -print || true
+
+      - name: Upload local artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: topface-ads-manager-results
+          path: |
+            *.xlsx
+            *.json
+            **/Итог_последнего_запуска*.xlsx
+            **/Предпросмотр_последнего_запуска*.xlsx
+            **/Сводка_последнего_запуска*.json
+            **/Лог_API*.xlsx
+            **/История_ставок*.xlsx
+            **/История_пауз*.xlsx
+          if-no-files-found: warn
+          retention-days: 14
