@@ -64,6 +64,14 @@ jobs:
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
 
+      # Эти имена должны совпадать с тем, что читает report_runner.py.
+      # Ошибка FIX32 была в том, что workflow передавал TELEGRAM_*_SECRET,
+      # а Python искал TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+      # Дублируем старые имена только как fallback, если они уже были заведены в secrets.
       TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
@@ -276,6 +284,32 @@ jobs:
           echo "YC_BUCKET_NAME=$YC_BUCKET_NAME"
           echo "YC_ENDPOINT_URL=${YC_ENDPOINT_URL:-default}"
 
+      - name: Validate Telegram env
+        if: steps.decide.outputs.send_telegram == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set -a
+          source .env || true
+          set +a
+
+          # Fallback на старые временные имена, если вдруг они попали в окружение.
+          export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
+          export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
+          export TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}}"
+
+          test -n "${TELEGRAM_BOT_TOKEN:-}" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
+          test -n "${TELEGRAM_CHAT_ID:-}" || { echo "ERROR: TELEGRAM_CHAT_ID is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
+
+          {
+            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
+            echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID"
+            echo "TELEGRAM_MESSAGE_THREAD_ID=${TELEGRAM_MESSAGE_THREAD_ID:-}"
+          } >> "$GITHUB_ENV"
+
+          echo "Telegram env OK"
+
       - name: Smoke test
         if: steps.decide.outputs.mode == 'smoke'
         shell: bash
@@ -311,6 +345,10 @@ jobs:
           source .env || true
           set +a
 
+          export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
+          export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
+          export TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}}"
+
           ARGS="--root . --full-refresh --store TOPFACE"
 
           if [ "$SEND_TELEGRAM" = "true" ]; then
@@ -328,6 +366,10 @@ jobs:
           set -a
           source .env || true
           set +a
+
+          export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
+          export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
+          export TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}}"
 
           ARGS="--root . --current-week-only --store TOPFACE"
 
