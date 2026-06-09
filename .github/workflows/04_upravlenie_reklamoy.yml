@@ -34,6 +34,10 @@ jobs:
     timeout-minutes: 60
 
     env:
+      # Можно хранить секреты двумя способами:
+      # 1) отдельными GitHub Secrets: YC_ACCESS_KEY_ID / YC_SECRET_ACCESS_KEY / YC_BUCKET_NAME / WB_PROMO_KEY_TOPFACE
+      # 2) одним многострочным секретом REPORT_ENV в формате KEY=VALUE
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
@@ -54,6 +58,50 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+
+      - name: Load secrets from REPORT_ENV if needed
+        run: |
+          python - <<'PY'
+          import os
+
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+          ]
+
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+          for raw_line in report_env.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('\"').strip("'")
+              if key in allowed and value:
+                  parsed[key] = value
+
+          loaded = []
+          github_env = os.environ.get("GITHUB_ENV")
+          if not github_env:
+              raise SystemExit("GITHUB_ENV is not available")
+
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in allowed:
+                  # Отдельный secret имеет приоритет. REPORT_ENV используется как fallback.
+                  value = os.getenv(key) or parsed.get(key)
+                  if value:
+                      f.write(f"{key}={value}\n")
+                      loaded.append(key)
+
+          print("Loaded secret names: " + ", ".join(loaded))
+          PY
 
       - name: Verify required secrets
         run: |
