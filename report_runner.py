@@ -446,13 +446,21 @@ def dedupe_abc_period_rows(df: pd.DataFrame) -> pd.DataFrame:
     out["month_key"] = out["period_start"].dt.strftime("%Y-%m")
     out["_abc_source_ts"] = out.get("source_file", "").map(parse_abc_source_timestamp)
     out["_abc_period_days"] = (out["period_end"] - out["period_start"]).dt.days + 1
-    # Cumulative monthly-family files are only multi-day periods that start at day 1.
-    # A real daily ABC for the 1st day of a month must remain a daily fact.
+    # Cumulative monthly-family files are only multi-day periods that start at day 1,
+    # BUT an exact closed Monday-Sunday week may also start on the 1st day of a month
+    # (example: 01.06.2026-07.06.2026). Such files are weekly ABC facts, not MTD.
+    # A real daily ABC for the 1st day of a month must also remain a daily fact.
+    out["_abc_is_closed_week"] = (
+        out["_abc_period_days"].eq(7)
+        & out["period_start"].dt.weekday.eq(0)
+        & out["period_end"].dt.weekday.eq(6)
+    )
     out["_abc_is_month_family"] = (
         out["_abc_period_days"].gt(1)
         & out["period_start"].dt.day.eq(1)
         & out["period_start"].dt.year.eq(out["period_end"].dt.year)
         & out["period_start"].dt.month.eq(out["period_end"].dt.month)
+        & ~out["_abc_is_closed_week"]
     )
 
     # 1) Exact same period + SKU can be re-exported several times. Keep latest export only.
@@ -483,7 +491,7 @@ def dedupe_abc_period_rows(df: pd.DataFrame) -> pd.DataFrame:
             "monthly MTD files are not summed" % (removed_exact, removed_month)
         )
 
-    out = out.drop(columns=["_abc_source_ts", "_abc_period_days", "_abc_is_month_family"], errors="ignore")
+    out = out.drop(columns=["_abc_source_ts", "_abc_period_days", "_abc_is_month_family", "_abc_is_closed_week"], errors="ignore")
     return out
 
 
@@ -1544,12 +1552,18 @@ class Loader:
                     and int(start.year) == int(end.year)
                     and int(end.day) == int(month_last_day)
                 )
+                is_closed_week = (
+                    period_days == 7
+                    and pd.Timestamp(start).normalize().weekday() == 0
+                    and pd.Timestamp(end).normalize().weekday() == 6
+                )
                 is_partial_mtd = (
                     period_days > 1
                     and int(start.day) == 1
                     and int(start.month) == int(end.month)
                     and int(start.year) == int(end.year)
                     and not is_full_closed_month
+                    and not is_closed_week
                 )
 
                 if is_full_closed_month:
