@@ -11,7 +11,8 @@
 Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 Реклама: получает кампании из API, статистика за последние 30 дней, формирует отчёты по категориям.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
-Для всех методов Wildberries используется единый ключ из переменной WB_PROMO_KEY_TOPFACE.
+Для TOPFACE используется WB_PROMO_KEY_TOPFACE, для MISSTAIS используется WB_KEY_MISSTAIS.
+MISSTAIS: поисковые запросы собираются с 2026-06-08 и далее, без исторической догрузки 90 дней.
 """
 
 import os
@@ -847,6 +848,16 @@ class WildberriesDailyUpdater:
 
         # 2. Определяем целевую дату – вчера
         target_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
+
+        # Для MISSTAIS не делаем историческую догрузку поисковых запросов.
+        # Старт накопления данных — 2026-06-08, далее данные копятся в обычных недельных файлах.
+        if normalize_store_name(store_name) == 'MISSTAIS' and target_date < MISSTAIS_KEYWORDS_START_DATE:
+            self.log(
+                f"⏭️ MISSTAIS: поисковые запросы до {MISSTAIS_KEYWORDS_START_DATE:%Y-%m-%d} не собираем. "
+                f"Целевая дата {target_date:%Y-%m-%d} пропущена."
+            )
+            return True
+
         target_date_str = target_date.strftime('%Y-%m-%d')
         self.log(f"📅 Целевая дата: {target_date_str}")
 
@@ -1647,6 +1658,57 @@ class WildberriesDailyUpdater:
         self.log("=" * 80)
 
 
+
+
+# ========================== НАСТРОЙКИ МАГАЗИНОВ ==========================
+
+STORE_SECRET_ENV = {
+    'TOPFACE': 'WB_PROMO_KEY_TOPFACE',
+    'MISSTAIS': 'WB_KEY_MISSTAIS',
+}
+
+STORE_ALIASES = {
+    'TOPFACE': 'TOPFACE',
+    'TF': 'TOPFACE',
+    'MISSTAIS': 'MISSTAIS',
+    'MISS TAIS': 'MISSTAIS',
+    'MISS_TAIS': 'MISSTAIS',
+    'MISS-TAIS': 'MISSTAIS',
+    'MT': 'MISSTAIS',
+    'ALL': 'ALL',
+}
+
+MISSTAIS_KEYWORDS_START_DATE = datetime(2026, 6, 8).date()
+
+
+def normalize_store_name(value: str) -> str:
+    raw = (value or 'TOPFACE').strip().upper().replace('-', '_')
+    raw = re.sub(r"\s+", " ", raw)
+    return STORE_ALIASES.get(raw, raw)
+
+
+def get_store_secret_env(store_name: str) -> str:
+    store = normalize_store_name(store_name)
+    if store not in STORE_SECRET_ENV:
+        raise ValueError(f"Неизвестный магазин: {store_name}. Поддерживаются: {', '.join(STORE_SECRET_ENV)}")
+    return STORE_SECRET_ENV[store]
+
+
+def default_reports_for_store(store_name: str) -> List[str]:
+    # MISSTAIS теперь тоже собирает keywords, но только с даты MISSTAIS_KEYWORDS_START_DATE.
+    return ['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords']
+
+
+def build_api_keys_for_stores(stores: List[str]) -> Dict[str, Dict[str, str]]:
+    api_keys: Dict[str, Dict[str, str]] = {}
+    for store in stores:
+        secret_env = get_store_secret_env(store)
+        key_value = os.environ.get(secret_env, '').strip()
+        if not key_value:
+            raise ValueError(f"Для магазина {store} не задан secret/env {secret_env}")
+        api_keys[store] = {'promo': key_value, 'stats': key_value}
+    return api_keys
+
 # ========================== МЕНЮ ДЛЯ РУЧНОГО ЗАПУСКА ==========================
 
 def show_menu() -> int:
@@ -1673,7 +1735,7 @@ def show_menu() -> int:
 
 def run_specific_report(updater: WildberriesDailyUpdater, store: str):
     """Подменю для выбора конкретного отчёта."""
-    reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords']
+    reports = default_reports_for_store(store)
     print("\n" + "="*60)
     print("ДОСТУПНЫЕ ОТЧЁТЫ:")
     for i, report in enumerate(reports, 1):
@@ -1700,21 +1762,21 @@ def run_specific_report(updater: WildberriesDailyUpdater, store: str):
             print("Ошибка: введите число.")
 
 def main():
-    """Основная функция запуска с поддержкой меню."""
+    """Основная функция запуска с поддержкой TOPFACE/MISSTAIS/ALL."""
     parser = argparse.ArgumentParser(description='Wildberries Daily Updater')
     parser.add_argument('--full', action='store_true', help='Полное ежедневное обновление (все отчёты)')
-    parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords'], 
+    parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords'],
                         help='Обновить конкретный отчёт')
-    parser.add_argument('--store', type=str, default='TOPFACE', help='Название магазина (по умолчанию TOPFACE)')
-    
-    args = parser.parse_args()
+    parser.add_argument('--store', type=str, default='TOPFACE', help='Магазин: TOPFACE, MISSTAIS или ALL')
 
-    required_env = [
-        'YC_ACCESS_KEY_ID',
-        'YC_SECRET_ACCESS_KEY',
-        'YC_BUCKET_NAME',
-        'WB_PROMO_KEY_TOPFACE'
-    ]
+    args = parser.parse_args()
+    store_arg = normalize_store_name(args.store)
+    stores = ['TOPFACE', 'MISSTAIS'] if store_arg == 'ALL' else [store_arg]
+
+    required_env = ['YC_ACCESS_KEY_ID', 'YC_SECRET_ACCESS_KEY', 'YC_BUCKET_NAME']
+    for store in stores:
+        required_env.append(get_store_secret_env(store))
+
     missing = [var for var in required_env if not os.environ.get(var)]
     if missing:
         print(f"❌ Отсутствуют переменные окружения: {missing}")
@@ -1726,48 +1788,39 @@ def main():
         bucket_name=os.environ['YC_BUCKET_NAME']
     )
 
-    api_keys = {
-        args.store: {
-            # Один универсальный ключ для всех методов API
-            'promo': os.environ['WB_PROMO_KEY_TOPFACE'],
-            # Оставляем alias 'stats' для обратной совместимости внутренних обращений,
-            # но он указывает на тот же универсальный ключ.
-            'stats': os.environ['WB_PROMO_KEY_TOPFACE'],
-        }
-    }
-
+    api_keys = build_api_keys_for_stores(stores)
     updater = WildberriesDailyUpdater(api_keys, s3)
-    store = args.store
 
-    # Если переданы аргументы, выполняем соответствующее действие
-    if args.full:
-        updater.run_daily_update(store)
-        return
-    if args.report:
-        updater.log(f"➡️ Запуск обновления отчёта: {args.report}")
-        method = getattr(updater, f"update_{args.report}")
-        success = method(store)
-        updater.log(f"📊 Отчёт {args.report}: {'✅' if success else '❌'}")
-        return
+    def run_for_store(store: str) -> None:
+        if args.full:
+            updater.run_daily_update(store)
+            return
+        if args.report:
+            updater.log(f"➡️ Запуск обновления отчёта: {args.report} | магазин {store}")
+            method = getattr(updater, f"update_{args.report}")
+            success = method(store)
+            updater.log(f"📊 Отчёт {args.report} | {store}: {'✅' if success else '❌'}")
+            return
+        if sys.stdin.isatty() and len(stores) == 1:
+            while True:
+                choice = show_menu()
+                if choice == 1:
+                    updater.run_daily_update(store)
+                elif choice == 2:
+                    run_specific_report(updater, store)
+                elif choice == 3:
+                    print("Выход из программы.")
+                    break
+                print("\n" + "="*60)
+                input("Нажмите Enter, чтобы вернуться в меню...")
+        else:
+            updater.log("🚀 Запуск в неинтерактивном режиме: выполняем полное ежедневное обновление")
+            updater.run_daily_update(store)
 
-    # Если аргументы не переданы, проверяем интерактивность
-    if sys.stdin.isatty():
-        # Интерактивный режим: показываем меню
-        while True:
-            choice = show_menu()
-            if choice == 1:
-                updater.run_daily_update(store)
-            elif choice == 2:
-                run_specific_report(updater, store)
-            elif choice == 3:
-                print("Выход из программы.")
-                break
-            print("\n" + "="*60)
-            input("Нажмите Enter, чтобы вернуться в меню...")
-    else:
-        # Неинтерактивный режим без аргументов: по умолчанию полное обновление
-        updater.log("🚀 Запуск в неинтерактивном режиме: выполняем полное ежедневное обновление")
-        updater.run_daily_update(store)
+    for idx, store in enumerate(stores, start=1):
+        if len(stores) > 1:
+            updater.log(f"===== Магазин {idx}/{len(stores)}: {store} =====")
+        run_for_store(store)
 
 if __name__ == "__main__":
     main()
