@@ -83,15 +83,15 @@ jobs:
                   continue
               key, value = line.split("=", 1)
               key = key.strip()
-              value = value.strip().strip('\"').strip("'")
+              value = value.strip().strip('"').strip("'")
               if key in allowed and value:
                   parsed[key] = value
 
-          loaded = []
           github_env = os.environ.get("GITHUB_ENV")
           if not github_env:
               raise SystemExit("GITHUB_ENV is not available")
 
+          loaded = []
           with open(github_env, "a", encoding="utf-8") as f:
               for key in allowed:
                   # Отдельный secret имеет приоритет. REPORT_ENV используется как fallback.
@@ -120,29 +120,47 @@ jobs:
           print("All required secrets are present.")
           PY
 
-      - name: Verify correct assistant_wb_ads_manager.py
+      - name: Resolve script file
         run: |
+          set -euo pipefail
           echo "=== Current directory ==="
           pwd
           echo "=== Repository files ==="
           ls -la
+
+          SCRIPT_PATH=""
+          if [ -f "upravlenie_reklamoy.py" ]; then
+            SCRIPT_PATH="upravlenie_reklamoy.py"
+          elif [ -f "assistant_wb_ads_manager.py" ]; then
+            SCRIPT_PATH="assistant_wb_ads_manager.py"
+          else
+            echo "ERROR: Не найден файл скрипта. Ожидал upravlenie_reklamoy.py или assistant_wb_ads_manager.py в корне репозитория"
+            exit 1
+          fi
+
+          echo "SCRIPT_PATH=$SCRIPT_PATH" >> "$GITHUB_ENV"
+          echo "Resolved script: $SCRIPT_PATH"
+
           echo "=== Script version marker ==="
-          grep -n "SCRIPT_VERSION" assistant_wb_ads_manager.py || true
+          grep -n "SCRIPT_VERSION" "$SCRIPT_PATH" || true
+
           echo "=== Old dayfirst bug check ==="
-          if grep -q "dayfirst=True" assistant_wb_ads_manager.py; then
-            echo "ERROR: В репозитории всё ещё старая версия assistant_wb_ads_manager.py с dayfirst=True"
+          if grep -q "dayfirst=True" "$SCRIPT_PATH"; then
+            echo "ERROR: В репозитории всё ещё старая версия $SCRIPT_PATH с dayfirst=True"
             exit 1
           fi
-          if ! grep -q "strict-drr-v29-night-experiment-only-yml-2026-06-09" assistant_wb_ads_manager.py; then
-            echo "ERROR: В assistant_wb_ads_manager.py нет маркера v29"
+
+          if ! grep -q "strict-drr-v29-night-experiment-only-yml-2026-06-09" "$SCRIPT_PATH"; then
+            echo "ERROR: В $SCRIPT_PATH нет маркера v29. Значит в репозитории лежит не актуальная версия кода."
             exit 1
           fi
+
           echo "=== Script SHA256 ==="
-          sha256sum assistant_wb_ads_manager.py
+          sha256sum "$SCRIPT_PATH"
 
       - name: Compile Python script
         run: |
-          python -m py_compile assistant_wb_ads_manager.py
+          python -m py_compile "$SCRIPT_PATH"
 
       - name: Run TOPFACE WB Ads Manager
         env:
@@ -153,7 +171,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          CMD="python assistant_wb_ads_manager.py run --skip-price"
+          CMD="python $SCRIPT_PATH run --skip-price"
           SLOT="main"
 
           if [ "$EVENT_NAME" = "schedule" ]; then
@@ -201,6 +219,7 @@ jobs:
           echo "Event: $EVENT_NAME"
           echo "Schedule cron: $SCHEDULE_CRON"
           echo "Resolved slot: $SLOT"
+          echo "Resolved script: $SCRIPT_PATH"
           echo "Running: $CMD"
           eval "$CMD"
 
