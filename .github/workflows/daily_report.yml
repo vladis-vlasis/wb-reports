@@ -33,7 +33,10 @@ on:
         type: string
 
   schedule:
-    - cron: "50 10 * * *"   # 13:50 МСК каждый день
+    # План: PDF должен приходить около 15:00 по Москве.
+    # GitHub cron указывается в UTC. 11:35 UTC = 14:35 МСК.
+    # Отчёт обычно считается 15-25 минут, поэтому запуск ставим заранее.
+    - cron: "35 11 * * *"
 
 permissions:
   contents: read
@@ -61,9 +64,9 @@ jobs:
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
 
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
       WB_MAX_SEARCH_QUERY_FILES: "4"
       WB_MAX_ENTRY_POINT_FILES: "4"
@@ -81,6 +84,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Show trigger time
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Event: ${{ github.event_name }}"
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+          echo "Planned cron: 35 11 * * * = 14:35 MSK start, expected PDF around 15:00 MSK"
 
       - name: Setup Python
         uses: actions/setup-python@v5
