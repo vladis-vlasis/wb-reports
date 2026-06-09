@@ -25,7 +25,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import boto3
@@ -38,8 +38,8 @@ from botocore.exceptions import ClientError
 # Константы проекта
 # =============================
 
-SCRIPT_NAME = "upravlenie_reklamoy.py"
-SCRIPT_VERSION = "strict-drr-v19-economics-zero-base-hotfix-dtype-fix-2026-05-27"
+SCRIPT_NAME = "assistant_wb_ads_manager.py"
+SCRIPT_VERSION = "strict-drr-v28-night-experiments-minbid-2026-06-09"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -57,12 +57,29 @@ SUBJECT_DRR_LIMITS = {
 PAUSE_ALLOWED_SUBJECTS = {"помады", "блески", "косметические карандаши"}
 PAUSE_MIN_IMPRESSIONS = int(os.environ.get("WB_PAUSE_MIN_IMPRESSIONS", "10000") or 10000)
 PAUSE_ANALYSIS_DAYS = int(os.environ.get("WB_PAUSE_ANALYSIS_DAYS", "21") or 21)
-AUTO_APPLY_PAUSE_REASON_CODES = {"PAUSE_MIN_BID_HIGH_DRR_21D_10000"}
+AUTO_APPLY_PAUSE_REASON_CODES = {"PAUSE_MIN_BID_HIGH_DRR_21D_10000", "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE"}
+AUTO_APPLY_START_REASON_CODES = {"START_AFTER_ECONOMY_RECOVERY_D7", "START_AFTER_ECONOMY_RECOVERY_D14", "ROLLBACK_WRONG_SUBJECT_PAUSE", "EXPERIMENT_2_NIGHT_WINDOW_END_START"}
 
-# Разгон слабых кампаний: цель — выйти на >=1000 показов/день при расходе <=500 ₽/день.
+# Разгон слабых кампаний: цель — дать карточке трафик и проверить, будут ли заказы.
 RAMP_TARGET_IMPRESSIONS_PER_DAY = float(os.environ.get("WB_RAMP_TARGET_IMPRESSIONS_PER_DAY", "1000") or 1000)
-RAMP_MAX_SPEND_PER_DAY = float(os.environ.get("WB_RAMP_MAX_SPEND_PER_DAY", "500") or 500)
-RAMP_CHECK_DAYS = int(os.environ.get("WB_RAMP_CHECK_DAYS", "7") or 7)
+# Базовая цель разгона: довести расход примерно до 500 ₽/день. До этого экономика не является стоп-фактором.
+RAMP_TARGET_SPEND_PER_DAY = float(os.environ.get("WB_RAMP_TARGET_SPEND_PER_DAY", "500") or 500)
+# Если после выхода на 500 ₽/день ДРР < 15% и условная ВП после рекламы положительная,
+# разрешаем масштабировать разгон до 1000 ₽/день. Выше 1000 ₽/день ставку не растим.
+RAMP_SCALE_MAX_SPEND_PER_DAY = float(os.environ.get("WB_RAMP_SCALE_MAX_SPEND_PER_DAY", "1000") or 1000)
+RAMP_MAX_SPEND_PER_DAY = RAMP_SCALE_MAX_SPEND_PER_DAY
+RAMP_OVERSPEND_PER_DAY = float(os.environ.get("WB_RAMP_OVERSPEND_PER_DAY", str(int(RAMP_SCALE_MAX_SPEND_PER_DAY))) or RAMP_SCALE_MAX_SPEND_PER_DAY)
+RAMP_SCALE_DRR_LIMIT_PCT = float(os.environ.get("WB_RAMP_SCALE_DRR_LIMIT_PCT", "15") or 15)
+# Контроль качества трафика: клики/переходы по CORE_80 важнее краткосрочного ДРР,
+# потому что заказы могут доезжать спустя 1-2 недели после рекламного клика.
+KEYWORD_CORE_CLICK_GUARD_ENABLED = str(os.environ.get("WB_KEYWORD_CORE_CLICK_GUARD_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "нет"}
+KEYWORD_CORE_CLICK_RISK_DROP_PCT = float(os.environ.get("WB_KEYWORD_CORE_CLICK_RISK_DROP_PCT", "15") or 15)
+KEYWORD_CORE_CLICK_BAD_DROP_PCT = float(os.environ.get("WB_KEYWORD_CORE_CLICK_BAD_DROP_PCT", "20") or 20)
+KEYWORD_CORE_MIN_CLICKS_PER_DAY = float(os.environ.get("WB_KEYWORD_CORE_MIN_CLICKS_PER_DAY", "20") or 20)
+KEYWORD_CORE_POSITION_RISK_DELTA = float(os.environ.get("WB_KEYWORD_CORE_POSITION_RISK_DELTA", "3") or 3)
+KEYWORD_CORE_VISIBILITY_RISK_DROP_PP = float(os.environ.get("WB_KEYWORD_CORE_VISIBILITY_RISK_DROP_PP", "5") or 5)
+KEYWORD_HARD_REDUCE_EXTRA_DRR_PP = float(os.environ.get("WB_KEYWORD_HARD_REDUCE_EXTRA_DRR_PP", "5") or 5)
+RAMP_CHECK_DAYS = int(os.environ.get("WB_RAMP_CHECK_DAYS", "14") or 14)
 
 # Эксперимент: одна лучшая РК на товарную группу для помад/блесков/карандашей.
 ONE_CAMPAIGN_EXPERIMENT_SUBJECTS = {"помады", "блески", "косметические карандаши"}
@@ -102,6 +119,28 @@ DEFAULT_PRICE_RAISE_STEP_PP = 1
 DEFAULT_MIN_SELLER_DISCOUNT_PCT = int(os.environ.get("WB_PRICE_MIN_SELLER_DISCOUNT_PCT", "25") or 25)
 PRICE_TEST_SUBJECTS = {"помады", "блески", "косметические карандаши"}
 MAX_PRICE_TEST_ITEMS_PER_RUN = int(os.environ.get("WB_MAX_PRICE_TEST_ITEMS_PER_RUN", "30") or 30)
+
+# Контур корректировки цен отключён: цены сейчас ведёт внешний автоматический репрайсер.
+# Даже если передать --apply-price, скрипт не должен читать Discounts & Prices API,
+# не должен формировать ценовые рекомендации и не должен перезаписывать историю цен.
+PRICE_CORRECTION_ENABLED = False
+
+# Защита от резкого скачка CPM/полок с 2-7 ₽ сразу до минимума WB 80 ₽,
+# если текущая короткая экономика уже показывает плохой тест.
+CPM_MIN_JUMP_DRR_BLOCK_PCT = 15.0
+CPM_MIN_JUMP_NO_REVENUE_CLICKS_BLOCK = 20
+CPM_MIN_JUMP_NO_REVENUE_SPEND_BLOCK_RUB = 100.0
+
+# Ночные эксперименты по Москве. GitHub Actions обычно живёт в UTC, поэтому окно считаем явно в MSK = UTC+3.
+NIGHT_EXPERIMENTS_ENABLED = str(os.environ.get("WB_NIGHT_EXPERIMENTS_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "нет"}
+NIGHT_EXPERIMENT_START_HOUR_MSK = int(os.environ.get("WB_NIGHT_EXPERIMENT_START_HOUR_MSK", "1") or 1)
+NIGHT_EXPERIMENT_END_HOUR_MSK = int(os.environ.get("WB_NIGHT_EXPERIMENT_END_HOUR_MSK", "5") or 5)
+EXPERIMENT_1_ARTICLES = {"901/6", "901/2", "901/8"}
+EXPERIMENT_1_REASON_CODE = "EXPERIMENT_1_NIGHT_MIN_BID_MSK_1_5"
+EXPERIMENT_2_REASON_CODE = "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE"
+EXPERIMENT_2_START_REASON_CODE = "EXPERIMENT_2_NIGHT_WINDOW_END_START"
+EXPERIMENT_2_DRR_LIMIT_PCT = float(os.environ.get("WB_EXPERIMENT_2_DRR_LIMIT_PCT", "15") or 15)
+
 # Условная ВП после рекламы: вычитаем себестоимость, если она есть в Экономике.
 ECONOMICS_SUBTRACT_COGS = str(os.environ.get("WB_ECONOMICS_SUBTRACT_COGS", "1")).strip().lower() not in {"0", "false", "no", "нет"}
 
@@ -179,9 +218,33 @@ KEYWORD_EFFECT_COLUMNS = [
     "keyword_group", "queries_count",
     "position_before", "position_d1", "position_d3", "position_delta_d1", "position_delta_d3",
     "visibility_before", "visibility_d1", "visibility_d3", "visibility_delta_d1", "visibility_delta_d3",
+    "clicks_before", "clicks_d1", "clicks_d3", "clicks_delta_d1_pct", "clicks_delta_d3_pct",
     "keyword_orders_before", "keyword_orders_d1", "keyword_orders_d3",
     "query_freq_before", "query_freq_d1", "query_freq_d3",
     "keyword_verdict_d1", "keyword_verdict_d3", "keyword_comment",
+]
+
+KEYWORD_TRAFFIC_GUARD_COLUMNS = [
+    "nm_id", "supplier_article", "subject_norm",
+    "keyword_profile_status", "keyword_guard_status",
+    "core80_queries_count",
+    "base_core80_clicks", "current_core80_clicks",
+    "base_core80_clicks_per_day", "current_core80_clicks_per_day", "core80_clicks_delta_pct",
+    "base_core80_orders", "current_core80_orders", "core80_orders_delta_pct",
+    "base_core80_avg_position", "current_core80_avg_position", "core80_position_delta",
+    "base_core80_visibility_pct", "current_core80_visibility_pct", "core80_visibility_delta_pp",
+    "base_tail_clicks", "current_tail_clicks", "tail_clicks_delta_pct",
+    "core_click_guard_comment",
+]
+
+KEYWORD_LOSS_DETAIL_COLUMNS = [
+    "nm_id", "supplier_article", "subject_norm", "query_text", "keyword_group",
+    "orders_share", "orders_cum_share",
+    "base_clicks", "current_clicks", "clicks_delta", "clicks_delta_pct",
+    "base_orders", "current_orders", "orders_delta", "orders_delta_pct",
+    "base_position", "current_position", "position_delta",
+    "base_visibility_pct", "current_visibility_pct", "visibility_delta_pp",
+    "risk_status",
 ]
 
 PRICE_HISTORY_COLUMNS = [
@@ -210,7 +273,20 @@ BID_RAMP_MONITOR_COLUMNS = [
     "last_bid_change_date", "last_bid_change_old_bid", "last_bid_change_new_bid", "last_bid_change_reason_code",
     "impressions", "avg_impressions_per_day", "spend", "avg_spend_per_day", "orders", "revenue",
     "campaign_drr_pct", "drr_limit_pct", "last21_impressions", "last21_drr_pct",
-    "target_impressions_per_day", "max_spend_per_day", "check_days", "monitor_status",
+    "keyword_profile_status", "keyword_guard_status", "current_core80_clicks_per_day", "base_core80_clicks_per_day",
+    "core80_clicks_delta_pct", "core80_position_delta", "core80_visibility_delta_pp", "core_click_guard_comment",
+    "target_impressions_per_day", "target_spend_per_day", "overspend_per_day", "max_spend_per_day", "check_days",
+    "ramp_lifecycle_status", "ramp_start_date", "ramp_day", "ramp_days_left", "monitor_status",
+]
+
+RAMP_SELECTION_COLUMNS = [
+    "subject_norm", "control_product", "placement",
+    "selected_campaign_id", "selected_nm_id", "selected_supplier_article",
+    "selected_current_bid_rub", "selected_min_bid_rub", "selected_new_bid_rub",
+    "selected_avg_spend_per_day", "selected_avg_impressions_per_day",
+    "selected_clicks", "selected_orders", "selected_ctr_pct", "selected_conversion_pct",
+    "selected_drr_pct", "selected_gp_after_ads", "selected_score", "selected_sample_tier",
+    "selection_status", "reason_text", "blocked_campaign_ids",
 ]
 
 BID_CAMPAIGN_COMPARE_COLUMNS = [
@@ -304,6 +380,23 @@ DECISION_COLUMNS = [
     "cpo",
     "ctr_pct",
     "gp_after_ads",
+    "keyword_profile_status",
+    "keyword_guard_status",
+    "core80_queries_count",
+    "base_core80_clicks_per_day",
+    "current_core80_clicks_per_day",
+    "core80_clicks_delta_pct",
+    "base_core80_orders",
+    "current_core80_orders",
+    "core80_orders_delta_pct",
+    "base_core80_avg_position",
+    "current_core80_avg_position",
+    "core80_position_delta",
+    "base_core80_visibility_pct",
+    "current_core80_visibility_pct",
+    "core80_visibility_delta_pp",
+    "tail_clicks_delta_pct",
+    "core_click_guard_comment",
     "previous_event_id",
     "postcheck_status",
     "last_bid_change_event_id",
@@ -319,8 +412,15 @@ DECISION_COLUMNS = [
     "pause_decision",
     "ramp_candidate",
     "ramp_status",
+    "ramp_lifecycle_status",
+    "ramp_start_date",
+    "ramp_day",
+    "ramp_days_left",
     "ramp_applied_in_current_run",
     "ramp_api_status",
+    "experiment_label",
+    "experiment_id",
+    "experiment_window_msk",
 ]
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
@@ -973,8 +1073,292 @@ def classify_core_keywords(keyword_df: pd.DataFrame, ctx: RunContext) -> pd.Data
     return result
 
 
+
+
+def _keyword_pct_delta(current: Any, base: Any) -> Optional[float]:
+    base_f = money_or_zero(base)
+    current_f = money_or_zero(current)
+    if abs(base_f) < 1e-9:
+        return None
+    return (current_f / base_f - 1.0) * 100.0
+
+
+def _keyword_weighted_avg(df: pd.DataFrame, value_col: str, weight_col: str = "query_freq") -> float:
+    if df is None or df.empty or value_col not in df.columns:
+        return 0.0
+    vals = pd.to_numeric(df[value_col], errors="coerce")
+    weights = pd.to_numeric(df.get(weight_col, pd.Series([1.0] * len(df), index=df.index)), errors="coerce").fillna(0.0)
+    mask = vals.notna() & (vals > 0) & (weights > 0)
+    if mask.any() and float(weights.loc[mask].sum()) > 0:
+        return float((vals.loc[mask] * weights.loc[mask]).sum() / weights.loc[mask].sum())
+    vals = vals[vals.notna() & (vals > 0)]
+    return float(vals.mean()) if not vals.empty else 0.0
+
+
+def _keyword_with_core_group(keyword_df: pd.DataFrame, core_map: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет к недельным/дневным строкам запросов группу CORE_80/TAIL_20.
+
+    CORE_80 строится на исторической доле заказов по SKU и запросу. Это нужно, чтобы
+    отличать потерю целевых кликов от отсечения хвостового нерелевантного трафика.
+    """
+    if keyword_df is None or keyword_df.empty:
+        return pd.DataFrame()
+    work = keyword_df.copy()
+    if "query_text_norm" not in work.columns and "query_text" in work.columns:
+        work["query_text_norm"] = work["query_text"].astype(str).str.strip().str.lower().str.replace("ё", "е", regex=False)
+    if core_map is None or core_map.empty:
+        work["keyword_group"] = "TAIL_20"
+        work["orders_share"] = 0.0
+        work["orders_cum_share"] = 0.0
+        return work
+    core_cols = [c for c in ["nm_id", "query_text_norm", "keyword_group", "orders_share", "orders_cum_share"] if c in core_map.columns]
+    if "nm_id" not in core_cols or "query_text_norm" not in core_cols:
+        work["keyword_group"] = "TAIL_20"
+        work["orders_share"] = 0.0
+        work["orders_cum_share"] = 0.0
+        return work
+    grouped = core_map[core_cols].drop_duplicates(["nm_id", "query_text_norm"], keep="last").copy()
+    result = work.merge(grouped, on=["nm_id", "query_text_norm"], how="left", suffixes=("", "_core"))
+    result["keyword_group"] = result.get("keyword_group", pd.Series(dtype=str)).fillna("TAIL_20")
+    result["orders_share"] = pd.to_numeric(result.get("orders_share", 0), errors="coerce").fillna(0.0)
+    result["orders_cum_share"] = pd.to_numeric(result.get("orders_cum_share", 0), errors="coerce").fillna(0.0)
+    return result
+
+
+def _keyword_current_base_parts(keyword_df: pd.DataFrame, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame, float, float, str]:
+    """Возвращает current/base части поисковых запросов.
+
+    Основной режим — даты из ctx. Если недельный файл содержит только одну дату на неделю
+    и окна не совпали, fallback берёт две последние даты: последнюю как current, предыдущую как base.
+    """
+    if keyword_df is None or keyword_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), 1.0, 1.0, "NO_KEYWORD_DATA"
+    local = keyword_df.copy()
+    if has_valid_dates(local):
+        local = local[local["date"].notna() & (local["date"] <= ctx.mature_end)].copy()
+        current = local[(local["date"] >= ctx.current_start) & (local["date"] <= ctx.current_end)].copy()
+        base = local[(local["date"] >= ctx.base_start) & (local["date"] <= ctx.base_end)].copy()
+        mode = "CTX_WINDOWS"
+        if current.empty or base.empty:
+            dates = sorted(local["date"].dropna().unique())
+            if len(dates) >= 2:
+                current = local[local["date"].eq(dates[-1])].copy()
+                base = local[local["date"].eq(dates[-2])].copy()
+                mode = "LAST_TWO_KEYWORD_DATES"
+            elif len(dates) == 1:
+                current = local[local["date"].eq(dates[-1])].copy()
+                base = local.iloc[0:0].copy()
+                mode = "ONLY_LAST_KEYWORD_DATE"
+        current_days = max(float(current["date"].nunique()), 1.0) if not current.empty and "date" in current.columns else 1.0
+        base_days = max(float(base["date"].nunique()), 1.0) if not base.empty and "date" in base.columns else 1.0
+        return current, base, current_days, base_days, mode
+    return local.copy(), local.iloc[0:0].copy(), float(ANALYSIS_WINDOW_DAYS), float(ANALYSIS_WINDOW_DAYS), "NO_DATES_CURRENT_ONLY"
+
+
+def _aggregate_keyword_group(part: pd.DataFrame) -> Dict[str, float]:
+    if part is None or part.empty:
+        return {"clicks": 0.0, "orders": 0.0, "query_freq": 0.0, "position": 0.0, "visibility": 0.0, "queries": 0.0}
+    return {
+        "clicks": float(pd.to_numeric(part.get("clicks_to_card", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+        "orders": float(pd.to_numeric(part.get("keyword_orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+        "query_freq": float(pd.to_numeric(part.get("query_freq", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+        "position": _keyword_weighted_avg(part, "median_position", "query_freq"),
+        "visibility": float(pd.to_numeric(part.get("visibility_pct", pd.Series(dtype=float)), errors="coerce").fillna(0).mean()) if len(part) else 0.0,
+        "queries": float(part.get("query_text_norm", pd.Series(dtype=str)).astype(str).nunique()) if "query_text_norm" in part.columns else 0.0,
+    }
+
+
+def _classify_keyword_guard(core_current: Dict[str, float], core_base: Dict[str, float], current_days: float, base_days: float) -> Tuple[str, str]:
+    base_clicks_day = float(core_base.get("clicks", 0.0) or 0.0) / max(base_days, 1.0)
+    current_clicks_day = float(core_current.get("clicks", 0.0) or 0.0) / max(current_days, 1.0)
+    delta_pct = _keyword_pct_delta(current_clicks_day, base_clicks_day)
+    pos_base = float(core_base.get("position", 0.0) or 0.0)
+    pos_current = float(core_current.get("position", 0.0) or 0.0)
+    pos_delta = (pos_current - pos_base) if pos_base > 0 and pos_current > 0 else 0.0
+    vis_delta = float(core_current.get("visibility", 0.0) or 0.0) - float(core_base.get("visibility", 0.0) or 0.0)
+
+    if float(core_base.get("queries", 0.0) or 0.0) <= 0:
+        return "NO_CORE_KEYWORDS", "нет CORE_80 запросов: нельзя оценить качество кликов"
+    if base_clicks_day < KEYWORD_CORE_MIN_CLICKS_PER_DAY and current_clicks_day < KEYWORD_CORE_MIN_CLICKS_PER_DAY:
+        return "LOW_CORE_VOLUME", f"мало CORE-кликов для уверенного вывода: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день"
+    if delta_pct is not None and delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT:
+        return "CORE_CLICK_BAD_LOSS", f"критичная потеря CORE-кликов: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}%)"
+    if pos_delta >= KEYWORD_CORE_POSITION_RISK_DELTA:
+        return "CORE_POSITION_BAD_LOSS", f"ухудшение позиции CORE_80: {pos_base:.1f}→{pos_current:.1f} (Δ={pos_delta:.1f})"
+    if vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP:
+        return "CORE_VISIBILITY_BAD_LOSS", f"падение видимости CORE_80: {vis_delta:.1f} п.п."
+    if delta_pct is not None and delta_pct <= -KEYWORD_CORE_CLICK_RISK_DROP_PCT:
+        return "CORE_CLICK_RISK", f"риск потери CORE-кликов: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}%)"
+    if delta_pct is not None and delta_pct >= 0:
+        return "CORE_CLICK_GROWING", f"CORE-клики растут/держатся: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}%)"
+    return "CORE_CLICK_STABLE", f"CORE-клики без критичной просадки: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}% if delta known)".replace(" if delta known", "")
+
+
+def build_keyword_traffic_guard(keyword_df: pd.DataFrame, keyword_core_df: pd.DataFrame, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Собирает SKU-level контроль целевых кликов и детальную таблицу потерянных CORE-запросов.
+
+    Используется для двух решений:
+    - не снижать ставку, если ДРР краткосрочно улучшился, но CORE-клики падают;
+    - после 500 ₽/день в разгоне масштабировать только если растут/держатся целевые CORE-клики.
+    """
+    empty_profile = pd.DataFrame(columns=KEYWORD_TRAFFIC_GUARD_COLUMNS)
+    empty_detail = pd.DataFrame(columns=KEYWORD_LOSS_DETAIL_COLUMNS)
+    if keyword_df is None or keyword_df.empty:
+        return empty_profile, empty_detail
+    work = _keyword_with_core_group(keyword_df, keyword_core_df)
+    work = filter_managed_subject_rows(work) if "subject_norm" in work.columns else work.copy()
+    if work.empty:
+        return empty_profile, empty_detail
+    current, base, current_days, base_days, mode = _keyword_current_base_parts(work, ctx)
+    rows: List[Dict[str, Any]] = []
+    details: List[Dict[str, Any]] = []
+    nm_ids = sorted(set(work["nm_id"].map(_clean_id_value).tolist()))
+    for nm_id in nm_ids:
+        if not nm_id:
+            continue
+        cur_nm = current[current["nm_id"].map(_clean_id_value).eq(nm_id)].copy() if not current.empty else current.copy()
+        base_nm = base[base["nm_id"].map(_clean_id_value).eq(nm_id)].copy() if not base.empty else base.copy()
+        all_nm = work[work["nm_id"].map(_clean_id_value).eq(nm_id)].copy()
+        supplier_article = ""
+        subject_norm = ""
+        for source in [cur_nm, base_nm, all_nm]:
+            if source is not None and not source.empty:
+                vals = [_clean_text_value(x) for x in source.get("supplier_article", pd.Series(dtype=str)).tolist() if _clean_text_value(x)]
+                if vals and not supplier_article:
+                    supplier_article = vals[-1]
+                subs = [normalize_subject_value(x) for x in source.get("subject_norm", pd.Series(dtype=str)).tolist() if normalize_subject_value(x)]
+                if subs and not subject_norm:
+                    subject_norm = subs[-1]
+        cur_core = cur_nm[cur_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not cur_nm.empty else pd.DataFrame()
+        base_core = base_nm[base_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not base_nm.empty else pd.DataFrame()
+        cur_tail = cur_nm[~cur_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not cur_nm.empty else pd.DataFrame()
+        base_tail = base_nm[~base_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not base_nm.empty else pd.DataFrame()
+        cur_core_agg = _aggregate_keyword_group(cur_core)
+        base_core_agg = _aggregate_keyword_group(base_core)
+        cur_tail_agg = _aggregate_keyword_group(cur_tail)
+        base_tail_agg = _aggregate_keyword_group(base_tail)
+        guard_status, comment = _classify_keyword_guard(cur_core_agg, base_core_agg, current_days, base_days)
+        base_core_day = base_core_agg["clicks"] / max(base_days, 1.0)
+        current_core_day = cur_core_agg["clicks"] / max(current_days, 1.0)
+        pos_delta = (cur_core_agg["position"] - base_core_agg["position"]) if cur_core_agg["position"] > 0 and base_core_agg["position"] > 0 else 0.0
+        vis_delta = cur_core_agg["visibility"] - base_core_agg["visibility"]
+        rows.append({
+            "nm_id": nm_id, "supplier_article": supplier_article, "subject_norm": subject_norm,
+            "keyword_profile_status": mode, "keyword_guard_status": guard_status,
+            "core80_queries_count": int(base_core_agg.get("queries", 0) or cur_core_agg.get("queries", 0) or 0),
+            "base_core80_clicks": base_core_agg["clicks"], "current_core80_clicks": cur_core_agg["clicks"],
+            "base_core80_clicks_per_day": base_core_day, "current_core80_clicks_per_day": current_core_day,
+            "core80_clicks_delta_pct": _keyword_pct_delta(current_core_day, base_core_day),
+            "base_core80_orders": base_core_agg["orders"], "current_core80_orders": cur_core_agg["orders"],
+            "core80_orders_delta_pct": _keyword_pct_delta(cur_core_agg["orders"], base_core_agg["orders"]),
+            "base_core80_avg_position": base_core_agg["position"], "current_core80_avg_position": cur_core_agg["position"], "core80_position_delta": pos_delta,
+            "base_core80_visibility_pct": base_core_agg["visibility"], "current_core80_visibility_pct": cur_core_agg["visibility"], "core80_visibility_delta_pp": vis_delta,
+            "base_tail_clicks": base_tail_agg["clicks"], "current_tail_clicks": cur_tail_agg["clicks"],
+            "tail_clicks_delta_pct": _keyword_pct_delta(cur_tail_agg["clicks"], base_tail_agg["clicks"]),
+            "core_click_guard_comment": comment,
+        })
+
+        # Детализация по запросам: показываем прежде всего потери CORE-запросов.
+        core_queries = set(all_nm[all_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].get("query_text_norm", pd.Series(dtype=str)).astype(str).tolist())
+        for q in sorted(core_queries):
+            if not q:
+                continue
+            bq = base_core[base_core.get("query_text_norm", pd.Series(dtype=str)).astype(str).eq(q)].copy() if not base_core.empty else pd.DataFrame()
+            cq = cur_core[cur_core.get("query_text_norm", pd.Series(dtype=str)).astype(str).eq(q)].copy() if not cur_core.empty else pd.DataFrame()
+            ba = _aggregate_keyword_group(bq)
+            ca = _aggregate_keyword_group(cq)
+            clicks_delta = ca["clicks"] - ba["clicks"]
+            clicks_delta_pct = _keyword_pct_delta(ca["clicks"], ba["clicks"])
+            orders_delta = ca["orders"] - ba["orders"]
+            orders_delta_pct = _keyword_pct_delta(ca["orders"], ba["orders"])
+            qmeta = all_nm[all_nm.get("query_text_norm", pd.Series(dtype=str)).astype(str).eq(q)].tail(1)
+            query_text = _clean_text_value(qmeta.iloc[0].get("query_text", q)) if not qmeta.empty else q
+            orders_share = float(pd.to_numeric(pd.Series([qmeta.iloc[0].get("orders_share", 0) if not qmeta.empty else 0]), errors="coerce").fillna(0).iloc[0])
+            orders_cum = float(pd.to_numeric(pd.Series([qmeta.iloc[0].get("orders_cum_share", 0) if not qmeta.empty else 0]), errors="coerce").fillna(0).iloc[0])
+            q_pos_delta = (ca["position"] - ba["position"]) if ca["position"] > 0 and ba["position"] > 0 else 0.0
+            q_vis_delta = ca["visibility"] - ba["visibility"]
+            if ba["clicks"] >= KEYWORD_CORE_MIN_CLICKS_PER_DAY and clicks_delta_pct is not None and clicks_delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT:
+                risk = "CORE_QUERY_BAD_CLICK_LOSS"
+            elif ba["clicks"] >= KEYWORD_CORE_MIN_CLICKS_PER_DAY and clicks_delta_pct is not None and clicks_delta_pct <= -KEYWORD_CORE_CLICK_RISK_DROP_PCT:
+                risk = "CORE_QUERY_CLICK_RISK"
+            elif q_pos_delta >= KEYWORD_CORE_POSITION_RISK_DELTA or q_vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP:
+                risk = "CORE_QUERY_POSITION_VISIBILITY_RISK"
+            else:
+                risk = "CORE_QUERY_OK"
+            details.append({
+                "nm_id": nm_id, "supplier_article": supplier_article, "subject_norm": subject_norm,
+                "query_text": query_text, "keyword_group": "CORE_80",
+                "orders_share": orders_share, "orders_cum_share": orders_cum,
+                "base_clicks": ba["clicks"], "current_clicks": ca["clicks"], "clicks_delta": clicks_delta, "clicks_delta_pct": clicks_delta_pct,
+                "base_orders": ba["orders"], "current_orders": ca["orders"], "orders_delta": orders_delta, "orders_delta_pct": orders_delta_pct,
+                "base_position": ba["position"], "current_position": ca["position"], "position_delta": q_pos_delta,
+                "base_visibility_pct": ba["visibility"], "current_visibility_pct": ca["visibility"], "visibility_delta_pp": q_vis_delta,
+                "risk_status": risk,
+            })
+    profile = pd.DataFrame(rows, columns=KEYWORD_TRAFFIC_GUARD_COLUMNS)
+    detail = pd.DataFrame(details, columns=KEYWORD_LOSS_DETAIL_COLUMNS)
+    if not detail.empty:
+        detail = detail.sort_values(["risk_status", "clicks_delta", "orders_share"], ascending=[True, True, False]).head(2000)
+    return profile, detail
+
+
+def enrich_metrics_with_keyword_traffic_guard(metrics_df: pd.DataFrame, keyword_guard_df: pd.DataFrame) -> pd.DataFrame:
+    if metrics_df is None or metrics_df.empty:
+        return metrics_df if metrics_df is not None else pd.DataFrame()
+    result = metrics_df.copy()
+    if keyword_guard_df is not None and not keyword_guard_df.empty:
+        guard = keyword_guard_df.copy()
+        guard["nm_id"] = guard["nm_id"].map(_clean_id_value)
+        result["nm_id"] = result["nm_id"].map(_clean_id_value)
+        merge_cols = [c for c in KEYWORD_TRAFFIC_GUARD_COLUMNS if c in guard.columns and c not in {"supplier_article", "subject_norm"}]
+        result = result.merge(guard[merge_cols], on="nm_id", how="left")
+    for col in KEYWORD_TRAFFIC_GUARD_COLUMNS:
+        if col in {"nm_id", "supplier_article", "subject_norm"}:
+            continue
+        if col not in result.columns:
+            result[col] = "" if col in {"keyword_profile_status", "keyword_guard_status", "core_click_guard_comment"} else float("nan")
+    return result
+
+
+def apply_keyword_effect_risk_to_bid_history(bid_history: pd.DataFrame, keyword_effects_df: pd.DataFrame) -> pd.DataFrame:
+    """Переписывает verdict снижения ставки, если после снижения просели CORE_80 клики.
+
+    Логика нужна из-за лага заказов: ДРР может временно улучшиться, пока заказы ещё доезжают
+    со старого трафика, но потеря CORE-кликов уже означает риск будущей выручки.
+    """
+    if bid_history is None or bid_history.empty or keyword_effects_df is None or keyword_effects_df.empty:
+        return bid_history if bid_history is not None else pd.DataFrame(columns=BID_HISTORY_COLUMNS)
+    result = coerce_history_columns_object(bid_history.copy(), BID_HISTORY_COLUMNS)
+    core = keyword_effects_df[keyword_effects_df.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy()
+    if core.empty:
+        return result[BID_HISTORY_COLUMNS]
+    core_by_event = {str(r.get("event_id", "")): r for _, r in core.iterrows() if _clean_text_value(r.get("event_id", ""))}
+    for idx, row in result.iterrows():
+        event_id = _clean_text_value(row.get("event_id", ""))
+        direction = _clean_text_value(row.get("direction", "")).lower()
+        if direction != "lower" or event_id not in core_by_event:
+            continue
+        eff = core_by_event[event_id]
+        clicks_before = money_or_zero(eff.get("clicks_before", 0))
+        delta_pct_raw = pd.to_numeric(pd.Series([eff.get("clicks_delta_d3_pct")]), errors="coerce").iloc[0]
+        pos_delta = money_or_zero(eff.get("position_delta_d3", 0))  # положительное = позиция улучшилась в старой функции; отрицательное = хуже
+        vis_delta = money_or_zero(eff.get("visibility_delta_d3", 0))
+        if pd.isna(delta_pct_raw) or clicks_before < KEYWORD_CORE_MIN_CLICKS_PER_DAY:
+            continue
+        delta_pct = float(delta_pct_raw)
+        current_verdict = _clean_text_value(row.get("final_verdict", ""))
+        if delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT or pos_delta <= -KEYWORD_CORE_POSITION_RISK_DELTA or vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP:
+            result.at[idx, "final_verdict"] = "LOWER_BAD_CORE_CLICK_LOSS"
+            result.at[idx, "postcheck_status"] = "resolved"
+            result.at[idx, "d3_verdict"] = "LOWER_BAD_CORE_CLICK_LOSS"
+        elif delta_pct <= -KEYWORD_CORE_CLICK_RISK_DROP_PCT and current_verdict in {"LOWER_GOOD", "LOWER_D3_MIXED", ""}:
+            result.at[idx, "final_verdict"] = "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK"
+            result.at[idx, "postcheck_status"] = "resolved"
+            result.at[idx, "d3_verdict"] = "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK"
+    return result[BID_HISTORY_COLUMNS]
+
 def _keyword_window_agg(keyword_df: pd.DataFrame, core_map: pd.DataFrame, nm_id: str, supplier_article: str, start_date: date, end_date: date, group_name: str) -> Dict[str, float]:
-    empty = {"queries_count": 0.0, "position": 0.0, "visibility": 0.0, "keyword_orders": 0.0, "query_freq": 0.0}
+    empty = {"queries_count": 0.0, "position": 0.0, "visibility": 0.0, "clicks_to_card": 0.0, "keyword_orders": 0.0, "query_freq": 0.0}
     if keyword_df is None or keyword_df.empty or core_map is None or core_map.empty:
         return empty
     core = core_map[(core_map["nm_id"].astype(str) == str(nm_id)) & (core_map["keyword_group"] == group_name)].copy()
@@ -993,7 +1377,7 @@ def _keyword_window_agg(keyword_df: pd.DataFrame, core_map: pd.DataFrame, nm_id:
     if has_valid_dates(part):
         part = part[(part["date"] >= start_date) & (part["date"] <= end_date)].copy()
     if part.empty:
-        return {"queries_count": float(len(queries)), "position": 0.0, "visibility": 0.0, "keyword_orders": 0.0, "query_freq": 0.0}
+        return {"queries_count": float(len(queries)), "position": 0.0, "visibility": 0.0, "clicks_to_card": 0.0, "keyword_orders": 0.0, "query_freq": 0.0}
     # Для позиции меньше = лучше. Берём медиану по фразам/дням.
     pos = pd.to_numeric(part["median_position"], errors="coerce")
     pos = pos[pos > 0]
@@ -1001,6 +1385,7 @@ def _keyword_window_agg(keyword_df: pd.DataFrame, core_map: pd.DataFrame, nm_id:
         "queries_count": float(len(queries)),
         "position": float(pos.median()) if not pos.empty else 0.0,
         "visibility": float(pd.to_numeric(part["visibility_pct"], errors="coerce").fillna(0).mean()),
+        "clicks_to_card": float(pd.to_numeric(part.get("clicks_to_card", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
         "keyword_orders": float(pd.to_numeric(part["keyword_orders"], errors="coerce").fillna(0).sum()),
         "query_freq": float(pd.to_numeric(part["query_freq"], errors="coerce").fillna(0).sum()),
     }
@@ -1020,17 +1405,20 @@ def _keyword_verdict(direction: str, before: Dict[str, float], after: Dict[str, 
         return "NO_CORE_KEYWORDS", "нет классифицированных продающих фраз"
     pos_delta = _position_delta(after.get("position", 0), before.get("position", 0))
     vis_delta = float(after.get("visibility", 0) or 0) - float(before.get("visibility", 0) or 0)
+    clicks_before = float(before.get("clicks_to_card", 0) or 0)
+    clicks_after = float(after.get("clicks_to_card", 0) or 0)
+    clicks_delta_pct = _keyword_pct_delta(clicks_after, clicks_before)
     orders_before = float(before.get("keyword_orders", 0) or 0)
     orders_after = float(after.get("keyword_orders", 0) or 0)
     direction = str(direction or "").lower()
     if direction == "raise":
-        if pos_delta > 0 or vis_delta >= 2 or (orders_before == 0 and orders_after > 0) or orders_after >= orders_before:
-            return f"RAISE_KEYWORDS_OK_{horizon}", f"позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п., заказы {orders_before:.0f}->{orders_after:.0f}"
-        return f"RAISE_KEYWORDS_WEAK_{horizon}", f"нет улучшения CORE_80: позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
+        if (clicks_delta_pct is not None and clicks_delta_pct >= 0) or pos_delta > 0 or vis_delta >= 2 or (orders_before == 0 and orders_after > 0) or orders_after >= orders_before:
+            return f"RAISE_KEYWORDS_OK_{horizon}", f"CORE_80: клики {clicks_before:.0f}->{clicks_after:.0f} ({clicks_delta_pct if clicks_delta_pct is not None else 0:.1f}%), позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п., заказы {orders_before:.0f}->{orders_after:.0f}"
+        return f"RAISE_KEYWORDS_WEAK_{horizon}", f"нет улучшения CORE_80: клики {clicks_before:.0f}->{clicks_after:.0f}, позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
     if direction == "lower":
-        if pos_delta < -3 or vis_delta <= -5 or (orders_before > 0 and orders_after < orders_before * 0.80):
-            return f"LOWER_KEYWORDS_RISK_{horizon}", f"просадка CORE_80: позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п., заказы {orders_before:.0f}->{orders_after:.0f}"
-        return f"LOWER_KEYWORDS_OK_{horizon}", f"CORE_80 без критичной просадки: позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
+        if (clicks_before >= KEYWORD_CORE_MIN_CLICKS_PER_DAY and clicks_delta_pct is not None and clicks_delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT) or pos_delta < -KEYWORD_CORE_POSITION_RISK_DELTA or vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP or (orders_before > 0 and orders_after < orders_before * 0.80):
+            return f"LOWER_KEYWORDS_RISK_{horizon}", f"просадка CORE_80: клики {clicks_before:.0f}->{clicks_after:.0f} ({clicks_delta_pct if clicks_delta_pct is not None else 0:.1f}%), позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п., заказы {orders_before:.0f}->{orders_after:.0f}"
+        return f"LOWER_KEYWORDS_OK_{horizon}", f"CORE_80 без критичной просадки: клики {clicks_before:.0f}->{clicks_after:.0f}, позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
     return f"KEYWORDS_MONITOR_{horizon}", f"позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
 
 
@@ -1053,8 +1441,8 @@ def build_keyword_effects(bid_history: pd.DataFrame, keyword_df: pd.DataFrame, c
         d3_end = event_day + timedelta(days=3)
         for group_name in ["CORE_80", "TAIL_20"]:
             before = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, before_start, before_end, group_name)
-            d1 = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, d1_day, d1_day, group_name) if ctx.mature_end >= d1_day else {"queries_count": before.get("queries_count", 0), "position": 0, "visibility": 0, "keyword_orders": 0, "query_freq": 0}
-            d3 = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, d3_start, d3_end, group_name) if ctx.mature_end >= d3_end else {"queries_count": before.get("queries_count", 0), "position": 0, "visibility": 0, "keyword_orders": 0, "query_freq": 0}
+            d1 = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, d1_day, d1_day, group_name) if ctx.mature_end >= d1_day else {"queries_count": before.get("queries_count", 0), "position": 0, "visibility": 0, "clicks_to_card": 0, "keyword_orders": 0, "query_freq": 0}
+            d3 = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, d3_start, d3_end, group_name) if ctx.mature_end >= d3_end else {"queries_count": before.get("queries_count", 0), "position": 0, "visibility": 0, "clicks_to_card": 0, "keyword_orders": 0, "query_freq": 0}
             v1, c1 = _keyword_verdict(direction, before, d1, "D1") if ctx.mature_end >= d1_day else ("WAIT_D1", "зрелый D+1 ещё не доступен")
             v3, c3 = _keyword_verdict(direction, before, d3, "D3") if ctx.mature_end >= d3_end else ("WAIT_D3", "зрелый D+3 ещё не доступен")
             rows.append({
@@ -1077,6 +1465,11 @@ def build_keyword_effects(bid_history: pd.DataFrame, keyword_df: pd.DataFrame, c
                 "visibility_d3": d3.get("visibility", 0),
                 "visibility_delta_d1": float(d1.get("visibility", 0) or 0) - float(before.get("visibility", 0) or 0),
                 "visibility_delta_d3": float(d3.get("visibility", 0) or 0) - float(before.get("visibility", 0) or 0),
+                "clicks_before": before.get("clicks_to_card", 0),
+                "clicks_d1": d1.get("clicks_to_card", 0),
+                "clicks_d3": d3.get("clicks_to_card", 0),
+                "clicks_delta_d1_pct": _keyword_pct_delta(d1.get("clicks_to_card", 0), before.get("clicks_to_card", 0)),
+                "clicks_delta_d3_pct": _keyword_pct_delta(d3.get("clicks_to_card", 0), before.get("clicks_to_card", 0)),
                 "keyword_orders_before": before.get("keyword_orders", 0),
                 "keyword_orders_d1": d1.get("keyword_orders", 0),
                 "keyword_orders_d3": d3.get("keyword_orders", 0),
@@ -1099,6 +1492,7 @@ def enrich_effects_with_keyword_monitoring(effect_df: pd.DataFrame, keyword_effe
     cols = [
         "event_id", "queries_count", "position_before", "position_d1", "position_d3", "position_delta_d1", "position_delta_d3",
         "visibility_before", "visibility_d1", "visibility_d3", "visibility_delta_d1", "visibility_delta_d3",
+        "clicks_before", "clicks_d1", "clicks_d3", "clicks_delta_d1_pct", "clicks_delta_d3_pct",
         "keyword_orders_before", "keyword_orders_d1", "keyword_orders_d3", "keyword_verdict_d1", "keyword_verdict_d3", "keyword_comment",
     ]
     core = core[cols].drop_duplicates(subset=["event_id"], keep="last")
@@ -2185,6 +2579,12 @@ def load_pending_events(bid_history: pd.DataFrame, ctx: Optional[RunContext] = N
     for _, row in local.iterrows():
         status = _clean_text_value(row.get("postcheck_status", "")).lower()
         verdict = _clean_text_value(row.get("final_verdict", ""))
+        reason_code = _clean_text_value(row.get("reason_code", ""))
+        # В новом режиме разгон НЕ блокирует ставку на D+7.
+        # В течение 7 календарных дней он управляется ежедневно: ниже 500 ₽/день — повышаем,
+        # выше 600 ₽/день — немного снижаем, затем после 14 дней возвращаемся в обычную логику.
+        if is_ramp_event_reason(reason_code):
+            continue
         if status == "resolved" or verdict in {"RAISE_NO_TRAFFIC_GROWTH"}:
             continue
         old_bid = pd.to_numeric(pd.Series([row.get("old_bid_rub", None)]), errors="coerce").iloc[0]
@@ -2213,6 +2613,79 @@ def latest_postcheck_results(bid_history: pd.DataFrame) -> Dict[Tuple[str, str, 
     for _, row in local.iterrows():
         latest[make_key(row)] = row.to_dict()
     return latest
+
+
+RAMP_TERMINAL_VERDICTS = {
+    "RAMP_FINISHED_D7_NORMAL_MODE",
+    "RAMP_FINISHED_D7_TARGET_REACHED",
+    "RAMP_FINISHED_D7_OVERSPEND",
+    "RAMP_GOOD_D7",
+    "RAMP_NEGATIVE_GP_D7",
+    "RAMP_SPEND_OVER_LIMIT_D7",
+}
+
+
+def build_ramp_lifecycle_states(bid_history: pd.DataFrame, ctx: RunContext) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    """Строит состояние 14-дневного разгона по каждой РК.
+
+    Разгон теперь не является post-check ожиданием. Это отдельный 14-дневный режим:
+    - каждый календарный день можно менять ставку;
+    - базовая цель расхода: около 500 ₽/день;
+    - после 500 ₽/день масштабируем до 1000 ₽/день только если ДРР < 15% и условная ВП после рекламы > 0;
+    - выше 1000 ₽/день ставку не растим;
+    - после 14 дней РК возвращается в обычную логику ДРР.
+
+    Состояние строится по истории ставок. Если у РК уже была ramp-сессия и прошло больше 14 дней,
+    возвращаем completed, чтобы код не начинал разгон заново автоматически.
+    """
+    states: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    if bid_history is None or bid_history.empty:
+        return states
+    local = bid_history.copy()
+    for col in BID_HISTORY_COLUMNS:
+        if col not in local.columns:
+            local[col] = ""
+    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce").dt.date
+    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
+    local = local[local["event_date_parsed"].notna()].copy()
+    if local.empty:
+        return states
+    local = local.sort_values(["campaign_id", "nm_id", "placement", "event_date_parsed", "run_dt_parsed"], na_position="first")
+    today = ctx.run_datetime.date()
+    for key, grp in local.groupby(["campaign_id", "nm_id", "placement"], dropna=False):
+        key_norm = (_clean_id_value(key[0]), _clean_id_value(key[1]), normalize_placement_value(key[2]))
+        if not all(key_norm):
+            continue
+        ramp_rows: List[pd.Series] = []
+        # Берём последнюю ramp-сессию после последнего terminal ramp-verdict.
+        for _, r in grp.iterrows():
+            reason = _clean_text_value(r.get("reason_code", ""))
+            verdict = _clean_text_value(r.get("final_verdict", ""))
+            if is_ramp_event_reason(reason):
+                # Даже если старые D+7 проверки уже resolved, сохраняем первый день сессии:
+                # иначе ежедневные изменения могли бы сдвигать старт и бесконечно продлевать разгон.
+                ramp_rows.append(r)
+        if not ramp_rows:
+            continue
+        start_day = min(r.get("event_date_parsed") for r in ramp_rows if r.get("event_date_parsed") is not None)
+        last_row = sorted(ramp_rows, key=lambda r: (r.get("event_date_parsed"), pd.to_datetime(r.get("run_datetime"), errors="coerce")))[-1]
+        last_day = last_row.get("event_date_parsed")
+        ramp_day = max((today - start_day).days + 1, 1)
+        active = ramp_day <= int(RAMP_CHECK_DAYS)
+        states[key_norm] = {
+            "active": bool(active),
+            "completed": bool(not active),
+            "ramp_lifecycle_status": "RAMP_ACTIVE_DAILY_CONTROL" if active else "RAMP_FINISHED_NORMAL_MODE",
+            "ramp_start_date": start_day.isoformat(),
+            "ramp_day": int(min(ramp_day, int(RAMP_CHECK_DAYS) + 1)),
+            "ramp_days_left": int(max(int(RAMP_CHECK_DAYS) - ramp_day, 0)),
+            "last_event_id": _clean_text_value(last_row.get("event_id", "")),
+            "last_event_date": last_day.isoformat() if last_day else "",
+            "last_reason_code": _clean_text_value(last_row.get("reason_code", "")),
+            "last_old_bid": last_row.get("old_bid_rub", ""),
+            "last_new_bid": last_row.get("new_bid_rub", ""),
+        }
+    return states
 
 
 def aggregate_after_event(
@@ -2362,11 +2835,11 @@ def _postcheck_target_action(
         return "WAIT_POSTCHECK", "ждём созревания данных для оценки изменения ставки", ""
     if verdict.startswith("WAIT") or verdict in {"RAMP_D3_MONITOR_WEEK"}:
         return "WAIT_POSTCHECK", "ждём финальную оценку изменения ставки", ""
-    if verdict in {"RAISE_BAD", "RAMP_NEGATIVE_GP_D7", "RAMP_SPEND_OVER_LIMIT_D7"}:
-        next_bid = round(max(float(current_new_bid or 0.0) - float(step or 1.0), TECHNICAL_BID_FLOOR_RUB), 2)
+    if verdict in {"RAISE_BAD"}:
+        next_bid = max(next_bid_by_step(current_new_bid, step, "lower"), TECHNICAL_BID_FLOOR_RUB)
         return "REVERT_TO_PREVIOUS_BID", "эффект плохой: откатить ставку на предыдущий уровень", next_bid
     if verdict == "LOWER_BAD":
-        next_bid = round(float(current_new_bid or 0.0) + float(step or 1.0), 2)
+        next_bid = next_bid_by_step(current_new_bid, step, "raise")
         return "REVERT_TO_PREVIOUS_BID", "снижение ухудшило трафик/экономику: откатить ставку вверх", next_bid
     if verdict in {"RAISE_GOOD"}:
         return "HOLD_BID_LEVEL", "повышение сработало: оставить новый уровень, следующий шаг только по обычной логике ДРР/разгона", ""
@@ -2376,11 +2849,10 @@ def _postcheck_target_action(
         return "HOLD_BID_LEVEL", "снижение сработало: оставить новый уровень; дальше снижать только если ДРР всё ещё выше лимита", ""
     if verdict in {"LOWER_D3_MIXED"}:
         return "HOLD_BID_LEVEL", "эффект снижения смешанный: оставить ставку до следующего окна", ""
-    if verdict == "RAMP_GOOD_D7":
-        return "STOP_RAMP_HOLD", "цель разгона достигнута: остановить разгон и оставить ставку", ""
+    if verdict in {"RAMP_GOOD_D7", "RAMP_FINISHED_D7_TARGET_REACHED", "RAMP_FINISHED_D7_NORMAL_MODE", "RAMP_FINISHED_D7_OVERSPEND"}:
+        return "STOP_RAMP_HOLD", "период разгона завершён: дальше обычный режим управления ставкой", ""
     if verdict == "RAMP_NEEDS_MORE_BID_D7":
-        next_bid = round(float(current_new_bid or 0.0) + float(step or 1.0), 2)
-        return "CONTINUE_RAMP", "цель 1000 показов/день не достигнута, расход в лимите: продолжить разгон следующим шагом", next_bid
+        return "STOP_RAMP_HOLD", "старая оценка RAMP_NEEDS_MORE_BID_D7 больше не продолжает разгон: после периода разгона обычный режим", ""
     return "HOLD_BID_LEVEL", f"вердикт {verdict}: оставить ставку до следующего окна", ""
 
 
@@ -2540,18 +3012,17 @@ def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: Ru
                 avg_imp_d7 = d7_daily["impressions"]
                 avg_spend_d7 = d7_daily["spend"]
                 gp_d7_daily = d7_daily["gp_after_ads"]
-                if not pd.isna(gp_d7_daily) and float(gp_d7_daily) < 0:
-                    d7_verdict = "RAMP_NEGATIVE_GP_D7"
-                    final_verdict = "RAMP_NEGATIVE_GP_D7"
-                elif avg_spend_d7 > RAMP_MAX_SPEND_PER_DAY:
-                    d7_verdict = "RAMP_SPEND_OVER_LIMIT_D7"
-                    final_verdict = "RAMP_SPEND_OVER_LIMIT_D7"
-                elif avg_imp_d7 >= RAMP_TARGET_IMPRESSIONS_PER_DAY and (pd.isna(gp_d7_daily) or float(gp_d7_daily) >= 0):
-                    d7_verdict = "RAMP_GOOD_D7"
-                    final_verdict = "RAMP_GOOD_D7"
+                # Финал разгона через 7 дней: экономику и ДРР не оцениваем.
+                # Цель разгона — дать товару тестовый трафик; дальше РК переходит в обычный режим.
+                if avg_spend_d7 >= RAMP_OVERSPEND_PER_DAY:
+                    d7_verdict = "RAMP_FINISHED_D7_OVERSPEND"
+                    final_verdict = "RAMP_FINISHED_D7_OVERSPEND"
+                elif avg_imp_d7 >= RAMP_TARGET_IMPRESSIONS_PER_DAY and avg_spend_d7 >= RAMP_TARGET_SPEND_PER_DAY:
+                    d7_verdict = "RAMP_FINISHED_D7_TARGET_REACHED"
+                    final_verdict = "RAMP_FINISHED_D7_TARGET_REACHED"
                 else:
-                    d7_verdict = "RAMP_NEEDS_MORE_BID_D7"
-                    final_verdict = "RAMP_NEEDS_MORE_BID_D7"
+                    d7_verdict = "RAMP_FINISHED_D7_NORMAL_MODE"
+                    final_verdict = "RAMP_FINISHED_D7_NORMAL_MODE"
                 updated.at[idx, "d7_verdict"] = d7_verdict
                 updated.at[idx, "d7_check_date"] = str(ctx.mature_end)
                 status = "resolved"
@@ -2772,6 +3243,83 @@ def bid_step_rub(placement: Any) -> Tuple[float, str]:
     return 1.0, "UNKNOWN_PLACEMENT_DEFAULT_STEP"
 
 
+def _round_half_up(value: float) -> int:
+    return int(math.floor(float(value) + 0.5))
+
+
+def normalize_bid_to_step(value: Any, placement: Any = "", step: Optional[float] = None) -> float:
+    """Приводит ставку к допустимой сетке: CPC = целые рубли, combined/полки = кратно 5 ₽."""
+    value_num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(value_num):
+        return float("nan")
+    bid = max(float(value_num), 0.0)
+    step_f = float(step if step is not None else bid_step_rub(placement)[0] or 1.0)
+    if step_f >= 5.0:
+        return float(_round_half_up(bid / step_f) * int(step_f))
+    return float(_round_half_up(bid))
+
+
+def normalize_bid_to_api_grid(value: Any, placement: Any = "", action: Any = "") -> float:
+    """Финальная сетка перед API: CPC — целые ₽; combined/полки — целые и кратно 5 ₽.
+
+    Для повышения округляем вверх, для снижения — вниз, чтобы API не получил дробную CPM-ставку
+    и чтобы решение не меняло направление из-за округления.
+    """
+    value_num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(value_num):
+        return float("nan")
+    bid = max(float(value_num), 0.0)
+    step, _ = bid_step_rub(placement)
+    step_f = float(step or 1.0)
+    action_norm = _clean_text_value(action).lower()
+    if step_f >= 5.0:
+        if action_norm in {"повысить", "raise", "up"}:
+            return float(math.ceil((bid - 1e-9) / step_f) * int(step_f))
+        if action_norm in {"снизить", "lower", "down"}:
+            return float(max(math.floor((bid + 1e-9) / step_f) * int(step_f), 0))
+        return float(_round_half_up(bid / step_f) * int(step_f))
+    if action_norm in {"повысить", "raise", "up"}:
+        return float(math.ceil(bid - 1e-9))
+    if action_norm in {"снизить", "lower", "down"}:
+        return float(max(math.floor(bid + 1e-9), 0))
+    return float(_round_half_up(bid))
+
+
+def should_block_cpm_min_jump(row: pd.Series | Dict[str, Any], min_bid: float, proposed_bid: Any) -> Tuple[bool, str]:
+    """CPM/полки имеют реальный WB minimum bid.
+
+    Минимальная ставка combined сейчас 80 ₽. Блокировка прыжка к 80 ₽ отключена: вместо неё
+    работает селектор разгона — не больше одной выбранной РК на товар и placement.
+    """
+    return False, ""
+
+
+def next_bid_for_action(current_bid: Any, placement: Any, direction: str) -> float:
+    """Следующая ставка строго по сетке: search/recommendations ±1 ₽; combined ±5 ₽."""
+    step, _ = bid_step_rub(placement)
+    base = normalize_bid_to_step(current_bid, placement, step)
+    if pd.isna(base):
+        return float("nan")
+    if str(direction).lower() in {"raise", "повысить", "up"}:
+        return float(base + step)
+    if str(direction).lower() in {"lower", "снизить", "down"}:
+        return float(max(base - step, 0.0))
+    return float(base)
+
+
+def next_bid_by_step(current_bid: Any, step: Any, direction: str) -> float:
+    """То же, но когда в функции известен только шаг, без placement."""
+    step_f = float(step or 1.0)
+    base = normalize_bid_to_step(current_bid, step=step_f)
+    if pd.isna(base):
+        return float("nan")
+    if str(direction).lower() in {"raise", "повысить", "up"}:
+        return float(base + step_f)
+    if str(direction).lower() in {"lower", "снизить", "down"}:
+        return float(max(base - step_f, 0.0))
+    return float(base)
+
+
 def format_float(value: Any, digits: int = 2) -> str:
     if value is None or pd.isna(value):
         return "н/д"
@@ -2804,7 +3352,13 @@ def technical_hold(reason_code: str, row: pd.Series, reason: str) -> Dict[str, A
     }
 
 
-def decide_action(row: pd.Series, pending_event: Optional[Dict[str, Any]] = None, postcheck_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def decide_action(
+    row: pd.Series,
+    pending_event: Optional[Dict[str, Any]] = None,
+    postcheck_result: Optional[Dict[str, Any]] = None,
+    ramp_state: Optional[Dict[str, Any]] = None,
+    ctx: Optional[RunContext] = None,
+) -> Dict[str, Any]:
     """
     Возвращает dict:
     {
@@ -2841,9 +3395,146 @@ def decide_action(row: pd.Series, pending_event: Optional[Dict[str, Any]] = None
     orders = money_or_zero(row.get("orders", 0))
     avg_impressions_per_day = money_or_zero(row.get("avg_impressions_per_day", impressions / ANALYSIS_WINDOW_DAYS))
     avg_spend_per_day = money_or_zero(row.get("avg_spend_per_day", spend / ANALYSIS_WINDOW_DAYS))
+    drr = float(row.get("campaign_drr_pct", 0) or 0)
+    keyword_guard_status = _clean_text_value(row.get("keyword_guard_status", ""))
+    core_click_delta_raw = pd.to_numeric(pd.Series([row.get("core80_clicks_delta_pct")]), errors="coerce").iloc[0]
+    core_click_delta_pct = None if pd.isna(core_click_delta_raw) else float(core_click_delta_raw)
+    core_current_clicks_day = money_or_zero(row.get("current_core80_clicks_per_day", 0))
+    core_base_clicks_day = money_or_zero(row.get("base_core80_clicks_per_day", 0))
+    core_position_delta = money_or_zero(row.get("core80_position_delta", 0))  # положительное = позиция стала хуже
+    core_visibility_delta = money_or_zero(row.get("core80_visibility_delta_pp", 0))
+    keyword_core_bad = KEYWORD_CORE_CLICK_GUARD_ENABLED and keyword_guard_status in {"CORE_CLICK_BAD_LOSS", "CORE_POSITION_BAD_LOSS", "CORE_VISIBILITY_BAD_LOSS"}
+    keyword_core_risk = KEYWORD_CORE_CLICK_GUARD_ENABLED and (keyword_core_bad or keyword_guard_status in {"CORE_CLICK_RISK"})
+    keyword_scale_ok = (
+        (not KEYWORD_CORE_CLICK_GUARD_ENABLED)
+        or keyword_guard_status in {"CORE_CLICK_GROWING", "LOW_CORE_VOLUME"}
+        or (keyword_guard_status == "CORE_CLICK_STABLE" and core_click_delta_pct is not None and core_click_delta_pct >= 0)
+    )
+    hard_reduce_by_drr = drr >= (drr_limit + KEYWORD_HARD_REDUCE_EXTRA_DRR_PP)
 
-    if final_verdict in {"RAISE_BAD", "RAISE_NO_TRAFFIC_GROWTH", "RAMP_NEGATIVE_GP_D7", "RAMP_SPEND_OVER_LIMIT_D7"}:
-        new_bid = round(current_bid_float - step, 2)
+    ramp_state = ramp_state or {}
+    today = ctx.run_datetime.date() if ctx is not None else date.today()
+    ramp_active = bool(ramp_state.get("active", False))
+    ramp_completed = bool(ramp_state.get("completed", False))
+    ramp_day = int(pd.to_numeric(pd.Series([ramp_state.get("ramp_day", 0)]), errors="coerce").fillna(0).iloc[0])
+    ramp_days_left = int(pd.to_numeric(pd.Series([ramp_state.get("ramp_days_left", 0)]), errors="coerce").fillna(0).iloc[0])
+    ramp_start_date = _clean_text_value(ramp_state.get("ramp_start_date", ""))
+    last_ramp_event_date = _clean_text_value(ramp_state.get("last_event_date", ""))
+
+    # 14-дневный разгон:
+    # 1) до 500 ₽/день расхода — даём карточке трафик, экономику не используем как стоп-фактор;
+    # 2) после 500 ₽/день — масштабируем только при строгой экономике: ДРР < 15%, есть выручка/заказы и ВП после рекламы > 0;
+    # 3) верхний предел разгона — 1000 ₽/день, выше этого ставку не повышаем.
+    if ramp_active:
+        gp_after_ads = money_or_zero(row.get("gp_after_ads", 0))
+        economy_only_scale_ok = (drr < RAMP_SCALE_DRR_LIMIT_PCT and revenue > 0 and orders > 0 and gp_after_ads > 0)
+        economy_scale_ok = economy_only_scale_ok and keyword_scale_ok
+        economy_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and not economy_only_scale_ok)
+        keyword_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and economy_only_scale_ok and not keyword_scale_ok)
+
+        if last_ramp_event_date == today.isoformat():
+            return technical_hold(
+                "RAMP_DAILY_ALREADY_CHANGED_TODAY",
+                row,
+                (
+                    f"разгон активен день {ramp_day}/{RAMP_CHECK_DAYS}, старт={ramp_start_date}; "
+                    f"сегодня уже была правка ставки по разгону; расход={avg_spend_per_day:.0f} ₽/день; "
+                    f"показы={avg_impressions_per_day:.0f}/день; ДРР={drr:.2f}%; ВП после рекламы={gp_after_ads:.0f} ₽; "
+                    f"CORE-клики={core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%); "
+                    f"статус CORE={keyword_guard_status or 'н/д'}; осталось дней={ramp_days_left}"
+                ),
+            )
+
+        if avg_spend_per_day > RAMP_SCALE_MAX_SPEND_PER_DAY:
+            new_bid = next_bid_for_action(current_bid_float, placement, "lower")
+            reason_code = "RAMP_DAILY_SPEND_OVER_1000_REDUCE"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            if new_bid < TECHNICAL_BID_FLOOR_RUB:
+                return technical_hold(
+                    "RAMP_DAILY_SPEND_OVER_1000_FLOOR_REACHED",
+                    row,
+                    f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день > верхнего лимита {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f}, но ниже технического пола снижать нельзя",
+                )
+            return {
+                "action": "Снизить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день > верхнего лимита {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f}; снижаем ставку, чтобы не разгоняться выше 1000 ₽/день"),
+                "pause_decision": "",
+            }
+
+        if avg_spend_per_day < RAMP_TARGET_SPEND_PER_DAY:
+            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
+            reason_code = "RAMP_DAILY_SPEND_UNDER_500_RAISE"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            return {
+                "action": "Повысить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день < базовой цели {RAMP_TARGET_SPEND_PER_DAY:.0f} ₽/день; показы {avg_impressions_per_day:.0f}/день, цель минимум {RAMP_TARGET_IMPRESSIONS_PER_DAY:.0f}; повышаем ежедневно, чтобы дать карточке тестовый трафик"),
+                "pause_decision": "",
+            }
+
+        if avg_spend_per_day < RAMP_SCALE_MAX_SPEND_PER_DAY and economy_scale_ok:
+            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
+            reason_code = "RAMP_DAILY_CORE_GROWING_ECONOMY_OK_SCALE_TO_1000"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            return {
+                "action": "Повысить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день уже >= {RAMP_TARGET_SPEND_PER_DAY:.0f}; экономика ОК: ДРР {drr:.2f}% < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП {gp_after_ads:.0f} ₽ > 0; CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус {keyword_guard_status or 'н/д'}; разрешаем масштабироваться до {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"),
+                "pause_decision": "",
+            }
+
+        if keyword_bad_after_target and avg_spend_per_day < RAMP_SCALE_MAX_SPEND_PER_DAY:
+            return technical_hold(
+                "RAMP_SPEND_GROWS_CORE_NOT_GROWING_HOLD",
+                row,
+                (
+                    f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: экономика позволяет масштабироваться до 1000 ₽/день, "
+                    f"но целевые CORE-клики не растут: {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день "
+                    f"({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), позиция Δ={core_position_delta:.1f}, "
+                    f"видимость Δ={core_visibility_delta:.1f} п.п.; ставку выше 500 ₽/день не увеличиваем"
+                ),
+            )
+
+        if economy_bad_after_target and avg_spend_per_day > RAMP_TARGET_SPEND_PER_DAY:
+            new_bid = next_bid_for_action(current_bid_float, placement, "lower")
+            reason_code = "RAMP_DAILY_ECONOMY_BAD_AFTER_500_REDUCE"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            if new_bid < TECHNICAL_BID_FLOOR_RUB:
+                return technical_hold(
+                    "RAMP_DAILY_ECONOMY_BAD_AFTER_500_FLOOR_REACHED",
+                    row,
+                    f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: после выхода за 500 ₽/день экономика не прошла контроль, но ниже технического пола снижать нельзя; ДРР={drr:.2f}%, ВП={gp_after_ads:.0f} ₽",
+                )
+            return {
+                "action": "Снизить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день >= 500, но экономика не проходит масштабирование: ДРР={drr:.2f}% / лимит {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП после рекламы={gp_after_ads:.0f} ₽, выручка={revenue:.0f} ₽, заказы={orders:.0f}; возвращаемся к уровню около 500 ₽/день"),
+                "pause_decision": "",
+            }
+
+        return technical_hold(
+            "RAMP_DAILY_SCALE_MAX_OR_ECONOMY_HOLD",
+            row,
+            (
+                f"разгон активен день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день; "
+                f"цель 500 ₽/день достигнута. Дальше растим только при ДРР < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}% "
+                f"и ВП после рекламы > 0 плюс CORE-клики должны расти/держаться; текущие ДРР={drr:.2f}%, ВП={gp_after_ads:.0f} ₽, "
+                f"выручка={revenue:.0f} ₽, заказы={orders:.0f}; CORE={keyword_guard_status or 'н/д'}, "
+                f"клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день; верхний предел={RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"
+            ),
+        )
+
+    if final_verdict in {"RAISE_BAD", "RAISE_NO_TRAFFIC_GROWTH"}:
+        new_bid = next_bid_for_action(current_bid_float, placement, "lower")
         reason_code = "RAISE_FAILED_REVERT"
         if step_reason:
             reason_code += f"__{step_reason}"
@@ -2863,9 +3554,9 @@ def decide_action(row: pd.Series, pending_event: Optional[Dict[str, Any]] = None
             "pause_decision": "",
         }
 
-    if final_verdict == "LOWER_BAD":
-        new_bid = round(current_bid_float + step, 2)
-        reason_code = "LOWER_FAILED_REVERT"
+    if final_verdict in {"LOWER_BAD", "LOWER_BAD_CORE_CLICK_LOSS"}:
+        new_bid = next_bid_for_action(current_bid_float, placement, "raise")
+        reason_code = "LOWER_FAILED_REVERT" if final_verdict == "LOWER_BAD" else "LOWER_CORE_CLICK_LOSS_REVERT"
         if step_reason:
             reason_code += f"__{step_reason}"
         return {
@@ -2875,6 +3566,13 @@ def decide_action(row: pd.Series, pending_event: Optional[Dict[str, Any]] = None
             "reason_text": build_reason_text(row, "Повысить", new_bid, f"откат после {final_verdict}; previous_event_id={previous_event_id}"),
             "pause_decision": "",
         }
+
+    if final_verdict == "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK":
+        return technical_hold(
+            "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK",
+            row,
+            f"после снижения ставки ДРР мог улучшиться, но CORE-клики просели; не снижаем дальше без следующего периода: {row.get('core_click_guard_comment', '')}"
+        )
 
     if pending_event is not None:
         wait_rule = _clean_text_value(pending_event.get("wait_rule", "WAIT_POSTCHECK"))
@@ -2892,27 +3590,39 @@ def decide_action(row: pd.Series, pending_event: Optional[Dict[str, Any]] = None
             f"правило={prev_reason}; ждём до {wait_until}; осталось дней={wait_days_left}"
         )
 
-    # Отдельная механика разгона слабых кампаний: если ставка настолько низкая,
-    # что нет расхода/заказов или нет 1000 показов в день при расходе до 500 ₽/день, повышаем ставку и смотрим неделю.
-    if avg_impressions_per_day < RAMP_TARGET_IMPRESSIONS_PER_DAY and avg_spend_per_day <= RAMP_MAX_SPEND_PER_DAY:
-        new_bid = round(current_bid_float + step, 2)
-        reason_code = "RAMP_TO_1000_IMPRESSIONS_PER_DAY"
+    # Старт 14-дневного разгона. Если РК уже прошла ramp-сессию, повторно автоматически не стартуем:
+    # после 14 дней она работает в обычном режиме. Стартуем, если не хватает расхода или показов.
+    if (not ramp_completed) and (avg_spend_per_day < RAMP_TARGET_SPEND_PER_DAY or avg_impressions_per_day < RAMP_TARGET_IMPRESSIONS_PER_DAY) and avg_spend_per_day < RAMP_SCALE_MAX_SPEND_PER_DAY:
+        new_bid = next_bid_for_action(current_bid_float, placement, "raise")
+        reason_code = "RAMP_START_DAILY_TO_500_SPEND"
         if spend == 0 and orders == 0:
-            reason_code = "LOW_BID_NO_SPEND_NO_ORDERS_RAMP"
+            reason_code = "LOW_BID_NO_SPEND_NO_ORDERS_RAMP_START"
         if step_reason:
             reason_code += f"__{step_reason}"
         return {
             "action": "Повысить",
             "new_bid_rub": new_bid,
             "reason_code": reason_code,
-            "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон показов: {avg_impressions_per_day:.0f}/день < {RAMP_TARGET_IMPRESSIONS_PER_DAY:.0f}/день; расход {avg_spend_per_day:.0f} ₽/день <= {RAMP_MAX_SPEND_PER_DAY:.0f} ₽/день; проверка D+{RAMP_CHECK_DAYS}"),
+            "reason_text": build_reason_text(row, "Повысить", new_bid, f"старт разгона на {RAMP_CHECK_DAYS} дней: расход {avg_spend_per_day:.0f} ₽/день < цели {RAMP_TARGET_SPEND_PER_DAY:.0f} ₽/день; показы {avg_impressions_per_day:.0f}/день, целевой минимум {RAMP_TARGET_IMPRESSIONS_PER_DAY:.0f}; задача — дать карточке трафик и проверить заказы, экономику в разгоне не оцениваем"),
             "pause_decision": "",
         }
 
-    drr = float(row.get("campaign_drr_pct", 0) or 0)
     if drr >= drr_limit:
-        new_bid = round(current_bid_float - step, 2)
+        if keyword_core_risk and not hard_reduce_by_drr:
+            return technical_hold(
+                "DRR_GE_LIMIT_HOLD_CORE_CLICK_RISK",
+                row,
+                (
+                    f"ДРР {drr:.2f}% >= лимита {drr_limit:.1f}%, но снижение запрещено: падают целевые CORE-клики. "
+                    f"CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день "
+                    f"({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус={keyword_guard_status}; "
+                    f"жёсткое снижение разрешено только при ДРР >= {drr_limit + KEYWORD_HARD_REDUCE_EXTRA_DRR_PP:.1f}%"
+                ),
+            )
+        new_bid = next_bid_for_action(current_bid_float, placement, "lower")
         reason_code = "DRR_GE_LIMIT_REDUCE"
+        if keyword_core_risk and hard_reduce_by_drr:
+            reason_code = "DRR_HARD_REDUCE_DESPITE_CORE_RISK"
         if step_reason:
             reason_code += f"__{step_reason}"
         if new_bid < TECHNICAL_BID_FLOOR_RUB:
@@ -2931,7 +3641,7 @@ def decide_action(row: pd.Series, pending_event: Optional[Dict[str, Any]] = None
             "pause_decision": "",
         }
 
-    new_bid = round(current_bid_float + step, 2)
+    new_bid = next_bid_for_action(current_bid_float, placement, "raise")
     reason_code = "DRR_LT_LIMIT_GROW"
     if step_reason:
         reason_code += f"__{step_reason}"
@@ -2955,6 +3665,221 @@ def business_min_bid_rub(placement: Any) -> float:
     return 1.0
 
 
+def moscow_now(ctx: Optional[RunContext] = None) -> datetime:
+    """Текущее время в Москве. Для GitHub Actions считаем явно через UTC+3."""
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
+
+
+def is_night_experiment_window(ctx: Optional[RunContext] = None) -> bool:
+    if not NIGHT_EXPERIMENTS_ENABLED:
+        return False
+    hour = moscow_now(ctx).hour
+    start = int(NIGHT_EXPERIMENT_START_HOUR_MSK)
+    end = int(NIGHT_EXPERIMENT_END_HOUR_MSK)
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def night_experiment_window_text() -> str:
+    return f"{NIGHT_EXPERIMENT_START_HOUR_MSK:02d}:00-{NIGHT_EXPERIMENT_END_HOUR_MSK:02d}:00 МСК"
+
+
+def normalize_experiment_article(value: Any) -> str:
+    text = _clean_text_value(value).upper().replace(" ", "")
+    if not text:
+        return ""
+    text = text.replace("_/", "/")
+    text = text.replace("_", "/")
+    text = re.sub(r"/+", "/", text)
+    return text
+
+
+def is_experiment_1_article(value: Any) -> bool:
+    return normalize_experiment_article(value) in {normalize_experiment_article(x) for x in EXPERIMENT_1_ARTICLES}
+
+
+def experiment_min_bid_for_row(row: pd.Series | Dict[str, Any]) -> float:
+    placement = row.get("placement", "")
+    business_min = business_min_bid_rub(placement)
+    min_bid = pd.to_numeric(pd.Series([row.get("min_bid_rub", business_min)]), errors="coerce").iloc[0]
+    if pd.isna(min_bid) or float(min_bid) <= 0:
+        min_bid = business_min
+    target = max(float(min_bid), float(business_min))
+    return normalize_bid_to_api_grid(target, placement, "Повысить")
+
+
+def apply_night_bid_experiment_rules(decisions: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
+    """Эксперимент 1: ночью по 901/6, 901/2, 901/8 держим минимальную валидную ставку.
+
+    01:00-05:00 МСК: search/recommendations = не ниже min WB и 4 ₽, combined = не ниже min WB и 80 ₽.
+    После 05:00 этот override не применяется, работает обычная логика/разгон.
+    """
+    if decisions is None or decisions.empty:
+        return decisions
+    result = decisions.copy()
+    if not is_night_experiment_window(ctx):
+        for col in ["experiment_label", "experiment_id", "experiment_window_msk"]:
+            if col not in result.columns:
+                result[col] = ""
+        return result
+
+    for idx, row in result.iterrows():
+        if not is_active_campaign(row.get("campaign_status", "")):
+            continue
+        if not is_experiment_1_article(row.get("supplier_article", "")):
+            continue
+        placement = normalize_placement_value(row.get("placement", ""))
+        if placement not in {"search", "recommendations", "combined"}:
+            continue
+        target_bid = experiment_min_bid_for_row(row)
+        current_bid = pd.to_numeric(pd.Series([row.get("current_bid_rub", None)]), errors="coerce").iloc[0]
+        if pd.isna(current_bid) or float(current_bid) <= 0:
+            continue
+        current_bid_f = float(current_bid)
+        if current_bid_f > target_bid + 0.001:
+            action = "Снизить"
+        elif current_bid_f < target_bid - 0.001:
+            action = "Повысить"
+        else:
+            action = "Без изменений"
+            target_bid = None
+        result.at[idx, "action"] = action
+        result.at[idx, "new_bid_rub"] = target_bid
+        result.at[idx, "reason_code"] = EXPERIMENT_1_REASON_CODE
+        result.at[idx, "reason_text"] = build_reason_text(
+            result.loc[idx],
+            action,
+            target_bid,
+            (
+                f"Эксперимент 1: ночная минимальная ставка {night_experiment_window_text()} для 901/6, 901/2, 901/8; "
+                f"гипотеза: ночью конкуренция ниже, нет смысла держать высокую ставку. "
+                f"CPC/search минимум 4 ₽ или min WB, combined/полки минимум 80 ₽ или min WB"
+            ),
+        )
+        result.at[idx, "experiment_label"] = "Эксперимент 1 — ночная минимальная ставка"
+        result.at[idx, "experiment_id"] = "EXP1_NIGHT_MIN_BID_901_6_2_8"
+        result.at[idx, "experiment_window_msk"] = night_experiment_window_text()
+    return normalize_decision_bids_final(result)
+
+
+def build_experiment_2_pause_candidates(decisions: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
+    """Эксперимент 2: ночью 01:00-05:00 МСК паузим combined/полки с ДРР > 15%."""
+    if decisions is None or decisions.empty or not is_night_experiment_window(ctx):
+        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    work = decisions.copy()
+    work = work[work.get("placement", pd.Series(dtype=str)).map(normalize_placement_value) == "combined"].copy()
+    if work.empty:
+        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    work = work[work.get("campaign_status", pd.Series(dtype=str)).map(is_active_campaign)].copy()
+    if work.empty:
+        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    rows: List[Dict[str, Any]] = []
+    today_msk = moscow_now(ctx).date().isoformat()
+    for campaign_id, g in work.groupby(work["campaign_id"].map(_clean_id_value), dropna=False):
+        campaign_id_clean = _clean_id_value(campaign_id)
+        if not campaign_id_clean:
+            continue
+        spend = money_or_zero(pd.to_numeric(g.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        revenue = money_or_zero(pd.to_numeric(g.get("revenue", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        orders = money_or_zero(pd.to_numeric(g.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        impressions = money_or_zero(pd.to_numeric(g.get("impressions", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        clicks = money_or_zero(pd.to_numeric(g.get("clicks", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        drr = safe_drr_pct(spend, revenue)
+        if drr <= EXPERIMENT_2_DRR_LIMIT_PCT:
+            continue
+        main = g.sort_values([c for c in ["spend", "impressions", "clicks"] if c in g.columns], ascending=False).iloc[0]
+        gp_series = pd.to_numeric(g.get("gp_after_ads", pd.Series(dtype=float)), errors="coerce")
+        gp = float(gp_series.sum()) if gp_series.notna().any() else float("nan")
+        rows.append({
+            "pause_event_id": str(uuid.uuid4()),
+            "pause_date": today_msk,
+            "campaign_id": campaign_id_clean,
+            "nm_id": main.get("nm_id", ""),
+            "placement": "combined",
+            "supplier_article": main.get("supplier_article", ""),
+            "subject_norm": main.get("subject_norm", ""),
+            "reason_code": EXPERIMENT_2_REASON_CODE,
+            "impressions_before_pause": impressions,
+            "clicks_before_pause": clicks,
+            "spend_before_pause": spend,
+            "revenue_before_pause": revenue,
+            "orders_before_pause": orders,
+            "drr_before_pause": drr,
+            "gp_before_pause": gp,
+            "status": "candidate",
+            "next_check_date": today_msk,
+            "api_status": "",
+        })
+    return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
+
+
+def build_experiment_2_start_candidates(pause_history: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
+    """После 05:00 МСК возвращаем кампании, которые были выключены Экспериментом 2."""
+    if pause_history is None or pause_history.empty or is_night_experiment_window(ctx):
+        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    latest = latest_pause_records(pause_history)
+    if latest.empty:
+        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    rows: List[Dict[str, Any]] = []
+    today_msk = moscow_now(ctx).date().isoformat()
+    for _, row in latest.iterrows():
+        status = _clean_text_value(row.get("status", "")).lower()
+        if status not in {"paused", "keep_paused"}:
+            continue
+        if _clean_text_value(row.get("reason_code", "")) != EXPERIMENT_2_REASON_CODE:
+            continue
+        rows.append({
+            "pause_event_id": str(uuid.uuid4()),
+            "pause_date": today_msk,
+            "campaign_id": row.get("campaign_id", ""),
+            "nm_id": row.get("nm_id", ""),
+            "placement": row.get("placement", "combined"),
+            "supplier_article": row.get("supplier_article", ""),
+            "subject_norm": row.get("subject_norm", ""),
+            "reason_code": EXPERIMENT_2_START_REASON_CODE,
+            "impressions_before_pause": row.get("impressions_before_pause", 0),
+            "clicks_before_pause": row.get("clicks_before_pause", 0),
+            "spend_before_pause": row.get("spend_before_pause", 0),
+            "revenue_before_pause": row.get("revenue_before_pause", 0),
+            "orders_before_pause": row.get("orders_before_pause", 0),
+            "drr_before_pause": row.get("drr_before_pause", 0),
+            "gp_before_pause": row.get("gp_before_pause", float("nan")),
+            "status": "restart_candidate",
+            "next_check_date": today_msk,
+            "api_status": "",
+        })
+    return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
+
+
+def build_experiments_description(ctx: RunContext) -> pd.DataFrame:
+    now_msk = moscow_now(ctx)
+    return pd.DataFrame([
+        {
+            "experiment_id": "EXP1_NIGHT_MIN_BID_901_6_2_8",
+            "Название": "Эксперимент 1 — ночная минимальная ставка",
+            "Окно МСК": night_experiment_window_text(),
+            "Статус окна сейчас": "активно" if is_night_experiment_window(ctx) else "не активно",
+            "Товары/артикулы": "901/6, 901/2, 901/8",
+            "Правило": "В 01:00-05:00 МСК ставим минимально допустимую ставку: CPC/search 4 ₽ или min WB; combined/полки 80 ₽ или min WB.",
+            "Гипотеза": "В ночные часы часть конкурентов выключает рекламу, конкуренция ниже, поэтому нет смысла держать высокую ставку.",
+            "Как оценивать": "Сравнить ночные клики, CTR, заказы, ДРР, CORE-клики и расход до/после. Если клики не падают, а расход ниже — оставить.",
+            "now_msk": now_msk.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        {
+            "experiment_id": "EXP2_NIGHT_COMBINED_DRR_GT_15_PAUSE",
+            "Название": "Эксперимент 2 — ночная пауза дорогих полок",
+            "Окно МСК": night_experiment_window_text(),
+            "Статус окна сейчас": "активно" if is_night_experiment_window(ctx) else "не активно",
+            "Товары/артикулы": "все managed combined/полки",
+            "Правило": "Если combined/полка имеет ДРР > 15%, в 01:00-05:00 МСК ставим РК на паузу; после 05:00 МСК запускаем обратно.",
+            "Гипотеза": "Дорогие полки ночью могут докупать слабый трафик; экономим бюджет, но не трогаем дневную работу.",
+            "Как оценивать": "Сравнить ночной расход, клики, заказы, корзины и ДРР по combined. Если экономим без потери целевых кликов/заказов — оставить.",
+            "now_msk": now_msk.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    ])
+
+
 def is_ramp_related_reason(reason_code: Any, wait_rule: Any = "", last_reason_code: Any = "") -> bool:
     text = " ".join([
         _clean_text_value(reason_code).upper(),
@@ -2965,14 +3890,14 @@ def is_ramp_related_reason(reason_code: Any, wait_rule: Any = "", last_reason_co
 
 
 def is_ramp_candidate_by_metrics(row: pd.Series | Dict[str, Any]) -> bool:
-    """Кампания подходит под режим разгона по текущим метрикам: мало показов и расход в лимите."""
+    """Кампания подходит под старт/контроль разгона: расход ниже 500 ₽/день или трафик ниже 1000 показов/день."""
     if not is_active_campaign(row.get("campaign_status", "")):
         return False
     if not is_managed_subject(row.get("subject_norm", "")):
         return False
     avg_imp = money_or_zero(row.get("avg_impressions_per_day", 0))
     avg_spend = money_or_zero(row.get("avg_spend_per_day", 0))
-    return avg_imp < RAMP_TARGET_IMPRESSIONS_PER_DAY and avg_spend <= RAMP_MAX_SPEND_PER_DAY
+    return avg_spend < RAMP_TARGET_SPEND_PER_DAY or avg_imp < RAMP_TARGET_IMPRESSIONS_PER_DAY
 
 
 def classify_ramp_status(row: pd.Series | Dict[str, Any]) -> Tuple[str, str, bool]:
@@ -2989,8 +3914,14 @@ def classify_ramp_status(row: pd.Series | Dict[str, Any]) -> Tuple[str, str, boo
     wait_upper = wait_rule.upper()
     api_ok = api_status.isdigit() and 200 <= int(api_status) < 300
 
-    if api_ok and action == "Повысить" and related:
+    if api_ok and action in {"Повысить", "Снизить"} and related:
         return "РАЗГОН_ПРИМЕНЕН_СЕЙЧАС_API_200", "APPLIED_NOW", True
+    if wait_status == "RAMP_ACTIVE_DAILY_CONTROL" or _clean_text_value(row.get("ramp_lifecycle_status", "")) == "RAMP_ACTIVE_DAILY_CONTROL":
+        if reason_upper == "RAMP_DAILY_TARGET_SPEND_REACHED_HOLD":
+            return "РАЗГОН_АКТИВЕН_ЦЕЛЬ_ДНЕВНАЯ_ДОСТИГНУТА", "ACTIVE_DAILY_TARGET_REACHED", True
+        return "РАЗГОН_АКТИВЕН_ЕЖЕДНЕВНЫЙ_КОНТРОЛЬ", "ACTIVE_DAILY_CONTROL", True
+    if wait_status == "RAMP_FINISHED_NORMAL_MODE" or _clean_text_value(row.get("ramp_lifecycle_status", "")) == "RAMP_FINISHED_NORMAL_MODE":
+        return "РАЗГОН_ЗАВЕРШЕН_ОБЫЧНЫЙ_РЕЖИМ", "FINISHED_NORMAL_MODE", False
     if ("WAIT_D7_RAMP" in reason_upper or "WAIT_D7_RAMP" in wait_upper or "RAMP" in last_reason.upper()) and wait_status == "WAIT_ACTIVE":
         return "РАЗГОН_АКТИВЕН_ЖДЕМ_D7", "ACTIVE_WAIT_D7", True
     if related and "WB_MIN_BID_NOT_ALLOWED" in reason_upper:
@@ -3007,7 +3938,13 @@ def classify_ramp_status(row: pd.Series | Dict[str, Any]) -> Tuple[str, str, boo
         return "РАЗГОН_КОНТРОЛЬ", "RELATED_CONTROL", False
     return "", "", False
 
-def build_decisions(metrics_df: pd.DataFrame, pending_events: Dict[Tuple[str, str, str], Dict[str, Any]], postcheck_results: Dict[Tuple[str, str, str], Dict[str, Any]], ctx: Optional[RunContext] = None) -> pd.DataFrame:
+def build_decisions(
+    metrics_df: pd.DataFrame,
+    pending_events: Dict[Tuple[str, str, str], Dict[str, Any]],
+    postcheck_results: Dict[Tuple[str, str, str], Dict[str, Any]],
+    ctx: Optional[RunContext] = None,
+    ramp_states: Optional[Dict[Tuple[str, str, str], Dict[str, Any]]] = None,
+) -> pd.DataFrame:
     if metrics_df.empty:
         return pd.DataFrame(columns=DECISION_COLUMNS)
     rows: List[Dict[str, Any]] = []
@@ -3015,8 +3952,9 @@ def build_decisions(metrics_df: pd.DataFrame, pending_events: Dict[Tuple[str, st
         key = make_key(row)
         pending = pending_events.get(key)
         latest_result = postcheck_results.get(key)
+        ramp_state = (ramp_states or {}).get(key, {})
         reference_event = pending or latest_result or {}
-        decision = decide_action(row, pending_event=pending, postcheck_result=latest_result)
+        decision = decide_action(row, pending_event=pending, postcheck_result=latest_result, ramp_state=ramp_state, ctx=ctx)
         previous_event_id = _clean_text_value((latest_result or {}).get("event_id", ""))
         postcheck_status = _clean_text_value((latest_result or {}).get("postcheck_status", ""))
         wait_info = pending_wait_info(reference_event, ctx) if reference_event else {
@@ -3024,6 +3962,20 @@ def build_decisions(metrics_df: pd.DataFrame, pending_events: Dict[Tuple[str, st
         }
         if pending is None and reference_event:
             wait_info["wait_status"] = "WAIT_EXPIRED_OR_RESOLVED"
+        if ramp_state.get("active"):
+            wait_info = {
+                "wait_rule": "RAMP_DAILY_CONTROL_14D",
+                "wait_until_date": "",
+                "wait_days_left": ramp_state.get("ramp_days_left", ""),
+                "wait_status": "RAMP_ACTIVE_DAILY_CONTROL",
+            }
+        elif ramp_state.get("completed") and pending is None:
+            wait_info = {
+                "wait_rule": "RAMP_FINISHED_NORMAL_MODE",
+                "wait_until_date": "",
+                "wait_days_left": 0,
+                "wait_status": "RAMP_FINISHED_NORMAL_MODE",
+            }
         out = {
             "campaign_id": row.get("campaign_id", ""),
             "nm_id": row.get("nm_id", ""),
@@ -3069,9 +4021,17 @@ def build_decisions(metrics_df: pd.DataFrame, pending_events: Dict[Tuple[str, st
             "wait_days_left": wait_info.get("wait_days_left", ""),
             "wait_status": wait_info.get("wait_status", ""),
             "pause_decision": decision.get("pause_decision", ""),
+            "ramp_lifecycle_status": ramp_state.get("ramp_lifecycle_status", ""),
+            "ramp_start_date": ramp_state.get("ramp_start_date", ""),
+            "ramp_day": ramp_state.get("ramp_day", ""),
+            "ramp_days_left": ramp_state.get("ramp_days_left", ""),
         }
+        for keyword_col in KEYWORD_TRAFFIC_GUARD_COLUMNS:
+            if keyword_col in {"nm_id", "supplier_article", "subject_norm"}:
+                continue
+            out[keyword_col] = row.get(keyword_col, "")
         ramp_status, ramp_reason_group, ramp_applied = classify_ramp_status(out)
-        out["ramp_candidate"] = bool(is_ramp_candidate_by_metrics(out))
+        out["ramp_candidate"] = bool(is_ramp_candidate_by_metrics(out) or bool(ramp_state.get("active")))
         out["ramp_status"] = ramp_status
         out["ramp_applied_in_current_run"] = bool(ramp_applied and _clean_text_value(out.get("ramp_api_status", "")))
         out["ramp_api_status"] = ""
@@ -3108,7 +4068,8 @@ def build_bid_payload(row: pd.Series) -> Optional[Dict[str, Any]]:
     new_bid = row.get("new_bid_rub")
     if advert_id is None or nm_id is None or not placement or pd.isna(new_bid):
         return None
-    bid_kopecks = int(round(float(new_bid) * 100))
+    api_bid_rub = normalize_bid_to_api_grid(float(new_bid), placement, row.get("action", ""))
+    bid_kopecks = int(round(api_bid_rub * 100))
     return {
         "bids": [
             {
@@ -3241,14 +4202,27 @@ def fetch_wb_min_bids_for_decisions(decisions: pd.DataFrame, config: Config, ctx
     return min_df, pd.DataFrame(api_logs)
 
 
-def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.DataFrame) -> pd.DataFrame:
-    if decisions is None or decisions.empty:
-        return pd.DataFrame(columns=DECISION_COLUMNS)
-    result = decisions.copy()
+def enrich_frame_with_effective_min_bids(frame: pd.DataFrame, min_bids_df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет effective min_bid_rub в любой датафрейм с campaign_id/nm_id/placement.
+
+    Это нужно до расчёта решений: код должен видеть реальные минимальные ставки WB заранее,
+    особенно для combined/полок, где минимум сейчас 80 ₽.
+    """
+    if frame is None or frame.empty:
+        return frame if frame is not None else pd.DataFrame()
+    result = frame.copy()
     if "min_bid_rub" not in result.columns:
         result["min_bid_rub"] = float("nan")
     if min_bids_df is None or min_bids_df.empty:
-        return result[DECISION_COLUMNS]
+        # Даже если WB min API недоступен, бизнес-минимум для combined должен быть 80 ₽.
+        for idx, row in result.iterrows():
+            fallback = business_min_bid_rub(row.get("placement", ""))
+            cur = pd.to_numeric(row.get("min_bid_rub", None), errors="coerce")
+            if pd.isna(cur) or float(cur) <= 0:
+                result.at[idx, "min_bid_rub"] = fallback
+            else:
+                result.at[idx, "min_bid_rub"] = max(float(cur), fallback)
+        return result
 
     lookup: Dict[Tuple[str, str, str], float] = {}
     for _, r in min_bids_df.iterrows():
@@ -3263,11 +4237,223 @@ def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.Data
 
     for idx, row in result.iterrows():
         key = make_key(row)
+        fallback = business_min_bid_rub(row.get("placement", ""))
         min_bid = lookup.get(key)
         if min_bid is None:
+            current = pd.to_numeric(row.get("min_bid_rub", None), errors="coerce")
+            min_bid = fallback if pd.isna(current) or float(current) <= 0 else float(current)
+        result.at[idx, "min_bid_rub"] = round(max(float(min_bid), fallback), 2)
+    return result
+
+
+def ramp_control_product_key(row: pd.Series | Dict[str, Any]) -> str:
+    subject = normalize_subject_value(row.get("subject_norm", ""))
+    article = _clean_text_value(row.get("supplier_article", ""))
+    if subject == "кисти косметические":
+        return article
+    return product_group_from_article(article)
+
+
+def ramp_sample_tier(clicks: float, orders: float) -> int:
+    clicks = float(clicks or 0)
+    orders = float(orders or 0)
+    if clicks >= 200:
+        tier = 3
+    elif clicks >= 100:
+        tier = 2
+    elif clicks >= 50:
+        tier = 1
+    else:
+        tier = 0
+    if orders <= 0:
+        tier = min(tier, 1)
+    return int(tier)
+
+
+def ramp_selection_score(row: pd.Series | Dict[str, Any]) -> float:
+    clicks = money_or_zero(row.get("clicks", 0))
+    orders = money_or_zero(row.get("orders", 0))
+    impressions = money_or_zero(row.get("impressions", 0))
+    ctr = money_or_zero(row.get("ctr_pct", safe_ctr_pct(clicks, impressions)))
+    conv = (orders / clicks * 100.0) if clicks > 0 else 0.0
+    tier = ramp_sample_tier(clicks, orders)
+    score = tier * 10000.0 + conv * 120.0 + ctr * 80.0 + math.log1p(clicks) * 100.0 + orders * 10.0
+    avg_spend = money_or_zero(row.get("avg_spend_per_day", 0))
+    drr = money_or_zero(row.get("campaign_drr_pct", 999))
+    gp = pd.to_numeric(pd.Series([row.get("gp_after_ads", float("nan"))]), errors="coerce").iloc[0]
+    if avg_spend >= RAMP_TARGET_SPEND_PER_DAY and (drr >= RAMP_SCALE_DRR_LIMIT_PCT or (not pd.isna(gp) and float(gp) <= 0)):
+        score -= 5000.0
+    return float(score)
+
+
+def is_ramp_raise_decision(row: pd.Series | Dict[str, Any]) -> bool:
+    return (
+        _clean_text_value(row.get("action", "")) == "Повысить"
+        and is_ramp_related_reason(row.get("reason_code", ""), row.get("wait_rule", ""), row.get("last_bid_change_reason_code", ""))
+    )
+
+
+def normalize_decision_bids_final(decisions: pd.DataFrame) -> pd.DataFrame:
+    """Последний предохранитель перед API: никаких дробных ставок и ставок ниже min WB."""
+    if decisions is None or decisions.empty:
+        return pd.DataFrame(columns=DECISION_COLUMNS)
+    result = decisions.copy()
+    for idx, row in result.iterrows():
+        action = _clean_text_value(row.get("action", ""))
+        if action not in {"Повысить", "Снизить"}:
             continue
-        # Используем эффективный минимум: максимум из WB API min и нашего бизнес-минимума.
-        # Для поиска/рекомендаций бизнес-минимум 4 ₽, для combined/полок 80 ₽.
+        new_bid = pd.to_numeric(row.get("new_bid_rub", None), errors="coerce")
+        if pd.isna(new_bid):
+            result.at[idx, "action"] = "Без изменений"
+            result.at[idx, "reason_code"] = (_clean_text_value(row.get("reason_code", "")) + "__NO_NEW_BID").strip("_")
+            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, "нет рассчитанной новой ставки")
+            continue
+        placement = row.get("placement", "")
+        min_bid = pd.to_numeric(row.get("min_bid_rub", business_min_bid_rub(placement)), errors="coerce")
+        if pd.isna(min_bid) or float(min_bid) <= 0:
+            min_bid = business_min_bid_rub(placement)
+        min_bid = max(float(min_bid), business_min_bid_rub(placement))
+        normalized = normalize_bid_to_api_grid(new_bid, placement, action)
+        if action == "Повысить" and normalized < min_bid:
+            normalized = normalize_bid_to_api_grid(min_bid, placement, action)
+        if action == "Снизить" and normalized < min_bid:
+            result.at[idx, "action"] = "Без изменений"
+            result.at[idx, "new_bid_rub"] = None
+            result.at[idx, "reason_code"] = (_clean_text_value(row.get("reason_code", "")) + "__WB_MIN_BID_REACHED").strip("_")
+            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"снижение ниже effective min_bid {min_bid:.0f} ₽ запрещено")
+            continue
+        result.at[idx, "new_bid_rub"] = float(normalized)
+    for col in DECISION_COLUMNS:
+        if col not in result.columns:
+            result[col] = ""
+    return result[DECISION_COLUMNS]
+
+
+def select_ramp_campaigns_per_product_placement(decisions: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Оставляет в разгоне максимум одну РК на товар и placement.
+
+    Для кистей товар = конкретный артикул. Для помад/блесков/карандашей товар = product_root
+    (209, 155, 617 и т.д.). Отдельно допускается 1 search/CPC и 1 combined/полки.
+    Выбор: достаточность кликов -> конверсия в заказ -> CTR -> заказы -> клики.
+    """
+    if decisions is None or decisions.empty:
+        return pd.DataFrame(columns=DECISION_COLUMNS), pd.DataFrame(columns=RAMP_SELECTION_COLUMNS)
+    result = decisions.copy()
+    work = result.copy()
+    work["subject_norm_norm"] = work.get("subject_norm", "").map(normalize_subject_value)
+    work["placement_norm"] = work.get("placement", "").map(normalize_placement_value)
+    work["control_product"] = work.apply(ramp_control_product_key, axis=1)
+    work["is_active"] = work.get("campaign_status", "").map(is_active_campaign)
+    work["is_managed"] = work.get("subject_norm", "").map(is_managed_subject)
+    work["is_ramp_context"] = work.apply(lambda r: is_ramp_related_reason(r.get("reason_code", ""), r.get("wait_rule", ""), r.get("last_bid_change_reason_code", "")) or bool(r.get("ramp_candidate", False)), axis=1)
+    work["is_ramp_raise"] = work.apply(is_ramp_raise_decision, axis=1)
+    work["score"] = work.apply(ramp_selection_score, axis=1)
+    work["clicks_num"] = pd.to_numeric(work.get("clicks", 0), errors="coerce").fillna(0.0)
+    work["orders_num"] = pd.to_numeric(work.get("orders", 0), errors="coerce").fillna(0.0)
+    work["ctr_num"] = pd.to_numeric(work.get("ctr_pct", 0), errors="coerce").fillna(0.0)
+    work["conv_num"] = work.apply(lambda r: (money_or_zero(r.get("orders", 0)) / money_or_zero(r.get("clicks", 0)) * 100.0) if money_or_zero(r.get("clicks", 0)) > 0 else 0.0, axis=1)
+    work["sample_tier"] = work.apply(lambda r: ramp_sample_tier(r.get("clicks_num", 0), r.get("orders_num", 0)), axis=1)
+
+    pool = work[
+        work["is_active"] & work["is_managed"]
+        & work["placement_norm"].isin(["search", "combined"])
+        & work["control_product"].astype(str).str.strip().ne("")
+        & work["is_ramp_context"]
+    ].copy()
+    if pool.empty:
+        return normalize_decision_bids_final(result), pd.DataFrame(columns=RAMP_SELECTION_COLUMNS)
+
+    selected_index_by_group: Dict[Tuple[str, str, str], int] = {}
+    selection_rows: List[Dict[str, Any]] = []
+    for group_key, g in pool.groupby(["subject_norm_norm", "control_product", "placement_norm"], dropna=False):
+        ranked = g.sort_values(["sample_tier", "conv_num", "ctr_num", "orders_num", "clicks_num", "score"], ascending=False)
+        selected = ranked.iloc[0]
+        selected_idx = int(selected.name)
+        selected_index_by_group[group_key] = selected_idx
+        blocked = [str(x) for x in ranked.index.tolist() if int(x) != selected_idx and bool(work.at[x, "is_ramp_raise"])]
+        blocked_campaign_ids = sorted({_clean_id_value(work.at[int(i), "campaign_id"]) for i in blocked if _clean_id_value(work.at[int(i), "campaign_id"])})
+        selection_rows.append({
+            "subject_norm": group_key[0],
+            "control_product": group_key[1],
+            "placement": group_key[2],
+            "selected_campaign_id": selected.get("campaign_id", ""),
+            "selected_nm_id": selected.get("nm_id", ""),
+            "selected_supplier_article": selected.get("supplier_article", ""),
+            "selected_current_bid_rub": selected.get("current_bid_rub", ""),
+            "selected_min_bid_rub": selected.get("min_bid_rub", ""),
+            "selected_new_bid_rub": selected.get("new_bid_rub", ""),
+            "selected_avg_spend_per_day": selected.get("avg_spend_per_day", ""),
+            "selected_avg_impressions_per_day": selected.get("avg_impressions_per_day", ""),
+            "selected_clicks": selected.get("clicks", ""),
+            "selected_orders": selected.get("orders", ""),
+            "selected_ctr_pct": selected.get("ctr_pct", ""),
+            "selected_conversion_pct": selected.get("conv_num", ""),
+            "selected_drr_pct": selected.get("campaign_drr_pct", ""),
+            "selected_gp_after_ads": selected.get("gp_after_ads", ""),
+            "selected_score": selected.get("score", ""),
+            "selected_sample_tier": selected.get("sample_tier", ""),
+            "selection_status": "selected_one_per_product_placement",
+            "reason_text": f"выбрана 1 РК на товар+placement: клики={money_or_zero(selected.get('clicks',0)):.0f}, заказы={money_or_zero(selected.get('orders',0)):.0f}, CTR={money_or_zero(selected.get('ctr_pct',0)):.2f}%, CR={selected.get('conv_num',0):.2f}%",
+            "blocked_campaign_ids": ",".join(blocked_campaign_ids),
+        })
+
+    for idx, row in work[work["is_ramp_raise"]].iterrows():
+        group_key = (row.get("subject_norm_norm", ""), row.get("control_product", ""), row.get("placement_norm", ""))
+        selected_idx = selected_index_by_group.get(group_key)
+        if selected_idx is None:
+            continue
+        selected = work.loc[selected_idx]
+        if int(idx) != int(selected_idx):
+            result.at[idx, "action"] = "Без изменений"
+            result.at[idx, "new_bid_rub"] = None
+            result.at[idx, "reason_code"] = "RAMP_BLOCKED_NOT_BEST_PRODUCT_PLACEMENT"
+            result.at[idx, "reason_text"] = build_reason_text(
+                result.loc[idx],
+                "Без изменений",
+                None,
+                (
+                    f"разгон заблокирован: на товар {group_key[1]} / {group_key[2]} разрешена только одна РК. "
+                    f"Выбрана campaign_id={_clean_id_value(selected.get('campaign_id',''))}, "
+                    f"артикул={_clean_text_value(selected.get('supplier_article',''))}, "
+                    f"клики={money_or_zero(selected.get('clicks',0)):.0f}, заказы={money_or_zero(selected.get('orders',0)):.0f}, "
+                    f"CTR={money_or_zero(selected.get('ctr_pct',0)):.2f}%, CR={selected.get('conv_num',0):.2f}%"
+                ),
+            )
+            continue
+
+        # Даже выбранную РК не усиливаем, если выбор статистически уже показал плохой тест.
+        clicks = money_or_zero(row.get("clicks", 0))
+        orders = money_or_zero(row.get("orders", 0))
+        avg_spend = money_or_zero(row.get("avg_spend_per_day", 0))
+        drr = money_or_zero(row.get("campaign_drr_pct", 999))
+        gp = pd.to_numeric(pd.Series([row.get("gp_after_ads", float("nan"))]), errors="coerce").iloc[0]
+        revenue = money_or_zero(row.get("revenue", 0))
+        if clicks >= 50 and orders <= 0:
+            result.at[idx, "action"] = "Без изменений"
+            result.at[idx, "new_bid_rub"] = None
+            result.at[idx, "reason_code"] = "RAMP_BLOCKED_NO_ORDERS_AFTER_50_CLICKS"
+            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"разгон заблокирован: уже было {clicks:.0f} кликов без заказов; сначала не повышаем ставку")
+            continue
+        if avg_spend >= RAMP_TARGET_SPEND_PER_DAY and (drr >= RAMP_SCALE_DRR_LIMIT_PCT or revenue <= 0 or orders <= 0 or (not pd.isna(gp) and float(gp) <= 0)):
+            result.at[idx, "action"] = "Без изменений"
+            result.at[idx, "new_bid_rub"] = None
+            result.at[idx, "reason_code"] = "RAMP_BLOCKED_AFTER_500_ECONOMY_CONTROL"
+            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"после 500 ₽/день масштабирование запрещено: ДРР={drr:.2f}%, выручка={revenue:.0f}, заказы={orders:.0f}, ВП={0 if pd.isna(gp) else float(gp):.0f}")
+            continue
+
+    out = pd.DataFrame(selection_rows, columns=RAMP_SELECTION_COLUMNS)
+    return normalize_decision_bids_final(result), out
+
+
+def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.DataFrame) -> pd.DataFrame:
+    if decisions is None or decisions.empty:
+        return pd.DataFrame(columns=DECISION_COLUMNS)
+    result = enrich_frame_with_effective_min_bids(decisions, min_bids_df)
+
+    for idx, row in result.iterrows():
+        min_bid = pd.to_numeric(row.get("min_bid_rub", business_min_bid_rub(row.get("placement", ""))), errors="coerce")
+        if pd.isna(min_bid) or float(min_bid) <= 0:
+            min_bid = business_min_bid_rub(row.get("placement", ""))
         min_bid = max(float(min_bid), business_min_bid_rub(row.get("placement", "")))
         result.at[idx, "min_bid_rub"] = round(min_bid, 2)
 
@@ -3330,14 +4516,26 @@ def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.Data
             and at_wb_min_bid
             and last21_impressions < PAUSE_MIN_IMPRESSIONS
             and last21_drr_f > drr_limit_f
-            and avg_spend_per_day <= RAMP_MAX_SPEND_PER_DAY
-            and avg_impressions_per_day < RAMP_TARGET_IMPRESSIONS_PER_DAY
+            and avg_spend_per_day < RAMP_TARGET_SPEND_PER_DAY
+            and _clean_text_value(row.get("ramp_lifecycle_status", "")) != "RAMP_FINISHED_NORMAL_MODE"
         ):
             step, step_reason = bid_step_rub(row.get("placement", ""))
-            ramp_bid = round(current_bid_f + step, 2)
-            rc = "RAMP_MIN_BID_HIGH_DRR_UNDER_10000_IMPRESSIONS_21D"
+            raw_ramp_bid = next_bid_for_action(current_bid_f, row.get("placement", ""), "raise")
+            block_jump, block_reason = should_block_cpm_min_jump(row, float(min_bid), raw_ramp_bid)
+            if block_jump:
+                result.at[idx, "action"] = "Без изменений"
+                result.at[idx, "new_bid_rub"] = None
+                result.at[idx, "reason_code"] = "RAMP_CPM_MIN_JUMP_BLOCKED_ECONOMY_RISK"
+                result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, block_reason)
+                result.at[idx, "wait_status"] = "NO_WAIT_CPM_MIN_JUMP_BLOCKED"
+                result.at[idx, "pause_decision"] = ""
+                continue
+            ramp_bid = normalize_bid_to_api_grid(max(float(raw_ramp_bid), float(min_bid)), row.get("placement", ""), "Повысить")
+            rc = "RAMP_START_MIN_BID_HIGH_DRR_UNDER_10000_DAILY"
             if step_reason:
                 rc += f"__{step_reason}"
+            if ramp_bid >= float(min_bid):
+                rc += "__TO_EFFECTIVE_MIN_BID"
             result.at[idx, "action"] = "Повысить"
             result.at[idx, "new_bid_rub"] = ramp_bid
             result.at[idx, "reason_code"] = rc
@@ -3346,10 +4544,11 @@ def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.Data
                 "Повысить",
                 ramp_bid,
                 (
-                    f"разгон вместо паузы: ставка на минимуме WB {float(min_bid):.2f} ₽, "
+                    f"разгон вместо паузы: ставка ниже/на минимуме WB {float(min_bid):.2f} ₽, "
                     f"ДРР за {PAUSE_ANALYSIS_DAYS} дней {last21_drr_f:.2f}% > лимита {drr_limit_f:.1f}%, "
                     f"но показов {last21_impressions:.0f} < {PAUSE_MIN_IMPRESSIONS}; "
-                    f"расход {avg_spend_per_day:.0f} ₽/день <= {RAMP_MAX_SPEND_PER_DAY:.0f} ₽/день; проверка D+{RAMP_CHECK_DAYS}"
+                    f"расход {avg_spend_per_day:.0f} ₽/день < цели {RAMP_TARGET_SPEND_PER_DAY:.0f} ₽/день; "
+                    f"ставка приведена к API-сетке и effective min_bid"
                 ),
             )
             result.at[idx, "wait_status"] = "NO_WAIT_RAMP_UNDER_10000_21D"
@@ -3374,16 +4573,24 @@ def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.Data
             if not pd.isna(new_bid) and float(new_bid) < float(min_bid) and row.get("action") == "Повысить":
                 rc = _clean_text_value(result.at[idx, "reason_code"])
                 if is_ramp_related_reason(rc) or is_ramp_candidate_by_metrics(row):
-                    adjusted_bid = round(float(min_bid), 2)
-                    result.at[idx, "new_bid_rub"] = adjusted_bid
-                    result.at[idx, "reason_code"] = (rc + "__TO_EFFECTIVE_MIN_BID").strip("_")
-                    result.at[idx, "reason_text"] = build_reason_text(
-                        result.loc[idx],
-                        "Повысить",
-                        adjusted_bid,
-                        f"разгон: расчётная ставка {float(new_bid):.2f} ₽ ниже effective min_bid {float(min_bid):.2f} ₽; ставим сразу минимально допустимую ставку"
-                    )
-                    result.at[idx, "pause_decision"] = ""
+                    block_jump, block_reason = should_block_cpm_min_jump(row, float(min_bid), float(new_bid))
+                    if block_jump:
+                        result.at[idx, "action"] = "Без изменений"
+                        result.at[idx, "new_bid_rub"] = None
+                        result.at[idx, "reason_code"] = (rc + "__CPM_MIN_JUMP_BLOCKED_ECONOMY_RISK").strip("_")
+                        result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, block_reason)
+                        result.at[idx, "pause_decision"] = ""
+                    else:
+                        adjusted_bid = normalize_bid_to_api_grid(float(min_bid), row.get("placement", ""), "Повысить")
+                        result.at[idx, "new_bid_rub"] = adjusted_bid
+                        result.at[idx, "reason_code"] = (rc + "__TO_EFFECTIVE_MIN_BID").strip("_")
+                        result.at[idx, "reason_text"] = build_reason_text(
+                            result.loc[idx],
+                            "Повысить",
+                            adjusted_bid,
+                            f"разгон: расчётная ставка {float(new_bid):.2f} ₽ ниже effective min_bid {float(min_bid):.2f} ₽; ставим сразу минимально допустимую ставку"
+                        )
+                        result.at[idx, "pause_decision"] = ""
                 else:
                     result.at[idx, "action"] = "Без изменений"
                     result.at[idx, "new_bid_rub"] = None
@@ -3823,7 +5030,7 @@ def build_pause_candidates(decisions: pd.DataFrame, bid_history: pd.DataFrame) -
             "drr_before_pause": campaign_drr_21d,
             "gp_before_pause": gp,
             "status": "candidate",
-            "next_check_date": (date.today() + timedelta(days=1)).isoformat(),
+            "next_check_date": (date.today() + timedelta(days=7)).isoformat(),
             "api_status": "",
         })
     return pd.DataFrame(candidates, columns=PAUSE_HISTORY_COLUMNS)
@@ -3901,6 +5108,11 @@ def latest_pause_records(pause_history: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_start_candidates(pause_history: pd.DataFrame, ads_df: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
+    """Проверка paused РК только недельными окнами.
+
+    После паузы ждём 7 дней. Если за 7 дней дошли заказы/экономика восстановилась — возвращаем.
+    Если нет, ждём ещё неделю и смотрим 14 дней после паузы. Раньше 7 дней РК не возвращаем.
+    """
     latest = latest_pause_records(pause_history)
     if latest.empty:
         return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
@@ -3912,11 +5124,19 @@ def build_start_candidates(pause_history: pd.DataFrame, ads_df: pd.DataFrame, ct
         pause_date = pd.to_datetime(row.get("pause_date", ""), errors="coerce")
         if pd.isna(pause_date):
             continue
+        pause_day = pause_date.date()
+        days_after_pause = (ctx.mature_end - pause_day).days
+        if days_after_pause < 7:
+            continue
+        check_days = 7 if days_after_pause < 14 else 14
+        check_end = min(pause_day + timedelta(days=check_days), ctx.mature_end)
         key = make_key(row)
-        after = aggregate_after_event(ads_df, key, pause_date.date() + timedelta(days=1), ctx.mature_end)
+        after = aggregate_after_event(ads_df, key, pause_day + timedelta(days=1), check_end)
         drr_after = safe_drr_pct(after["spend"], after["revenue"])
         gp_after = after["gp_after_ads"]
-        if (after["revenue"] > 0 and after["orders"] > 0 and drr_after < DRR_LIMIT_PCT) or (not pd.isna(gp_after) and gp_after > 0):
+        subject_limit = drr_limit_for_subject(row.get("subject_norm", ""))
+        recovery_ok = (after["revenue"] > 0 and after["orders"] > 0 and drr_after < subject_limit) or (not pd.isna(gp_after) and gp_after > 0)
+        if recovery_ok:
             rows.append({
                 "pause_event_id": str(uuid.uuid4()),
                 "pause_date": date.today().isoformat(),
@@ -3924,14 +5144,15 @@ def build_start_candidates(pause_history: pd.DataFrame, ads_df: pd.DataFrame, ct
                 "nm_id": row.get("nm_id", ""),
                 "placement": row.get("placement", ""),
                 "supplier_article": row.get("supplier_article", ""),
-                "reason_code": "START_AFTER_ECONOMY_RECOVERY",
+                "subject_norm": row.get("subject_norm", ""),
+                "reason_code": f"START_AFTER_ECONOMY_RECOVERY_D{check_days}",
                 "spend_before_pause": after["spend"],
                 "revenue_before_pause": after["revenue"],
                 "orders_before_pause": after["orders"],
                 "drr_before_pause": drr_after,
                 "gp_before_pause": gp_after,
                 "status": "restart_candidate",
-                "next_check_date": (date.today() + timedelta(days=1)).isoformat(),
+                "next_check_date": (date.today() + timedelta(days=7)).isoformat(),
                 "api_status": "",
             })
     return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
@@ -3995,13 +5216,13 @@ def apply_start_actions(start_candidates: pd.DataFrame, config: Config, ctx: Run
         result["api_status"] = "dry_run_no_call"
         return result, pd.DataFrame(api_logs)
     if not ctx.apply_start:
-        rollback_mask = result.get("reason_code", pd.Series(dtype=str)).astype(str).eq("ROLLBACK_WRONG_SUBJECT_PAUSE")
-        if not rollback_mask.any():
+        auto_mask = result.get("reason_code", pd.Series(dtype=str)).astype(str).isin(AUTO_APPLY_START_REASON_CODES)
+        if not auto_mask.any():
             result["api_status"] = "not_applied_without_flag"
             return result, pd.DataFrame(api_logs)
-        # Технический rollback ошибочных пауз прошлой версии запускаем автоматически в обычном run.
-        result.loc[~rollback_mask, "api_status"] = "not_applied_without_flag"
-        result = result.loc[rollback_mask].copy()
+        # Автовозврат разрешён только после недельного/двухнедельного контроля или rollback ошибочных пауз.
+        result.loc[~auto_mask, "api_status"] = "not_applied_without_flag"
+        result = result.loc[auto_mask].copy()
 
     url_base = config.wb_base_url.rstrip("/") + WB_START_ENDPOINT
     status_by_campaign: Dict[str, Tuple[str, str]] = {}
@@ -4129,7 +5350,7 @@ def enrich_decisions_with_bid_api_status(decisions: pd.DataFrame, successful_cha
         if key in success_map:
             tmp["api_status"] = success_map[key]
         status, reason_group, applied = classify_ramp_status(tmp)
-        result.at[idx, "ramp_candidate"] = bool(is_ramp_candidate_by_metrics(tmp))
+        result.at[idx, "ramp_candidate"] = bool(is_ramp_candidate_by_metrics(tmp) or _clean_text_value(tmp.get("ramp_lifecycle_status", "")) == "RAMP_ACTIVE_DAILY_CONTROL")
         result.at[idx, "ramp_status"] = status
         result.at[idx, "ramp_applied_in_current_run"] = bool(key in success_map and is_ramp_related_reason(tmp.get("reason_code", ""), tmp.get("wait_rule", ""), tmp.get("last_bid_change_reason_code", "")))
     for col in DECISION_COLUMNS:
@@ -4153,7 +5374,8 @@ def build_bid_ramp_monitor(decisions: pd.DataFrame) -> pd.DataFrame:
         rc = _clean_text_value(row.get("reason_code", ""))
         related = is_ramp_related_reason(rc, row.get("wait_rule", ""), row.get("last_bid_change_reason_code", ""))
         candidate = is_ramp_candidate_by_metrics(row)
-        if not related and not candidate:
+        lifecycle = _clean_text_value(row.get("ramp_lifecycle_status", ""))
+        if not related and not candidate and not lifecycle:
             continue
         status, reason_group, applied = classify_ramp_status(row)
         rows.append({
@@ -4191,9 +5413,24 @@ def build_bid_ramp_monitor(decisions: pd.DataFrame) -> pd.DataFrame:
             "drr_limit_pct": row.get("drr_limit_pct", 0),
             "last21_impressions": row.get("last21_impressions", 0),
             "last21_drr_pct": row.get("last21_drr_pct", 0),
+            "keyword_profile_status": row.get("keyword_profile_status", ""),
+            "keyword_guard_status": row.get("keyword_guard_status", ""),
+            "current_core80_clicks_per_day": row.get("current_core80_clicks_per_day", ""),
+            "base_core80_clicks_per_day": row.get("base_core80_clicks_per_day", ""),
+            "core80_clicks_delta_pct": row.get("core80_clicks_delta_pct", ""),
+            "core80_position_delta": row.get("core80_position_delta", ""),
+            "core80_visibility_delta_pp": row.get("core80_visibility_delta_pp", ""),
+            "core_click_guard_comment": row.get("core_click_guard_comment", ""),
             "target_impressions_per_day": RAMP_TARGET_IMPRESSIONS_PER_DAY,
+            "target_spend_per_day": RAMP_TARGET_SPEND_PER_DAY,
+            "overspend_per_day": RAMP_OVERSPEND_PER_DAY,
+            "scale_drr_limit_pct": RAMP_SCALE_DRR_LIMIT_PCT,
             "max_spend_per_day": RAMP_MAX_SPEND_PER_DAY,
             "check_days": RAMP_CHECK_DAYS,
+            "ramp_lifecycle_status": row.get("ramp_lifecycle_status", ""),
+            "ramp_start_date": row.get("ramp_start_date", ""),
+            "ramp_day": row.get("ramp_day", ""),
+            "ramp_days_left": row.get("ramp_days_left", ""),
             "monitor_status": status or "not_ramp",
         })
     out = pd.DataFrame(rows)
@@ -4280,7 +5517,7 @@ def build_one_campaign_experiment(metrics_df: pd.DataFrame, keyword_core_df: pd.
         selected_conversion = (selected_orders / selected_clicks * 100.0) if selected_clicks > 0 else 0.0
         step, _ = bid_step_rub(selected.get("placement", ""))
         selected_bid = money_or_zero(selected.get("current_bid_rub", 0))
-        recommended_new_bid = round(selected_bid + step, 2) if selected_bid > 0 else ""
+        recommended_new_bid = next_bid_for_action(selected_bid, selected.get("placement", ""), "raise") if selected_bid > 0 else ""
 
         kw_stats = keyword_core_stats_for_group(keyword_core_df, subject, product_group, g["supplier_article"].unique())
         rows.append({
@@ -4811,14 +6048,16 @@ def build_campaign_7d_comparison(
         ]
         no_after = pd.to_numeric(out.get("after_days", pd.Series(dtype=float)), errors="coerce").fillna(0).le(0)
         if no_after.any():
-            # pandas в GitHub Actions стал строже: нельзя записывать строку "" в int/float-колонки.
-            # Для строк без зрелого after-периода в Excel должны быть пустые ячейки, поэтому
-            # переводим только эти output-колонки в object и затем проставляем пустые значения.
-            after_cols = [c for c in after_cols if c in out.columns]
+            # Pandas 3.x запрещает записывать строку "" в int64/float64 колонки пачкой.
+            # Для строк без зрелого after-периода делаем эти поля object и ставим пустоту,
+            # чтобы в Excel не появлялись ложные нули как будто это эффект изменения ставки.
             for col in after_cols:
-                out[col] = out[col].astype("object")
-                out.loc[no_after, col] = ""
+                if col in out.columns:
+                    out[col] = out[col].astype("object")
+                    out.loc[no_after, col] = ""
+            out["after_period"] = out["after_period"].astype("object")
             out.loc[no_after, "after_period"] = ""
+            out["diagnostic_conclusion"] = out["diagnostic_conclusion"].astype("object")
             out.loc[no_after, "diagnostic_conclusion"] = (
                 "WAIT_AFTER_DATA: после изменения ставки ещё нет зрелых данных для сравнения; "
                 "нули не используются как эффект изменения"
@@ -4844,41 +6083,75 @@ def write_outputs(
     min_bids_df: pd.DataFrame,
     keyword_core_df: Optional[pd.DataFrame] = None,
     keyword_effects_df: Optional[pd.DataFrame] = None,
+    keyword_loss_detail_df: Optional[pd.DataFrame] = None,
     price_decisions: Optional[pd.DataFrame] = None,
     price_history: Optional[pd.DataFrame] = None,
     price_effects_df: Optional[pd.DataFrame] = None,
     applied_price_changes: Optional[pd.DataFrame] = None,
     bid_ramp_monitor: Optional[pd.DataFrame] = None,
+    ramp_selection: Optional[pd.DataFrame] = None,
     one_campaign_experiment: Optional[pd.DataFrame] = None,
     rename_plan: Optional[pd.DataFrame] = None,
     bid_campaign_compare: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     summary = build_summary(ctx, decisions, successful_changes, pause_candidates, applied_pauses, start_candidates, applied_starts)
     summary["Ключевых фраз CORE_80"] = int(len(keyword_core_df[keyword_core_df["keyword_group"] == "CORE_80"])) if keyword_core_df is not None and not keyword_core_df.empty and "keyword_group" in keyword_core_df.columns else 0
-    summary["Рекомендаций по цене"] = int(price_decisions["price_action"].isin(["Повысить цену", "Вернуть скидку"]).sum()) if price_decisions is not None and not price_decisions.empty and "price_action" in price_decisions.columns else 0
-    summary["Ценовых тестов без воронки"] = int(price_decisions.get("funnel_missing", pd.Series(dtype=bool)).astype(bool).sum()) if price_decisions is not None and not price_decisions.empty and "funnel_missing" in price_decisions.columns else 0
-    summary["Изменений цены отправлено"] = int(applied_price_changes["api_status"].astype(str).str.fullmatch(r"2\d\d", na=False).sum()) if applied_price_changes is not None and not applied_price_changes.empty and "api_status" in applied_price_changes.columns else 0
-    summary["Скидка продавца по умолчанию"] = DEFAULT_SELLER_DISCOUNT_PCT
-    summary["Минимальная скидка продавца"] = DEFAULT_MIN_SELLER_DISCOUNT_PCT
+    if PRICE_CORRECTION_ENABLED:
+        summary["Рекомендаций по цене"] = int(price_decisions["price_action"].isin(["Повысить цену", "Вернуть скидку"]).sum()) if price_decisions is not None and not price_decisions.empty and "price_action" in price_decisions.columns else 0
+        summary["Ценовых тестов без воронки"] = int(price_decisions.get("funnel_missing", pd.Series(dtype=bool)).astype(bool).sum()) if price_decisions is not None and not price_decisions.empty and "funnel_missing" in price_decisions.columns else 0
+        summary["Изменений цены отправлено"] = int(applied_price_changes["api_status"].astype(str).str.fullmatch(r"2\d\d", na=False).sum()) if applied_price_changes is not None and not applied_price_changes.empty and "api_status" in applied_price_changes.columns else 0
+        summary["Скидка продавца по умолчанию"] = DEFAULT_SELLER_DISCOUNT_PCT
+        summary["Минимальная скидка продавца"] = DEFAULT_MIN_SELLER_DISCOUNT_PCT
+    else:
+        summary["Корректировка цен"] = "отключено: цены ведёт внешний репрайсер"
+        summary["Рекомендаций по цене"] = 0
+        summary["Ценовых тестов без воронки"] = 0
+        summary["Изменений цены отправлено"] = 0
     summary["Кандидатов на разгон показов"] = int(len(bid_ramp_monitor)) if bid_ramp_monitor is not None else 0
     if bid_ramp_monitor is not None and not bid_ramp_monitor.empty and "ramp_mode_status" in bid_ramp_monitor.columns:
         ramp_counts = bid_ramp_monitor["ramp_mode_status"].astype(str).value_counts().to_dict()
-        summary["Разгон: активен ждём D+7"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЖДЕМ_D7", 0))
+        summary["Разгон: активен ежедневный контроль"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЕЖЕДНЕВНЫЙ_КОНТРОЛЬ", 0))
+        summary["Разгон: активен цель дня достигнута"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЦЕЛЬ_ДНЕВНАЯ_ДОСТИГНУТА", 0))
+        summary["Разгон: завершён обычный режим"] = int(ramp_counts.get("РАЗГОН_ЗАВЕРШЕН_ОБЫЧНЫЙ_РЕЖИМ", 0))
         summary["Разгон: применён сейчас"] = int(ramp_counts.get("РАЗГОН_ПРИМЕНЕН_СЕЙЧАС_API_200", 0))
         summary["Разгон: заблокирован min WB"] = int(ramp_counts.get("РАЗГОН_ПОДХОДИТ_НО_БЛОК_MIN_WB", 0))
+        summary["Разгон: активен ждём старый D+7"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЖДЕМ_D7", 0))
         summary["Разгон: подходит по метрикам, но ждёт другой post-check"] = int(ramp_counts.get("РАЗГОН_ПОДХОДИТ_НО_ЖДЕМ_ДРУГОЙ_POSTCHECK", 0))
     summary["Эксперимент 1РК групп"] = int(len(one_campaign_experiment)) if one_campaign_experiment is not None else 0
+    summary["Разгон цель расхода в день"] = RAMP_TARGET_SPEND_PER_DAY
+    summary["Разгон верхний порог расхода в день"] = RAMP_SCALE_MAX_SPEND_PER_DAY
+    summary["Разгон порог ДРР для масштабирования 500-1000"] = RAMP_SCALE_DRR_LIMIT_PCT
+    summary["Разгон срок дней"] = RAMP_CHECK_DAYS
+    summary["Разгон: выбранных РК товар+тип"] = int(len(ramp_selection)) if ramp_selection is not None else 0
+    summary["Контроль CORE-кликов включён"] = "да" if KEYWORD_CORE_CLICK_GUARD_ENABLED else "нет"
+    summary["Порог риска CORE-кликов, %"] = -KEYWORD_CORE_CLICK_RISK_DROP_PCT
+    summary["Порог критичной потери CORE-кликов, %"] = -KEYWORD_CORE_CLICK_BAD_DROP_PCT
     summary["Порог паузы по показам"] = PAUSE_MIN_IMPRESSIONS
     summary["Окно проверки паузы, дней"] = PAUSE_ANALYSIS_DAYS
-    summary["Правило автопаузы"] = "минимальная ставка WB + ДРР > лимита за 21 день + показы >= 10000"
+    summary["Правило автопаузы"] = "минимальная ставка WB + ДРР > лимита за 21 день + показы >= 10000; возврат после D+7/D+14"
     summary["Кисти паузим"] = "нет"
     summary["Кандидатов на переименование РК"] = 0
     summary["Переименовано РК"] = 0
     summary["Переименование РК"] = "отключено"
     summary["Строк сравнения РК 7д"] = int(len(bid_campaign_compare)) if bid_campaign_compare is not None else 0
+    summary["Строк потерь CORE-запросов"] = int(len(keyword_loss_detail_df)) if keyword_loss_detail_df is not None else 0
+    if decisions is not None and not decisions.empty and "keyword_guard_status" in decisions.columns:
+        summary["CORE-клики: критичный риск"] = int(decisions["keyword_guard_status"].astype(str).isin(["CORE_CLICK_BAD_LOSS", "CORE_POSITION_BAD_LOSS", "CORE_VISIBILITY_BAD_LOSS"]).sum())
+        summary["CORE-клики: риск"] = int(decisions["keyword_guard_status"].astype(str).isin(["CORE_CLICK_RISK"]).sum())
+    experiment_docs = build_experiments_description(ctx)
+    summary["Ночные эксперименты"] = "включены" if NIGHT_EXPERIMENTS_ENABLED else "отключены"
+    summary["Окно ночных экспериментов МСК"] = night_experiment_window_text()
+    summary["Окно ночных экспериментов сейчас"] = "активно" if is_night_experiment_window(ctx) else "не активно"
+    if decisions is not None and not decisions.empty and "reason_code" in decisions.columns:
+        summary["Эксперимент 1: строк минимальной ночной ставки"] = int(decisions["reason_code"].astype(str).eq(EXPERIMENT_1_REASON_CODE).sum())
+    if pause_candidates is not None and not pause_candidates.empty and "reason_code" in pause_candidates.columns:
+        summary["Эксперимент 2: кандидатов на ночную паузу"] = int(pause_candidates["reason_code"].astype(str).eq(EXPERIMENT_2_REASON_CODE).sum())
+    if start_candidates is not None and not start_candidates.empty and "reason_code" in start_candidates.columns:
+        summary["Эксперимент 2: кандидатов на запуск после ночи"] = int(start_candidates["reason_code"].astype(str).eq(EXPERIMENT_2_START_REASON_CODE).sum())
     summary_df = pd.DataFrame([{"Показатель": k, "Значение": v} for k, v in summary.items()])
 
     sheets = {
+        "Эксперименты": experiment_docs,
         "Решения": decisions if decisions is not None else pd.DataFrame(columns=DECISION_COLUMNS),
         "История_изменений_ставок": bid_history if bid_history is not None else pd.DataFrame(columns=BID_HISTORY_COLUMNS),
         "Эффект_изменения_ставки": effect_df if effect_df is not None else pd.DataFrame(),
@@ -4886,7 +6159,9 @@ def write_outputs(
         "Сравнение_РК_7дней": bid_campaign_compare if bid_campaign_compare is not None else pd.DataFrame(columns=BID_CAMPAIGN_COMPARE_COLUMNS),
         "Ключевые_фразы_80": keyword_core_df if keyword_core_df is not None else pd.DataFrame(columns=KEYWORD_POSITION_COLUMNS),
         "Эффект_по_ключевым_фразам": keyword_effects_df if keyword_effects_df is not None else pd.DataFrame(columns=KEYWORD_EFFECT_COLUMNS),
+        "Потери_CORE_запросов": keyword_loss_detail_df if keyword_loss_detail_df is not None else pd.DataFrame(columns=KEYWORD_LOSS_DETAIL_COLUMNS),
         "Разгон_показов": bid_ramp_monitor if bid_ramp_monitor is not None else pd.DataFrame(columns=BID_RAMP_MONITOR_COLUMNS),
+        "Разгон_выбор_1РК": ramp_selection if ramp_selection is not None else pd.DataFrame(columns=RAMP_SELECTION_COLUMNS),
         "Эксперимент_1РК_на_товар": one_campaign_experiment if one_campaign_experiment is not None else pd.DataFrame(columns=ONE_CAMPAIGN_EXPERIMENT_COLUMNS),
         "Решения_по_цене": price_decisions if price_decisions is not None else pd.DataFrame(columns=PRICE_DECISION_COLUMNS),
         "История_изменений_цен": price_history if price_history is not None else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS),
@@ -4963,53 +6238,64 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     funnel_df = load_funnel_report(s3_client, config)
-    print(f"Воронка продаж загружена для price-check: {len(funnel_df):,} строк".replace(",", " "), flush=True)
+    print(f"Воронка продаж загружена для анализа конверсий: {len(funnel_df):,} строк".replace(",", " "), flush=True)
 
     economics_df = load_economics_report(s3_client, config)
     ads_df = enrich_ads_with_estimated_gp(ads_df, economics_df)
 
     bid_history_raw = load_bid_history(s3_client, config)
     pause_history_raw = load_pause_history(s3_client, config)
-    price_history_raw = load_price_history(s3_client, config)
+    # Контур цен отключён: внешний репрайсер управляет ценами. Историю цен не читаем и не перезаписываем.
+    price_history_raw = pd.DataFrame(columns=PRICE_HISTORY_COLUMNS)
     bid_history = filter_bid_history_managed_only(bid_history_raw, ads_df)
     pause_history = filter_pause_history_managed_only(pause_history_raw, ads_df)
     print(
         (
             f"История ставок: {len(bid_history):,} строк из {len(bid_history_raw):,} после фильтра 4 предметов; "
             f"история пауз: {len(pause_history):,} строк из {len(pause_history_raw):,} после фильтра 4 предметов; "
-            f"история цен: {len(price_history_raw):,} строк"
+            f"контур цен: отключён, история цен не читается"
         ).replace(",", " ")
     )
 
     bid_history, effect_df = evaluate_postchecks(ads_df, bid_history, ctx)
     keyword_effects_df = build_keyword_effects(bid_history, keyword_df, keyword_core_df, ctx)
+    bid_history = apply_keyword_effect_risk_to_bid_history(bid_history, keyword_effects_df)
     effect_df = enrich_effects_with_keyword_monitoring(effect_df, keyword_effects_df)
+    keyword_guard_df, keyword_loss_detail_df = build_keyword_traffic_guard(keyword_df, keyword_core_df, ctx)
+    if not keyword_guard_df.empty:
+        print("Диагностика CORE-кликов: " + json.dumps(keyword_guard_df.get("keyword_guard_status", pd.Series(dtype=str)).astype(str).value_counts().to_dict(), ensure_ascii=False), flush=True)
 
-    # Price post-check D+2 по истории изменения скидки продавца.
-    managed_nmids = set(ads_df["nm_id"].astype(str).unique()) if ads_df is not None and not ads_df.empty and "nm_id" in ads_df.columns else set()
-    price_history_for_check = price_history_raw.copy() if price_history_raw is not None else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS)
-    for col in PRICE_HISTORY_COLUMNS:
-        if col not in price_history_for_check.columns:
-            price_history_for_check[col] = ""
-    if managed_nmids and not price_history_for_check.empty:
-        price_history_for_check = price_history_for_check[price_history_for_check["nm_id"].astype(str).isin(managed_nmids)].copy()
-    price_history, price_effects_df = evaluate_price_postchecks(price_history_for_check, ads_df, funnel_df, ctx)
+    # Price post-check отключён: цены ведёт внешний репрайсер.
+    price_history = pd.DataFrame(columns=PRICE_HISTORY_COLUMNS)
+    price_effects_df = pd.DataFrame()
 
     pending_events = load_pending_events(bid_history, ctx)
     postcheck_results = latest_postcheck_results(bid_history)
 
     metrics_df = aggregate_campaign_metrics(ads_df, ctx)
     metrics_df = enrich_supplier_articles_from_economics(metrics_df, economics_df)
+    metrics_df = enrich_metrics_with_keyword_traffic_guard(metrics_df, keyword_guard_df)
     print(f"Диагностика агрегации: строк метрик={len(metrics_df)}", flush=True)
     if not metrics_df.empty:
         print("Диагностика метрик по статусам: " + json.dumps(metrics_df.get("campaign_status", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
         print("Диагностика метрик по предметам: " + json.dumps(metrics_df.get("subject_norm", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-    decisions = build_decisions(metrics_df, pending_events, postcheck_results, ctx)
+    ramp_states = build_ramp_lifecycle_states(bid_history, ctx)
+    # Сначала получаем минимальные ставки WB/effective min, затем строим решения.
+    # Особенно важно для combined/полок: сейчас минимум WB = 80 ₽.
+    min_bids_df, min_bid_api_log = fetch_wb_min_bids_for_decisions(metrics_df, config, ctx)
+    metrics_df = enrich_frame_with_effective_min_bids(metrics_df, min_bids_df)
+    decisions = build_decisions(metrics_df, pending_events, postcheck_results, ctx, ramp_states)
     decisions = enrich_supplier_articles_from_economics(decisions, economics_df)
-    min_bids_df, min_bid_api_log = fetch_wb_min_bids_for_decisions(decisions, config, ctx)
     decisions = enrich_decisions_with_min_bids(decisions, min_bids_df)
+    decisions, ramp_selection = select_ramp_campaigns_per_product_placement(decisions)
+    decisions = apply_night_bid_experiment_rules(decisions, ctx)
     if not min_bids_df.empty:
         print(f"Диагностика WB min bids: получено строк={len(min_bids_df)}", flush=True)
+    if ramp_selection is not None and not ramp_selection.empty:
+        print(f"Диагностика разгона: выбранных РК товар+тип={len(ramp_selection)}", flush=True)
+    if is_night_experiment_window(ctx):
+        exp1_count = int(decisions.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_1_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0
+        print(f"Диагностика ночных экспериментов: окно {night_experiment_window_text()} активно; Эксперимент 1 строк={exp1_count}", flush=True)
     if not decisions.empty:
         print("Диагностика решений action: " + json.dumps(decisions["action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
         print("Диагностика решений reason_code: " + json.dumps(decisions["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
@@ -5029,16 +6315,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     rename_plan = pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
     rename_api_log = pd.DataFrame()
     goods_prices = pd.DataFrame()
-    if not getattr(args, "skip_price", False):
-        goods_prices, price_list_api_log = fetch_current_goods_prices(config, ctx)
-        funnel_current = aggregate_funnel_metrics(funnel_df, ctx.current_start, ctx.current_end)
-        price_decisions = build_price_decisions(metrics_df, funnel_current, goods_prices, price_history, config, ctx)
-        if not price_decisions.empty:
-            print("Диагностика цен action: " + json.dumps(price_decisions["price_action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
-            print("Диагностика цен reason_code: " + json.dumps(price_decisions["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-        apply_price_now = (ctx.mode == "run" and not ctx.dry_run) or bool(getattr(args, "apply_price", False))
-        applied_price_changes, price_api_log = apply_price_changes(price_decisions, goods_prices, config, ctx, apply_price=apply_price_now)
-        price_history = record_price_events(applied_price_changes, price_history, ctx)
+    print("Контур цен отключён: корректировка скидок/цен не строится, Discounts & Prices API не вызывается", flush=True)
 
     # Переименование РК отключено: кампании уже вернули к артикулам, больше не отправляем /adv/v0/rename.
     rename_plan = pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
@@ -5046,6 +6323,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     decisions = enrich_supplier_articles_from_economics(decisions, economics_df)
 
     pause_candidates = build_pause_candidates(decisions, bid_history)
+    experiment2_pause_candidates = build_experiment_2_pause_candidates(decisions, ctx)
+    if experiment2_pause_candidates is not None and not experiment2_pause_candidates.empty:
+        pause_candidates = pd.concat([pause_candidates, experiment2_pause_candidates], ignore_index=True, sort=False)
+        print(f"Диагностика Эксперимент 2: ночных кандидатов на паузу combined={len(experiment2_pause_candidates)}", flush=True)
 
     if ctx.apply_experiment and one_campaign_experiment is not None and not one_campaign_experiment.empty:
         experiment_bid_decisions = build_experiment_bid_decisions(one_campaign_experiment, decisions)
@@ -5053,6 +6334,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             exp_keys = set(experiment_bid_decisions.apply(make_key, axis=1).tolist())
             decisions = decisions.loc[~decisions.apply(lambda r: make_key(r) in exp_keys, axis=1)].copy() if not decisions.empty else decisions
             decisions = pd.concat([decisions, experiment_bid_decisions], ignore_index=True, sort=False)
+            decisions = enrich_decisions_with_min_bids(decisions, min_bids_df)
+            decisions, ramp_selection = select_ramp_campaigns_per_product_placement(decisions)
+            decisions = apply_night_bid_experiment_rules(decisions, ctx)
             print(f"Диагностика эксперимента 1РК: ставок к применению={len(experiment_bid_decisions)}", flush=True)
         experiment_pause_candidates = build_experiment_pause_candidates(one_campaign_experiment, metrics_df)
         if not experiment_pause_candidates.empty:
@@ -5083,14 +6367,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         pause_history = pd.concat([pause_history, applied_pauses[PAUSE_HISTORY_COLUMNS]], ignore_index=True, sort=False)
 
     normal_start_candidates = build_start_candidates(pause_history, ads_df, ctx)
+    experiment2_start_candidates = build_experiment_2_start_candidates(pause_history, ctx)
     rollback_start_candidates = build_wrong_subject_pause_rollback_candidates(pause_history_raw, ads_df, ctx)
+    if not experiment2_start_candidates.empty:
+        print(f"Диагностика Эксперимент 2: кандидатов на запуск после ночного окна={len(experiment2_start_candidates)}", flush=True)
     if not rollback_start_candidates.empty:
         print(f"Диагностика rollback ошибочных пауз вне 4 предметов: кандидатов на запуск={len(rollback_start_candidates)}", flush=True)
     start_candidates = pd.concat(
-        [df for df in [normal_start_candidates, rollback_start_candidates] if df is not None and not df.empty],
+        [df for df in [normal_start_candidates, experiment2_start_candidates, rollback_start_candidates] if df is not None and not df.empty],
         ignore_index=True,
         sort=False,
-    ) if any(df is not None and not df.empty for df in [normal_start_candidates, rollback_start_candidates]) else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    ) if any(df is not None and not df.empty for df in [normal_start_candidates, experiment2_start_candidates, rollback_start_candidates]) else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
     applied_starts, start_api_log = apply_start_actions(start_candidates, config, ctx)
     if not applied_starts.empty:
         pause_history = pd.concat([pause_history, applied_starts[PAUSE_HISTORY_COLUMNS]], ignore_index=True, sort=False)
@@ -5104,7 +6391,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     save_table_to_s3_excel(s3_client, config, BID_HISTORY_KEY, bid_history[BID_HISTORY_COLUMNS])
     save_table_to_s3_excel(s3_client, config, PAUSE_HISTORY_KEY, pause_history[PAUSE_HISTORY_COLUMNS] if not pause_history.empty else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS))
-    save_table_to_s3_excel(s3_client, config, PRICE_HISTORY_KEY, price_history[PRICE_HISTORY_COLUMNS] if price_history is not None and not price_history.empty else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS))
+    if PRICE_CORRECTION_ENABLED:
+        save_table_to_s3_excel(s3_client, config, PRICE_HISTORY_KEY, price_history[PRICE_HISTORY_COLUMNS] if price_history is not None and not price_history.empty else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS))
 
     summary = write_outputs(
         s3_client=s3_client,
@@ -5123,11 +6411,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_bids_df=min_bids_df,
         keyword_core_df=keyword_core_df,
         keyword_effects_df=keyword_effects_df,
+        keyword_loss_detail_df=keyword_loss_detail_df,
         price_decisions=price_decisions,
         price_history=price_history[PRICE_HISTORY_COLUMNS] if price_history is not None and not price_history.empty else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS),
         price_effects_df=price_effects_df,
         applied_price_changes=applied_price_changes,
         bid_ramp_monitor=bid_ramp_monitor,
+        ramp_selection=ramp_selection,
         one_campaign_experiment=one_campaign_experiment,
         rename_plan=rename_plan,
         bid_campaign_compare=bid_campaign_compare,
