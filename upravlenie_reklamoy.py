@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v28-night-experiments-minbid-2026-06-09"
+SCRIPT_VERSION = "strict-drr-v29-night-experiment-only-yml-2026-06-09"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -464,6 +464,7 @@ class RunContext:
     apply_start: bool
     apply_price: bool
     apply_experiment: bool
+    night_experiment_only: bool
     run_datetime: datetime
     mature_end: date
     current_start: date
@@ -2298,6 +2299,7 @@ def build_run_context(args: argparse.Namespace) -> RunContext:
         apply_start=bool(args.apply_start),
         apply_price=bool(getattr(args, "apply_price", False)),
         apply_experiment=bool(getattr(args, "apply_experiment", False)),
+        night_experiment_only=bool(getattr(args, "night_experiment_only", False)),
         run_datetime=datetime.now(),
         mature_end=mature_end,
         current_start=current_start,
@@ -3761,6 +3763,47 @@ def apply_night_bid_experiment_rules(decisions: pd.DataFrame, ctx: RunContext) -
         result.at[idx, "experiment_id"] = "EXP1_NIGHT_MIN_BID_901_6_2_8"
         result.at[idx, "experiment_window_msk"] = night_experiment_window_text()
     return normalize_decision_bids_final(result)
+
+
+def filter_decisions_for_night_experiment_only(decisions: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
+    """В ночных запусках YAML не даём обычному алгоритму двигать ставки.
+
+    01:00 МСК: в API уходят только строки Эксперимента 1.
+    05:00 МСК: по ставкам ничего не отправляем, запуск нужен только для возврата РК Эксперимента 2.
+    """
+    if not bool(getattr(ctx, "night_experiment_only", False)):
+        return decisions
+    if decisions is None or decisions.empty:
+        return decisions
+    result = decisions.copy()
+    exp1_mask = result.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_1_REASON_CODE)
+    if is_night_experiment_window(ctx):
+        result.loc[~exp1_mask, "action"] = "Без изменений"
+        result.loc[~exp1_mask, "new_bid_rub"] = pd.NA
+        result.loc[~exp1_mask, "reason_code"] = "NIGHT_EXPERIMENT_ONLY_SKIP_MAIN_LOGIC"
+        result.loc[~exp1_mask, "reason_text"] = "Ночной запуск YAML: обычные изменения ставок отключены, работают только Эксперимент 1/2."
+    else:
+        result["action"] = "Без изменений"
+        result["new_bid_rub"] = pd.NA
+        result["reason_code"] = "NIGHT_EXPERIMENT_ONLY_START_WINDOW_NO_BID_CHANGES"
+        result["reason_text"] = "Ночной запуск YAML 05:00 МСК: изменения ставок не отправляются, запуск нужен для возврата РК Эксперимента 2."
+    return normalize_decision_bids_final(result)
+
+
+def filter_pause_candidates_for_night_experiment_only(pause_candidates: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
+    if not bool(getattr(ctx, "night_experiment_only", False)):
+        return pause_candidates
+    if pause_candidates is None or pause_candidates.empty:
+        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    return pause_candidates[pause_candidates.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_2_REASON_CODE)].copy()
+
+
+def filter_start_candidates_for_night_experiment_only(start_candidates: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
+    if not bool(getattr(ctx, "night_experiment_only", False)):
+        return start_candidates
+    if start_candidates is None or start_candidates.empty:
+        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    return start_candidates[start_candidates.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_2_START_REASON_CODE)].copy()
 
 
 def build_experiment_2_pause_candidates(decisions: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
@@ -6142,6 +6185,7 @@ def write_outputs(
     summary["Ночные эксперименты"] = "включены" if NIGHT_EXPERIMENTS_ENABLED else "отключены"
     summary["Окно ночных экспериментов МСК"] = night_experiment_window_text()
     summary["Окно ночных экспериментов сейчас"] = "активно" if is_night_experiment_window(ctx) else "не активно"
+    summary["Режим только ночных экспериментов"] = "да" if bool(getattr(ctx, "night_experiment_only", False)) else "нет"
     if decisions is not None and not decisions.empty and "reason_code" in decisions.columns:
         summary["Эксперимент 1: строк минимальной ночной ставки"] = int(decisions["reason_code"].astype(str).eq(EXPERIMENT_1_REASON_CODE).sum())
     if pause_candidates is not None and not pause_candidates.empty and "reason_code" in pause_candidates.columns:
@@ -6200,7 +6244,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     preview = subparsers.add_parser("preview", help="Предпросмотр без отправки изменений ставок")
-    preview.set_defaults(dry_run=False, apply_pause=False, apply_start=False, apply_price=False, apply_experiment=False, skip_price=False)
+    preview.set_defaults(dry_run=False, apply_pause=False, apply_start=False, apply_price=False, apply_experiment=False, skip_price=False, night_experiment_only=False)
 
     run = subparsers.add_parser("run", help="Боевой расчёт и отправка изменений ставок")
     run.add_argument("--dry-run", action="store_true", help="Расчёт run-режима без реальных API-вызовов")
@@ -6209,6 +6253,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     run.add_argument("--apply-price", action="store_true", help="Разрешить отправку изменений скидки продавца через Discounts & Prices API")
     run.add_argument("--apply-experiment", action="store_true", help="Разрешить применение экспериментального блока 1 РК на товарную группу")
     run.add_argument("--skip-price", action="store_true", help="Не строить контур цен в этом запуске")
+    run.add_argument("--night-experiment-only", action="store_true", help="Ночной режим: отправлять только действия Эксперимент 1/2, без обычных изменений ставок")
     return parser.parse_args(argv)
 
 
@@ -6224,7 +6269,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ctx = build_run_context(args)
     s3_client = make_s3_client(config)
 
-    print(f"[{ctx.run_datetime:%Y-%m-%d %H:%M:%S}] Старт {SCRIPT_NAME}: версия={SCRIPT_VERSION}, режим={ctx.mode}, dry_run={ctx.dry_run}")
+    print(f"[{ctx.run_datetime:%Y-%m-%d %H:%M:%S}] Старт {SCRIPT_NAME}: версия={SCRIPT_VERSION}, режим={ctx.mode}, dry_run={ctx.dry_run}, night_experiment_only={ctx.night_experiment_only}")
     print(f"Окна: база {ctx.base_start}..{ctx.base_end}; текущее {ctx.current_start}..{ctx.current_end}; mature_end={ctx.mature_end}")
 
     ads_df = load_ads_report(s3_client, config)
@@ -6343,6 +6388,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             pause_candidates = pd.concat([pause_candidates, experiment_pause_candidates], ignore_index=True, sort=False)
             print(f"Диагностика эксперимента 1РК: пауз кандидатов={len(experiment_pause_candidates)}", flush=True)
 
+    if bool(getattr(ctx, "night_experiment_only", False)):
+        decisions = filter_decisions_for_night_experiment_only(decisions, ctx)
+        if decisions is not None and not decisions.empty:
+            print("Диагностика night_experiment_only по ставкам: " + json.dumps(decisions.get("reason_code", pd.Series(dtype=str)).astype(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
+        pause_candidates = filter_pause_candidates_for_night_experiment_only(pause_candidates, ctx)
+        print(f"Диагностика night_experiment_only по паузам: к API допущено {len(pause_candidates)} строк Эксперимента 2", flush=True)
+
     successful_changes, bid_api_log = apply_bid_changes(decisions, config, ctx)
     bid_history = record_bid_events(successful_changes, bid_history, ctx)
     decisions = enrich_decisions_with_bid_api_status(decisions, successful_changes)
@@ -6378,6 +6430,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         ignore_index=True,
         sort=False,
     ) if any(df is not None and not df.empty for df in [normal_start_candidates, experiment2_start_candidates, rollback_start_candidates]) else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
+    if bool(getattr(ctx, "night_experiment_only", False)):
+        start_candidates = filter_start_candidates_for_night_experiment_only(start_candidates, ctx)
+        print(f"Диагностика night_experiment_only по запускам: к API допущено {len(start_candidates)} строк Эксперимента 2", flush=True)
+
     applied_starts, start_api_log = apply_start_actions(start_candidates, config, ctx)
     if not applied_starts.empty:
         pause_history = pd.concat([pause_history, applied_starts[PAUSE_HISTORY_COLUMNS]], ignore_index=True, sort=False)
