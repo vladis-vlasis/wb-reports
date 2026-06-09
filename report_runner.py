@@ -1,4 +1,5 @@
 # VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
+# PATCH: FIX31_1500_MSK_ZERODIV_SCHEDULE_20260608
 # INTERNAL_FIX: FIX30_STRICT_1330_NO_MTD_WEEKLY_DAILY_GP_20260604
 # CALC_REPAIR: 2026-06-02 nmId canonical article + May closed month + orders-rub card
 # FIX27: weekly page-1 cards + demand fallback for missing day + money dynamics for orders-rub cards
@@ -296,6 +297,27 @@ def safe_div(a: Any, b: Any, default: float = np.nan) -> float:
     if pd.isna(a) or pd.isna(b) or b == 0:
         return default
     return float(a) / float(b)
+
+
+def safe_div_series(numer: Any, denom: Any, default: float = 0.0) -> pd.Series:
+    """Vector division without eager zero-division from np.where.
+
+    Pandas/NumPy evaluates both branches of np.where before applying the mask.
+    If the denominator is object/Decimal and contains zero, expressions like
+    np.where(den > 0, numer / den, 0) can still raise ZeroDivisionError.
+    This helper divides only on a non-zero mask.
+    """
+    n = pd.to_numeric(numer, errors="coerce")
+    d = pd.to_numeric(denom, errors="coerce")
+    if not isinstance(n, pd.Series):
+        n = pd.Series(n)
+    if not isinstance(d, pd.Series):
+        d = pd.Series(d, index=n.index)
+    n = n.reindex(d.index)
+    out = pd.Series(default, index=d.index, dtype="float64")
+    mask = n.notna() & d.notna() & (d.abs() > 1e-12)
+    out.loc[mask] = n.loc[mask].astype(float) / d.loc[mask].astype(float)
+    return out
 
 
 def money_format() -> str:
@@ -3662,8 +3684,8 @@ def compute_entry_points_bridge(builder: AnalyticsBuilder, week_start: pd.Timest
         gp_cur = _abc_gp_for_period(builder, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
         ag = ag.merge(gp_cur, on=["subject", "product", "supplier_article", "nm_id"], how="left")
         ag["gp_use"] = ag["gp_fact"].fillna(ag.get("gross_profit_model", 0))
-        ag["margin_use"] = np.where(ag["order_sum"] > 0, ag["gp_use"] / ag["order_sum"], 0)
-        ag["avg_price_use"] = np.where(ag["orders"] > 0, ag["order_sum"] / ag["orders"], 0)
+        ag["margin_use"] = safe_div_series(ag["gp_use"], ag["order_sum"], 0.0)
+        ag["avg_price_use"] = safe_div_series(ag["order_sum"], ag["orders"], 0.0)
         out = out.merge(ag[["subject", "product", "supplier_article", "nm_id", "margin_use", "avg_price_use"]], on=["subject", "product", "supplier_article", "nm_id"], how="left")
     else:
         out["margin_use"] = 0.0
@@ -3675,7 +3697,7 @@ def compute_entry_points_bridge(builder: AnalyticsBuilder, week_start: pd.Timest
     out["effect_gp_rub"] = out["delta_orders"] * out["avg_price_use"].fillna(0) * out["margin_use"].fillna(0)
     totals = out.groupby(["subject", "product", "supplier_article", "nm_id"], as_index=False)["orders"].sum().rename(columns={"orders": "orders_total"})
     out = out.merge(totals, on=["subject", "product", "supplier_article", "nm_id"], how="left")
-    out["orders_share_pct"] = np.where(out["orders_total"] > 0, out["orders"] / out["orders_total"] * 100, np.nan)
+    out["orders_share_pct"] = safe_div_series(out["orders"], out["orders_total"], np.nan) * 100
     return out.sort_values(["subject", "product", "supplier_article", "effect_gp_rub"], ascending=[True, True, True, False])
 
 
