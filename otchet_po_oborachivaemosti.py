@@ -30,7 +30,7 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-06-10_v14_MT_ONLY_REDISTRIBUTION_TOPFACE_FULL_REPORT"
+SCRIPT_VERSION = "2026-06-10_v17_TF_REPORT_MT_TF_REDISTRIBUTION_MIN4"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -363,6 +363,16 @@ def is_first_monday_of_month(run_date: date) -> bool:
     return run_date.weekday() == 0 and 1 <= run_date.day <= 7
 
 
+def get_redistribution_min_qty() -> int:
+    raw = (os.getenv("WB_REDISTRIBUTION_MIN_QTY") or "4").strip()
+    try:
+        value = int(float(raw.replace(",", ".")))
+    except Exception:
+        log(f"Некорректный WB_REDISTRIBUTION_MIN_QTY={raw!r}; использую 4")
+        value = 4
+    return max(value, 1)
+
+
 def filter_plan_for_template(plan_df: pd.DataFrame, run_date: date) -> pd.DataFrame:
     if plan_df.empty:
         return plan_df.copy()
@@ -371,15 +381,16 @@ def filter_plan_for_template(plan_df: pd.DataFrame, run_date: date) -> pd.DataFr
     if "Количество" not in work.columns:
         return work
 
+    min_qty = get_redistribution_min_qty()
     work["Количество"] = work["Количество"].map(round_int)
 
     if is_first_monday_of_month(run_date):
-        log("Это первый понедельник месяца — заявки < 8 шт оставляем в шаблоне")
+        log(f"Это первый понедельник месяца — заявки < {min_qty} шт оставляем в шаблоне")
         return work
 
-    filtered = work[work["Количество"] >= 8].copy()
+    filtered = work[work["Количество"] >= min_qty].copy()
     excluded = len(work) - len(filtered)
-    log(f"Это не первый понедельник месяца — из шаблона исключено мелких заявок < 8 шт: {excluded}")
+    log(f"Это не первый понедельник месяца — из шаблона исключено мелких заявок < {min_qty} шт: {excluded}")
     return filtered
 
 
