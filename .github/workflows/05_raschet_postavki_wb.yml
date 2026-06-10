@@ -1,8 +1,20 @@
+# VERSION: v11_restore_working_20260610
+# Основа: рабочая схема через REPORT_ENV. Добавлен выбор магазина TOPFACE/MISSTAIS/ALL.
+
 name: Расчет поставки WB
 
 on:
   workflow_dispatch:
     inputs:
+      store:
+        description: "Магазин"
+        required: true
+        default: "TOPFACE"
+        type: choice
+        options:
+          - TOPFACE
+          - MISSTAIS
+          - ALL
       mode:
         description: "Режим расчета"
         required: true
@@ -81,20 +93,25 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+          WB_KEY_MISSTAIS: ${{ secrets.WB_KEY_MISSTAIS }}
         run: |
+          echo "__RUNNING_YML_VERSION_v11_restore_working_05__"
+
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не задан secret REPORT_ENV"
             exit 1
           fi
 
-          printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
+          printf '%s
+' "$REPORT_ENV" | sed 's/
+$//' >> "$GITHUB_ENV"
 
           echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
           echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
           echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
           echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
+          echo "WB_KEY_MISSTAIS=$WB_KEY_MISSTAIS" >> "$GITHUB_ENV"
 
-          echo "WB_STORE=TOPFACE" >> "$GITHUB_ENV"
           echo "WB_OUTPUT_DIR=output" >> "$GITHUB_ENV"
           echo "WB_SEND_TELEGRAM=${{ inputs.send_telegram }}" >> "$GITHUB_ENV"
 
@@ -128,10 +145,8 @@ jobs:
             echo "SUPPLY_SCRIPT=Поставки.py" >> "$GITHUB_ENV"
           elif [ -f "wb_supply_calculator.py" ]; then
             echo "SUPPLY_SCRIPT=wb_supply_calculator.py" >> "$GITHUB_ENV"
-          elif [ -f "wb_supply_calculator (4).py" ]; then
-            echo "SUPPLY_SCRIPT=wb_supply_calculator (4).py" >> "$GITHUB_ENV"
           else
-            echo "::error::Не найден файл Поставки.py, wb_supply_calculator.py или wb_supply_calculator (4).py в корне репозитория"
+            echo "::error::Не найден файл Поставки.py или wb_supply_calculator.py в корне репозитория"
             exit 1
           fi
 
@@ -139,6 +154,7 @@ jobs:
         run: |
           ARGS=()
 
+          ARGS+=(--store "${{ inputs.store }}")
           ARGS+=(--mode "${{ inputs.mode }}")
           ARGS+=(--season-coeff "${{ inputs.season_coeff }}")
           ARGS+=(--strategy-mode "${{ inputs.strategy_mode }}")
