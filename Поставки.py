@@ -26,6 +26,8 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
+SCRIPT_VERSION = "2026-06-10_v20_MISSTAIS_MT_SHEET_FIX"
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -411,6 +413,31 @@ def normalize_supplier_article_key(value: object) -> str:
     s = re.sub(r"_+", "/", s)
     s = re.sub(r"/+", "/", s)
     return s.strip("/")
+
+
+def is_misstais_store(store_name: object) -> bool:
+    name = normalize_text(store_name).upper().replace(" ", "").replace("-", "")
+    return name in {"MISSTAIS", "MISSTAISWB", "MISSTAISВБ", "MISST", "MT", "МТ", "MISS", "TAIS"}
+
+
+def resolve_article_1c_for_store(
+    nmid: object,
+    supplier_article: object,
+    article_1c_map: Dict[str, str],
+    cfg: AppConfig,
+) -> str:
+    article_1c = normalize_text(article_1c_map.get(normalize_nmid(nmid), ""))
+    if article_1c:
+        return article_1c
+
+    supplier_article_norm = normalize_text(supplier_article)
+
+    # Для MISSTAIS в файле соответствий 1С часто нет nmId -> 1С.
+    # Чтобы шаблон "МТ ВБ" не оставался пустым, используем supplierArticle как код товара.
+    if is_misstais_store(cfg.store_name) and supplier_article_norm:
+        return supplier_article_norm
+
+    return supplier_article_norm
 
 
 def month_key(dt: datetime) -> str:
@@ -1170,7 +1197,8 @@ def calculate_supply_plan(
         if sku_shares.empty:
             continue
 
-        article_1c = article_1c_map.get(nmid, "")
+        supplier_article = normalize_text(sku["supplierArticle"])
+        article_1c = resolve_article_1c_for_store(nmid, supplier_article, article_1c_map, cfg)
         network_available = float(network_stock_map.get(nmid, {}).get("network_stock_available", 0.0))
 
         if int(sku["sales_90_total"]) < cfg.low_turnover_sales_threshold:
@@ -1199,7 +1227,7 @@ def calculate_supply_plan(
                 rows.append(
                     {
                         "nmId": nmid,
-                        "supplierArticle": sku["supplierArticle"],
+                        "supplierArticle": supplier_article,
                         "subject": sku["subject"],
                         "Артикул 1С": article_1c,
                         "warehouse": warehouse,
@@ -1248,7 +1276,7 @@ def calculate_supply_plan(
             rows.append(
                 {
                     "nmId": nmid,
-                    "supplierArticle": sku["supplierArticle"],
+                    "supplierArticle": supplier_article,
                     "subject": sku["subject"],
                     "Артикул 1С": article_1c,
                     "warehouse": warehouse,
@@ -1911,7 +1939,18 @@ def pick_sheet_name(store_name: str) -> str:
 
 
 def build_template_dataset(plan_df: pd.DataFrame, stocks_1c_map: pd.DataFrame) -> pd.DataFrame:
-    wide = plan_df.pivot_table(
+    work = plan_df.copy()
+
+    if "Артикул 1С" not in work.columns:
+        work["Артикул 1С"] = ""
+
+    missing_article_mask = work["Артикул 1С"].map(normalize_text).eq("")
+    if missing_article_mask.any() and "supplierArticle" in work.columns:
+        filled_count = int(missing_article_mask.sum())
+        work.loc[missing_article_mask, "Артикул 1С"] = work.loc[missing_article_mask, "supplierArticle"].map(normalize_text)
+        log(f"Для шаблона поставки заполнены пустые 'Артикул 1С' из supplierArticle: {filled_count:,} строк")
+
+    wide = work.pivot_table(
         index=["supplierArticle", "Артикул 1С", "nmId", "subject"],
         columns="warehouse",
         values="to_supply",
@@ -2234,6 +2273,10 @@ def main(cfg: AppConfig = CONFIG) -> str:
         raise ValueError("После расчёта план поставки пуст.")
 
     template_data = build_template_dataset(plan_df, stocks_1c_map)
+    log(f"Строк для заполнения шаблона: {len(template_data):,}")
+    if template_data.empty:
+        missing_articles = int(plan_df["Артикул 1С"].map(normalize_text).eq("").sum()) if "Артикул 1С" in plan_df.columns else 0
+        log(f"⚠️ Шаблон пустой: в плане строк={len(plan_df):,}, строк без 'Артикул 1С'={missing_articles:,}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         template_path = resolve_template(storage, cfg, tmpdir)
@@ -2270,14 +2313,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--supplier-breakthrough-threshold", type=float, default=None, help="Порог для статуса Прорыв")
     parser.add_argument("--abc-target-month", default=None, help="Месяц ABC в формате YYYY-MM")
     parser.add_argument("--strategy-mode", choices=["default", "economy"], default=None, help="Стратегия распределения для warehouse-режима")
-    parser.add_argument("--store", choices=["TOPFACE", "MISSTAIS", "ALL"], default=None, help="Магазин: TOPFACE, MISSTAIS или ALL")
     return parser
 
 
 def build_cfg_from_args(args: argparse.Namespace) -> AppConfig:
     cfg = AppConfig()
-    if getattr(args, "store", None) and str(args.store).upper() != "ALL":
-        cfg.store_name = str(args.store).upper()
     if args.mode:
         cfg.calculation_mode = normalize_calculation_mode(args.mode)
     if args.run_date:
@@ -2301,16 +2341,4 @@ def build_cfg_from_args(args: argparse.Namespace) -> AppConfig:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    store_arg = str(args.store or os.getenv("WB_STORE", "TOPFACE")).strip().upper()
-
-    if store_arg == "ALL":
-        for store in ["TOPFACE", "MISSTAIS"]:
-            cfg = build_cfg_from_args(args)
-            cfg.store_name = store
-            cfg.output_dir = str(Path(cfg.output_dir) / store)
-            log(f"===== Запуск расчёта поставки для магазина {store} =====")
-            main(cfg)
-    else:
-        cfg = build_cfg_from_args(args)
-        cfg.store_name = store_arg
-        main(cfg)
+    main(build_cfg_from_args(args))
