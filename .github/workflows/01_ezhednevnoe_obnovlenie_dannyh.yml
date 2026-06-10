@@ -1,19 +1,13 @@
+# VERSION: v11_restore_working_20260610
+# Основа: последняя рабочая схема запуска через REPORT_ENV.
+# Изменения минимальные: добавлен WB_KEY_MISSTAIS, запуск --store ALL, cron 10:00 МСК.
+
 name: Ежедневное обновление данных
 
 on:
   workflow_dispatch:
-    inputs:
-      store:
-        description: "Магазин"
-        required: true
-        default: "ALL"
-        type: choice
-        options:
-          - ALL
-          - TOPFACE
-          - MISSTAIS
   schedule:
-    # Каждый день в 10:00 МСК = 07:00 UTC
+    # 10:00 МСК = 07:00 UTC
     - cron: "0 7 * * *"
 
 jobs:
@@ -35,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Загрузить переменные из REPORT_ENV и secrets магазинов
+      - name: Загрузить переменные из REPORT_ENV и отдельные secrets
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
@@ -44,30 +38,33 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
+          echo "__RUNNING_YML_VERSION_v11_restore_working_01__"
+
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не задан secret REPORT_ENV"
             exit 1
           fi
 
-          printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
+          printf '%s
+' "$REPORT_ENV" | sed 's/
+$//' >> "$GITHUB_ENV"
 
-          [ -n "$WB_PROMO_KEY_TOPFACE" ] && echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
-          [ -n "$WB_KEY_MISSTAIS" ] && echo "WB_KEY_MISSTAIS=$WB_KEY_MISSTAIS" >> "$GITHUB_ENV"
-          [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
-          [ -n "$TELEGRAM_CHAT_ID" ] && echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
-          [ -n "$TORGSTAT_ABC_URL" ] && echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
-
-      - name: Проверить обязательные переменные
-        run: |
-          missing=0
-          for var in YC_ACCESS_KEY_ID YC_SECRET_ACCESS_KEY YC_BUCKET_NAME WB_PROMO_KEY_TOPFACE WB_KEY_MISSTAIS; do
-            if [ -z "${!var}" ]; then
-              echo "::error::Не найдена переменная $var"
-              missing=1
-            fi
-          done
-          [ "$missing" -ne 0 ] && exit 1 || true
+          if [ -n "$WB_PROMO_KEY_TOPFACE" ]; then
+            echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$WB_KEY_MISSTAIS" ]; then
+            echo "WB_KEY_MISSTAIS=$WB_KEY_MISSTAIS" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$TELEGRAM_CHAT_ID" ]; then
+            echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$TORGSTAT_ABC_URL" ]; then
+            echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
+          fi
 
       - name: Запустить ежедневное обновление данных
         run: |
-          python ezhednevnoe_obnovlenie_dannyh.py --full --store "${{ inputs.store || 'ALL' }}"
+          python ezhednevnoe_obnovlenie_dannyh.py --full --store ALL
