@@ -151,6 +151,7 @@ jobs:
           fi
 
           echo "SCRIPT_PATH=$SCRIPT_PATH" >> "$GITHUB_ENV"
+          export SCRIPT_PATH
           echo "Resolved script: $SCRIPT_PATH"
 
           echo "=== Script version marker ==="
@@ -168,7 +169,14 @@ jobs:
           import re
           from pathlib import Path
 
-          script_path = os.environ["SCRIPT_PATH"]
+          script_path = os.environ.get("SCRIPT_PATH")
+          if not script_path:
+              for candidate in ("upravlenie_reklamoy.py", "assistant_wb_ads_manager.py"):
+                  if Path(candidate).exists():
+                      script_path = candidate
+                      break
+          if not script_path:
+              raise SystemExit("ERROR: SCRIPT_PATH is empty and script file was not found")
           text = Path(script_path).read_text(encoding="utf-8", errors="replace")
 
           m = re.search(r'SCRIPT_VERSION\s*=\s*["\']([^"\']+)["\']', text)
