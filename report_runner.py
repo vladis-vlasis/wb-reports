@@ -3,6 +3,7 @@
 # INTERNAL_FIX: FIX30_STRICT_1330_NO_MTD_WEEKLY_DAILY_GP_20260604
 # CALC_REPAIR: 2026-06-02 nmId canonical article + May closed month + orders-rub card
 # FIX27: weekly page-1 cards + demand fallback for missing day + money dynamics for orders-rub cards
+# FIX34: current-week product/article simplified drop-detail section; compare absolutes to prev-week daily average x elapsed days
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -6759,6 +6760,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"]),
         ["subject_disp"],
     )
+    cur_prod = _current_week_prev_avg_comparison(
+        _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp", "product_code"]),
+        ["subject_disp", "product_code"],
+    )
+    cur_art = _current_week_prev_avg_comparison(
+        _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp", "product_code", "supplier_article", "nm_id"]),
+        ["subject_disp", "product_code", "supplier_article", "nm_id"],
+    )
     prev_cat = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp"])
     closed_cat = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
     current_month_cat = _metrics_period(cur_start.replace(day=1), cur_actual_end, (cur_start.replace(day=1)-pd.offsets.MonthBegin(1)).normalize(), cur_start.replace(day=1)-pd.Timedelta(days=1), ["subject_disp"])
@@ -6789,6 +6798,49 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
         return x.sort_values(["_cat_order", "gp_use", "sum_use"], ascending=[True, False, False])
 
+    def _filter_current_week_drop_articles(df: pd.DataFrame) -> pd.DataFrame:
+        """Current-week simplified detail: keep only articles whose GP fell > threshold.
+
+        Previous value for absolute metrics is already normalized by
+        _current_week_prev_avg_comparison(): previous full week / 7 × elapsed days.
+        For percent/average metrics the previous value is the previous-week average level.
+        """
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["subject_disp", "product_code", "supplier_article", "nm_id"])
+        x = df.copy()
+        for c0 in ["gp_use", "gp_prev_use", "sum_use", "sum_prev_use"]:
+            if c0 not in x.columns:
+                x[c0] = 0.0
+            x[c0] = pd.to_numeric(x[c0], errors="coerce").fillna(0.0)
+        threshold = float(os.getenv("PDF_CURRENT_WEEK_ARTICLE_GP_DROP_PCT", "5") or "5")
+        prev_gp = x["gp_prev_use"]
+        cur_gp = x["gp_use"]
+        x["current_week_gp_drop_pct"] = np.where(prev_gp.abs() > 1e-9, (cur_gp / prev_gp - 1.0) * 100.0, np.nan)
+        x["current_week_gp_drop_rub"] = cur_gp - prev_gp
+        # Управленческий фильтр: смотрим только артикулы с реальной базой прошлой недели
+        # и падением ВП более чем на threshold%. Остальные строки в текущем оперативном разборе не нужны.
+        x = x[(prev_gp > 0) & (x["current_week_gp_drop_pct"] <= -abs(threshold))].copy()
+        if x.empty:
+            return x
+        x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+        x["_drop_abs"] = x["current_week_gp_drop_rub"].abs()
+        return x.sort_values(["_cat_order", "_drop_abs", "gp_use", "sum_use"], ascending=[True, False, False, False])
+
+    def _filter_current_week_drop_products(prod_df: pd.DataFrame, art_drop_df: pd.DataFrame) -> pd.DataFrame:
+        if prod_df is None or prod_df.empty or art_drop_df is None or art_drop_df.empty:
+            return pd.DataFrame(columns=["subject_disp", "product_code"])
+        pairs = art_drop_df[["subject_disp", "product_code"]].drop_duplicates().copy()
+        x = prod_df.copy()
+        x = _normalize_pdf_merge_keys(x, ["subject_disp", "product_code"])
+        pairs = _normalize_pdf_merge_keys(pairs, ["subject_disp", "product_code"])
+        x = x.merge(pairs, on=["subject_disp", "product_code"], how="inner")
+        if x.empty:
+            return x
+        x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+        return x.sort_values(["_cat_order", "gp_use", "sum_use"], ascending=[True, False, False])
+
+    cur_art_drop = _filter_current_week_drop_articles(cur_art)
+    cur_prod_detail = _filter_current_week_drop_products(cur_prod, cur_art_drop)
     prev_prod_detail = _filter_detail_products(prev_prod)
     closed_prod_detail = _filter_detail_products(closed_prod)
 
@@ -6809,6 +6861,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     # Build contour dictionaries and planned bookmarks.
     contours = {
+        "cur": {
+            "label": "Текущая неделя",
+            "period": f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y}",
+            "start": cur_start, "end": cur_actual_end, "prev_start": prev_start, "prev_end": prev_end,
+            "summary_key": "cur_categories", "cat_df": cur_cat, "prod_df": cur_prod_detail, "art_df": cur_art_drop,
+            "back_label": "← текущая неделя",
+            "simplified": True,
+        },
         "prev": {
             "label": "Прошлая неделя",
             "period": f"{prev_start:%d.%m}-{prev_end:%d.%m.%Y}",
@@ -7077,9 +7137,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if key == "cur_categories":
             rows=[]
             for _, r in x.iterrows():
-                rows.append({"cells": [
-                    str(r["subject_disp"]),
+                cat = str(r["subject_disp"])
+                tgt = _cat_key(target_contour, cat) if target_contour and _has_category_detail(target_contour, cat) else None
+                rows.append({"_target": tgt, "cells": [
+                    cat,
                     (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
                     (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
                     (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
                     (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
@@ -7087,8 +7150,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
                 ]})
             t = _summary_total_row(x, current_only=True)
-            rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), "—", "—", "—"]})
-            _draw_table(75, 330, W-150, ["Категория", "Сумма", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [250,220,220,170,160,240,200], rows, row_h=72, font_size=15)
+            rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["gp_use"]), _delta_abs(t["gp_use"], t["gp_prev_use"]), "ВП"), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), "—", "—", "—"]})
+            _draw_table(75, 315, W-150, ["Категория", "Сумма", "ВП", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [180,185,175,185,115,105,175,135], rows, row_h=68, font_size=14)
             return
 
         rows=[]
@@ -7229,7 +7292,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _draw_table(80, 155, W-160, ["День", "Сумма заказов", "ВП", "Расход РК", "ДРР", "Спрос WB", "% поиска"], widths, rows, row_h=48, font_size=11)
 
     def _current_week_categories():
-        _summary_category_page("cur_categories", "Текущая неделя: категории", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор", "Текущая неделя", cur_cat, target_contour=None)
+        _summary_category_page(
+            "cur_categories",
+            "Текущая неделя: категории",
+            f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор; детализация только по артикулам с падением ВП >5%",
+            "Текущая неделя",
+            cur_cat,
+            target_contour="cur",
+        )
 
     def _current_month_page():
         # Текущий месяц:
@@ -7698,7 +7768,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
             ]})
         _draw_listing_pages(f"Товар: {prod}", f"{cat} / {info['period']} / артикулы", "Товар 2/2", pk+"_list", [(1160,798,220,"← категория",cat_list_key),(1400,798,100,"стр.1",pk)], ["Артикул", "Сумма", "ВП", "Расход РК", "Рент.", "ДРР"], [240,250,250,250,210,210], rows, row_h=52, font_size=14, rows_per_page=12)
-        _draw_entity_entry_factor_page("product", pf, f"Товар: {prod}", f"{cat} / {info['period']} / точки входа и факторы", "Товар факторы", prod_row, [(1160,798,220,"← товар",pk+"_list"),(1400,798,100,"стр.1",pk)])
+        if info.get("simplified"):
+            _draw_entity_factor_only_page("product", pf, f"Товар: {prod}", f"{cat} / {info['period']} / факторы текущей недели", "Товар факторы", prod_row, [(1160,798,220,"← товар",pk+"_list"),(1400,798,100,"стр.1",pk)])
+        else:
+            _draw_entity_entry_factor_page("product", pf, f"Товар: {prod}", f"{cat} / {info['period']} / точки входа и факторы", "Товар факторы", prod_row, [(1160,798,220,"← товар",pk+"_list"),(1400,798,100,"стр.1",pk)])
 
     def _entity_entry_rows(level: str, contour: str, row: pd.Series, max_items: int = 8) -> List[Dict[str, Any]]:
         if contour != "prev" or entry_bridge.empty:
@@ -7743,6 +7816,22 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             factor_rows=[{"cells":["—", "—", "—", "—", "→ 0,0%", "0 ₽"]}]
         _draw_table(75, 80, W-150, ["Фактор", "Блок", "Текущее", "Прошлая неделя", "Изм.", "Эффект ВП"], [280,390,180,180,150,180], factor_rows, row_h=32, font_size=11, max_rows=9)
 
+    def _draw_entity_factor_only_page(level: str, key: str, title: str, subtitle: str, section: str, row: pd.Series, back_buttons):
+        _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
+        _draw_text(
+            "Без точек входа: текущая неделя сравнивается с прошлой неделей. "
+            "Суммы/ВП/заказы/РК = среднедневная база прошлой недели × факт прошедших дней; "
+            "проценты и средние = средний уровень прошлой недели.",
+            75, 720, W-150, F_REG, 16, GRAY, align="left"
+        )
+        factors = _factor_rows(row, section)
+        factor_rows=[]
+        for fr in factors[:13]:
+            factor_rows.append({"cells": [fr["Фактор"], fr["Блок"], fr["Текущее"], fr["База"], fr["Изменение"], _fmt_signed_money(fr["Эффект ВП"]), fr.get("Вывод", "")]})
+        if not factor_rows:
+            factor_rows=[{"cells":["—", "—", "—", "—", "→ 0,0%", "0 ₽", "нет значимых изменений"]}]
+        _draw_table(75, 115, W-150, ["Фактор", "Блок", "Текущее", "База", "Изм.", "Эффект ВП", "Вывод"], [230,300,145,145,120,145,315], factor_rows, row_h=38, font_size=10, max_rows=13)
+
     def _draw_article_pages(contour: str, art_row: pd.Series):
         info = contours[contour]
         cat = str(art_row["subject_disp"]); prod = str(art_row["product_code"]); art = _clean_article_local(art_row.get("supplier_article"))
@@ -7763,7 +7852,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             page2_buttons = [(1230,798,210,"← категория", product_back),(1480,798,80,"стр.1",a1)]
         else:
             page2_buttons = [(1120,798,170,"← товар", product_back),(1310,798,150,"← категория",cat_list_key),(1480,798,80,"стр.1",a1)]
-        _draw_entity_entry_factor_page("article", a2, f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", "Артикул 2/2", art_row, page2_buttons)
+        if info.get("simplified"):
+            _draw_entity_factor_only_page("article", a2, f"Артикул: {art}", f"{cat} / товар {prod} / факторы текущей недели", "Артикул 2/2", art_row, page2_buttons)
+        else:
+            _draw_entity_entry_factor_page("article", a2, f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", "Артикул 2/2", art_row, page2_buttons)
 
     def _render_contour(contour: str):
         for cat in CATEGORY_ORDER:
@@ -7785,8 +7877,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                         _draw_article_pages(contour, ar)
 
     # ---------- build pages in the requested order ----------
-    # 1) Current week.
+    # 1) Current week: daily overview + simplified product/article detail for GP drops.
     _current_week_overview()
+    _current_week_categories()
+    _render_contour("cur")
     # 2) Previous full week summary.
     _summary_category_page("prev_summary", "Прошлая полная неделя", f"{_period_label(prev_start, prev_end)} / категория → товар → артикул", "Прошлая неделя", prev_cat, target_contour="prev")
     # 3) Current month.
