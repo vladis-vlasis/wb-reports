@@ -22,11 +22,14 @@ on:
           - "true"
 
   schedule:
-    # GitHub Actions cron работает в UTC.
-    # МСК = UTC+3.
-    - cron: "0 22 * * *"  # 01:00 МСК — ночные эксперименты: минимальные ставки + pause combined с ДРР > 15%
-    - cron: "0 2 * * *"   # 05:00 МСК — ночные эксперименты: вернуть paused combined после окна
+    # GitHub Actions cron работает в UTC. Москва = UTC+3.
+    - cron: "0 22 * * *"  # 01:00 МСК — Эксперимент 1: минимальные ставки; Эксперимент 2: pause combined с ДРР > 15%
+    - cron: "0 2 * * *"   # 05:00 МСК — Эксперимент 2: включить обратно ночные паузы
     - cron: "0 9 * * *"   # 12:00 МСК — основной дневной запуск алгоритма
+
+concurrency:
+  group: topface-wb-ads-manager
+  cancel-in-progress: false
 
 jobs:
   run-topface-ads-manager:
@@ -34,16 +37,20 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # Можно хранить секреты двумя способами:
-      # 1) отдельными GitHub Secrets: YC_ACCESS_KEY_ID / YC_SECRET_ACCESS_KEY / YC_BUCKET_NAME / WB_PROMO_KEY_TOPFACE
-      # 2) одним многострочным секретом REPORT_ENV в формате KEY=VALUE
+      # Можно использовать отдельные GitHub Secrets или общий многострочный REPORT_ENV.
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+
       PYTHONUNBUFFERED: "1"
       TZ: "Europe/Moscow"
+
+      # Явно фиксируем ночное окно для кода.
+      WB_NIGHT_EXPERIMENTS_ENABLED: "1"
+      WB_NIGHT_EXPERIMENT_START_HOUR_MSK: "1"
+      WB_NIGHT_EXPERIMENT_END_HOUR_MSK: "5"
 
     steps:
       - name: Checkout repository
@@ -56,11 +63,13 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
 
-      - name: Load secrets from REPORT_ENV if needed
+      - name: Load secrets from REPORT_ENV
         run: |
+          set -euo pipefail
           python - <<'PY'
           import os
 
@@ -94,7 +103,6 @@ jobs:
           loaded = []
           with open(github_env, "a", encoding="utf-8") as f:
               for key in allowed:
-                  # Отдельный secret имеет приоритет. REPORT_ENV используется как fallback.
                   value = os.getenv(key) or parsed.get(key)
                   if value:
                       f.write(f"{key}={value}\n")
@@ -105,9 +113,9 @@ jobs:
 
       - name: Verify required secrets
         run: |
+          set -euo pipefail
           python - <<'PY'
           import os
-
           required = [
               "YC_ACCESS_KEY_ID",
               "YC_SECRET_ACCESS_KEY",
@@ -120,9 +128,13 @@ jobs:
           print("All required secrets are present.")
           PY
 
-      - name: Resolve script file
+      - name: Resolve and verify script
         run: |
           set -euo pipefail
+          echo "=== Time diagnostics ==="
+          echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+
           echo "=== Current directory ==="
           pwd
           echo "=== Repository files ==="
@@ -134,7 +146,7 @@ jobs:
           elif [ -f "assistant_wb_ads_manager.py" ]; then
             SCRIPT_PATH="assistant_wb_ads_manager.py"
           else
-            echo "ERROR: Не найден файл скрипта. Ожидал upravlenie_reklamoy.py или assistant_wb_ads_manager.py в корне репозитория"
+            echo "ERROR: не найден файл скрипта: ожидал ./upravlenie_reklamoy.py или ./assistant_wb_ads_manager.py"
             exit 1
           fi
 
@@ -146,20 +158,51 @@ jobs:
 
           echo "=== Old dayfirst bug check ==="
           if grep -q "dayfirst=True" "$SCRIPT_PATH"; then
-            echo "ERROR: В репозитории всё ещё старая версия $SCRIPT_PATH с dayfirst=True"
+            echo "ERROR: В $SCRIPT_PATH есть старый dayfirst=True"
             exit 1
           fi
 
-          if ! grep -q "strict-drr-v29-night-experiment-only-yml-2026-06-09" "$SCRIPT_PATH"; then
-            echo "ERROR: В $SCRIPT_PATH нет маркера v29. Значит в репозитории лежит не актуальная версия кода."
-            exit 1
-          fi
+          echo "=== Required code markers ==="
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          script_path = os.environ["SCRIPT_PATH"]
+          text = Path(script_path).read_text(encoding="utf-8", errors="replace")
+
+          m = re.search(r'SCRIPT_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+          if not m:
+              raise SystemExit(f"ERROR: В {script_path} нет SCRIPT_VERSION")
+          version = m.group(1)
+          print(f"SCRIPT_VERSION={version}")
+
+          vm = re.search(r'strict-drr-v(\d+)', version)
+          if not vm:
+              raise SystemExit(f"ERROR: Неизвестный формат SCRIPT_VERSION: {version}")
+          vnum = int(vm.group(1))
+          if vnum < 30:
+              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v30+")
+
+          markers = [
+              "night_experiment_only",
+              "EXPERIMENT_1_NIGHT_MIN_BID_MSK_1_5",
+              "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE",
+              "ABC_PROFITABILITY_MIN_PCT",
+              "abc_profitability_pct",
+          ]
+          missing = [marker for marker in markers if marker not in text]
+          if missing:
+              raise SystemExit("ERROR: В коде нет обязательных маркеров: " + ", ".join(missing))
+          print("Code marker check OK: v30+, night experiments, ABC profitability present.")
+          PY
 
           echo "=== Script SHA256 ==="
           sha256sum "$SCRIPT_PATH"
 
       - name: Compile Python script
         run: |
+          set -euo pipefail
           python -m py_compile "$SCRIPT_PATH"
 
       - name: Run TOPFACE WB Ads Manager
@@ -171,21 +214,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          CMD="python $SCRIPT_PATH run --skip-price"
+          BASE_CMD="python $SCRIPT_PATH run --skip-price"
           SLOT="main"
 
           if [ "$EVENT_NAME" = "schedule" ]; then
             case "$SCHEDULE_CRON" in
               "0 22 * * *")
                 SLOT="night_start"
-                CMD="$CMD --night-experiment-only --apply-pause"
+                CMD="$BASE_CMD --night-experiment-only --apply-pause"
                 ;;
               "0 2 * * *")
                 SLOT="night_end"
-                CMD="$CMD --night-experiment-only --apply-start"
+                CMD="$BASE_CMD --night-experiment-only --apply-start"
                 ;;
               "0 9 * * *")
                 SLOT="main"
+                CMD="$BASE_CMD"
                 ;;
               *)
                 echo "ERROR: неизвестное расписание: $SCHEDULE_CRON"
@@ -196,14 +240,15 @@ jobs:
             case "$INPUT_RUN_SLOT" in
               "night_start")
                 SLOT="night_start"
-                CMD="$CMD --night-experiment-only --apply-pause"
+                CMD="$BASE_CMD --night-experiment-only --apply-pause"
                 ;;
               "night_end")
                 SLOT="night_end"
-                CMD="$CMD --night-experiment-only --apply-start"
+                CMD="$BASE_CMD --night-experiment-only --apply-start"
                 ;;
               "main"|"")
                 SLOT="main"
+                CMD="$BASE_CMD"
                 ;;
               *)
                 echo "ERROR: неизвестный run_slot: $INPUT_RUN_SLOT"
@@ -216,18 +261,23 @@ jobs:
             CMD="$CMD --dry-run"
           fi
 
+          echo "=== Run slot diagnostics ==="
           echo "Event: $EVENT_NAME"
-          echo "Schedule cron: $SCHEDULE_CRON"
+          echo "Schedule cron: ${SCHEDULE_CRON:-manual}"
+          echo "Manual input slot: ${INPUT_RUN_SLOT:-none}"
           echo "Resolved slot: $SLOT"
           echo "Resolved script: $SCRIPT_PATH"
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
           echo "Running: $CMD"
+
           eval "$CMD"
 
       - name: Show local result files
         if: always()
         run: |
           echo "=== Local XLSX/JSON files after run ==="
-          find . -maxdepth 3 -type f \( -name "*.xlsx" -o -name "*.json" \) -print || true
+          find . -maxdepth 4 -type f \( -name "*.xlsx" -o -name "*.json" \) -print || true
 
       - name: Upload local artifacts
         if: always()
