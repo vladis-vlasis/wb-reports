@@ -21,7 +21,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-STORE_NAME = "TOPFACE"
+STORE_NAME = os.getenv("WB_STORE", "TOPFACE").strip().upper() or "TOPFACE"
 WB_STOCKS_PREFIX = f"Отчёты/Остатки/{STORE_NAME}/Недельные/"
 WB_ORDERS_PREFIX = f"Отчёты/Заказы/{STORE_NAME}/Недельные/"
 ARTICLE_MAP_KEY = "Отчёты/Остатки/1С/Артикулы 1с.xlsx"
@@ -30,7 +30,7 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-05-22_STRAWBERRY_FORMAT_DEAD_STOCK_SPLIT_FIX_HIGHLIGHT_ZERO_SALES"
+SCRIPT_VERSION = "2026-06-10_v14_MT_ONLY_REDISTRIBUTION_TOPFACE_FULL_REPORT"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -326,6 +326,37 @@ def should_send_redistribution(cfg: Config) -> bool:
     if cfg.force_send or cfg.send_redistribution_always:
         return True
     return cfg.run_date.weekday() == 0
+
+
+REDISTRIBUTION_ONLY_STORES = {"MISSTAIS", "MISS TAIS", "MT", "МТ"}
+
+
+def is_redistribution_only_mode() -> bool:
+    env_value = os.getenv("WB_ONLY_REDISTRIBUTION", "").strip().lower()
+    if env_value in {"1", "true", "yes", "y", "да"}:
+        return True
+    return STORE_NAME in REDISTRIBUTION_ONLY_STORES
+
+
+def run_redistribution_only(storage: S3Storage, cfg: Config, article_map: dict[str, str]) -> Path:
+    log(f"STORE={STORE_NAME}: режим только перераспределения. Отчёт по оборачиваемости/остаткам не формируется.")
+    redistribution_calc_path, redistribution_template_path = create_redistribution_outputs(
+        storage=storage,
+        cfg=cfg,
+        article_map=article_map,
+    )
+
+    if should_send_redistribution(cfg):
+        send_document_to_telegram(
+            cfg,
+            redistribution_template_path,
+            f"🚚 Перераспределение WB {STORE_NAME}\nШаблон заполнен автоматически по расчёту за {cfg.redistribution_days} дней",
+        )
+        log(f"Полный расчёт перераспределения в Telegram не отправляется: {redistribution_calc_path.name}")
+    else:
+        log("Отправка шаблона перераспределения в Telegram пропущена по расписанию")
+
+    return redistribution_template_path
 
 
 def is_first_monday_of_month(run_date: date) -> bool:
@@ -1797,8 +1828,8 @@ def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: 
     template_plan_df = filter_plan_for_template(plan_df, cfg.run_date)
 
     date_label = format_ru_date_for_filename(cfg.run_date)
-    calc_path = Path(OUT_DIR) / f"Расчёт перераспределения_{date_label}.xlsx"
-    template_out_path = Path(OUT_DIR) / f"Перераспределение_{date_label}.xlsx"
+    calc_path = Path(OUT_DIR) / f"Расчёт перераспределения_{STORE_NAME}_{date_label}.xlsx"
+    template_out_path = Path(OUT_DIR) / f"Перераспределение_{STORE_NAME}_{date_label}.xlsx"
 
     save_redistribution_workbook(
         path=calc_path,
@@ -1828,9 +1859,13 @@ def run() -> Path:
     storage = S3Storage(cfg)
     stop_articles = parse_stop_articles(cfg.stop_articles_raw)
 
+    article_map = load_article_map(storage)
+
+    if is_redistribution_only_mode():
+        return run_redistribution_only(storage=storage, cfg=cfg, article_map=article_map)
+
     wb_stocks, stock_source = load_latest_wb_stocks(storage)
     sales_df, order_sources = load_orders_metrics(storage)
-    article_map = load_article_map(storage)
     stocks_1c = load_stocks_1c(storage)
     rrc_df = load_rrc(storage)
     inbound_df = load_inbound(storage, cfg.run_date)
@@ -1858,7 +1893,7 @@ def run() -> Path:
 
     critical, monitor, dead_wb, dead_all, calc = split_sheets(report_df)
     date_label = format_ru_date_for_filename(cfg.run_date)
-    report_path = Path(OUT_DIR) / f"Отчёт Остатки и товары в пути_{date_label}.xlsx"
+    report_path = Path(OUT_DIR) / f"Отчёт Остатки и товары в пути_{STORE_NAME}_{date_label}.xlsx"
     save_report(report_path, critical, monitor, dead_wb, dead_all, calc)
 
     log(f"Отчёт сохранён: {report_path}")
