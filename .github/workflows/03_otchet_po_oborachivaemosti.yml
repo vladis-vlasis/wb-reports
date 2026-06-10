@@ -1,12 +1,14 @@
-# VERSION: v14_MT_ONLY_REDISTRIBUTION_20260610
+# VERSION: v17_TF_REPORT_MT_TF_REDISTRIBUTION_MIN4_20260610
 # В GitHub заменить содержимое файла:
 # .github/workflows/03_otchet_po_oborachivaemosti.yml
 #
-# Логика:
-# TOPFACE  -> полный отчёт по остаткам/оборачиваемости + перераспределение
-# MISSTAIS -> только перераспределение, без отчёта по оборачиваемости
+# Каждый понедельник:
+# 1) TOPFACE  -> отчёт по остаткам и товарам в пути + перераспределение
+# 2) MISSTAIS -> только перераспределение
+#
+# Планка попадания строк в шаблон перераспределения: от 4 шт.
 
-name: Отчет по оборачиваемости и перераспределение
+name: Отчет по остаткам и перераспределение
 
 on:
   workflow_dispatch:
@@ -16,8 +18,9 @@ on:
 
 jobs:
   run:
-    name: Запустить отчет и перераспределение
+    name: TOPFACE отчет + перераспределение; MISSTAIS перераспределение
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
       - name: Скачать репозиторий
@@ -36,13 +39,10 @@ jobs:
       - name: Загрузить REPORT_ENV и secrets
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-          WB_KEY_MISSTAIS: ${{ secrets.WB_KEY_MISSTAIS }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
-          echo "YML_VERSION=v14_MT_ONLY_REDISTRIBUTION_20260610"
+          echo "YML_VERSION=v17_TF_REPORT_MT_TF_REDISTRIBUTION_MIN4_20260610"
 
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не задан secret REPORT_ENV"
@@ -50,14 +50,6 @@ jobs:
           fi
 
           printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
-
-          if [ -n "$WB_PROMO_KEY_TOPFACE" ]; then
-            echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
-          fi
-
-          if [ -n "$WB_KEY_MISSTAIS" ]; then
-            echo "WB_KEY_MISSTAIS=$WB_KEY_MISSTAIS" >> "$GITHUB_ENV"
-          fi
 
           if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
             echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
@@ -67,16 +59,28 @@ jobs:
             echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
           fi
 
-          if [ -n "$TORGSTAT_ABC_URL" ]; then
-            echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
+      - name: Проверить переменные Yandex Cloud
+        run: |
+          missing=0
+          for var in YC_ACCESS_KEY_ID YC_SECRET_ACCESS_KEY YC_BUCKET_NAME; do
+            if [ -z "${!var}" ]; then
+              echo "::error::После загрузки REPORT_ENV не найдена переменная $var"
+              missing=1
+            else
+              echo "$var найден"
+            fi
+          done
+
+          if [ "$missing" -ne 0 ]; then
+            exit 1
           fi
 
-      - name: TOPFACE — полный отчет и перераспределение
+      - name: TOPFACE — отчет по остаткам и товарам в пути + перераспределение
         run: |
-          echo "===== STORE=TOPFACE | FULL REPORT + REDISTRIBUTION ====="
-          WB_STORE="TOPFACE" python otchet_po_oborachivaemosti.py
+          echo "===== STORE=TOPFACE | REPORT + REDISTRIBUTION | MIN_QTY=4 ====="
+          WB_STORE="TOPFACE"           WB_FORCE_SEND="true"           WB_SEND_REDISTRIBUTION_ALWAYS="true"           WB_REDISTRIBUTION_MIN_QTY="4"           python otchet_po_oborachivaemosti.py
 
       - name: MISSTAIS — только перераспределение
         run: |
-          echo "===== STORE=MISSTAIS | REDISTRIBUTION ONLY ====="
-          WB_STORE="MISSTAIS" WB_ONLY_REDISTRIBUTION="true" WB_SEND_REDISTRIBUTION_ALWAYS="true" python otchet_po_oborachivaemosti.py
+          echo "===== STORE=MISSTAIS | REDISTRIBUTION ONLY | MIN_QTY=4 ====="
+          WB_STORE="MISSTAIS"           WB_ONLY_REDISTRIBUTION="true"           WB_SEND_REDISTRIBUTION_ALWAYS="true"           WB_REDISTRIBUTION_MIN_QTY="4"           python otchet_po_oborachivaemosti.py
