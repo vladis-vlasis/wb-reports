@@ -1,9 +1,9 @@
-# VERSION: v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL
-# IMPORTANT: This downloadable file is intentionally versioned.
-# In GitHub, paste this content into:
+# VERSION: v7_20260610_UNIQUE_FILE_NO_REPORT_ENV_STOP
+# Скачиваемый файл намеренно имеет уникальное имя.
+# В GitHub нужно полностью заменить содержимое:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
-name: Ежедневное обновление данных v6
+name: Ежедневное обновление данных MISSTAIS v7
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ on:
 
 jobs:
   run:
-    name: Запустить ежедневное обновление данных v6
+    name: Запустить ежедневное обновление данных MISSTAIS v7
     runs-on: ubuntu-latest
 
     steps:
@@ -40,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Загрузить переменные окружения v6
+      - name: Загрузить secrets v7
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
           YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
@@ -52,13 +52,13 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
-          echo "YML_VERSION=v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL"
+          echo "__RUNNING_YML_VERSION_v7_20260610_UNIQUE_FILE_NO_REPORT_ENV_STOP__"
 
           if [ -n "$REPORT_ENV" ]; then
             printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
             echo "REPORT_ENV загружен"
           else
-            echo "::warning::REPORT_ENV пустой или недоступен. Продолжаю через отдельные secrets."
+            echo "::warning::REPORT_ENV пустой или недоступен. Это НЕ останавливает workflow."
           fi
 
           if [ -n "$YC_ACCESS_KEY_ID" ]; then echo "YC_ACCESS_KEY_ID=$YC_ACCESS_KEY_ID" >> "$GITHUB_ENV"; fi
@@ -70,16 +70,16 @@ jobs:
           if [ -n "$TELEGRAM_CHAT_ID" ]; then echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"; fi
           if [ -n "$TORGSTAT_ABC_URL" ]; then echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"; fi
 
-      - name: Проверить обязательные переменные v6
+      - name: Проверить обязательные переменные v7
         env:
           STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
         run: |
-          echo "Проверка YML_VERSION=v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL"
+          echo "__CHECKING_YML_VERSION_v7_20260610_UNIQUE_FILE_NO_REPORT_ENV_STOP__"
           missing=0
 
           for var in YC_ACCESS_KEY_ID YC_SECRET_ACCESS_KEY YC_BUCKET_NAME; do
             if [ -z "${!var}" ]; then
-              echo "::error::Не найдена переменная $var. Она должна быть внутри REPORT_ENV или отдельным GitHub Secret."
+              echo "::error::Не найдена переменная $var. Добавь её в REPORT_ENV или отдельным GitHub Secret."
               missing=1
             else
               echo "$var загружена"
@@ -108,9 +108,9 @@ jobs:
             exit 1
           fi
 
-      - name: Запустить ежедневное обновление данных v6
+      - name: Запустить ежедневное обновление данных v7
         env:
           STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
         run: |
-          echo "Запуск YML_VERSION=v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL"
+          echo "__START_PYTHON_FROM_YML_VERSION_v7_20260610_UNIQUE_FILE_NO_REPORT_ENV_STOP__"
           python ezhednevnoe_obnovlenie_dannyh.py --full --store "$STORE_INPUT"
