@@ -26,7 +26,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "2026-06-10_v20_MISSTAIS_MT_SHEET_FIX"
+SCRIPT_VERSION = "2026-06-10_v21_MISSTAIS_1C_EQUALS_SUPPLIER_ARTICLE"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -426,16 +426,16 @@ def resolve_article_1c_for_store(
     article_1c_map: Dict[str, str],
     cfg: AppConfig,
 ) -> str:
+    supplier_article_norm = normalize_text(supplier_article)
+
+    # Для MISSTAIS / МТ бизнес-правило: Артикул 1С = Артикул продавца / supplierArticle.
+    # Маппинг nmId -> 1С для MISSTAIS не используем, чтобы не заполнять лист "МТ ВБ" чужими кодами.
+    if is_misstais_store(cfg.store_name):
+        return supplier_article_norm
+
     article_1c = normalize_text(article_1c_map.get(normalize_nmid(nmid), ""))
     if article_1c:
         return article_1c
-
-    supplier_article_norm = normalize_text(supplier_article)
-
-    # Для MISSTAIS в файле соответствий 1С часто нет nmId -> 1С.
-    # Чтобы шаблон "МТ ВБ" не оставался пустым, используем supplierArticle как код товара.
-    if is_misstais_store(cfg.store_name) and supplier_article_norm:
-        return supplier_article_norm
 
     return supplier_article_norm
 
