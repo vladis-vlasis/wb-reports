@@ -1,4 +1,9 @@
-name: Ежедневное обновление данных
+# VERSION: v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL
+# IMPORTANT: This downloadable file is intentionally versioned.
+# In GitHub, paste this content into:
+# .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
+
+name: Ежедневное обновление данных v6
 
 on:
   workflow_dispatch:
@@ -18,7 +23,7 @@ on:
 
 jobs:
   run:
-    name: Запустить ежедневное обновление данных
+    name: Запустить ежедневное обновление данных v6
     runs-on: ubuntu-latest
 
     steps:
@@ -35,7 +40,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Загрузить переменные из REPORT_ENV и отдельных secrets
+      - name: Загрузить переменные окружения v6
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
           YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
@@ -47,55 +52,46 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
+          echo "YML_VERSION=v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL"
+
           if [ -n "$REPORT_ENV" ]; then
             printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
             echo "REPORT_ENV загружен"
           else
-            echo "::warning::REPORT_ENV пустой или недоступен для этого workflow. Пробую отдельные secrets."
+            echo "::warning::REPORT_ENV пустой или недоступен. Продолжаю через отдельные secrets."
           fi
 
-          add_env_if_set() {
-            name="$1"
-            value="$2"
-            if [ -n "$value" ]; then
-              echo "$name=$value" >> "$GITHUB_ENV"
-              echo "$name загружен"
-            fi
-          }
+          if [ -n "$YC_ACCESS_KEY_ID" ]; then echo "YC_ACCESS_KEY_ID=$YC_ACCESS_KEY_ID" >> "$GITHUB_ENV"; fi
+          if [ -n "$YC_SECRET_ACCESS_KEY" ]; then echo "YC_SECRET_ACCESS_KEY=$YC_SECRET_ACCESS_KEY" >> "$GITHUB_ENV"; fi
+          if [ -n "$YC_BUCKET_NAME" ]; then echo "YC_BUCKET_NAME=$YC_BUCKET_NAME" >> "$GITHUB_ENV"; fi
+          if [ -n "$WB_PROMO_KEY_TOPFACE" ]; then echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"; fi
+          if [ -n "$WB_KEY_MISSTAIS" ]; then echo "WB_KEY_MISSTAIS=$WB_KEY_MISSTAIS" >> "$GITHUB_ENV"; fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"; fi
+          if [ -n "$TELEGRAM_CHAT_ID" ]; then echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"; fi
+          if [ -n "$TORGSTAT_ABC_URL" ]; then echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"; fi
 
-          add_env_if_set "YC_ACCESS_KEY_ID" "$YC_ACCESS_KEY_ID"
-          add_env_if_set "YC_SECRET_ACCESS_KEY" "$YC_SECRET_ACCESS_KEY"
-          add_env_if_set "YC_BUCKET_NAME" "$YC_BUCKET_NAME"
-          add_env_if_set "WB_PROMO_KEY_TOPFACE" "$WB_PROMO_KEY_TOPFACE"
-          add_env_if_set "WB_KEY_MISSTAIS" "$WB_KEY_MISSTAIS"
-          add_env_if_set "TELEGRAM_BOT_TOKEN" "$TELEGRAM_BOT_TOKEN"
-          add_env_if_set "TELEGRAM_CHAT_ID" "$TELEGRAM_CHAT_ID"
-          add_env_if_set "TORGSTAT_ABC_URL" "$TORGSTAT_ABC_URL"
-
-      - name: Проверить доступ к Object Storage
-        run: |
-          missing=0
-          for var in YC_ACCESS_KEY_ID YC_SECRET_ACCESS_KEY YC_BUCKET_NAME; do
-            if [ -z "${!var}" ]; then
-              echo "::error::Не найдена переменная $var. Она должна быть либо внутри REPORT_ENV, либо отдельным GitHub Secret."
-              missing=1
-            fi
-          done
-
-          if [ "$missing" -ne 0 ]; then
-            exit 1
-          fi
-
-      - name: Проверить API-ключи магазинов
+      - name: Проверить обязательные переменные v6
         env:
           STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
         run: |
+          echo "Проверка YML_VERSION=v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL"
           missing=0
+
+          for var in YC_ACCESS_KEY_ID YC_SECRET_ACCESS_KEY YC_BUCKET_NAME; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Не найдена переменная $var. Она должна быть внутри REPORT_ENV или отдельным GitHub Secret."
+              missing=1
+            else
+              echo "$var загружена"
+            fi
+          done
 
           if [ "$STORE_INPUT" = "ALL" ] || [ "$STORE_INPUT" = "TOPFACE" ]; then
             if [ -z "$WB_PROMO_KEY_TOPFACE" ]; then
               echo "::error::Не найден WB_PROMO_KEY_TOPFACE для TOPFACE"
               missing=1
+            else
+              echo "WB_PROMO_KEY_TOPFACE загружен"
             fi
           fi
 
@@ -103,6 +99,8 @@ jobs:
             if [ -z "$WB_KEY_MISSTAIS" ]; then
               echo "::error::Не найден WB_KEY_MISSTAIS для MISSTAIS"
               missing=1
+            else
+              echo "WB_KEY_MISSTAIS загружен"
             fi
           fi
 
@@ -110,8 +108,9 @@ jobs:
             exit 1
           fi
 
-      - name: Запустить ежедневное обновление данных
+      - name: Запустить ежедневное обновление данных v6
         env:
           STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
         run: |
+          echo "Запуск YML_VERSION=v6_2026-06-10_MISSTAIS_NO_REPORT_ENV_HARD_FAIL"
           python ezhednevnoe_obnovlenie_dannyh.py --full --store "$STORE_INPUT"
