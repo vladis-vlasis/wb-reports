@@ -39,7 +39,7 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v29-night-experiment-only-yml-2026-06-09"
+SCRIPT_VERSION = "strict-drr-v30-abc-profitability-guard-2026-06-09"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -107,6 +107,18 @@ API_LOG_KEY = SERVICE_PREFIX + "Лог_API.xlsx"
 KEYWORDS_WEEKLY_PREFIX = "Отчёты/Поисковые запросы/TOPFACE/Недельные/"
 FUNNEL_KEY = "Отчёты/Воронка продаж/TOPFACE/Воронка продаж.xlsx"
 ECONOMICS_KEY = "Отчёты/Финансовые показатели/TOPFACE/Экономика.xlsx"
+# ABC / АБС анализ ТОРГСТАТ: источник рентабельности по SKU.
+# Основной путь в S3: Отчёты/ABC/wb_abc_report_goods__DD.MM.YYYY-DD.MM.YYYY__at_YYYY-MM-DD_HH-MM.xlsx
+ABC_REPORT_PREFIXES = [
+    "Отчёты/ABC/",
+    "Отчёты/ABC/TOPFACE/",
+    "Отчёты/АБС/",
+    "Отчёты/АБС анализ/",
+    "Отчёты/АБС анализ/TOPFACE/",
+]
+ABC_PROFITABILITY_MIN_PCT = float(os.environ.get("WB_ABC_PROFITABILITY_MIN_PCT", "15") or 15)
+# Зона неоднозначного ДРР: около лимита используем рентабельность ABC как решающий фильтр.
+ABC_DRR_UNCERTAINTY_PP = float(os.environ.get("WB_ABC_DRR_UNCERTAINTY_PP", "2") or 2)
 PRICE_HISTORY_KEY = SERVICE_PREFIX + "История_изменений_цен.xlsx"
 ONE_CAMPAIGN_EXPERIMENT_HISTORY_KEY = SERVICE_PREFIX + "История_эксперимента_1РК.xlsx"
 
@@ -380,6 +392,15 @@ DECISION_COLUMNS = [
     "cpo",
     "ctr_pct",
     "gp_after_ads",
+    "abc_profitability_pct",
+    "abc_profitability_status",
+    "abc_drr_pct",
+    "abc_gross_profit",
+    "abc_gross_revenue",
+    "abc_period_start",
+    "abc_period_end",
+    "abc_source_file",
+    "abc_match_method",
     "keyword_profile_status",
     "keyword_guard_status",
     "core80_queries_count",
@@ -1693,6 +1714,199 @@ def load_economics_report(s3_client, config: Config) -> pd.DataFrame:
         print(f"Предупреждение: не удалось прочитать экономику {ECONOMICS_KEY}: {exc}", flush=True)
         return pd.DataFrame()
 
+
+
+
+# =============================
+# ABC / АБС: рентабельность товара для страховки решений по ставкам
+# =============================
+
+def parse_abc_period_from_key(key: Any) -> Tuple[Optional[date], Optional[date]]:
+    """Парсит период из имени ABC-файла вида DD.MM.YYYY-DD.MM.YYYY."""
+    name = str(key).split("/")[-1]
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})-(\d{2})\.(\d{2})\.(\d{4})", name)
+    if not m:
+        return None, None
+    try:
+        start = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        end = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
+        return start, end
+    except Exception:
+        return None, None
+
+
+def parse_abc_export_timestamp_from_key(key: Any) -> datetime:
+    """Берём последнюю выгрузку по суффиксу __at_YYYY-MM-DD_HH-MM."""
+    name = str(key).split("/")[-1]
+    m = re.search(r"__at_(\d{4})-(\d{2})-(\d{2})[_\s-](\d{2})-(\d{2})", name)
+    if not m:
+        return datetime.min
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+    except Exception:
+        return datetime.min
+
+
+def latest_abc_report_key(s3_client, config: Config) -> str:
+    keys: List[str] = []
+    for prefix in ABC_REPORT_PREFIXES:
+        try:
+            keys.extend(list_s3_keys(s3_client, config.yc_bucket_name, prefix))
+        except Exception as exc:
+            print(f"Предупреждение ABC: не удалось просканировать {prefix}: {exc}", flush=True)
+    candidates = []
+    for key in sorted(set(keys)):
+        name = str(key).split("/")[-1]
+        low = name.lower()
+        if not low.endswith((".xlsx", ".xlsm")) or name.startswith("~$"):
+            continue
+        if not any(token in low for token in ["abc", "абс", "авс"]):
+            continue
+        start, end = parse_abc_period_from_key(key)
+        if start is None or end is None:
+            continue
+        candidates.append((end, start, parse_abc_export_timestamp_from_key(key), key))
+    if not candidates:
+        return ""
+    candidates.sort()
+    return candidates[-1][3]
+
+
+def normalize_abc_profitability_report(df: pd.DataFrame, source_key: str, source_sheet: str = "") -> pd.DataFrame:
+    """Нормализует ABC ТОРГСТАТ до рентабельности по nm_id / артикулу."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    result = pd.DataFrame(index=df.index)
+    start, end = parse_abc_period_from_key(source_key)
+    result["abc_source_file"] = source_key
+    result["abc_source_sheet"] = source_sheet
+    result["abc_period_start"] = start.isoformat() if start else ""
+    result["abc_period_end"] = end.isoformat() if end else ""
+    result["nm_id"] = series_or_default(df, ["Артикул WB", "Артикул ВБ", "nmID", "nmId", "nm_id", "Номенклатура WB"], default="").map(_clean_id_value)
+    result["supplier_article"] = _text_series(df, ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "vendorCode"], default="")
+    result["subject_norm"] = series_or_default(df, ["Предмет", "Название предмета", "subject", "subject_norm", "Категория"], default="").map(normalize_subject_value)
+    result["abc_profitability_pct"] = numeric_series(df, ["Рентабельность, %", "Рентабельность", "profitability_pct", "abc_profitability_pct", "margin_pct"], default=float("nan"))
+    result["abc_drr_pct"] = numeric_series(df, ["ДРР, %", "ДРР", "abc_drr_pct", "drr_pct"], default=float("nan"))
+    result["abc_gross_profit"] = numeric_series(df, ["Валовая прибыль", "Валовая прибыль, руб", "gross_profit"], default=0.0)
+    result["abc_gross_revenue"] = numeric_series(df, ["Валовая выручка", "Валовая выручка, руб", "gross_revenue", "Выручка"], default=0.0)
+    result = result[(result["nm_id"].map(_clean_id_value).ne("") | result["supplier_article"].map(_clean_text_value).ne(""))].copy()
+    result = filter_managed_subject_rows(result)
+    result = result[pd.to_numeric(result["abc_profitability_pct"], errors="coerce").notna()].copy()
+    return result
+
+
+def load_abc_profitability_report(s3_client, config: Config) -> pd.DataFrame:
+    key = latest_abc_report_key(s3_client, config)
+    if not key:
+        print("Диагностика ABC-рентабельности: файл ABC/АБС не найден", flush=True)
+        return pd.DataFrame()
+    try:
+        payload = read_s3_bytes(s3_client, config.yc_bucket_name, key)
+        sheets = read_excel_bytes_as_sheets(payload)
+        frames: List[pd.DataFrame] = []
+        for sheet_name, df in sheets.items():
+            norm = normalize_abc_profitability_report(df, key, str(sheet_name))
+            if not norm.empty:
+                frames.append(norm)
+        result = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+        if result.empty:
+            print(f"Диагностика ABC-рентабельности: файл найден, но рентабельность не распознана: {key}", flush=True)
+            return result
+        result["_sort_revenue"] = pd.to_numeric(result.get("abc_gross_revenue", 0), errors="coerce").fillna(0.0)
+        result["_sort_gp"] = pd.to_numeric(result.get("abc_gross_profit", 0), errors="coerce").fillna(0.0)
+        result = result.sort_values(["nm_id", "supplier_article", "_sort_revenue", "_sort_gp"], ascending=[True, True, False, False])
+        result = result.drop_duplicates(["nm_id", "supplier_article"], keep="first").drop(columns=["_sort_revenue", "_sort_gp"], errors="ignore")
+        ok_count = int((pd.to_numeric(result["abc_profitability_pct"], errors="coerce") >= ABC_PROFITABILITY_MIN_PCT).sum())
+        print(
+            f"Диагностика ABC-рентабельности: файл={key}; строк={len(result)}; "
+            f"рентабельность >= {ABC_PROFITABILITY_MIN_PCT:.1f}%: {ok_count}",
+            flush=True,
+        )
+        return result
+    except Exception as exc:
+        print(f"Предупреждение: не удалось прочитать ABC-рентабельность {key}: {exc}", flush=True)
+        return pd.DataFrame()
+
+
+def enrich_metrics_with_abc_profitability(metrics_df: pd.DataFrame, abc_df: pd.DataFrame) -> pd.DataFrame:
+    """Добавляет к campaign metrics рентабельность ABC по SKU."""
+    if metrics_df is None or metrics_df.empty:
+        return metrics_df if metrics_df is not None else pd.DataFrame()
+    result = metrics_df.copy()
+    default_cols = {
+        "abc_profitability_pct": float("nan"),
+        "abc_profitability_status": "ABC_NOT_FOUND",
+        "abc_drr_pct": float("nan"),
+        "abc_gross_profit": float("nan"),
+        "abc_gross_revenue": float("nan"),
+        "abc_period_start": "",
+        "abc_period_end": "",
+        "abc_source_file": "",
+        "abc_match_method": "",
+    }
+    for col, default in default_cols.items():
+        if col not in result.columns:
+            result[col] = default
+    if abc_df is None or abc_df.empty:
+        return result
+
+    abc_cols = ["nm_id", "supplier_article", "abc_profitability_pct", "abc_drr_pct", "abc_gross_profit", "abc_gross_revenue", "abc_period_start", "abc_period_end", "abc_source_file"]
+    abc = abc_df[[c for c in abc_cols if c in abc_df.columns]].copy()
+    for col in abc_cols:
+        if col not in abc.columns:
+            abc[col] = "" if col in {"nm_id", "supplier_article", "abc_period_start", "abc_period_end", "abc_source_file"} else float("nan")
+    abc["nm_id"] = abc["nm_id"].map(_clean_id_value)
+    abc["article_norm"] = abc["supplier_article"].map(normalize_article_for_campaign_name)
+    result["_row_order_for_abc"] = range(len(result))
+    result["nm_id"] = result["nm_id"].map(_clean_id_value)
+    result["article_norm"] = result.get("supplier_article", pd.Series([""] * len(result), index=result.index)).map(normalize_article_for_campaign_name)
+
+    by_nm = abc[abc["nm_id"].map(_clean_id_value).ne("")].drop_duplicates("nm_id", keep="first").copy()
+    by_nm = by_nm.drop(columns=["supplier_article", "article_norm"], errors="ignore")
+    result = result.merge(by_nm.add_suffix("_abc_nm"), left_on="nm_id", right_on="nm_id_abc_nm", how="left")
+    matched_nm = result["abc_profitability_pct_abc_nm"].notna() if "abc_profitability_pct_abc_nm" in result.columns else pd.Series(False, index=result.index)
+    for col in ["abc_profitability_pct", "abc_drr_pct", "abc_gross_profit", "abc_gross_revenue", "abc_period_start", "abc_period_end", "abc_source_file"]:
+        src_col = f"{col}_abc_nm"
+        if src_col in result.columns:
+            result[col] = result[col].where(~matched_nm, result[src_col])
+    result.loc[matched_nm, "abc_match_method"] = "exact_nm_id"
+
+    by_art = abc[abc["article_norm"].map(_clean_text_value).ne("")].drop_duplicates("article_norm", keep="first").copy()
+    by_art = by_art.drop(columns=["nm_id", "supplier_article"], errors="ignore")
+    result = result.merge(by_art.add_suffix("_abc_art"), left_on="article_norm", right_on="article_norm_abc_art", how="left")
+    not_matched = result["abc_match_method"].map(_clean_text_value).eq("")
+    if "abc_profitability_pct_abc_art" in result.columns:
+        matched_art = not_matched & result["abc_profitability_pct_abc_art"].notna()
+    else:
+        matched_art = pd.Series(False, index=result.index)
+    for col in ["abc_profitability_pct", "abc_drr_pct", "abc_gross_profit", "abc_gross_revenue", "abc_period_start", "abc_period_end", "abc_source_file"]:
+        src_col = f"{col}_abc_art"
+        if src_col in result.columns:
+            result[col] = result[col].where(~matched_art, result[src_col])
+    result.loc[matched_art, "abc_match_method"] = "exact_supplier_article"
+
+    result["abc_profitability_pct"] = pd.to_numeric(result["abc_profitability_pct"], errors="coerce")
+    result["abc_profitability_status"] = "ABC_NOT_FOUND"
+    result.loc[result["abc_profitability_pct"].notna() & (result["abc_profitability_pct"] >= ABC_PROFITABILITY_MIN_PCT), "abc_profitability_status"] = "PROFITABILITY_OK_GE_15"
+    result.loc[result["abc_profitability_pct"].notna() & (result["abc_profitability_pct"] < ABC_PROFITABILITY_MIN_PCT), "abc_profitability_status"] = "PROFITABILITY_LOW_LT_15"
+    result = result.sort_values("_row_order_for_abc") if "_row_order_for_abc" in result.columns else result
+    cleanup_cols = [c for c in result.columns if c.endswith("_abc_nm") or c.endswith("_abc_art")] + ["article_norm", "_row_order_for_abc"]
+    return result.drop(columns=cleanup_cols, errors="ignore")
+
+
+def abc_profitability_value(row: pd.Series | Dict[str, Any]) -> float:
+    value = pd.to_numeric(pd.Series([row.get("abc_profitability_pct", float("nan"))]), errors="coerce").iloc[0]
+    return float(value) if not pd.isna(value) else float("nan")
+
+
+def abc_profitability_is_low(row: pd.Series | Dict[str, Any]) -> bool:
+    value = abc_profitability_value(row)
+    return (not pd.isna(value)) and value < ABC_PROFITABILITY_MIN_PCT
+
+
+def abc_profitability_is_ok(row: pd.Series | Dict[str, Any]) -> bool:
+    value = abc_profitability_value(row)
+    return (not pd.isna(value)) and value >= ABC_PROFITABILITY_MIN_PCT
 
 def _weighted_mean_numeric(df: pd.DataFrame, value_col: str, weight_col: str = "sales_qty") -> float:
     if df is None or df.empty or value_col not in df.columns:
@@ -3398,6 +3612,10 @@ def decide_action(
     avg_impressions_per_day = money_or_zero(row.get("avg_impressions_per_day", impressions / ANALYSIS_WINDOW_DAYS))
     avg_spend_per_day = money_or_zero(row.get("avg_spend_per_day", spend / ANALYSIS_WINDOW_DAYS))
     drr = float(row.get("campaign_drr_pct", 0) or 0)
+    abc_margin = abc_profitability_value(row)
+    abc_margin_text = "н/д" if pd.isna(abc_margin) else f"{abc_margin:.2f}%"
+    abc_margin_low = abc_profitability_is_low(row)
+    abc_margin_ok = abc_profitability_is_ok(row)
     keyword_guard_status = _clean_text_value(row.get("keyword_guard_status", ""))
     core_click_delta_raw = pd.to_numeric(pd.Series([row.get("core80_clicks_delta_pct")]), errors="coerce").iloc[0]
     core_click_delta_pct = None if pd.isna(core_click_delta_raw) else float(core_click_delta_raw)
@@ -3429,7 +3647,10 @@ def decide_action(
     # 3) верхний предел разгона — 1000 ₽/день, выше этого ставку не повышаем.
     if ramp_active:
         gp_after_ads = money_or_zero(row.get("gp_after_ads", 0))
-        economy_only_scale_ok = (drr < RAMP_SCALE_DRR_LIMIT_PCT and revenue > 0 and orders > 0 and gp_after_ads > 0)
+        # После 500 ₽/день разгон масштабируем только при нормальной ABC-рентабельности.
+        # Если ABC не найден, не блокируем старую логику, но в reason_text будет видно abc_margin=н/д.
+        abc_margin_scale_ok = (pd.isna(abc_margin) or abc_margin_ok)
+        economy_only_scale_ok = (drr < RAMP_SCALE_DRR_LIMIT_PCT and revenue > 0 and orders > 0 and gp_after_ads > 0 and abc_margin_scale_ok)
         economy_scale_ok = economy_only_scale_ok and keyword_scale_ok
         economy_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and not economy_only_scale_ok)
         keyword_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and economy_only_scale_ok and not keyword_scale_ok)
@@ -3488,7 +3709,7 @@ def decide_action(
                 "action": "Повысить",
                 "new_bid_rub": new_bid,
                 "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день уже >= {RAMP_TARGET_SPEND_PER_DAY:.0f}; экономика ОК: ДРР {drr:.2f}% < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП {gp_after_ads:.0f} ₽ > 0; CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус {keyword_guard_status or 'н/д'}; разрешаем масштабироваться до {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"),
+                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день уже >= {RAMP_TARGET_SPEND_PER_DAY:.0f}; экономика ОК: ДРР {drr:.2f}% < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП {gp_after_ads:.0f} ₽ > 0, ABC-рентабельность={abc_margin_text}; CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус {keyword_guard_status or 'н/д'}; разрешаем масштабироваться до {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"),
                 "pause_decision": "",
             }
 
@@ -3519,7 +3740,7 @@ def decide_action(
                 "action": "Снизить",
                 "new_bid_rub": new_bid,
                 "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день >= 500, но экономика не проходит масштабирование: ДРР={drr:.2f}% / лимит {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП после рекламы={gp_after_ads:.0f} ₽, выручка={revenue:.0f} ₽, заказы={orders:.0f}; возвращаемся к уровню около 500 ₽/день"),
+                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день >= 500, но экономика не проходит масштабирование: ДРР={drr:.2f}% / лимит {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ABC-рентабельность={abc_margin_text} / минимум {ABC_PROFITABILITY_MIN_PCT:.1f}%, ВП после рекламы={gp_after_ads:.0f} ₽, выручка={revenue:.0f} ₽, заказы={orders:.0f}; возвращаемся к уровню около 500 ₽/день"),
                 "pause_decision": "",
             }
 
@@ -3529,7 +3750,7 @@ def decide_action(
             (
                 f"разгон активен день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день; "
                 f"цель 500 ₽/день достигнута. Дальше растим только при ДРР < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}% "
-                f"и ВП после рекламы > 0 плюс CORE-клики должны расти/держаться; текущие ДРР={drr:.2f}%, ВП={gp_after_ads:.0f} ₽, "
+                f"и ВП после рекламы > 0, ABC-рентабельность >= {ABC_PROFITABILITY_MIN_PCT:.1f}% плюс CORE-клики должны расти/держаться; текущие ДРР={drr:.2f}%, ABC-рентабельность={abc_margin_text}, ВП={gp_after_ads:.0f} ₽, "
                 f"выручка={revenue:.0f} ₽, заказы={orders:.0f}; CORE={keyword_guard_status or 'н/д'}, "
                 f"клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день; верхний предел={RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"
             ),
@@ -3609,21 +3830,40 @@ def decide_action(
             "pause_decision": "",
         }
 
+    # ABC-рентабельность — решающий фильтр в спорной зоне ДРР.
+    # Пример: ДРР 11%, ABC-рентабельность 14% -> ставку нужно снижать, а не терпеть из-за CORE-кликов.
+    drr_in_uncertain_zone = drr <= (drr_limit + ABC_DRR_UNCERTAINTY_PP)
+
     if drr >= drr_limit:
-        if keyword_core_risk and not hard_reduce_by_drr:
+        if abc_margin_ok and drr_in_uncertain_zone and not keyword_core_risk and revenue > 0 and orders > 0 and money_or_zero(row.get("gp_after_ads", 0)) > 0:
+            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
+            reason_code = "DRR_SLIGHTLY_HIGH_BUT_ABC_PROFITABILITY_OK_GROW"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            return {
+                "action": "Повысить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% немного выше лимита {drr_limit:.1f}%, но ABC-рентабельность {abc_margin_text} >= {ABC_PROFITABILITY_MIN_PCT:.1f}%, заказы/выручка/ВП есть, CORE-риск не обнаружен; можно аккуратно тестировать рост ставки"),
+                "pause_decision": "",
+            }
+        if keyword_core_risk and not hard_reduce_by_drr and not abc_margin_low:
             return technical_hold(
                 "DRR_GE_LIMIT_HOLD_CORE_CLICK_RISK",
                 row,
                 (
                     f"ДРР {drr:.2f}% >= лимита {drr_limit:.1f}%, но снижение запрещено: падают целевые CORE-клики. "
+                    f"ABC-рентабельность={abc_margin_text}; "
                     f"CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день "
                     f"({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус={keyword_guard_status}; "
-                    f"жёсткое снижение разрешено только при ДРР >= {drr_limit + KEYWORD_HARD_REDUCE_EXTRA_DRR_PP:.1f}%"
+                    f"жёсткое снижение разрешено при ДРР >= {drr_limit + KEYWORD_HARD_REDUCE_EXTRA_DRR_PP:.1f}% или ABC-рентабельности < {ABC_PROFITABILITY_MIN_PCT:.1f}%"
                 ),
             )
         new_bid = next_bid_for_action(current_bid_float, placement, "lower")
         reason_code = "DRR_GE_LIMIT_REDUCE"
-        if keyword_core_risk and hard_reduce_by_drr:
+        if abc_margin_low:
+            reason_code = "DRR_GE_LIMIT_ABC_PROFITABILITY_LOW_REDUCE"
+        elif keyword_core_risk and hard_reduce_by_drr:
             reason_code = "DRR_HARD_REDUCE_DESPITE_CORE_RISK"
         if step_reason:
             reason_code += f"__{step_reason}"
@@ -3639,23 +3879,30 @@ def decide_action(
             "action": "Снизить",
             "new_bid_rub": new_bid,
             "reason_code": reason_code,
-            "reason_text": build_reason_text(row, "Снизить", new_bid, f"ДРР >= допустимого порога {drr_limit:.1f}%"),
+            "reason_text": build_reason_text(row, "Снизить", new_bid, f"ДРР {drr:.2f}% >= лимита {drr_limit:.1f}%; ABC-рентабельность={abc_margin_text}, минимум для роста {ABC_PROFITABILITY_MIN_PCT:.1f}%"),
             "pause_decision": "",
         }
 
+    if abc_margin_low:
+        return technical_hold(
+            "DRR_LT_LIMIT_BUT_ABC_PROFITABILITY_LOW_HOLD",
+            row,
+            f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%, но ABC-рентабельность {abc_margin_text} < {ABC_PROFITABILITY_MIN_PCT:.1f}%; ставку не повышаем, чтобы не разгонять низкорентабельный товар"
+        )
+
     new_bid = next_bid_for_action(current_bid_float, placement, "raise")
     reason_code = "DRR_LT_LIMIT_GROW"
+    if abc_margin_ok:
+        reason_code = "DRR_LT_LIMIT_ABC_PROFITABILITY_OK_GROW"
     if step_reason:
         reason_code += f"__{step_reason}"
     return {
         "action": "Повысить",
         "new_bid_rub": new_bid,
         "reason_code": reason_code,
-        "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР < допустимого порога {drr_limit:.1f}%"),
+        "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%; ABC-рентабельность={abc_margin_text}; рост разрешён только если рентабельность не ниже {ABC_PROFITABILITY_MIN_PCT:.1f}% или ABC недоступен"),
         "pause_decision": "",
     }
-
-
 
 def business_min_bid_rub(placement: Any) -> float:
     """Бизнес-минимум для отчёта и решений: поиск/CPC не ниже 4 ₽, полки/combined не ниже 80 ₽."""
@@ -4051,6 +4298,15 @@ def build_decisions(
             "cpo": row.get("cpo", 0),
             "ctr_pct": row.get("ctr_pct", 0),
             "gp_after_ads": row.get("gp_after_ads", float("nan")),
+            "abc_profitability_pct": row.get("abc_profitability_pct", float("nan")),
+            "abc_profitability_status": row.get("abc_profitability_status", ""),
+            "abc_drr_pct": row.get("abc_drr_pct", float("nan")),
+            "abc_gross_profit": row.get("abc_gross_profit", float("nan")),
+            "abc_gross_revenue": row.get("abc_gross_revenue", float("nan")),
+            "abc_period_start": row.get("abc_period_start", ""),
+            "abc_period_end": row.get("abc_period_end", ""),
+            "abc_source_file": row.get("abc_source_file", ""),
+            "abc_match_method": row.get("abc_match_method", ""),
             "previous_event_id": previous_event_id,
             "postcheck_status": postcheck_status,
             "last_bid_change_event_id": _clean_text_value(reference_event.get("event_id", "")) if reference_event else "",
@@ -5709,6 +5965,9 @@ def build_summary(ctx: RunContext, decisions: pd.DataFrame, successful_changes: 
         "Текущее окно по": ctx.current_end.isoformat(),
         "База с": ctx.base_start.isoformat(),
         "База по": ctx.base_end.isoformat(),
+        "ABC-рентабельность включена": "да" if decisions is not None and not decisions.empty and "abc_profitability_pct" in decisions.columns and pd.to_numeric(decisions["abc_profitability_pct"], errors="coerce").notna().any() else "нет",
+        "Порог ABC-рентабельности, %": ABC_PROFITABILITY_MIN_PCT,
+        "РК с ABC-рентабельностью < 15%": int((pd.to_numeric(decisions.get("abc_profitability_pct", pd.Series(dtype=float)), errors="coerce") < ABC_PROFITABILITY_MIN_PCT).sum()) if decisions is not None and not decisions.empty else 0,
     }
 
 
@@ -6286,6 +6545,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"Воронка продаж загружена для анализа конверсий: {len(funnel_df):,} строк".replace(",", " "), flush=True)
 
     economics_df = load_economics_report(s3_client, config)
+    abc_profitability_df = load_abc_profitability_report(s3_client, config)
     ads_df = enrich_ads_with_estimated_gp(ads_df, economics_df)
 
     bid_history_raw = load_bid_history(s3_client, config)
@@ -6319,6 +6579,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     metrics_df = aggregate_campaign_metrics(ads_df, ctx)
     metrics_df = enrich_supplier_articles_from_economics(metrics_df, economics_df)
+    metrics_df = enrich_metrics_with_abc_profitability(metrics_df, abc_profitability_df)
     metrics_df = enrich_metrics_with_keyword_traffic_guard(metrics_df, keyword_guard_df)
     print(f"Диагностика агрегации: строк метрик={len(metrics_df)}", flush=True)
     if not metrics_df.empty:
