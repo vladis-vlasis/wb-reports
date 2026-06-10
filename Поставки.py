@@ -2270,11 +2270,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--supplier-breakthrough-threshold", type=float, default=None, help="Порог для статуса Прорыв")
     parser.add_argument("--abc-target-month", default=None, help="Месяц ABC в формате YYYY-MM")
     parser.add_argument("--strategy-mode", choices=["default", "economy"], default=None, help="Стратегия распределения для warehouse-режима")
+    parser.add_argument("--store", choices=["TOPFACE", "MISSTAIS", "ALL"], default=None, help="Магазин: TOPFACE, MISSTAIS или ALL")
     return parser
 
 
 def build_cfg_from_args(args: argparse.Namespace) -> AppConfig:
     cfg = AppConfig()
+    if getattr(args, "store", None) and str(args.store).upper() != "ALL":
+        cfg.store_name = str(args.store).upper()
     if args.mode:
         cfg.calculation_mode = normalize_calculation_mode(args.mode)
     if args.run_date:
@@ -2298,4 +2301,16 @@ def build_cfg_from_args(args: argparse.Namespace) -> AppConfig:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    main(build_cfg_from_args(args))
+    store_arg = str(args.store or os.getenv("WB_STORE", "TOPFACE")).strip().upper()
+
+    if store_arg == "ALL":
+        for store in ["TOPFACE", "MISSTAIS"]:
+            cfg = build_cfg_from_args(args)
+            cfg.store_name = store
+            cfg.output_dir = str(Path(cfg.output_dir) / store)
+            log(f"===== Запуск расчёта поставки для магазина {store} =====")
+            main(cfg)
+    else:
+        cfg = build_cfg_from_args(args)
+        cfg.store_name = store_arg
+        main(cfg)
