@@ -6,7 +6,7 @@
 Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
 Автоматическое получение артикулов из заказов для отчёта по ключам.
 Формат для keywords: Неделя ГГГГ-WНН.xlsx
-Финансовые показатели: проверяется только последняя неделя.
+Финансовые показатели: догружаются недостающие дни за 90 дней.
 Всегда читается первый лист в файле.
 Поисковые запросы: загружается ТОЛЬКО предыдущий день (вчера).
 Реклама: получает кампании из API, статистика за последние 30 дней, формирует отчёты по категориям.
@@ -296,8 +296,25 @@ class WildberriesDailyUpdater:
         start_date = end_date - timedelta(days=n - 1)
         return start_date, end_date
 
-    def _get_articles_by_subjects(self, store_name: str, subjects: List[str]) -> List[int]:
-        self.log(f"🔍 Сбор артикулов из заказов по категориям: {subjects}")
+    def _get_articles_by_subjects(
+        self,
+        store_name: str,
+        subjects: List[str],
+        min_order_date: Optional[datetime.date] = None,
+    ) -> List[int]:
+        """Собрать nmId из недельных файлов заказов по нужным предметам.
+
+        Для MISSTAIS в поисковых запросах можно передать min_order_date=2026-06-08,
+        чтобы не тащить в keywords старые артикулы из мартовской истории.
+        """
+        if min_order_date:
+            self.log(
+                f"🔍 Сбор артикулов из заказов по категориям: {subjects}; "
+                f"дата заказа >= {min_order_date:%Y-%m-%d}"
+            )
+        else:
+            self.log(f"🔍 Сбор артикулов из заказов по категориям: {subjects}")
+
         prefix = f"Отчёты/Заказы/{store_name}/Недельные/"
         all_files = self.s3.list_files(prefix)
         if not all_files:
@@ -307,6 +324,7 @@ class WildberriesDailyUpdater:
         articles_set = set()
         possible_nm_cols = ['nmId', 'nmID', 'Артикул WB', 'Артикул']
         possible_subj_cols = ['subject', 'Предмет', 'subjectName', 'Название предмета']
+        possible_date_cols = ['date', 'Дата', 'Дата заказа', 'createdAt', 'Дата создания']
 
         for file_key in all_files:
             self.log(f"📄 Обработка файла: {file_key}")
@@ -315,20 +333,28 @@ class WildberriesDailyUpdater:
                 if df.empty:
                     continue
 
-                nm_col = None
-                for col in possible_nm_cols:
-                    if col in df.columns:
-                        nm_col = col
-                        break
-                subj_col = None
-                for col in possible_subj_cols:
-                    if col in df.columns:
-                        subj_col = col
-                        break
+                nm_col = next((col for col in possible_nm_cols if col in df.columns), None)
+                subj_col = next((col for col in possible_subj_cols if col in df.columns), None)
 
                 if nm_col is None or subj_col is None:
                     self.log(f"⚠️ В файле {file_key} не найдены колонки с артикулом или предметом")
                     continue
+
+                if min_order_date:
+                    date_col = next((col for col in possible_date_cols if col in df.columns), None)
+                    if date_col is None:
+                        self.log(
+                            f"⚠️ В файле {file_key} не найдена колонка даты заказа; "
+                            f"файл пропущен для фильтрации с {min_order_date:%Y-%m-%d}"
+                        )
+                        continue
+                    dates = pd.to_datetime(df[date_col], errors='coerce').dt.date
+                    before = len(df)
+                    df = df.loc[dates >= min_order_date].copy()
+                    if df.empty:
+                        self.log(f"ℹ️ В файле {file_key} нет заказов после {min_order_date:%Y-%m-%d}")
+                        continue
+                    self.log(f"   ↳ после фильтра по дате осталось строк: {len(df)} из {before}")
 
                 df[subj_col] = df[subj_col].astype(str).str.lower().str.strip()
                 target_lower = [s.lower() for s in subjects]
@@ -637,48 +663,54 @@ class WildberriesDailyUpdater:
 
     # ---------- Финансовые показатели ----------
     def update_finance(self, store_name: str) -> bool:
-        self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name} (оптимизировано)")
+        self.log(f"\n📌 ОБНОВЛЕНИЕ: Финансовые показатели для магазина {store_name} (догрузка недостающих дней за 90 дней)")
         config = self.reports_config['finance']
-        today = datetime.now(pytz.timezone('Europe/Moscow')).date()
-        last_date = today - timedelta(days=1)
-        last_week_start = self._get_week_start(datetime.combine(last_date, datetime.min.time()))
+        start_date, end_date = self._get_date_range_90_days()
 
-        self.log(f"📅 Обработка последней недели, начинающейся {last_week_start.strftime('%Y-%m-%d')}")
-        weekly_df = self._load_weekly_data(store_name, 'finance', last_week_start)
+        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+        weeks = defaultdict(list)
+        for d in all_dates:
+            week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
+            weeks[week_start].append(d)
 
-        if not weekly_df.empty:
-            existing_dates = set(pd.to_datetime(weekly_df['rr_dt']).dt.date.unique()) if 'rr_dt' in weekly_df.columns else set()
-        else:
-            existing_dates = set()
+        api_key = self.api_keys[store_name][config['key_type']]
+        headers = {"Authorization": f"Bearer {api_key.strip()}"}
+        total_loaded_rows = 0
+        total_loaded_days = 0
 
-        required_dates = []
-        current = last_week_start.date()
-        while current <= last_date:
-            required_dates.append(current)
-            current += timedelta(days=1)
+        for week_start in sorted(weeks.keys()):
+            dates = weeks[week_start]
+            self.log(f"📅 Обработка финансовой недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
+            weekly_df = self._load_weekly_data(store_name, 'finance', week_start)
 
-        dates_to_load = [d for d in required_dates if d not in existing_dates]
-        if not dates_to_load:
-            self.log(f"✅ Все дни последней недели уже загружены")
-        else:
-            self.log(f"📅 Недостающие дни последней недели: {[d.strftime('%Y-%m-%d') for d in dates_to_load]}")
-            api_key = self.api_keys[store_name][config['key_type']]
-            headers = {"Authorization": f"Bearer {api_key.strip()}"}
+            if not weekly_df.empty and 'rr_dt' in weekly_df.columns:
+                existing_dates = set(pd.to_datetime(weekly_df['rr_dt'], errors='coerce').dt.date.dropna().unique())
+            else:
+                existing_dates = set()
+
+            dates_to_load = [d for d in dates if d not in existing_dates]
+            if not dates_to_load:
+                self.log("✅ Все дни финансовой недели уже загружены")
+                continue
+
+            self.log(f"📅 Недостающие дни финансовой недели: {[d.strftime('%Y-%m-%d') for d in dates_to_load]}")
             new_data = []
 
             for date in dates_to_load:
                 date_str = date.strftime('%Y-%m-%d')
-                self.log(f"📅 Загрузка дня: {date_str}")
+                self.log(f"📅 Загрузка финансового дня: {date_str}")
                 day_data = self._fetch_finance_day(config, headers, date_str)
                 if day_data:
                     day_df = pd.DataFrame(day_data)
                     day_df['store'] = store_name
                     if 'rr_dt' in day_df.columns:
-                        day_df['rr_dt'] = pd.to_datetime(day_df['rr_dt']).dt.strftime('%Y-%m-%d')
+                        day_df['rr_dt'] = pd.to_datetime(day_df['rr_dt'], errors='coerce').dt.strftime('%Y-%m-%d')
                     new_data.append(day_df)
+                    total_loaded_rows += len(day_df)
+                    total_loaded_days += 1
                     self.log(f"✅ Получено {len(day_df)} записей")
                 else:
-                    self.log(f"ℹ️ Нет данных за {date_str}")
+                    self.log(f"ℹ️ Нет финансовых данных за {date_str}")
 
                 if date != dates_to_load[-1]:
                     time.sleep(self.delays['finance'])
@@ -689,25 +721,23 @@ class WildberriesDailyUpdater:
                     weekly_df = new_df
                 else:
                     weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
-                self._save_weekly_data(weekly_df, store_name, 'finance', last_week_start)
+
+                id_cols = [col for col in config.get('id_columns', []) if col in weekly_df.columns]
+                if id_cols:
+                    before = len(weekly_df)
+                    weekly_df = weekly_df.drop_duplicates(subset=id_cols, keep='last')
+                    removed = before - len(weekly_df)
+                    if removed:
+                        self.log(f"🔍 Удалено дубликатов в финансовой неделе: {removed}")
+
+                self._save_weekly_data(weekly_df, store_name, 'finance', week_start)
             else:
-                self.log(f"ℹ️ Нет новых данных за последнюю неделю")
+                self.log("ℹ️ Нет новых финансовых данных за неделю")
 
-        # Проверка наличия файлов для остальных недель
-        start_date, end_date = self._get_date_range_90_days()
-        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
-        weeks = set()
-        for d in all_dates:
-            week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
-            weeks.add(week_start)
-        weeks.discard(last_week_start)
+            # Пауза между неделями только если впереди есть ещё недели с недостающими днями.
+            # Основная защита лимита уже стоит между дневными запросами.
 
-        for week_start in weeks:
-            key = self._get_weekly_key(store_name, 'finance', week_start)
-            if not self.s3.file_exists(key):
-                self.log(f"⚠️ Отсутствует файл за неделю {week_start.strftime('%Y-%m-%d')}. Возможно, потребуется историческая загрузка.")
-
-        self.log("✅ Финансовые показатели успешно обновлены")
+        self.log(f"✅ Финансовые показатели обновлены. Загружено дней: {total_loaded_days}, строк: {total_loaded_rows}")
         return True
 
     # ---------- Повторные попытки для поисковых запросов ----------
@@ -733,14 +763,17 @@ class WildberriesDailyUpdater:
 
             batches = [nm_ids[i:i+50] for i in range(0, len(nm_ids), 50)]
             for batch in batches:
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+                past_date_str = (date_obj - timedelta(days=1)).strftime('%Y-%m-%d')
                 payload = {
                     "currentPeriod": {"start": date_str, "end": date_str},
+                    "pastPeriod": {"start": past_date_str, "end": past_date_str},
                     "nmIds": batch,
                     "topOrderBy": filter_field,
                     "includeSubstitutedSKUs": False,
                     "includeSearchTexts": True,
-                    "orderBy": {"field": filter_field, "mode": "desc"},
-                    "limit": 100
+                    "orderBy": {"field": "avgPosition", "mode": "asc"},
+                    "limit": 30
                 }
                 max_retries = 5
                 for attempt in range(max_retries):
@@ -813,7 +846,7 @@ class WildberriesDailyUpdater:
                             self.log(f"    ⚠ Ошибка {resp.status_code}, повтор через {wait} сек...")
                             time.sleep(wait)
                         else:
-                            self.log(f"    ❌ Ошибка {resp.status_code}, пропускаем")
+                            self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:1000]}, пропускаем")
                             for nm_id in batch:
                                 new_errors.append((date_str, nm_id, filter_field))
                             break
@@ -837,28 +870,32 @@ class WildberriesDailyUpdater:
     def update_keywords(self, store_name: str) -> bool:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name} (только за вчера)")
 
-        # 1. Получаем актуальные артикулы из заказов
-        articles = self._get_articles_by_subjects(store_name, self.target_subjects)
+        # 1. Определяем целевую дату – вчера
+        target_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
+
+        # MISSTAIS: поисковые запросы начинаем копить только с 2026-06-08.
+        # Историческую загрузку за 90 дней для MISSTAIS не делаем.
+        min_articles_date = None
+        if normalize_store_name(store_name) == 'MISSTAIS':
+            if target_date < MISSTAIS_KEYWORDS_START_DATE:
+                self.log(
+                    f"⏭️ MISSTAIS: поисковые запросы до {MISSTAIS_KEYWORDS_START_DATE:%Y-%m-%d} не собираем. "
+                    f"Целевая дата {target_date:%Y-%m-%d} пропущена."
+                )
+                return True
+            min_articles_date = MISSTAIS_KEYWORDS_START_DATE
+
+        target_date_str = target_date.strftime('%Y-%m-%d')
+        self.log(f"📅 Целевая дата: {target_date_str}")
+
+        # 2. Получаем актуальные артикулы из заказов.
+        # Для MISSTAIS берём только заказы с 2026-06-08, чтобы не отправлять старые SKU в keywords.
+        articles = self._get_articles_by_subjects(store_name, self.target_subjects, min_order_date=min_articles_date)
         if not articles:
             self.log("⚠️ Не найдено артикулов из заказов. Отчёт будет пропущен.")
             return False
 
         self.log(f"📦 Актуальных артикулов: {len(articles)}")
-
-        # 2. Определяем целевую дату – вчера
-        target_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
-
-        # MISSTAIS: поисковые запросы начинаем копить только с 2026-06-08.
-        # Историческую загрузку за 90 дней для MISSTAIS не делаем.
-        if normalize_store_name(store_name) == 'MISSTAIS' and target_date < MISSTAIS_KEYWORDS_START_DATE:
-            self.log(
-                f"⏭️ MISSTAIS: поисковые запросы до {MISSTAIS_KEYWORDS_START_DATE:%Y-%m-%d} не собираем. "
-                f"Целевая дата {target_date:%Y-%m-%d} пропущена."
-            )
-            return True
-
-        target_date_str = target_date.strftime('%Y-%m-%d')
-        self.log(f"📅 Целевая дата: {target_date_str}")
 
         # 3. Определяем неделю, к которой относится целевая дата
         week_start = self._get_week_start(datetime.combine(target_date, datetime.min.time()))
@@ -917,14 +954,16 @@ class WildberriesDailyUpdater:
             batch_data = []
             for filter_field in filters:
                 self.log(f"    🔍 Фильтр {filter_field}", end="")
+                past_date_str = (target_date - timedelta(days=1)).strftime('%Y-%m-%d')
                 payload = {
                     "currentPeriod": {"start": target_date_str, "end": target_date_str},
+                    "pastPeriod": {"start": past_date_str, "end": past_date_str},
                     "nmIds": batch,
                     "topOrderBy": filter_field,
                     "includeSubstitutedSKUs": False,
                     "includeSearchTexts": True,
-                    "orderBy": {"field": filter_field, "mode": "desc"},
-                    "limit": 100
+                    "orderBy": {"field": "avgPosition", "mode": "asc"},
+                    "limit": 30
                 }
                 max_retries = 5
                 success = False
@@ -991,7 +1030,7 @@ class WildberriesDailyUpdater:
                             self.log(f" -> ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
                             time.sleep(wait)
                         else:
-                            self.log(f" -> ❌ Ошибка {resp.status_code}")
+                            self.log(f" -> ❌ Ошибка {resp.status_code}: {resp.text[:1000]}")
                             break
                     except Exception as e:
                         self.log(f"    ❌ Исключение: {e}")
@@ -1027,6 +1066,10 @@ class WildberriesDailyUpdater:
 
         if self.keyword_errors:
             self._retry_keyword_errors(store_name)
+
+        if self.keyword_errors:
+            self.log(f"❌ Поисковые запросы не собраны полностью: осталось ошибок {len(self.keyword_errors)}")
+            return False
 
         return True
 
