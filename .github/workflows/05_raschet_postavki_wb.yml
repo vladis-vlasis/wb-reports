@@ -1,5 +1,12 @@
-# VERSION: v11_restore_working_20260610
-# Основа: рабочая схема через REPORT_ENV. Добавлен выбор магазина TOPFACE/MISSTAIS/ALL.
+# VERSION: v18_CORRECT_WB_STORE_TOPFACE_MT_20260610
+# В GitHub заменить содержимое файла:
+# .github/workflows/05_raschet_postavki_wb.yml
+#
+# Важно:
+# - текущий файл Поставки.py принимает магазин только через WB_STORE;
+# - магазин передаётся через переменную окружения WB_STORE;
+# - REPORT_ENV читается по старой рабочей схеме;
+# - поддержаны TOPFACE, MISSTAIS и ALL.
 
 name: Расчет поставки WB
 
@@ -22,6 +29,7 @@ on:
         type: choice
         options:
           - warehouse
+          - supply
           - supplier
       run_date:
         description: "Дата расчета YYYY-MM-DD. Если пусто — сегодня"
@@ -29,12 +37,12 @@ on:
         default: ""
         type: string
       season_coeff:
-        description: "Коэффициент сезонности для warehouse-режима"
+        description: "Коэффициент сезонности для warehouse/supply-режима"
         required: false
         default: "1.0"
         type: string
       strategy_mode:
-        description: "Стратегия распределения для warehouse-режима"
+        description: "Стратегия распределения для warehouse/supply-режима"
         required: false
         default: "default"
         type: choice
@@ -61,6 +69,11 @@ on:
         required: false
         default: "60"
         type: string
+      supplier_breakthrough_threshold:
+        description: "Порог Прорыв для supplier-режима"
+        required: false
+        default: "1.5"
+        type: string
       abc_target_month:
         description: "Месяц ABC YYYY-MM"
         required: false
@@ -71,6 +84,7 @@ jobs:
   run:
     name: Запустить расчет поставки WB
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
       - name: Скачать репозиторий
@@ -91,26 +105,23 @@ jobs:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
-          WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-          WB_KEY_MISSTAIS: ${{ secrets.WB_KEY_MISSTAIS }}
         run: |
-          echo "__RUNNING_YML_VERSION_v11_restore_working_05__"
+          echo "YML_VERSION=v18_CORRECT_WB_STORE_TOPFACE_MT_20260610"
 
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не задан secret REPORT_ENV"
             exit 1
           fi
 
-          printf '%s
-' "$REPORT_ENV" | sed 's/
-$//' >> "$GITHUB_ENV"
+          printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
 
-          echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
-          echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
-          echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
-          echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
-          echo "WB_KEY_MISSTAIS=$WB_KEY_MISSTAIS" >> "$GITHUB_ENV"
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "$TELEGRAM_CHAT_ID" ]; then
+            echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
+          fi
 
           echo "WB_OUTPUT_DIR=output" >> "$GITHUB_ENV"
           echo "WB_SEND_TELEGRAM=${{ inputs.send_telegram }}" >> "$GITHUB_ENV"
@@ -123,6 +134,8 @@ $//' >> "$GITHUB_ENV"
             if [ -z "${!var}" ]; then
               echo "::error::Не найдена переменная $var. Проверь secret REPORT_ENV"
               missing=1
+            else
+              echo "$var найден"
             fi
           done
 
@@ -131,6 +144,8 @@ $//' >> "$GITHUB_ENV"
               if [ -z "${!var}" ]; then
                 echo "::error::Не найдена переменная $var. Она нужна для отправки в Telegram"
                 missing=1
+              else
+                echo "$var найден"
               fi
             done
           fi
@@ -151,23 +166,57 @@ $//' >> "$GITHUB_ENV"
           fi
 
       - name: Запустить расчет поставки WB
+        env:
+          STORE_INPUT: ${{ inputs.store }}
+          MODE_INPUT: ${{ inputs.mode }}
+          RUN_DATE_INPUT: ${{ inputs.run_date }}
+          SEASON_COEFF_INPUT: ${{ inputs.season_coeff }}
+          STRATEGY_MODE_INPUT: ${{ inputs.strategy_mode }}
+          SUPPLIER_DEFAULT_COEFF_INPUT: ${{ inputs.supplier_default_coeff }}
+          SUPPLIER_LEAD_DAYS_INPUT: ${{ inputs.supplier_lead_days }}
+          SUPPLIER_COVERAGE_DAYS_INPUT: ${{ inputs.supplier_coverage_days }}
+          SUPPLIER_BREAKTHROUGH_THRESHOLD_INPUT: ${{ inputs.supplier_breakthrough_threshold }}
+          ABC_TARGET_MONTH_INPUT: ${{ inputs.abc_target_month }}
         run: |
-          ARGS=()
+          echo "STORE_INPUT=$STORE_INPUT"
+          echo "MODE_INPUT=$MODE_INPUT"
 
-          ARGS+=(--store "${{ inputs.store }}")
-          ARGS+=(--mode "${{ inputs.mode }}")
-          ARGS+=(--season-coeff "${{ inputs.season_coeff }}")
-          ARGS+=(--strategy-mode "${{ inputs.strategy_mode }}")
-          ARGS+=(--supplier-default-coeff "${{ inputs.supplier_default_coeff }}")
-          ARGS+=(--supplier-lead-days "${{ inputs.supplier_lead_days }}")
-          ARGS+=(--supplier-coverage-days "${{ inputs.supplier_coverage_days }}")
-          ARGS+=(--abc-target-month "${{ inputs.abc_target_month }}")
+          status=0
 
-          if [ -n "${{ inputs.run_date }}" ]; then
-            ARGS+=(--run-date "${{ inputs.run_date }}")
+          run_store() {
+            local store="$1"
+            echo "===== Расчет поставки WB: STORE=$store | MODE=$MODE_INPUT ====="
+
+            ARGS=()
+            ARGS+=(--mode "$MODE_INPUT")
+            ARGS+=(--season-coeff "$SEASON_COEFF_INPUT")
+            ARGS+=(--strategy-mode "$STRATEGY_MODE_INPUT")
+            ARGS+=(--supplier-default-coeff "$SUPPLIER_DEFAULT_COEFF_INPUT")
+            ARGS+=(--supplier-lead-days "$SUPPLIER_LEAD_DAYS_INPUT")
+            ARGS+=(--supplier-coverage-days "$SUPPLIER_COVERAGE_DAYS_INPUT")
+            ARGS+=(--supplier-breakthrough-threshold "$SUPPLIER_BREAKTHROUGH_THRESHOLD_INPUT")
+            ARGS+=(--abc-target-month "$ABC_TARGET_MONTH_INPUT")
+
+            if [ -n "$RUN_DATE_INPUT" ]; then
+              ARGS+=(--run-date "$RUN_DATE_INPUT")
+            fi
+
+            WB_STORE="$store" python "$SUPPLY_SCRIPT" "${ARGS[@]}" || status=1
+          }
+
+          if [ "$STORE_INPUT" = "ALL" ]; then
+            run_store "TOPFACE"
+            run_store "MISSTAIS"
+          elif [ "$STORE_INPUT" = "TOPFACE" ]; then
+            run_store "TOPFACE"
+          elif [ "$STORE_INPUT" = "MISSTAIS" ]; then
+            run_store "MISSTAIS"
+          else
+            echo "::error::Неизвестный STORE_INPUT=$STORE_INPUT"
+            exit 1
           fi
 
-          python "$SUPPLY_SCRIPT" "${ARGS[@]}"
+          exit "$status"
 
       - name: Сохранить результат как artifact
         if: always()
