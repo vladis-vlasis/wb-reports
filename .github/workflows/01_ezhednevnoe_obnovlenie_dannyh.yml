@@ -1,4 +1,4 @@
-# version: v12_normal_REPORT_ENV_MISSTAIS
+# version: v20_cron_1007_msk_REPORT_ENV_MISSTAIS
 # В GitHub заменить содержимое файла:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -17,8 +17,8 @@ on:
           - TOPFACE
           - MISSTAIS
   schedule:
-    # Каждый день в 10:00 МСК = 07:00 UTC
-    - cron: "0 7 * * *"
+    # Каждый день в 10:07 МСК = 07:07 UTC. Не ставим ровно на начало часа, чтобы GitHub не пропускал schedule.
+    - cron: "7 7 * * *"
 
 jobs:
   run:
@@ -48,7 +48,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
-          echo "YML_VERSION=v12_normal_REPORT_ENV_MISSTAIS"
+          echo "YML_VERSION=v20_cron_1007_msk_REPORT_ENV_MISSTAIS"
 
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не найден secret REPORT_ENV. Он нужен для Yandex Cloud: YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME, YC_ENDPOINT_URL."
