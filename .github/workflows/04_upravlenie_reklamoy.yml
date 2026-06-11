@@ -25,7 +25,7 @@ on:
     # GitHub Actions cron работает в UTC. Москва = UTC+3.
     - cron: "0 22 * * *"  # 01:00 МСК — ночной старт экспериментов
     - cron: "0 2 * * *"   # 05:00 МСК — ночное завершение / включение обратно
-    - cron: "0 11 * * *"  # 14:00 МСК — основной дневной запуск
+    - cron: "0 15 * * *"  # 18:00 МСК — основной дневной запуск
 
 concurrency:
   group: topface-wb-ads-manager
@@ -150,8 +150,8 @@ jobs:
 
           echo "=== Wrong replacement diagnostic ==="
           if [ -f "report_runner.py" ] && grep -q "strict-drr-v" "report_runner.py"; then
-            echo "WARNING: report_runner.py похож на рекламный скрипт. Его, вероятно, заменили ошибочно."
-            echo "Для этого workflow используется только ./upravlenie_reklamoy.py. report_runner.py нужно вернуть как отчётный скрипт для другого workflow."
+            echo "INFO: report_runner.py содержит маркеры рекламного скрипта; этот workflow всё равно использует только ./upravlenie_reklamoy.py."
+            echo "Проверяю только ./upravlenie_reklamoy.py."
           fi
 
           echo "=== Script version marker ==="
@@ -182,20 +182,22 @@ jobs:
           if not vm:
               raise SystemExit(f"ERROR: Неизвестный формат SCRIPT_VERSION: {version}")
           vnum = int(vm.group(1))
-          if vnum < 33:
-              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v33+. Значит заменён не тот файл или в GitHub остался старый код.")
+          if vnum < 47:
+              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v47+. В репозитории сейчас код ниже требуемой версии v47.")
 
           markers = [
+              "FIX46_CORE_RAMP_PAUSE_20260611",
               "night_experiment_only",
               "EXPERIMENT_1_NIGHT_MIN_BID_MSK_1_5",
               "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE",
               "night_experiment_slot",
               "TECHNICAL_COMBINED_MIN_BID_80_FIX",
+              "RAMP_ACTIVE_TO_5000_IMPRESSIONS",
           ]
           missing = [marker for marker in markers if marker not in text]
           if missing:
               raise SystemExit("ERROR: В коде нет обязательных маркеров: " + ", ".join(missing))
-          print("Code marker check OK: v33+, forced night slot, night experiments, combined floor 80 present.")
+          print("Code marker check OK: v47+, FIX46 runner, forced night slot, night experiments, combined floor 80 present.")
           PY
 
           echo "=== Script SHA256 ==="
@@ -228,7 +230,7 @@ jobs:
                 SLOT="night_end"
                 EXTRA_ARGS=(--night-experiment-only --night-experiment-slot end --apply-start)
                 ;;
-              "0 11 * * *")
+              "0 15 * * *")
                 SLOT="main"
                 EXTRA_ARGS=()
                 ;;
