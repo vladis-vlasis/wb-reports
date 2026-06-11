@@ -51,7 +51,7 @@ import pandas as pd
 import requests
 from botocore.exceptions import ClientError
 
-SCRIPT_VERSION = "strict-drr-v51-fix46-rollback-guarded-runner-2026-06-11"
+SCRIPT_VERSION = "strict-drr-v52-fix46-subject-fill-hotfix-2026-06-11"
 VERSION = "FIX46_CORE_RAMP_PAUSE_20260611"
 
 # -------------------------
@@ -461,7 +461,8 @@ def load_ads_daily(path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
             camp = camp.copy()
             camp["subject_from_ads_daily"] = camp["campaign_id"].map(subject_by_campaign).fillna("")
             bad_subject = ~camp.get("subject_norm", pd.Series([""] * len(camp), index=camp.index)).map(is_managed_subject_value)
-            camp.loc[bad_subject & camp["subject_from_ads_daily"].map(is_managed_subject_value), "subject_norm"] = camp.loc[bad_subject, "subject_from_ads_daily"]
+            fill_mask = bad_subject & camp["subject_from_ads_daily"].map(is_managed_subject_value)
+            camp.loc[fill_mask, "subject_norm"] = camp.loc[fill_mask, "subject_from_ads_daily"].to_numpy()
         if "subject_norm" in out.columns and "subject_norm_x" not in out.columns:
             # Если после merge появились дубликаты, ниже они будут обработаны в build_campaign_base.
             pass
