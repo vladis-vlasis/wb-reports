@@ -4,7 +4,7 @@
 """
 Ежедневный сбор данных Wildberries с сохранением в Yandex Cloud Object Storage.
 Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
-Автоматическое получение артикулов из заказов для отчёта по ключам.
+Автоматическое получение всех артикулов из заказов для отчёта по ключам.
 Формат для keywords: Неделя ГГГГ-WНН.xlsx
 Финансовые показатели: догружаются недостающие дни за 90 дней.
 Всегда читается первый лист в файле.
@@ -38,6 +38,8 @@ from botocore.exceptions import ClientError
 import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+SCRIPT_VERSION = "2026-06-11_v23_KEYWORDS_ALL_ARTICLES_FROM_2026_06_01"
 
 # ========================== КЛАСС ДЛЯ РАБОТЫ С YANDEX CLOUD ==========================
 
@@ -216,7 +218,9 @@ class WildberriesDailyUpdater:
             '1c_stocks': 0,
         }
 
-        self.target_subjects = ['Помады', 'Косметические карандаши', 'Кисти косметические', 'Блески']
+        # v22: поисковые запросы выгружаем по всем артикулам из заказов, без ограничения 4 категориями.
+        self.target_subjects = []
+        self.log(f"VERSION: {SCRIPT_VERSION}")
         self.log(f"🚀 Запуск обновления данных. Время: {self.start_time}")
 
     # ====================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ======================
@@ -302,18 +306,31 @@ class WildberriesDailyUpdater:
         subjects: List[str],
         min_order_date: Optional[datetime.date] = None,
     ) -> List[int]:
-        """Собрать nmId из недельных файлов заказов по нужным предметам.
+        """Собрать nmId из недельных файлов заказов.
 
-        Для MISSTAIS в поисковых запросах можно передать min_order_date=2026-06-08,
-        чтобы не тащить в keywords старые артикулы из мартовской истории.
+        v22:
+        - если subjects пустой список, берём ВСЕ артикулы из заказов, без фильтра по категориям;
+        - если subjects передан, оставляем старую логику фильтрации по предметам;
+        - для MISSTAIS можно передать min_order_date=2026-06-08, чтобы не тащить старые SKU.
         """
-        if min_order_date:
-            self.log(
-                f"🔍 Сбор артикулов из заказов по категориям: {subjects}; "
-                f"дата заказа >= {min_order_date:%Y-%m-%d}"
-            )
+        use_subject_filter = bool(subjects)
+
+        if use_subject_filter:
+            if min_order_date:
+                self.log(
+                    f"🔍 Сбор артикулов из заказов по категориям: {subjects}; "
+                    f"дата заказа >= {min_order_date:%Y-%m-%d}"
+                )
+            else:
+                self.log(f"🔍 Сбор артикулов из заказов по категориям: {subjects}")
         else:
-            self.log(f"🔍 Сбор артикулов из заказов по категориям: {subjects}")
+            if min_order_date:
+                self.log(
+                    f"🔍 Сбор ВСЕХ артикулов из заказов без фильтра по категориям; "
+                    f"дата заказа >= {min_order_date:%Y-%m-%d}"
+                )
+            else:
+                self.log("🔍 Сбор ВСЕХ артикулов из заказов без фильтра по категориям")
 
         prefix = f"Отчёты/Заказы/{store_name}/Недельные/"
         all_files = self.s3.list_files(prefix)
@@ -334,10 +351,8 @@ class WildberriesDailyUpdater:
                     continue
 
                 nm_col = next((col for col in possible_nm_cols if col in df.columns), None)
-                subj_col = next((col for col in possible_subj_cols if col in df.columns), None)
-
-                if nm_col is None or subj_col is None:
-                    self.log(f"⚠️ В файле {file_key} не найдены колонки с артикулом или предметом")
+                if nm_col is None:
+                    self.log(f"⚠️ В файле {file_key} не найдена колонка с артикулом")
                     continue
 
                 if min_order_date:
@@ -356,11 +371,19 @@ class WildberriesDailyUpdater:
                         continue
                     self.log(f"   ↳ после фильтра по дате осталось строк: {len(df)} из {before}")
 
-                df[subj_col] = df[subj_col].astype(str).str.lower().str.strip()
-                target_lower = [s.lower() for s in subjects]
+                if use_subject_filter:
+                    subj_col = next((col for col in possible_subj_cols if col in df.columns), None)
+                    if subj_col is None:
+                        self.log(f"⚠️ В файле {file_key} не найдена колонка предмета")
+                        continue
 
-                mask = df[subj_col].isin(target_lower)
-                filtered = df.loc[mask, nm_col].dropna().unique()
+                    df[subj_col] = df[subj_col].astype(str).str.lower().str.strip()
+                    target_lower = [s.lower() for s in subjects]
+                    mask = df[subj_col].isin(target_lower)
+                    filtered = df.loc[mask, nm_col].dropna().unique()
+                else:
+                    filtered = df[nm_col].dropna().unique()
+
                 for val in filtered:
                     try:
                         articles_set.add(int(val))
@@ -371,8 +394,11 @@ class WildberriesDailyUpdater:
                 self.log(f"❌ Ошибка при обработке файла {file_key}: {e}")
                 continue
 
-        articles = list(articles_set)
-        self.log(f"✅ Собрано {len(articles)} уникальных артикулов из заказов")
+        articles = sorted(articles_set)
+        if use_subject_filter:
+            self.log(f"✅ Собрано {len(articles)} уникальных артикулов из заказов по выбранным категориям")
+        else:
+            self.log(f"✅ Собрано {len(articles)} уникальных артикулов из заказов по ВСЕМ категориям")
         return articles
 
     # ====================== МЕТОДЫ ДЛЯ КАЖДОГО ОТЧЁТА ======================
@@ -866,94 +892,67 @@ class WildberriesDailyUpdater:
         else:
             self.log("✅ Все ошибки устранены")
 
-    # ---------- Позиции по ключам (загрузка только за предыдущий день) ----------
-    def update_keywords(self, store_name: str) -> bool:
-        self.log(f"\n📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name} (только за вчера)")
-
-        # 1. Определяем целевую дату – вчера
-        target_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
-
-        # MISSTAIS: поисковые запросы начинаем копить только с 2026-06-08.
-        # Историческую загрузку за 90 дней для MISSTAIS не делаем.
-        min_articles_date = None
-        if normalize_store_name(store_name) == 'MISSTAIS':
-            if target_date < MISSTAIS_KEYWORDS_START_DATE:
-                self.log(
-                    f"⏭️ MISSTAIS: поисковые запросы до {MISSTAIS_KEYWORDS_START_DATE:%Y-%m-%d} не собираем. "
-                    f"Целевая дата {target_date:%Y-%m-%d} пропущена."
-                )
-                return True
-            min_articles_date = MISSTAIS_KEYWORDS_START_DATE
-
+    # ---------- Позиции по ключам ----------
+    def _update_keywords_for_date(self, store_name: str, target_date: datetime.date, articles: List[int]) -> bool:
+        """Загрузить поисковые запросы за одну дату по переданному списку nmId."""
         target_date_str = target_date.strftime('%Y-%m-%d')
-        self.log(f"📅 Целевая дата: {target_date_str}")
+        self.log("")
+        self.log(f"📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name} за {target_date_str}")
 
-        # 2. Получаем актуальные артикулы из заказов.
-        # Для MISSTAIS берём только заказы с 2026-06-08, чтобы не отправлять старые SKU в keywords.
-        articles = self._get_articles_by_subjects(store_name, self.target_subjects, min_order_date=min_articles_date)
-        if not articles:
-            self.log("⚠️ Не найдено артикулов из заказов. Отчёт будет пропущен.")
-            return False
-
-        self.log(f"📦 Актуальных артикулов: {len(articles)}")
-
-        # 3. Определяем неделю, к которой относится целевая дата
         week_start = self._get_week_start(datetime.combine(target_date, datetime.min.time()))
         self.log(f"📅 Неделя начинается: {week_start.strftime('%Y-%m-%d')}")
 
-        # 4. Загружаем существующий недельный файл (если есть)
         weekly_df = self._load_weekly_data(store_name, 'keywords', week_start)
 
-        # 5. Формируем множество существующих комбинаций (дата, артикул, фильтр) для целевой даты
         existing_keys = set()
-        if not weekly_df.empty:
-            # Фильтруем только строки за целевую дату
-            day_df = weekly_df[weekly_df['Дата'] == target_date_str].copy()
-            if not day_df.empty:
+        if not weekly_df.empty and 'Дата' in weekly_df.columns:
+            day_df = weekly_df[weekly_df['Дата'].astype(str) == target_date_str].copy()
+            if not day_df.empty and 'Артикул WB' in day_df.columns and 'Фильтр' in day_df.columns:
+                day_df['Артикул WB'] = pd.to_numeric(day_df['Артикул WB'], errors='coerce')
+                day_df = day_df.dropna(subset=['Артикул WB'])
                 day_df['Артикул WB'] = day_df['Артикул WB'].astype(int)
                 for _, row in day_df.iterrows():
-                    nm = row['Артикул WB']
-                    f = row['Фильтр']
-                    existing_keys.add((target_date_str, nm, f))
-                self.log(f"🔍 В недельном файле найдено {len(existing_keys)} записей за {target_date_str}")
+                    existing_keys.add((target_date_str, int(row['Артикул WB']), str(row['Фильтр'])))
+                self.log(f"🔍 В недельном файле найдено {len(existing_keys)} комбинаций за {target_date_str}")
             else:
                 self.log(f"ℹ️ За {target_date_str} в недельном файле записей нет")
 
         filters = ["orders", "openCard", "addToCart"]
 
-        # 6. Определяем, каких фильтров не хватает для каждого артикула
-        missing_articles = []
+        missing_by_filter = {f: [] for f in filters}
         for nm_id in articles:
-            missing_filters = []
             for f in filters:
                 if (target_date_str, nm_id, f) not in existing_keys:
-                    missing_filters.append(f)
-            if missing_filters:
-                missing_articles.append(nm_id)
-                if len(missing_articles) <= 3:
-                    self.log(f"❌ Для артикула {nm_id} пропущены фильтры: {missing_filters}")
+                    missing_by_filter[f].append(nm_id)
 
-        if not missing_articles:
+        total_missing = sum(len(v) for v in missing_by_filter.values())
+        if total_missing == 0:
             self.log(f"✅ Все данные за {target_date_str} уже загружены полностью.")
             return True
 
-        self.log(f"📅 Необходимо загрузить данные для {len(missing_articles)} артикулов")
+        self.log(
+            f"📅 Необходимо загрузить комбинаций: {total_missing}; "
+            f"артикулов всего: {len(articles)}"
+        )
 
-        # 7. Загружаем недостающие данные
         api_key = self.api_keys[store_name]['promo']
         headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
         url = self.reports_config['keywords']['api_url']
 
-        # Сброс списка ошибок перед началом
         self.keyword_errors = []
-
         new_data = []
-        batches = [missing_articles[i:i+50] for i in range(0, len(missing_articles), 50)]
-        for batch_idx, batch in enumerate(batches, 1):
-            self.log(f"  📦 Батч {batch_idx}/{len(batches)}: {len(batch)} артикулов")
-            batch_data = []
-            for filter_field in filters:
-                self.log(f"    🔍 Фильтр {filter_field}", end="")
+
+        for filter_idx, filter_field in enumerate(filters, 1):
+            nm_ids_for_filter = sorted(set(missing_by_filter.get(filter_field, [])))
+            if not nm_ids_for_filter:
+                self.log(f"✅ Фильтр {filter_field}: всё уже загружено")
+                continue
+
+            batches = [nm_ids_for_filter[i:i+50] for i in range(0, len(nm_ids_for_filter), 50)]
+            self.log(f"🔍 Фильтр {filter_field}: {len(nm_ids_for_filter)} артикулов, батчей: {len(batches)}")
+
+            for batch_idx, batch in enumerate(batches, 1):
+                self.log(f"  📦 Батч {batch_idx}/{len(batches)}: {len(batch)} артикулов")
                 past_date_str = (target_date - timedelta(days=1)).strftime('%Y-%m-%d')
                 payload = {
                     "currentPeriod": {"start": target_date_str, "end": target_date_str},
@@ -965,6 +964,7 @@ class WildberriesDailyUpdater:
                     "orderBy": {"field": "avgPosition", "mode": "asc"},
                     "limit": 30
                 }
+
                 max_retries = 5
                 success = False
                 for attempt in range(max_retries):
@@ -973,14 +973,15 @@ class WildberriesDailyUpdater:
                         if resp.status_code == 200:
                             data = resp.json()
                             items = data.get('data', {}).get('items', [])
+                            batch_data = []
                             for item in items:
-                                text = item.get('text', '').strip()
-                                if not text:
+                                text_value = item.get('text', '').strip()
+                                if not text_value:
                                     continue
                                 row = {
                                     "Дата": target_date_str,
                                     "Магазин": store_name,
-                                    "Поисковый запрос": text,
+                                    "Поисковый запрос": text_value,
                                     "Фильтр": filter_field,
                                     "Артикул WB": item.get("nmId", ""),
                                     "Предмет": item.get("subjectName", ""),
@@ -1018,38 +1019,42 @@ class WildberriesDailyUpdater:
                                     "Максимальная цена": item.get("price", {}).get("maxPrice", 0),
                                 }
                                 batch_data.append(row)
-                            self.log(f" -> ✓ {len(items)} записей")
+
+                            if batch_data:
+                                new_data.append(pd.DataFrame(batch_data))
+                            self.log(f"    ✓ {len(items)} записей")
                             success = True
                             break
+
                         elif resp.status_code == 429:
                             wait = 60 * (attempt + 1)
-                            self.log(f" -> ⚠ Лимит, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
+                            self.log(f"    ⚠ Лимит 429, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
                             time.sleep(wait)
                         elif resp.status_code in (502, 503, 504):
                             wait = 30 * (attempt + 1)
-                            self.log(f" -> ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
+                            self.log(f"    ⚠ Ошибка шлюза {resp.status_code}, попытка {attempt+1}/{max_retries}, ждём {wait} сек...")
                             time.sleep(wait)
                         else:
-                            self.log(f" -> ❌ Ошибка {resp.status_code}: {resp.text[:1000]}")
+                            self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:1000]}")
                             break
+
                     except Exception as e:
                         self.log(f"    ❌ Исключение: {e}")
                         if attempt < max_retries - 1:
                             time.sleep(10)
                         else:
                             break
+
                 if not success:
                     for nm_id in batch:
                         self.keyword_errors.append((target_date_str, nm_id, filter_field))
-                if filter_field != filters[-1]:
-                    time.sleep(30)
 
-            if batch_data:
-                batch_df = pd.DataFrame(batch_data)
-                new_data.append(batch_df)
+                # Пауза между запросами к search-texts API.
+                time.sleep(30)
 
-            if batch_idx < len(batches):
-                self.log("    ⏳ Пауза 30 сек между батчами...")
+            # Дополнительная пауза между фильтрами.
+            if filter_idx < len(filters):
+                self.log("    ⏳ Пауза 30 сек между фильтрами...")
                 time.sleep(30)
 
         if new_data:
@@ -1068,10 +1073,53 @@ class WildberriesDailyUpdater:
             self._retry_keyword_errors(store_name)
 
         if self.keyword_errors:
-            self.log(f"❌ Поисковые запросы не собраны полностью: осталось ошибок {len(self.keyword_errors)}")
+            self.log(f"❌ Поисковые запросы не собраны полностью за {target_date_str}: осталось ошибок {len(self.keyword_errors)}")
             return False
 
         return True
+
+    def update_keywords(self, store_name: str) -> bool:
+        self.log("")
+        self.log(f"📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
+
+        end_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
+        start_date = KEYWORDS_BACKFILL_START_DATE
+
+        if end_date < start_date:
+            self.log(f"⏭️ Целевая дата {end_date:%Y-%m-%d} раньше старта keywords {start_date:%Y-%m-%d}; пропускаем")
+            return True
+
+        self.log(
+            f"📅 Диапазон проверки keywords: {start_date:%Y-%m-%d} — {end_date:%Y-%m-%d}. "
+            f"Если данные за день уже есть, день будет пропущен."
+        )
+
+        # v23: все категории/предметы. Артикулы берём из заказов с 1 июня.
+        articles = self._get_articles_by_subjects(
+            store_name,
+            self.target_subjects,
+            min_order_date=start_date,
+        )
+        if not articles:
+            self.log("⚠️ Не найдено артикулов из заказов. Отчёт будет пропущен.")
+            return False
+
+        self.log(f"📦 Актуальных артикулов для keywords: {len(articles)}")
+
+        overall_success = True
+        total_days = (end_date - start_date).days + 1
+
+        for idx in range(total_days):
+            target_date = start_date + timedelta(days=idx)
+            ok = self._update_keywords_for_date(store_name, target_date, articles)
+            if not ok:
+                overall_success = False
+
+            if idx < total_days - 1:
+                self.log("⏳ Пауза 30 секунд перед следующей датой keywords...")
+                time.sleep(30)
+
+        return overall_success
 
     # ---------- Воронка продаж ----------
     def update_funnel(self, store_name: str) -> bool:
@@ -1719,7 +1767,8 @@ STORE_ALIASES = {
     'ALL': 'ALL',
 }
 
-MISSTAIS_KEYWORDS_START_DATE = datetime(2026, 6, 8).date()
+KEYWORDS_BACKFILL_START_DATE = datetime(2026, 6, 1).date()
+MISSTAIS_KEYWORDS_START_DATE = KEYWORDS_BACKFILL_START_DATE
 
 
 def normalize_store_name(value: str) -> str:
