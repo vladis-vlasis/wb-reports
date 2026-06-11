@@ -5,6 +5,9 @@
 # FIX27: weekly page-1 cards + demand fallback for missing day + money dynamics for orders-rub cards
 # FIX39: Telegram sends all-category daily summaries by manager using ABC Ваша категория
 # FIX40: advertising sources are store-scoped; Telegram/PDF can use filtered ads_daily when category sheet is absent
+# FIX41: Telegram manager ads uses current-date all-category manager_ads_daily_source; stale category sheet no longer zeros spend; ads_daily keeps subject for new nmId fallback
+# FIX42: Telegram manager GP is taken strictly from exact daily ABC rows using raw Ваша категория; no model/reference remapping
+# FIX43: Telegram manager order_sum is also taken from exact daily ABC gross_revenue; WB Orders priceWithDisc is not used for manager finance
 # FIX38: advertising truth uses category-level ad report only; raw campaign rows are not allowed for PDF/Telegram totals
 
 #!/usr/bin/env python3
@@ -1300,7 +1303,12 @@ class Loader:
             raw["cpc"] = np.where(raw["clicks"] > 0, raw["spend"] / raw["clicks"], raw["cpc_src"])
             raw["cr_pct"] = np.where(raw["clicks"] > 0, raw["orders"] / raw["clicks"] * 100, raw["cr_pct_src"])
             raw["drr_pct"] = np.where(raw["order_sum"] > 0, raw["spend"] / raw["order_sum"] * 100, raw["drr_pct_src"])
-            daily = raw.groupby(["day", "nm_id", "ad_type"], dropna=False, as_index=False).agg(
+            # FIX41: keep subject in grouped daily ads.
+            # New campaign nmIds may be absent from the last closed ABC manager reference;
+            # subject fallback is then needed, for example new liquid eyeliner articles -> Игорь.
+            if "subject" not in raw.columns:
+                raw["subject"] = ""
+            daily = raw.groupby(["day", "nm_id", "subject", "ad_type"], dropna=False, as_index=False).agg(
                 impressions=("impressions", "sum"), clicks=("clicks", "sum"), orders=("orders", "sum"),
                 order_sum=("order_sum", "sum"), spend=("spend", "sum"),
             )
@@ -2652,6 +2660,9 @@ class AnalyticsBuilder:
             "manager_orders_source": self.pack.orders.copy() if isinstance(self.pack.orders, pd.DataFrame) else pd.DataFrame(),
             "manager_search_source": self.pack.search_queries.copy() if isinstance(self.pack.search_queries, pd.DataFrame) else pd.DataFrame(),
             "manager_ads_category_source": self.pack.ads_category.copy() if isinstance(self.pack.ads_category, pd.DataFrame) else pd.DataFrame(),
+            # FIX41: raw grouped ads daily source, all TOPFACE categories, not enriched through the 4-category PDF dictionary.
+            # This is the source for Telegram manager spend when the category sheet is absent/stale.
+            "manager_ads_daily_source": self.pack.ads_daily.copy() if isinstance(self.pack.ads_daily, pd.DataFrame) else pd.DataFrame(),
             "manager_abc_source": manager_abc_source,
             "metrics_summary_90d": metrics,
             "best_days": best,
@@ -2880,7 +2891,7 @@ def export_outputs(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> List[Pa
     # Technical report
     wb = Workbook()
     wb.remove(wb.active)
-    for name in ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_abc_source", "metrics_summary_90d", "best_days", "best_day_factors", "price_ranges", "channel_summary", "ads_category_source", "ads_raw_source", "ads_daily_source", "core_queries_80", "search_query_gp_position", "search_unique_demand", "entry_points_summary", "localization_summary", "localization_detail", "gp_potential_90d", "buyout_validation", "dictionary", "diagnostics"]:
+    for name in ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_ads_daily_source", "manager_abc_source", "metrics_summary_90d", "best_days", "best_day_factors", "price_ranges", "channel_summary", "ads_category_source", "ads_raw_source", "ads_daily_source", "core_queries_80", "search_query_gp_position", "search_unique_demand", "entry_points_summary", "localization_summary", "localization_detail", "gp_potential_90d", "buyout_validation", "dictionary", "diagnostics"]:
         write_df_sheet(wb, name[:31], outputs.get(name, pd.DataFrame()))
     p = local_dir / TECH_REPORT_NAME
     wb.save(p)
@@ -3082,11 +3093,13 @@ def _require_report_data_available(outputs: Dict[str, Any], context: str = "") -
         # category sheet at all. In that case allow only store-scoped ads_daily_source
         # (already filtered to TOPFACE in Loader); never use ads_raw_source by default.
         category_src = outputs.get("ads_category_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        manager_daily_src = outputs.get("manager_ads_daily_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
         daily_src = outputs.get("ads_daily_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
         category_days = _active_days_from_source(category_src, ["spend", "clicks", "impressions"])
+        manager_daily_days = _active_days_from_source(manager_daily_src, ["spend", "clicks", "impressions"])
         daily_days = _active_days_from_source(daily_src, ["spend", "clicks", "impressions", "manual_spend", "unified_spend", "unknown_spend"])
         raw_details = []
-        for source_name in ["ads_category_source", "ads_daily_source", "ads_raw_source"]:
+        for source_name in ["ads_category_source", "manager_ads_daily_source", "ads_daily_source", "ads_raw_source"]:
             src = outputs.get(source_name, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
             days_ads = _active_days_from_source(src, ["spend", "clicks", "impressions", "ad_spend_total", "manual_spend", "unified_spend", "unknown_spend"])
             if not days_ads.empty:
@@ -3095,6 +3108,8 @@ def _require_report_data_available(outputs: Dict[str, Any], context: str = "") -
         candidates: List[Tuple[str, pd.Series]] = []
         if not category_days.empty:
             candidates.append(("ads_category_source", category_days))
+        if not manager_daily_days.empty:
+            candidates.append(("manager_ads_daily_source", manager_daily_days))
         if not daily_days.empty:
             candidates.append(("ads_daily_source", daily_days))
 
@@ -3111,7 +3126,7 @@ def _require_report_data_available(outputs: Dict[str, Any], context: str = "") -
             latest_text = ", ".join(raw_details) if raw_details else "рекламных источников нет"
             raise RuntimeError(
                 f"Нет безопасного рекламного источника за нужную дату {required_ads:%d.%m.%Y}. "
-                f"Проверены ads_category_source и store-scoped ads_daily_source. Последние даты: {latest_text}. "
+                f"Проверены ads_category_source, all-category manager_ads_daily_source и store-scoped ads_daily_source. Последние даты: {latest_text}. "
                 f"ads_raw_source напрямую не принимаю как источник Расхода РК/ДРР, чтобы не задвоить расход. "
                 f"Отчёт не отправляю, чтобы не показать неверный ДРР. context={context}"
             )
@@ -3315,7 +3330,7 @@ def run_preflight_date_check(root: str, reports_root: str, store: str) -> None:
 
 
 PDF_ONLY_SHEETS = {
-    TECH_REPORT_NAME: ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_abc_source", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source", "gp_potential_90d"],
+    TECH_REPORT_NAME: ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_ads_daily_source", "manager_abc_source", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source", "gp_potential_90d"],
     FACTOR_REPORT_NAME: ["optimal_benchmarks", "factor_bridge", "entry_points_bridge", "factor_summary_for_pdf"],
 }
 
@@ -8642,8 +8657,10 @@ def _tg_normalize_manager(value: Any) -> str:
 
 
 def _tg_clean_subject_full(value: Any) -> str:
+    # Telegram manager matching needs case-insensitive subject keys because
+    # WB ads export uses lowercase предмета while ABC uses title case.
     text = canonical_subject(value)
-    return normalize_text(text)
+    return normalize_text(text).lower().replace("ё", "е")
 
 
 def build_manager_reference_from_abc(*frames: pd.DataFrame) -> pd.DataFrame:
@@ -8836,7 +8853,81 @@ def _tg_allocate_subject_rows(df: pd.DataFrame, ref: pd.DataFrame, value_cols: S
     return out
 
 
+def _tg_manager_abc_finance_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
+    """Daily manager finance for Telegram from exact daily ABC rows.
+
+    FIX43: For Telegram manager blocks, financial truth is daily ABC, not WB Orders.
+    WB Orders priceWithDisc does not match the seller-cabinet daily money chart and can
+    be lower because it is an order-row API price. ABC contains manager category
+    (`Ваша категория`), gross revenue, gross profit and promotion cost in one source.
+
+    Columns returned:
+    - order_sum = ABC gross_revenue / `Валовая выручка`;
+    - gross_profit = ABC gross_profit / `Валовая прибыль`;
+    - orders = ABC orders count when present.
+    """
+    src = outputs.get("manager_abc_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        frames = []
+        for nm in ["abc_weekly", "abc_monthly"]:
+            df = outputs.get(nm, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                frames.append(df)
+        src = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    x = src.copy()
+    if "period_start" not in x.columns or "period_end" not in x.columns:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+    x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+    x = x[x["period_start"].notna() & x["period_start"].eq(x["period_end"])].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    x["day"] = x["period_start"]
+
+    if "manager" not in x.columns:
+        if "manager_raw" in x.columns:
+            x["manager"] = x["manager_raw"]
+        elif "Ваша категория" in x.columns:
+            x["manager"] = x["Ваша категория"]
+        else:
+            x["manager"] = ""
+    if "manager_raw" not in x.columns:
+        x["manager_raw"] = x["manager"]
+    for col in ["gross_revenue", "gross_profit", "orders"]:
+        if col not in x.columns:
+            x[col] = 0.0
+        x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+
+    # Raw ABC manager is primary. For rows where `Ваша категория` is empty, use the
+    # existing exact/subject reference only as a fallback (e.g. new PT619 liquid liners).
+    x = _tg_attach_manager_exact(x, ref)
+    x = x[x["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    out = x.groupby(["day", "manager"], dropna=False, as_index=False).agg(
+        order_sum=("gross_revenue", "sum"),
+        orders=("orders", "sum"),
+        gross_profit=("gross_profit", "sum"),
+    )
+    try:
+        mx = pd.to_datetime(out["day"], errors="coerce").dropna().max()
+        if pd.notna(mx):
+            mask = pd.to_datetime(out["day"], errors="coerce").dt.normalize().eq(pd.Timestamp(mx).normalize())
+            order_sum = pd.to_numeric(out.loc[mask, "order_sum"], errors="coerce").fillna(0).sum()
+            gp = pd.to_numeric(out.loc[mask, "gross_profit"], errors="coerce").fillna(0).sum()
+            log(f"telegram_manager_finance: source=daily_abc_gross_revenue, latest={pd.Timestamp(mx).date()}, order_sum_latest={order_sum:.2f}, gross_profit_latest={gp:.2f}")
+    except Exception:
+        pass
+    return out
+
+
 def _tg_manager_orders_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
+    finance = _tg_manager_abc_finance_daily(outputs, ref)
+    if isinstance(finance, pd.DataFrame) and not finance.empty:
+        return finance[["day", "manager", "order_sum", "orders"]].copy()
+    # Emergency fallback only if daily ABC is absent. Normal daily workflow should not use this.
     src = outputs.get("manager_orders_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
     if not isinstance(src, pd.DataFrame) or src.empty:
         src = outputs.get("article_day_fact", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
@@ -8848,30 +8939,100 @@ def _tg_manager_orders_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.D
         if col not in x.columns:
             x[col] = 0.0
         x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+    log("telegram_manager_orders: WARN fallback=WB_orders_priceWithDisc; daily ABC finance was unavailable")
     return x.groupby(["day", "manager"], dropna=False, as_index=False).agg(order_sum=("order_sum", "sum"), orders=("orders", "sum"))
 
-
 def _tg_manager_ads_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
-    src = outputs.get("manager_ads_category_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(src, pd.DataFrame) or src.empty:
-        src = outputs.get("ads_category_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(src, pd.DataFrame) or src.empty:
-        # FIX40: if the category sheet is absent in the current weekly ad export,
-        # fall back to the store-scoped article/day advertising source.
-        src = outputs.get("ads_daily_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(src, pd.DataFrame) or src.empty:
+    """Advertising spend by manager for Telegram.
+
+    FIX41:
+    - category sheet is preferred only when it contains the requested/current date;
+    - if category sheet is stale or absent, use manager_ads_daily_source = raw grouped TOPFACE
+      article/day advertising source, mapped to managers by nmId from ABC;
+    - do not use ads_raw_source directly here, because raw campaign rows can duplicate spend.
+    """
+    if not isinstance(outputs, dict):
         return pd.DataFrame(columns=["day", "manager", "spend", "clicks", "impressions"])
-    x = src.copy()
-    rename = {"ad_spend_total": "spend", "ad_clicks_total": "clicks", "ad_impressions_total": "impressions", "shows": "impressions", "views": "impressions"}
-    for old, new in rename.items():
-        if new not in x.columns and old in x.columns:
-            x[new] = x[old]
-    x = _tg_allocate_subject_rows(x, ref, ["spend", "clicks", "impressions"])
+
+    target_day = _env_date("REPORT_AS_OF_DATE") or _env_date("REPORT_REQUIRE_ADS_DATE") or _env_date("WB_DAILY_TARGET_DATE")
+
+    candidate_names = [
+        "manager_ads_category_source",
+        "ads_category_source",
+        "manager_ads_daily_source",
+        "ads_daily_source",
+    ]
+
+    def _prep_source(src: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(src, pd.DataFrame) or src.empty:
+            return pd.DataFrame()
+        x = src.copy()
+        rename = {
+            "ad_spend_total": "spend",
+            "ad_clicks_total": "clicks",
+            "ad_impressions_total": "impressions",
+            "shows": "impressions",
+            "views": "impressions",
+        }
+        for old, new in rename.items():
+            if new not in x.columns and old in x.columns:
+                x[new] = x[old]
+        if "day" in x.columns:
+            x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+        else:
+            x["day"] = pd.NaT
+        for col in ["spend", "clicks", "impressions"]:
+            if col not in x.columns:
+                x[col] = 0.0
+            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+        return x
+
+    chosen_name = ""
+    chosen = pd.DataFrame()
+    diagnostics: List[str] = []
+    prepared: List[Tuple[str, pd.DataFrame]] = []
+
+    for name in candidate_names:
+        src = outputs.get(name, pd.DataFrame())
+        x = _prep_source(src)
+        if x.empty:
+            diagnostics.append(f"{name}=empty")
+            continue
+        days = _active_days_from_source(x, ["spend", "clicks", "impressions"])
+        if days.empty:
+            diagnostics.append(f"{name}=no_active_days")
+            continue
+        diagnostics.append(f"{name}=latest:{pd.Timestamp(days.max()).strftime('%d.%m.%Y')}")
+        prepared.append((name, x))
+        if target_day is not None and (days.dt.normalize() == pd.Timestamp(target_day).normalize()).any():
+            chosen_name, chosen = name, x
+            break
+
+    if chosen.empty and target_day is None and prepared:
+        # No explicit date was requested: use the freshest safe source.
+        chosen_name, chosen = max(
+            prepared,
+            key=lambda item: pd.Timestamp(_active_days_from_source(item[1], ["spend", "clicks", "impressions"]).max()).normalize(),
+        )
+
+    if chosen.empty:
+        log("telegram_manager_ads: no current safe ad source; " + "; ".join(diagnostics))
+        return pd.DataFrame(columns=["day", "manager", "spend", "clicks", "impressions"])
+
+    x = _tg_allocate_subject_rows(chosen, ref, ["spend", "clicks", "impressions"])
     if x.empty:
+        log(f"telegram_manager_ads: chosen={chosen_name}, but manager allocation produced 0 rows")
         return pd.DataFrame(columns=["day", "manager", "spend", "clicks", "impressions"])
     x = x[x["day"].notna()].copy()
-    return x.groupby(["day", "manager"], dropna=False, as_index=False).agg(spend=("spend", "sum"), clicks=("clicks", "sum"), impressions=("impressions", "sum"))
-
+    out = x.groupby(["day", "manager"], dropna=False, as_index=False).agg(spend=("spend", "sum"), clicks=("clicks", "sum"), impressions=("impressions", "sum"))
+    try:
+        mx = pd.to_datetime(out["day"], errors="coerce").dropna().max()
+        if pd.notna(mx):
+            spend = pd.to_numeric(out.loc[pd.to_datetime(out["day"], errors="coerce").dt.normalize().eq(pd.Timestamp(mx).normalize()), "spend"], errors="coerce").fillna(0).sum()
+            log(f"telegram_manager_ads: source={chosen_name}, latest={pd.Timestamp(mx).date()}, spend_latest={spend:.2f}; " + "; ".join(diagnostics))
+    except Exception:
+        pass
+    return out
 
 def _tg_manager_demand_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
     src = outputs.get("manager_search_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
@@ -8896,32 +9057,10 @@ def _tg_manager_demand_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.D
 
 
 def _tg_manager_gp_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
-    src = outputs.get("manager_abc_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-    if not isinstance(src, pd.DataFrame) or src.empty:
-        frames = []
-        for nm in ["abc_weekly", "abc_monthly"]:
-            df = outputs.get(nm, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                frames.append(df)
-        src = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-    if not isinstance(src, pd.DataFrame) or src.empty:
-        return pd.DataFrame(columns=["day", "manager", "gross_profit"])
-    x = src.copy()
-    if "period_start" not in x.columns or "period_end" not in x.columns:
-        return pd.DataFrame(columns=["day", "manager", "gross_profit"])
-    x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
-    x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
-    x = x[x["period_start"].notna() & x["period_start"].eq(x["period_end"])].copy()
-    if x.empty:
-        return pd.DataFrame(columns=["day", "manager", "gross_profit"])
-    x["day"] = x["period_start"]
-    x = _tg_attach_manager_exact(x, ref)
-    x = x[x["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
-    if "gross_profit" not in x.columns:
-        x["gross_profit"] = 0.0
-    x["gross_profit"] = pd.to_numeric(x["gross_profit"], errors="coerce").fillna(0.0)
-    return x.groupby(["day", "manager"], dropna=False, as_index=False).agg(gross_profit=("gross_profit", "sum"))
-
+    finance = _tg_manager_abc_finance_daily(outputs, ref)
+    if isinstance(finance, pd.DataFrame) and not finance.empty:
+        return finance[["day", "manager", "gross_profit"]].copy()
+    return pd.DataFrame(columns=["day", "manager", "gross_profit"])
 
 def _tg_manager_value(df: pd.DataFrame, day: pd.Timestamp, col: str, manager: Optional[str] = None) -> float:
     if not isinstance(df, pd.DataFrame) or df.empty or "day" not in df.columns or col not in df.columns:
@@ -9435,7 +9574,7 @@ def main() -> None:
                 cw_start = latest - pd.Timedelta(days=int(pd.Timestamp(latest).weekday()))
                 cw_end = cw_start + pd.Timedelta(days=6)
                 log(f"current_week_only: refresh cache dates {cw_start.date()}..{cw_end.date()} using limited source load")
-                for name in ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_abc_source", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source"]:
+                for name in ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_ads_daily_source", "manager_abc_source", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source"]:
                     new_df = upd.get(name, pd.DataFrame())
                     old_df = outputs.get(name, pd.DataFrame())
                     if new_df is None or new_df.empty or "day" not in new_df.columns:
