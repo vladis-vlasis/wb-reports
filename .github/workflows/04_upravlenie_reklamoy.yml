@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       run_slot:
-        description: "Что запустить вручную"
+        description: "Что запустить вручную: сначала один раз rollback_wrong_pauses, потом main"
         required: true
         default: "main"
         type: choice
         options:
+          - rollback_wrong_pauses
           - main
           - night_start
           - night_end
@@ -182,8 +183,8 @@ jobs:
           if not vm:
               raise SystemExit(f"ERROR: Неизвестный формат SCRIPT_VERSION: {version}")
           vnum = int(vm.group(1))
-          if vnum < 47:
-              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v47+. В репозитории сейчас код ниже требуемой версии v47.")
+          if vnum < 51:
+              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v51+. В репозитории сейчас код ниже требуемой версии v51.")
 
           markers = [
               "FIX46_CORE_RAMP_PAUSE_20260611",
@@ -193,11 +194,13 @@ jobs:
               "night_experiment_slot",
               "TECHNICAL_COMBINED_MIN_BID_80_FIX",
               "RAMP_ACTIVE_TO_5000_IMPRESSIONS",
+              "ROLLBACK_WRONG_FIX46_PAUSE_START",
+              "--rollback-wrong-pauses-only",
           ]
           missing = [marker for marker in markers if marker not in text]
           if missing:
               raise SystemExit("ERROR: В коде нет обязательных маркеров: " + ", ".join(missing))
-          print("Code marker check OK: v47+, FIX46 runner, forced night slot, night experiments, combined floor 80 present.")
+          print("Code marker check OK: v51+, FIX46 runner, rollback wrong pauses, guarded main run, night experiments, combined floor 80 present.")
           PY
 
           echo "=== Script SHA256 ==="
@@ -241,6 +244,10 @@ jobs:
             esac
           else
             case "$INPUT_RUN_SLOT" in
+              "rollback_wrong_pauses")
+                SLOT="rollback_wrong_pauses"
+                EXTRA_ARGS=(--rollback-wrong-pauses-only --apply-start)
+                ;;
               "night_start")
                 SLOT="night_start"
                 EXTRA_ARGS=(--night-experiment-only --night-experiment-slot start --apply-pause)
