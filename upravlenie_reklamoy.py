@@ -14,6 +14,7 @@ WB Ads Manager — decision engine for ставки, CORE-трафик, разг
 - CORE оценивается не только кликами/позициями, но и кликами на 1 заказ и CPO запроса.
 - Разгон: не больше 1 CPC и 1 CPM на товарный блок одновременно, до 5000 показов, затем пауза на дозревание.
 - Пауза: не просто срез расхода, а pause_and_reallocate внутри product_root+placement.
+- Перед паузой РК сначала опускается до минимальной ставки; если минимум простоял всё зрелое окно и ДРР всё ещё >15%, тогда pause; если ДРР восстановился <=15%, ставка поднимается на 1 шаг.
 
 Скрипт не отправляет API-вызовы сам. Он формирует решения и payload-preview.
 Дальше текущий боевой runner должен отправлять только строки action in {raise, lower, pause, start}.
@@ -51,14 +52,15 @@ import pandas as pd
 import requests
 from botocore.exceptions import ClientError
 
-SCRIPT_VERSION = "strict-drr-v54-summary-api-current-run-2026-06-11"
-VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V53_ROLLBACK_OUTPUT_HOTFIX"
+SCRIPT_VERSION = "strict-drr-v57-min-bid-probe-postcheck-2026-06-12"
+VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V57_MIN_BID_PROBE_POSTCHECK"
 
 # -------------------------
 # Business constants
 # -------------------------
 DRR_RAISE_GATE_PCT = 10.0          # ДРР < 10 => повышение можно рассматривать, но не автоматически
-DRR_PAUSE_LIMIT_PCT = 15.0         # 14д + 10000 показов + ДРР > 15 => pause candidate
+DRR_PAUSE_LIMIT_PCT = 15.0         # pause/post-check limit: ДРР > 15% на минимальной ставке => pause candidate
+MIN_BID_RECOVERY_DRR_PCT = 15.0     # если после зрелого окна на минимальной ставке ДРР <= 15%, ставка восстанавливается на 1 шаг
 DRR_FORECAST_CAP_PCT = 16.0        # потолок прогнозного ДРР для предельной ставки
 SEARCH_MIN_BID_RUB = 4             # WB min can be fetched externally; safe default for CPC
 SEARCH_STEP_RUB = 1
@@ -93,6 +95,14 @@ MANAGED_SUBJECTS_CANON = {
 }
 # Кисти не паузим автоматически: пауза разрешена только этим предметам.
 PAUSE_ALLOWED_SUBJECTS_CANON = {"Помады", "Блески", "Косметические карандаши"}
+
+# Эти reason_code пишутся в Историю_ставок, когда мы опускаем РК до минимальной
+# ставки не навсегда, а как контролируемый post-check: дать зрелому окну пройти
+# на минимуме и потом либо восстановить ставку, либо поставить РК на паузу.
+MIN_BID_PROBE_REASON_CODES = {
+    "HIGH_DRR_14D_LOWER_TO_MIN_BID_FOR_POSTCHECK",
+    "DRR_GT_10_LOWER_TO_MIN_BID_FOR_POSTCHECK",
+}
 
 
 def is_managed_subject_value(value: Any) -> bool:
@@ -919,9 +929,11 @@ def decide_all(campaigns: pd.DataFrame, core: pd.DataFrame, pause_history: pd.Da
     core_summary = summarize_core_by_product(core[core["query_role"].eq("flagship")]) if not core.empty else pd.DataFrame()
     if not core_summary.empty:
         df = df.merge(core_summary, on="product_root", how="left")
+        df["has_core_source"] = True
     else:
         for c in ["flagship_queries", "flagship_orders", "flagship_clicks", "flagship_frequency", "flagship_position", "flagship_visibility_pct", "flagship_cpo", "flagship_clicks_per_order"]:
             df[c] = np.nan
+        df["has_core_source"] = False
 
     df = rank_blocks(df)
     df = select_ramp_slots(df)
@@ -962,6 +974,26 @@ def select_ramp_slots(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _has_flagship_raise_proof(r: pd.Series) -> bool:
+    """True only when CORE data justifies a controlled raise despite DRR > 10%.
+
+    This is intentionally strict: without a loaded CORE source we do not use
+    RAMP_ACTIVE as a workaround for high mature DRR.
+    """
+    if not bool(r.get("has_core_source", False)):
+        return False
+    flagship_position = r.get("flagship_position", np.nan)
+    flagship_cpo = r.get("flagship_cpo", np.nan)
+    avg_price = r.get("avg_finished_price", np.nan)
+    flagship_drr = pct(flagship_cpo, avg_price) if pd.notna(flagship_cpo) and pd.notna(avg_price) and avg_price > 0 else np.nan
+    return (
+        pd.notna(flagship_position)
+        and float(flagship_position) > FLAGSHIP_TARGET_POSITION
+        and pd.notna(flagship_drr)
+        and float(flagship_drr) <= DRR_FORECAST_CAP_PCT
+    )
+
+
 def decide_campaign(r: pd.Series, pause_history: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> Dict[str, Any]:
     cid = int(r["campaign_id"])
     placement = r.get("placement", "")
@@ -972,17 +1004,12 @@ def decide_campaign(r: pd.Series, pause_history: pd.DataFrame, windows: Dict[str
     drr_14 = r.get("drr_pct_14d", np.nan)
     impressions_14 = r.get("impressions_14d", 0.0)
     impressions_cur = r.get("impressions_cur", 0.0)
-    orders_cur = r.get("orders_cur", 0.0)
-    cpo_cur = r.get("cpo_cur", np.nan)
-    ctr_cur = r.get("ctr_pct_cur", np.nan)
     new_status = bool(r.get("is_new", False))
     is_leader = bool(r.get("is_block_leader", False))
-    is_top3 = bool(r.get("is_block_top3", False))
     active_in_block = int(r.get("active_in_block", 1) or 1)
     ramp_slot = bool(r.get("ramp_slot_selected", False))
     recent_bid = bool(r.get("recent_bid_change", False))
     subject = canon_subject(r.get("subject_norm", ""))
-    root = str(r.get("product_root", ""))
 
     if subject not in MANAGED_SUBJECTS_CANON:
         safe_bid = current_bid if pd.notna(current_bid) else np.nan
@@ -1003,55 +1030,237 @@ def decide_campaign(r: pd.Series, pause_history: pd.DataFrame, windows: Dict[str
         next_up = bid_effective + step
         next_down = max(min_bid, bid_effective - step)
 
-    # paused campaigns: start candidates.
+    # Paused campaigns: start candidates are handled separately from bid-change guards.
     last_pause_status = get_last_pause_status(pause_history, cid)
     if not active:
         start_decision = decide_start_candidate(r, last_pause_status, windows)
         return {"campaign_id": cid, **start_decision}
 
-    # Never pause NEW for 14 days.
+    # Hard guard: after any successful bid change we wait for post-check data.
+    # This must be above NEW/RAMP branches, otherwise repeated manual runs can send
+    # the same PATCH several times during the same day.
+    if recent_bid:
+        return decision(
+            cid,
+            "hold",
+            bid_effective,
+            "WAIT_AFTER_RECENT_BID_CHANGE_HARD_GUARD",
+            f"Ставка уже менялась недавно ({r.get('last_bid_change_date', 'н/д')}); повторный PATCH запрещён, ждём дозревание быстрых метрик и post-check",
+        )
+
+    flagship_raise_ok = _has_flagship_raise_proof(r)
+    drr_gt_raise_gate = pd.notna(drr_cur) and float(drr_cur) > DRR_RAISE_GATE_PCT
+
+    # Never pause NEW for 14 days. NEW can be ramped only if DRR is not already above gate,
+    # unless CORE flagship economics prove that a raise is justified.
     if new_status:
+        if drr_gt_raise_gate and not flagship_raise_ok:
+            return decision(
+                cid,
+                "hold",
+                bid_effective,
+                "NEW_RAMP_BLOCKED_DRR_GT_10_NO_FLAGSHIP_CORE",
+                f"NEW<{NEW_NO_PAUSE_DAYS}д: пауза запрещена; ДРР зрелого окна {drr_cur:.1f}% >10%, а CORE-обоснования флагманского запроса нет; разгон ставкой запрещён",
+            )
         if ramp_slot and can_raise(next_up, max_bid):
             return decision(cid, "raise", next_up, "NEW_RAMP_RAISE_TO_TRAFFIC", f"NEW<{NEW_NO_PAUSE_DAYS}д: пауза запрещена; разгон по одному шагу до 5000 показов; ставка {bid_effective}->{next_up}; cap={max_bid}")
         return decision(cid, "hold", bid_effective, "NEW_UNDER_14D_NO_PAUSE", f"NEW<{NEW_NO_PAUSE_DAYS}д: пауза запрещена; ждём трафик/позиции/клики")
 
-    # Hard pause: high mature traffic and high DRR, but keep leader/last active.
-    if (subject in PAUSE_ALLOWED_SUBJECTS_CANON and impressions_14 >= 10000 and pd.notna(drr_14) and drr_14 > DRR_PAUSE_LIMIT_PCT and active_in_block > 1 and not is_leader):
-        return decision(cid, "pause", bid_effective, "PAUSE_HIGH_DRR_14D_10000_REALLOCATE", f"14д: показы={impressions_14:.0f} >=10000, ДРР={drr_14:.1f}% >15%; не лидер блока; пауза для перелива бюджета в лидеров")
+    # Minimal-bid post-check flow.
+    # Новое правило: если РК плохая, но ставка выше минимума, мы НЕ паузим её сразу.
+    # Сначала понижаем ставку до минимума и помечаем это reason_code в Истории_ставок.
+    # После того как минимальная ставка простоит всё зрелое окно без изменений:
+    #   - если экономика восстановилась (ДРР зрелого окна <= 15% и есть заказы) — повышаем на 1 шаг;
+    #   - если экономика не восстановилась (ДРР зрелого окна > 15%) — ставим на паузу;
+    #   - если данных мало/ДРР не сформировался — держим на минимуме и ждём.
+    last_bid_change_date = pd.to_datetime(r.get("last_bid_change_date", pd.NaT), errors="coerce")
+    last_reason = str(r.get("last_bid_reason_code", "") or "")
+    min_bid_probe_marked = last_reason in MIN_BID_PROBE_REASON_CODES
+    min_bid_probe_matured = (
+        bid_effective <= min_bid
+        and min_bid_probe_marked
+        and pd.notna(last_bid_change_date)
+        and last_bid_change_date < windows["current_start"]
+    )
+    min_bid_without_mark = (
+        bid_effective <= min_bid
+        and not min_bid_probe_marked
+    )
+    drr_cur_known = pd.notna(drr_cur)
+    orders_cur = float(r.get("orders_cur", 0.0) or 0.0)
 
-    # Low-volume ramp flow: if not enough impressions, do not judge by orders yet. Ramp only selected slots, pause/queue others.
+    high_drr_pause_base = (
+        subject in PAUSE_ALLOWED_SUBJECTS_CANON
+        and active_in_block > 1
+        and not is_leader
+    )
+
+    if min_bid_probe_matured:
+        if drr_cur_known and float(drr_cur) <= MIN_BID_RECOVERY_DRR_PCT and orders_cur > 0:
+            if can_raise(next_up, max_bid):
+                return decision(
+                    cid,
+                    "raise",
+                    next_up,
+                    "MIN_BID_PROBE_RECOVERED_RAISE_ONE_STEP",
+                    f"РК простояла на минимальной ставке {min_bid} всё зрелое окно {windows['current_start'].date()}..{windows['current_end'].date()}; ситуация улучшилась: ДРР={drr_cur:.1f}%<=15%, заказов={orders_cur:.0f}; восстанавливаем ставку на 1 шаг {bid_effective}->{next_up}",
+                    min_bid_probe_stage="recovered_raise",
+                )
+            return decision(
+                cid,
+                "hold",
+                bid_effective,
+                "MIN_BID_PROBE_RECOVERED_RAISE_BLOCKED_BY_CAP",
+                f"РК простояла на минимальной ставке {min_bid} всё зрелое окно; ДРР={drr_cur:.1f}%<=15%, но следующий шаг {next_up} выше cap={max_bid}; держим минимум",
+                min_bid_probe_stage="recovered_hold_cap",
+            )
+        if drr_cur_known and float(drr_cur) > DRR_PAUSE_LIMIT_PCT:
+            if high_drr_pause_base:
+                return decision(
+                    cid,
+                    "pause",
+                    bid_effective,
+                    "PAUSE_AFTER_MIN_BID_PROBE_DRR_STILL_GT15",
+                    f"РК была помечена как lowered-to-min, простояла на минимальной ставке {min_bid} всё зрелое окно {windows['current_start'].date()}..{windows['current_end'].date()} без изменений; ситуация не улучшилась: ДРР={drr_cur:.1f}%>15%; не лидер блока и не единственная активная — пауза",
+                    min_bid_probe_stage="matured_pause",
+                )
+            return decision(
+                cid,
+                "hold",
+                bid_effective,
+                "MIN_BID_PROBE_BAD_BUT_PAUSE_GUARD_HOLD",
+                f"Минимальная ставка {min_bid} прошла зрелое окно, ДРР={drr_cur:.1f}%>15%, но пауза запрещена guard-условиями: предмет={subject}, active_in_block={active_in_block}, is_leader={is_leader}",
+                min_bid_probe_stage="matured_bad_pause_guard_hold",
+            )
+        return decision(
+            cid,
+            "hold",
+            bid_effective,
+            "MIN_BID_PROBE_MATURED_NO_STABLE_DRR_HOLD",
+            f"РК простояла на минимальной ставке {min_bid} всё зрелое окно, но стабильный вывод не сформирован: ДРР={drr_cur if pd.notna(drr_cur) else 'н/д'}, заказов={orders_cur:.0f}; держим минимум и ждём следующего окна",
+            min_bid_probe_stage="matured_no_stable_drr_hold",
+        )
+
+    # Стандартный high-DRR контур: если ставка выше минимума — снижаем.
+    # Если снижение текущим шагом доводит РК до минимума, ставим специальную метку
+    # *_LOWER_TO_MIN_BID_FOR_POSTCHECK, чтобы следующий зрелый период был проверен
+    # по правилу recovered_raise / still_bad_pause.
+    high_drr_for_lower = (
+        subject in PAUSE_ALLOWED_SUBJECTS_CANON
+        and impressions_14 >= 10000
+        and pd.notna(drr_14)
+        and float(drr_14) > DRR_PAUSE_LIMIT_PCT
+        and active_in_block > 1
+        and not is_leader
+    )
+    if high_drr_for_lower:
+        if bid_effective > min_bid:
+            if next_down <= min_bid:
+                return decision(
+                    cid,
+                    "lower",
+                    min_bid,
+                    "HIGH_DRR_14D_LOWER_TO_MIN_BID_FOR_POSTCHECK",
+                    f"14д: показы={impressions_14:.0f}>=10000, ДРР={drr_14:.1f}%>15%; ставка {bid_effective} выше минимума {min_bid}. Опускаем до минимума и помечаем РК для post-check: после зрелого окна на минимуме либо raise при ДРР<=15%, либо pause при ДРР>15%",
+                    min_bid_probe_stage="lower_to_min_marked",
+                )
+            return decision(
+                cid,
+                "lower",
+                next_down,
+                "HIGH_DRR_14D_LOWER_BEFORE_PAUSE_NOT_MIN_BID",
+                f"14д: показы={impressions_14:.0f}>=10000, ДРР={drr_14:.1f}%>15%, но ставка {bid_effective} выше минимума {min_bid}; пауза запрещена, сначала снижаем на 1 шаг: {bid_effective}->{next_down}",
+                min_bid_probe_stage="lower_towards_min",
+            )
+        if min_bid_probe_marked:
+            return decision(
+                cid,
+                "hold",
+                bid_effective,
+                "HIGH_DRR_14D_WAIT_MIN_BID_FULL_MATURE_WINDOW",
+                f"14д: показы={impressions_14:.0f}>=10000, ДРР={drr_14:.1f}%>15%, ставка минимальная {min_bid}, но она ещё не простояла без изменений всё зрелое окно {windows['current_start'].date()}..{windows['current_end'].date()}; пауза запрещена, ждём post-check",
+                min_bid_probe_stage="waiting_mature_window",
+            )
+        return decision(
+            cid,
+            "hold",
+            bid_effective,
+            "MIN_BID_WITHOUT_PROBE_MARK_HOLD",
+            f"Ставка уже минимальная {min_bid}, но в Истории_ставок нет метки lowered-to-min для post-check; автоматическая пауза запрещена, чтобы не выключить РК без подтверждённого периода наблюдения",
+            min_bid_probe_stage="min_without_mark_hold",
+        )
+
+    # Low-volume ramp flow: if not enough impressions, do not judge by orders yet.
+    # Selected slots can be raised, but high-DRR slots require CORE flagship proof.
+    # Non-selected slots stay in queue/hold; they must not be sent to WB as PAUSE.
     if impressions_cur < RAMP_TARGET_IMPRESSIONS:
         if ramp_slot and can_raise(next_up, max_bid):
+            if drr_gt_raise_gate and not flagship_raise_ok:
+                return decision(
+                    cid,
+                    "hold",
+                    bid_effective,
+                    "RAMP_RAISE_BLOCKED_DRR_GT_10_NO_FLAGSHIP_CORE",
+                    f"Разгон заблокирован: показов {impressions_cur:.0f}<5000, но ДРР зрелого окна {drr_cur:.1f}% >10%, а CORE-обоснования флагманского запроса нет",
+                )
             return decision(cid, "raise", next_up, "RAMP_ACTIVE_TO_5000_IMPRESSIONS", f"Разгон: показов в зрелом окне {impressions_cur:.0f}<5000; слот выбран по CTR/кликам; ставка {bid_effective}->{next_up}; cap={max_bid}")
-        if subject in PAUSE_ALLOWED_SUBJECTS_CANON and not is_leader and active_in_block > 1:
-            return decision(cid, "pause", bid_effective, "PAUSE_TO_RAMP_QUEUE_LOW_VOLUME", f"Не лидер и не выбран в текущий слот разгона; ставим в очередь/паузу, чтобы не разгонять много РК одновременно")
+        if not is_leader and active_in_block > 1:
+            return decision(
+                cid,
+                "ramp_queue",
+                bid_effective,
+                "RAMP_QUEUE_LOW_VOLUME_HOLD",
+                "Не лидер и не выбран в текущий слот разгона; оставляем в очереди без API-паузы, чтобы не сушить low-volume РК автоматически",
+            )
         return decision(cid, "hold", bid_effective, "LOW_VOLUME_LEADER_HOLD", f"Лидер/единственная РК блока, но показов {impressions_cur:.0f}<5000; держим без резких действий")
 
-    # If enough impressions and high DRR: reduce first unless min bid; not pause leader.
-    if pd.notna(drr_cur) and drr_cur > DRR_RAISE_GATE_PCT:
-        # Special case: flagship position is bad and query economics are acceptable, allow a controlled flagship test instead of lowering.
-        flagship_position = r.get("flagship_position", np.nan)
-        flagship_cpo = r.get("flagship_cpo", np.nan)
-        avg_price = r.get("avg_finished_price", np.nan)
-        flagship_drr = pct(flagship_cpo, avg_price) if pd.notna(flagship_cpo) and pd.notna(avg_price) and avg_price > 0 else np.nan
-        if (pd.notna(flagship_position) and flagship_position > FLAGSHIP_TARGET_POSITION and pd.notna(flagship_drr) and flagship_drr <= DRR_FORECAST_CAP_PCT and can_raise(next_up, max_bid) and not recent_bid):
+    # If enough impressions and high DRR: reduce first unless min bid; raising is allowed only with CORE flagship proof.
+    if drr_gt_raise_gate:
+        if flagship_raise_ok and can_raise(next_up, max_bid):
+            flagship_cpo = r.get("flagship_cpo", np.nan)
+            avg_price = r.get("avg_finished_price", np.nan)
+            flagship_drr = pct(flagship_cpo, avg_price) if pd.notna(flagship_cpo) and pd.notna(avg_price) and avg_price > 0 else np.nan
             return decision(cid, "raise", next_up, "TEST_RAISE_DRR_HIGH_FLAGSHIP_BAD_POSITION", f"ДРР кампании {drr_cur:.1f}% >10%, но флагманские запросы ниже топ-10 и прогнозный ДРР флагмана {flagship_drr:.1f}%<=16%; тестируем рост ставки {bid_effective}->{next_up}")
-        if bid_effective > min_bid and not recent_bid:
-            return decision(cid, "lower", next_down, "DRR_GT_10_LOWER_ONE_STEP", f"ДРР зрелого окна {drr_cur:.1f}% >10%; сначала сушим на 1 шаг: {bid_effective}->{next_down}; следим за CORE-кликами")
-        return decision(cid, "hold", bid_effective, "DRR_GT_10_MIN_OR_RECENT_CHANGE_HOLD", f"ДРР {drr_cur:.1f}% >10%, но ставка на минимуме или недавно менялась; hold")
+        if bid_effective > min_bid:
+            if next_down <= min_bid:
+                return decision(
+                    cid,
+                    "lower",
+                    min_bid,
+                    "DRR_GT_10_LOWER_TO_MIN_BID_FOR_POSTCHECK",
+                    f"ДРР зрелого окна {drr_cur:.1f}% >10%; CORE-обоснования повышения нет. Опускаем ставку до минимума {min_bid} и помечаем РК для post-check: после зрелого окна на минимуме либо raise при ДРР<=15%, либо pause при ДРР>15%",
+                    min_bid_probe_stage="lower_to_min_marked",
+                )
+            return decision(
+                cid,
+                "lower",
+                next_down,
+                "DRR_GT_10_LOWER_ONE_STEP",
+                f"ДРР зрелого окна {drr_cur:.1f}% >10%; CORE-обоснования повышения нет; сначала сушим на 1 шаг: {bid_effective}->{next_down}",
+                min_bid_probe_stage="lower_towards_min",
+            )
+        if min_bid_probe_marked:
+            return decision(
+                cid,
+                "hold",
+                bid_effective,
+                "DRR_GT_10_MIN_WAIT_PROBE_MATURE_WINDOW",
+                f"ДРР {drr_cur:.1f}% >10%, ставка уже на минимуме {min_bid} и РК помечена для post-check; ждём, пока минимум простоит всё зрелое окно",
+                min_bid_probe_stage="waiting_mature_window",
+            )
+        return decision(cid, "hold", bid_effective, "DRR_GT_10_MIN_HOLD", f"ДРР {drr_cur:.1f}% >10%, но ставка на минимуме; hold без pause, потому что нет метки lowered-to-min/post-check")
 
-    # DRR <= 10: raise only if cap allows and not too recent. This is a test, not automatic scaling.
+    # DRR <= 10: raise only if cap allows. This is a test, not automatic scaling.
     if pd.notna(drr_cur) and drr_cur <= DRR_RAISE_GATE_PCT:
-        if recent_bid:
-            return decision(cid, "hold", bid_effective, "WAIT_AFTER_RECENT_BID_CHANGE", f"ДРР {drr_cur:.1f}% <=10%, но ставка менялась недавно; ждём быстрые метрики CORE")
         if can_raise(next_up, max_bid):
             if placement == "search":
-                return decision(cid, "raise", next_up, "TEST_RAISE_CORE_TRAFFIC_ONE_STEP", f"ДРР {drr_cur:.1f}%<=10%; тест +1р: {bid_effective}->{next_up}; cap={max_bid}; успех = рост доли флагманских CORE-кликов/показов без ухода в широкий мусор")
+                if bool(r.get("has_core_source", False)):
+                    return decision(cid, "raise", next_up, "TEST_RAISE_CORE_TRAFFIC_ONE_STEP", f"ДРР {drr_cur:.1f}%<=10%; тест +1р: {bid_effective}->{next_up}; cap={max_bid}; успех = рост доли флагманских CORE-кликов/показов без ухода в широкий мусор")
+                return decision(cid, "raise", next_up, "TEST_RAISE_TRAFFIC_ONE_STEP_NO_CORE", f"ДРР {drr_cur:.1f}%<=10%; CORE-источник не подгружен, поэтому это только осторожный тест трафика +1р: {bid_effective}->{next_up}; cap={max_bid}")
             return decision(cid, "raise", next_up, "TEST_RAISE_SHELF_TRAFFIC_ONE_STEP", f"ДРР {drr_cur:.1f}%<=10%; тест CPM +6р: {bid_effective}->{next_up}; cap={max_bid}; успех = рост показов/кликов и CTR не падает")
         return decision(cid, "hold", bid_effective, "RAISE_BLOCKED_BY_FORECAST_DRR_CAP", f"ДРР {drr_cur:.1f}%<=10%, но следующий шаг {next_up} выше предельной ставки {max_bid}; hold")
 
     return decision(cid, "hold", bid_effective, "NO_STABLE_DRR_HOLD", "Нет стабильного ДРР в зрелом окне; без изменений")
-
 
 def can_raise(next_bid: float, max_bid: Any) -> bool:
     if pd.isna(next_bid):
@@ -1085,14 +1294,16 @@ def decide_start_candidate(r: pd.Series, last_pause: Dict[str, Any], windows: Di
     return decision(cid, "hold_paused", min_bid, "KEEP_PAUSED_WAIT_RECOVERY", f"Paused РК: возврат не подтверждён; orders14={orders_14:.0f}, drr14={drr_14 if pd.notna(drr_14) else 'н/д'}")
 
 
-def decision(campaign_id: int, action: str, new_bid: Any, reason_code: str, reason_text: str) -> Dict[str, Any]:
-    return {
+def decision(campaign_id: int, action: str, new_bid: Any, reason_code: str, reason_text: str, **extra: Any) -> Dict[str, Any]:
+    out = {
         "campaign_id": campaign_id,
         "action": action,
         "new_bid_rub": new_bid,
         "reason_code": reason_code,
         "reason_text": reason_text,
     }
+    out.update(extra)
+    return out
 
 
 def build_payload_preview(decisions: pd.DataFrame) -> pd.DataFrame:
@@ -1173,6 +1384,7 @@ def summary_table(decisions: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> 
         ["pause_window", f"{windows['pause_start'].date()}..{windows['pause_end'].date()}"],
         ["drr_raise_gate_pct", DRR_RAISE_GATE_PCT],
         ["drr_pause_limit_pct", DRR_PAUSE_LIMIT_PCT],
+        ["min_bid_recovery_drr_pct", MIN_BID_RECOVERY_DRR_PCT],
         ["forecast_drr_cap_pct", DRR_FORECAST_CAP_PCT],
         ["ramp_target_impressions", RAMP_TARGET_IMPRESSIONS],
         ["abc_profitability_used", "NO"],
@@ -1196,6 +1408,7 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
             "avg_finished_price", "forecast_cpo_next_step", "forecast_drr_next_step_pct", "max_bid_reason",
             "flagship_queries", "flagship_position", "flagship_cpo", "flagship_clicks_per_order", "block_rank", "ramp_queue_rank", "ramp_slot_selected",
             "last_bid_change_date", "days_since_last_bid_change", "last_bid_reason_code",
+            "min_bid_probe_stage",
         ]
         existing = [c for c in cols_dec if c in decisions.columns]
         decisions[existing].to_excel(writer, sheet_name="Решения", index=False)
@@ -1248,7 +1461,7 @@ WB_BIDS_MIN_ENDPOINT = "/api/advert/v1/bids/min"
 # Разовый откат ошибочных пауз, созданных слишком широкой v47-версией FIX46-runner.
 # Откатываем только новые reason_code из v47/v50-контура, не трогаем старые штатные паузы и ночные эксперименты.
 WRONG_FIX46_PAUSE_REASON_CODES = {
-    "PAUSE_HIGH_DRR_14D_10000_REALLOCATE",
+    "PAUSE_HIGH_DRR_14D_MIN_BID_FULL_MATURE_REALLOCATE",
     "PAUSE_TO_RAMP_QUEUE_LOW_VOLUME",
 }
 ROLLBACK_WRONG_FIX46_PAUSE_REASON_CODE = "ROLLBACK_WRONG_FIX46_PAUSE_START"
@@ -1567,6 +1780,9 @@ def apply_api_actions(decisions: pd.DataFrame, config: RunnerConfig, mode: str, 
             logs.append(_api_log_row("SKIP", WB_START_ENDPOINT, {"id": campaign_id}, "not_sent_apply_start_false", "Запуск не отправлен: нужен --apply-start", campaign_id, nm_id, placement))
             continue
         if action in {"raise", "lower"}:
+            if bool(row.get("recent_bid_change", False)):
+                logs.append(_api_log_row("SKIP", WB_BIDS_ENDPOINT, {}, "skip_recent_bid_change_hard_guard", "PATCH не отправлен: ставка уже менялась недавно, ждём post-check", campaign_id, nm_id, placement))
+                continue
             endpoint = WB_BIDS_ENDPOINT
             payload = build_wb_bid_payload(row)
             if payload is None:
