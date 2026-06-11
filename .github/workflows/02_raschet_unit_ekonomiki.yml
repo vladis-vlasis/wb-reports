@@ -1,4 +1,4 @@
-# VERSION: v16_CORRECT_TOPFACE_MT_UNIT_ECONOMICS_20260610
+# VERSION: v17_REDUNDANT_SCHEDULE_1007_1017_MSK_20260611
 # В GitHub заменить содержимое файла:
 # .github/workflows/02_raschet_unit_ekonomiki.yml
 #
@@ -23,8 +23,14 @@ on:
           - TOPFACE
           - MISSTAIS
   schedule:
-    # Каждый день в 10:00 МСК = 07:00 UTC
-    - cron: "0 7 * * *"
+    # Каждый день с резервом: 10:07 и 10:17 МСК = 07:07 и 07:17 UTC.
+    # Не ставим ровно на начало часа, потому что GitHub schedule может быть задержан или отброшен при высокой нагрузке.
+    - cron: "7 7 * * *"
+    - cron: "17 7 * * *"
+
+concurrency:
+  group: unit-economics-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   raschet-ekonomiki:
@@ -52,7 +58,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          echo "YML_VERSION=v16_CORRECT_TOPFACE_MT_UNIT_ECONOMICS_20260610"
+          echo "YML_VERSION=v17_REDUNDANT_SCHEDULE_1007_1017_MSK_20260611"
 
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не задан secret REPORT_ENV"
