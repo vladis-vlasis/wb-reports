@@ -1,4 +1,5 @@
 name: Daily TOPFACE sales report
+# FIX37_READY_GITHUB_UPLOAD_20260611: active workflow. Upload as .github/workflows/daily_report.yml
 
 on:
   workflow_dispatch:
@@ -221,13 +222,15 @@ jobs:
             REPORT_REQUIRE_ADS_DATE="$REQUIRE_DATE"
             WB_DAILY_TARGET_DATE="$AS_OF_DATE"
           elif [ "$MODE" = "current_week" ]; then
+            # FIX36: оперативный daily-отчёт должен быть строго за вчера по МСК.
+            # Если данных/рекламы за вчера нет, отчёт не должен тихо откатываться на позавчера.
+            WB_DAILY_TARGET_DATE="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
             REPORT_REQUIRE_ABC_PERIOD="0"
-            REPORT_AUTO_COMPLETE_DATE="1"
-            REPORT_AS_OF_DATE=""
-            REPORT_REQUIRE_DATA_DATE=""
-            REPORT_REQUIRE_ADS_DATE=""
-            WB_DAILY_TARGET_DATE="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
+            REPORT_AUTO_COMPLETE_DATE="0"
+            REPORT_AS_OF_DATE="$WB_DAILY_TARGET_DATE"
+            REPORT_REQUIRE_DATA_DATE="$WB_DAILY_TARGET_DATE"
+            REPORT_REQUIRE_ADS_DATE="$WB_DAILY_TARGET_DATE"
           elif [ "$MODE" = "smoke" ]; then
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
             REPORT_REQUIRE_ABC_PERIOD="0"
