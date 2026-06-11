@@ -32,17 +32,26 @@ python assistant_wb_ads_manager__FIX46_CORE_RAMP_PAUSE_20260611.py \
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import math
 import os
 import re
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import boto3
 import numpy as np
 import pandas as pd
+import requests
+from botocore.exceptions import ClientError
 
+SCRIPT_VERSION = "strict-drr-v47-fix46-working-runner-2026-06-11"
 VERSION = "FIX46_CORE_RAMP_PAUSE_20260611"
 
 # -------------------------
@@ -150,7 +159,36 @@ def to_num(x: pd.Series) -> pd.Series:
 
 
 def to_date(x: pd.Series) -> pd.Series:
-    return pd.to_datetime(x, errors="coerce", dayfirst=True).dt.normalize()
+    """Robust date parser without global ambiguous parsing.
+
+    Supported formats:
+    - ISO: YYYY-MM-DD
+    - Russian/Excel exports: DD.MM.YYYY or DD/MM/YYYY
+    - already parsed Excel datetimes.
+    """
+    if x is None:
+        return pd.Series(dtype="datetime64[ns]")
+    raw = x if isinstance(x, pd.Series) else pd.Series(x)
+    result = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+    text = raw.astype(str).str.strip()
+
+    iso_mask = text.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)
+    if iso_mask.any():
+        result.loc[iso_mask] = pd.to_datetime(text.loc[iso_mask], format="%Y-%m-%d", errors="coerce")
+
+    dot_mask = result.isna() & text.str.fullmatch(r"\d{2}\.\d{2}\.\d{4}", na=False)
+    if dot_mask.any():
+        result.loc[dot_mask] = pd.to_datetime(text.loc[dot_mask], format="%d.%m.%Y", errors="coerce")
+
+    slash_mask = result.isna() & text.str.fullmatch(r"\d{2}/\d{2}/\d{4}", na=False)
+    if slash_mask.any():
+        result.loc[slash_mask] = pd.to_datetime(text.loc[slash_mask], format="%d/%m/%Y", errors="coerce")
+
+    remaining = result.isna() & raw.notna() & text.ne("") & text.ne("NaT") & text.ne("nan")
+    if remaining.any():
+        result.loc[remaining] = pd.to_datetime(raw.loc[remaining], errors="coerce")
+
+    return result.dt.normalize()
 
 
 def clean_article(v: Any) -> str:
@@ -347,7 +385,7 @@ def load_ads_daily(path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     out = pd.concat(daily_frames, ignore_index=True)
     # Dedupe exact day+campaign rows across overlapping exports; keep latest file in input order.
     out["_source_order"] = out["source_file"].map({Path(p).name: i for i, p in enumerate(paths)})
-    out = out.sort_values("_source_order").drop_duplicates(["campaign_id", "day"], keep="last").drop(columns=["_source_order"])
+    out = out.sort_values("_source_order").drop_duplicates(["campaign_id", "nm_id", "day"], keep="last").drop(columns=["_source_order"])
 
     camp = pd.concat(campaign_frames, ignore_index=True) if campaign_frames else pd.DataFrame()
     if not camp.empty:
@@ -1054,28 +1092,380 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
         payload.to_excel(writer, sheet_name="API_payload_preview", index=False)
 
 
+
 # -------------------------
-# CLI
+# Local CLI + GitHub/S3 runner
 # -------------------------
 
-def run(args: argparse.Namespace) -> int:
-    as_of = pd.Timestamp(args.as_of).normalize() if args.as_of else pd.Timestamp(datetime.utcnow().date())
+# These marker constants are intentionally present for the workflow guard.
+EXPERIMENT_1_REASON_CODE = "EXPERIMENT_1_NIGHT_MIN_BID_MSK_1_5"
+EXPERIMENT_2_REASON_CODE = "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE"
+EXPERIMENT_2_START_REASON_CODE = "EXPERIMENT_2_NIGHT_WINDOW_END_START"
+TECHNICAL_COMBINED_MIN_BID_80_FIX = "TECHNICAL_COMBINED_MIN_BID_80_FIX"
+EXPERIMENT_1_ARTICLES = {"901/6", "901/2", "901/8"}
+
+STORE_NAME = "TOPFACE"
+SERVICE_PREFIX = "Служебные файлы/Ассистент WB/TOPFACE/"
+ADS_MAIN_KEY = "Отчёты/Реклама/TOPFACE/Анализ рекламы.xlsx"
+ADS_WEEKLY_PREFIX = "Отчёты/Реклама/TOPFACE/Недельные/"
+ORDERS_WEEKLY_PREFIX = "Отчёты/Заказы/TOPFACE/Недельные/"
+RUN_OUTPUT_KEY = SERVICE_PREFIX + "Итог_последнего_запуска.xlsx"
+PREVIEW_OUTPUT_KEY = SERVICE_PREFIX + "Предпросмотр_последнего_запуска.xlsx"
+SUMMARY_JSON_KEY = SERVICE_PREFIX + "Сводка_последнего_запуска.json"
+API_LOG_KEY = SERVICE_PREFIX + "Лог_API.xlsx"
+BID_HISTORY_KEY = SERVICE_PREFIX + "История_ставок.xlsx"
+PAUSE_HISTORY_KEY = SERVICE_PREFIX + "История_пауз.xlsx"
+WB_ADVERT_BASE_URL = "https://advert-api.wildberries.ru"
+WB_BIDS_ENDPOINT = "/api/advert/v1/bids"
+WB_PAUSE_ENDPOINT = "/adv/v0/pause"
+WB_START_ENDPOINT = "/adv/v0/start"
+
+
+@dataclass
+class RunnerConfig:
+    yc_access_key_id: str
+    yc_secret_access_key: str
+    yc_bucket_name: str
+    wb_promo_key: str
+    s3_endpoint_url: str = "https://storage.yandexcloud.net"
+    wb_base_url: str = WB_ADVERT_BASE_URL
+
+
+def _env_required(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Не задан обязательный env/secret: {name}")
+    return value
+
+
+def load_runner_config() -> RunnerConfig:
+    return RunnerConfig(
+        yc_access_key_id=_env_required("YC_ACCESS_KEY_ID"),
+        yc_secret_access_key=_env_required("YC_SECRET_ACCESS_KEY"),
+        yc_bucket_name=_env_required("YC_BUCKET_NAME"),
+        wb_promo_key=_env_required("WB_PROMO_KEY_TOPFACE"),
+    )
+
+
+def make_s3_client(config: RunnerConfig):
+    return boto3.client(
+        "s3",
+        endpoint_url=config.s3_endpoint_url,
+        aws_access_key_id=config.yc_access_key_id,
+        aws_secret_access_key=config.yc_secret_access_key,
+    )
+
+
+def s3_key_exists(s3_client, bucket: str, key: str) -> bool:
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+
+
+def read_s3_bytes(s3_client, bucket: str, key: str) -> bytes:
+    return s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+
+
+def upload_s3_bytes(s3_client, bucket: str, key: str, payload: bytes, content_type: Optional[str] = None) -> None:
+    kwargs: Dict[str, Any] = {"Bucket": bucket, "Key": key, "Body": payload}
+    if content_type:
+        kwargs["ContentType"] = content_type
+    s3_client.put_object(**kwargs)
+
+
+def list_s3_keys(s3_client, bucket: str, prefix: str) -> List[str]:
+    keys: List[str] = []
+    token: Optional[str] = None
+    while True:
+        kwargs: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kwargs)
+        for item in resp.get("Contents", []):
+            key = item.get("Key", "")
+            if key:
+                keys.append(key)
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    return keys
+
+
+def latest_excel_keys(s3_client, bucket: str, prefix: str, limit: int = 4) -> List[str]:
+    keys = [k for k in list_s3_keys(s3_client, bucket, prefix) if k.lower().endswith((".xlsx", ".xlsm")) and "~$" not in k]
+    keys = sorted(set(keys), reverse=True)
+    return keys[:limit]
+
+
+def download_key_to_dir(s3_client, bucket: str, key: str, workdir: Path) -> str:
+    safe_name = Path(key).name or (uuid.uuid4().hex + ".bin")
+    path = workdir / safe_name
+    payload = read_s3_bytes(s3_client, bucket, key)
+    path.write_bytes(payload)
+    return str(path)
+
+
+def maybe_download_key_to_dir(s3_client, bucket: str, key: str, workdir: Path) -> Optional[str]:
+    if not s3_key_exists(s3_client, bucket, key):
+        return None
+    return download_key_to_dir(s3_client, bucket, key, workdir)
+
+
+def wb_headers(config: RunnerConfig) -> Dict[str, str]:
+    return {"Authorization": config.wb_promo_key, "Content-Type": "application/json"}
+
+
+def _clean_int(value: Any) -> Optional[int]:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    if text.endswith(".0"):
+        text = text[:-2]
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    try:
+        val = int(float(text))
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_article_for_experiment(value: Any) -> str:
+    text = clean_article(value).upper().replace("_", "/").replace(" ", "")
+    text = re.sub(r"^PT", "", text)
+    m = re.search(r"(901)[\./\-/]?F?(\d+)", text)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2))}"
+    m = re.search(r"(901)\s*/\s*(\d+)", text)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2))}"
+    return text
+
+
+def _api_log_row(method: str, endpoint: str, payload: Any, status: str, response_text: str, campaign_id: Any = "", nm_id: Any = "", placement: Any = "") -> Dict[str, Any]:
+    return {
+        "run_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "method": method,
+        "endpoint": endpoint,
+        "campaign_id": campaign_id,
+        "nm_id": nm_id,
+        "placement": placement,
+        "payload": json.dumps(payload, ensure_ascii=False) if payload not in (None, "") else "",
+        "api_status": status,
+        "response_text": str(response_text)[:2000],
+    }
+
+
+def _normal_bid_for_api(placement: Any, bid: Any) -> Optional[int]:
+    if pd.isna(bid):
+        return None
+    placement_s = str(placement or "").strip().lower()
+    value = float(bid)
+    if placement_s == "combined":
+        value = max(value, COMBINED_MIN_BID_RUB)
+        value = ceil_to_combined_grid(value)
+        return int(value) if value is not None else None
+    return int(round(max(value, SEARCH_MIN_BID_RUB)))
+
+
+def build_wb_bid_payload(row: pd.Series) -> Optional[Dict[str, Any]]:
+    advert_id = _clean_int(row.get("campaign_id"))
+    nm_id = _clean_int(row.get("nm_id"))
+    placement = str(row.get("placement", "") or "").strip().lower()
+    if placement not in {"search", "combined", "recommendations", "recommendation"}:
+        placement = "combined" if "combined" in placement else "search"
+    if placement == "recommendation":
+        placement = "recommendations"
+    new_bid = _normal_bid_for_api(placement, row.get("new_bid_rub"))
+    if advert_id is None or nm_id is None or new_bid is None:
+        return None
+    return {
+        "bids": [{
+            "advert_id": int(advert_id),
+            "nm_bids": [{
+                "nm_id": int(nm_id),
+                "bid_kopecks": int(new_bid * 100),
+                "placement": placement,
+            }],
+        }]
+    }
+
+
+def apply_api_actions(decisions: pd.DataFrame, config: RunnerConfig, mode: str, dry_run: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if decisions is None or decisions.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    logs: List[Dict[str, Any]] = []
+    successful: List[Dict[str, Any]] = []
+    for _, row in decisions.iterrows():
+        action = str(row.get("action", "hold") or "hold").strip().lower()
+        if action not in {"raise", "lower", "pause", "start"}:
+            continue
+        campaign_id = row.get("campaign_id", "")
+        nm_id = row.get("nm_id", "")
+        placement = row.get("placement", "")
+        if action in {"raise", "lower"}:
+            endpoint = WB_BIDS_ENDPOINT
+            payload = build_wb_bid_payload(row)
+            if payload is None:
+                logs.append(_api_log_row("PATCH", endpoint, {}, "payload_error", "Не удалось собрать payload", campaign_id, nm_id, placement))
+                continue
+            if mode == "preview" or dry_run:
+                status = "preview_no_call" if mode == "preview" else "dry_run_no_call"
+                logs.append(_api_log_row("PATCH", endpoint, payload, status, "API-вызов не отправлялся", campaign_id, nm_id, placement))
+                continue
+            try:
+                resp = requests.patch(config.wb_base_url.rstrip("/") + endpoint, headers=wb_headers(config), json=payload, timeout=60)
+                logs.append(_api_log_row("PATCH", endpoint, payload, str(resp.status_code), resp.text, campaign_id, nm_id, placement))
+                if 200 <= resp.status_code < 300:
+                    item = row.to_dict()
+                    item["api_status"] = str(resp.status_code)
+                    successful.append(item)
+            except Exception as exc:
+                logs.append(_api_log_row("PATCH", endpoint, payload, "exception", repr(exc), campaign_id, nm_id, placement))
+            time.sleep(0.2)
+        elif action in {"pause", "start"}:
+            endpoint = WB_PAUSE_ENDPOINT if action == "pause" else WB_START_ENDPOINT
+            cid = _clean_int(campaign_id)
+            if cid is None:
+                logs.append(_api_log_row("GET", endpoint, {}, "payload_error", "Нет campaign_id", campaign_id, nm_id, placement))
+                continue
+            params = {"id": int(cid)}
+            if mode == "preview" or dry_run:
+                status = "preview_no_call" if mode == "preview" else "dry_run_no_call"
+                logs.append(_api_log_row("GET", endpoint, params, status, "API-вызов не отправлялся", campaign_id, nm_id, placement))
+                continue
+            try:
+                resp = requests.get(config.wb_base_url.rstrip("/") + endpoint, headers=wb_headers(config), params=params, timeout=60)
+                logs.append(_api_log_row("GET", endpoint, params, str(resp.status_code), resp.text, campaign_id, nm_id, placement))
+                if 200 <= resp.status_code < 300:
+                    item = row.to_dict()
+                    item["api_status"] = str(resp.status_code)
+                    successful.append(item)
+            except Exception as exc:
+                logs.append(_api_log_row("GET", endpoint, params, "exception", repr(exc), campaign_id, nm_id, placement))
+            time.sleep(0.2)
+    return pd.DataFrame(successful), pd.DataFrame(logs)
+
+
+def append_excel(existing_path: Optional[str], additions: pd.DataFrame, default_columns: Optional[List[str]] = None) -> pd.DataFrame:
+    if existing_path and os.path.exists(existing_path):
+        try:
+            base = pd.read_excel(existing_path)
+        except Exception:
+            base = pd.DataFrame(columns=default_columns or [])
+    else:
+        base = pd.DataFrame(columns=default_columns or [])
+    if additions is None or additions.empty:
+        return base
+    return pd.concat([base, additions], ignore_index=True, sort=False)
+
+
+def record_successful_events(successful: pd.DataFrame, bid_history_path: Optional[str], pause_history_path: Optional[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    bid_rows: List[Dict[str, Any]] = []
+    pause_rows: List[Dict[str, Any]] = []
+    if successful is not None and not successful.empty:
+        for _, row in successful.iterrows():
+            action = str(row.get("action", "") or "").lower()
+            if action in {"raise", "lower"}:
+                bid_rows.append({
+                    "event_id": str(uuid.uuid4()),
+                    "run_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "event_date": datetime.now().date().isoformat(),
+                    "campaign_id": row.get("campaign_id", ""),
+                    "nm_id": row.get("nm_id", ""),
+                    "supplier_article": row.get("supplier_article", ""),
+                    "subject_norm": row.get("subject_norm", ""),
+                    "placement": row.get("placement", ""),
+                    "old_bid_rub": row.get("real_bid_rub", ""),
+                    "new_bid_rub": row.get("new_bid_rub", ""),
+                    "direction": "raise" if action == "raise" else "lower",
+                    "reason_code": row.get("reason_code", ""),
+                    "spend_before": row.get("spend_cur", ""),
+                    "revenue_before": row.get("order_sum_cur", ""),
+                    "orders_before": row.get("orders_cur", ""),
+                    "impressions_before": row.get("impressions_cur", ""),
+                    "clicks_before": row.get("clicks_cur", ""),
+                    "drr_before": row.get("drr_pct_cur", ""),
+                    "postcheck_status": "pending",
+                    "final_verdict": "",
+                    "api_status": row.get("api_status", ""),
+                })
+            elif action in {"pause", "start"}:
+                pause_rows.append({
+                    "pause_event_id": str(uuid.uuid4()),
+                    "pause_date": datetime.now().date().isoformat(),
+                    "campaign_id": row.get("campaign_id", ""),
+                    "nm_id": row.get("nm_id", ""),
+                    "placement": row.get("placement", ""),
+                    "supplier_article": row.get("supplier_article", ""),
+                    "subject_norm": row.get("subject_norm", ""),
+                    "reason_code": row.get("reason_code", ""),
+                    "impressions_before_pause": row.get("impressions_14d", row.get("impressions_cur", "")),
+                    "clicks_before_pause": row.get("clicks_14d", row.get("clicks_cur", "")),
+                    "spend_before_pause": row.get("spend_14d", row.get("spend_cur", "")),
+                    "revenue_before_pause": row.get("order_sum_14d", row.get("order_sum_cur", "")),
+                    "orders_before_pause": row.get("orders_14d", row.get("orders_cur", "")),
+                    "drr_before_pause": row.get("drr_pct_14d", row.get("drr_pct_cur", "")),
+                    "status": "paused" if action == "pause" else "started",
+                    "next_check_date": (datetime.now().date() + timedelta(days=POST_PAUSE_CHECK_DAYS)).isoformat() if action == "pause" else "",
+                    "api_status": row.get("api_status", ""),
+                })
+    bid_history = append_excel(bid_history_path, pd.DataFrame(bid_rows))
+    pause_history = append_excel(pause_history_path, pd.DataFrame(pause_rows))
+    return bid_history, pause_history
+
+
+def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
+    actions = decisions["action"].value_counts(dropna=False).to_dict() if decisions is not None and not decisions.empty and "action" in decisions.columns else {}
+    return {
+        "Режим": mode,
+        "Версия": SCRIPT_VERSION,
+        "Дата формирования": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Всего рекомендаций": int(len(decisions)) if decisions is not None else 0,
+        "Изменённых ставок": int(successful[successful.get("action", pd.Series(dtype=str)).astype(str).str.lower().isin(["raise", "lower"])].shape[0]) if successful is not None and not successful.empty else 0,
+        "Кандидатов на паузу": int((decisions.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "pause").sum()) if decisions is not None and not decisions.empty else 0,
+        "Поставлено на паузу": int((successful.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "pause").sum()) if successful is not None and not successful.empty else 0,
+        "Кандидатов на запуск": int((decisions.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "start").sum()) if decisions is not None and not decisions.empty else 0,
+        "Запущено обратно": int((successful.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "start").sum()) if successful is not None and not successful.empty else 0,
+        "Действия": {str(k): int(v) for k, v in actions.items()},
+        "Текущее окно с": windows["current_start"].date().isoformat(),
+        "Текущее окно по": windows["current_end"].date().isoformat(),
+        "База с": windows["base_start"].date().isoformat(),
+        "База по": windows["base_end"].date().isoformat(),
+        "Окно паузы с": windows["pause_start"].date().isoformat(),
+        "Окно паузы по": windows["pause_end"].date().isoformat(),
+        "ABC-рентабельность используется": "нет",
+        "Режим только ночных экспериментов": "да" if getattr(args, "night_experiment_only", False) else "нет",
+        "Ночной слот YAML": getattr(args, "night_experiment_slot", "") or "",
+        "Эксперимент 1: строк минимальной ночной ставки": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == EXPERIMENT_1_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0,
+        "Ошибок API": int((api_log.get("api_status", pd.Series(dtype=str)).astype(str).str.contains("exception|error|payload_error", case=False, na=False)).sum()) if api_log is not None and not api_log.empty else 0,
+    }
+
+
+def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.Timestamp]]:
+    as_of = pd.Timestamp(args.as_of).normalize() if args.as_of else pd.Timestamp(datetime.now().date())
     windows = date_windows(as_of)
-
     ads, campaigns = load_ads_daily(args.ads)
     orders = load_orders(args.orders)
     bid_history = load_bid_history(args.bid_history)
     pause_history = load_pause_history(args.pause_history)
     keywords = load_keywords_from_previous(args.previous_output)
-
     campaign_base = build_campaign_base(ads, campaigns, orders, bid_history, windows)
     campaign_base = compute_bid_caps(campaign_base)
     core = build_core_efficiency(keywords, campaigns, campaign_base)
     decisions = decide_all(campaign_base, core, pause_history, windows)
     payload = build_payload_preview(decisions)
+    return decisions, core, payload, windows
 
+
+def run_local(args: argparse.Namespace) -> int:
+    decisions, core, payload, windows = compute_engine(args)
     write_outputs(args.out, decisions, core, payload, windows)
-
     if args.print_summary:
         print(summary_table(decisions, windows).to_string(index=False))
         print(f"Output: {args.out}")
@@ -1083,7 +1473,130 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def _filter_night_decisions(decisions: pd.DataFrame, pause_history: pd.DataFrame, slot: str) -> pd.DataFrame:
+    if decisions is None:
+        return pd.DataFrame()
+    if slot == "start":
+        rows: List[Dict[str, Any]] = []
+        if not decisions.empty:
+            active = decisions[decisions.get("is_active", pd.Series([True] * len(decisions), index=decisions.index)).fillna(True).astype(bool)].copy()
+            for _, r in active.iterrows():
+                article_norm = _normalize_article_for_experiment(r.get("supplier_article", ""))
+                placement = str(r.get("placement", "") or "").lower()
+                if article_norm in EXPERIMENT_1_ARTICLES:
+                    current = float(r.get("real_bid_rub", np.nan)) if pd.notna(r.get("real_bid_rub", np.nan)) else np.nan
+                    target = SEARCH_MIN_BID_RUB if placement == "search" else COMBINED_MIN_BID_RUB
+                    if pd.isna(current) or int(round(current)) != int(target):
+                        item = r.to_dict()
+                        item["action"] = "raise" if pd.isna(current) or current < target else "lower"
+                        item["new_bid_rub"] = int(target)
+                        item["reason_code"] = EXPERIMENT_1_REASON_CODE
+                        item["reason_text"] = f"Ночной эксперимент 01:00-05:00 МСК: привести {article_norm} / {placement} к минимальной ставке {target} ₽"
+                        rows.append(item)
+                if placement == "combined" and float(r.get("drr_pct_14d", np.nan) if pd.notna(r.get("drr_pct_14d", np.nan)) else -1) > DRR_PAUSE_LIMIT_PCT:
+                    item = r.to_dict()
+                    item["action"] = "pause"
+                    item["new_bid_rub"] = np.nan
+                    item["reason_code"] = EXPERIMENT_2_REASON_CODE
+                    item["reason_text"] = f"Ночной эксперимент: combined с ДРР14 {r.get('drr_pct_14d')}% > {DRR_PAUSE_LIMIT_PCT}% на паузу до 05:00 МСК"
+                    rows.append(item)
+        return pd.DataFrame(rows)
+    if slot == "end":
+        rows = []
+        if pause_history is not None and not pause_history.empty:
+            ph = pause_history.copy()
+            if "reason_code" in ph.columns and "campaign_id" in ph.columns:
+                ph = ph[ph["reason_code"].astype(str).eq(EXPERIMENT_2_REASON_CODE)].copy()
+                if not ph.empty:
+                    ph["pause_dt"] = pd.to_datetime(ph.get("pause_date", pd.Series(pd.NaT, index=ph.index)), errors="coerce")
+                    ph = ph.sort_values("pause_dt").drop_duplicates("campaign_id", keep="last")
+                    for _, p in ph.iterrows():
+                        cid = _clean_int(p.get("campaign_id"))
+                        if cid is None:
+                            continue
+                        base = decisions[decisions["campaign_id"].astype(str).eq(str(cid))].tail(1).to_dict("records") if decisions is not None and not decisions.empty and "campaign_id" in decisions.columns else []
+                        item = base[0] if base else {"campaign_id": cid, "nm_id": p.get("nm_id", ""), "placement": p.get("placement", "combined"), "supplier_article": p.get("supplier_article", ""), "subject_norm": p.get("subject_norm", "")}
+                        item["action"] = "start"
+                        item["new_bid_rub"] = COMBINED_MIN_BID_RUB if str(item.get("placement", "")).lower() == "combined" else SEARCH_MIN_BID_RUB
+                        item["reason_code"] = EXPERIMENT_2_START_REASON_CODE
+                        item["reason_text"] = "Ночной эксперимент: вернуть кампанию после окна 01:00-05:00 МСК"
+                        rows.append(item)
+        return pd.DataFrame(rows)
+    return decisions
+
+
+def run_s3_legacy(args: argparse.Namespace) -> int:
+    mode = args.command
+    config = load_runner_config()
+    s3 = make_s3_client(config)
+    bucket = config.yc_bucket_name
+    with tempfile.TemporaryDirectory(prefix="wb_ads_fix46_") as tmp:
+        workdir = Path(tmp)
+        ads_paths: List[str] = []
+        if s3_key_exists(s3, bucket, ADS_MAIN_KEY):
+            ads_paths.append(download_key_to_dir(s3, bucket, ADS_MAIN_KEY, workdir))
+        else:
+            for key in latest_excel_keys(s3, bucket, ADS_WEEKLY_PREFIX, limit=4):
+                ads_paths.append(download_key_to_dir(s3, bucket, key, workdir))
+        if not ads_paths:
+            raise RuntimeError(f"Не найден рекламный отчёт: {ADS_MAIN_KEY} или {ADS_WEEKLY_PREFIX}")
+
+        order_paths = [download_key_to_dir(s3, bucket, key, workdir) for key in latest_excel_keys(s3, bucket, ORDERS_WEEKLY_PREFIX, limit=4)]
+        previous_output_path = maybe_download_key_to_dir(s3, bucket, RUN_OUTPUT_KEY, workdir)
+        bid_history_path = maybe_download_key_to_dir(s3, bucket, BID_HISTORY_KEY, workdir)
+        pause_history_path = maybe_download_key_to_dir(s3, bucket, PAUSE_HISTORY_KEY, workdir)
+
+        local_out = workdir / ("Предпросмотр_последнего_запуска.xlsx" if mode == "preview" else "Итог_последнего_запуска.xlsx")
+        engine_args = argparse.Namespace(
+            ads=";".join(ads_paths),
+            orders=";".join(order_paths) if order_paths else None,
+            previous_output=previous_output_path,
+            bid_history=bid_history_path,
+            pause_history=pause_history_path,
+            as_of=None,
+            out=str(local_out),
+            print_summary=True,
+        )
+        decisions, core, payload, windows = compute_engine(engine_args)
+        if getattr(args, "night_experiment_only", False):
+            ph = load_pause_history(pause_history_path)
+            decisions = _filter_night_decisions(decisions, ph, getattr(args, "night_experiment_slot", "") or "")
+            payload = build_payload_preview(decisions)
+        write_outputs(str(local_out), decisions, core, payload, windows)
+        successful, api_log = apply_api_actions(decisions, config, mode, bool(args.dry_run))
+        bid_history, pause_history = record_successful_events(successful, bid_history_path, pause_history_path)
+
+        # Append API log to existing log if any.
+        api_log_path = maybe_download_key_to_dir(s3, bucket, API_LOG_KEY, workdir)
+        full_api_log = append_excel(api_log_path, api_log)
+        summary = make_summary_json(mode, decisions, successful, full_api_log, windows, args)
+        summary_path = workdir / "Сводка_последнего_запуска.json"
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        bid_history_out = workdir / "История_ставок.xlsx"
+        pause_history_out = workdir / "История_пауз.xlsx"
+        api_log_out = workdir / "Лог_API.xlsx"
+        bid_history.to_excel(bid_history_out, index=False)
+        pause_history.to_excel(pause_history_out, index=False)
+        full_api_log.to_excel(api_log_out, index=False)
+
+        upload_s3_bytes(s3, bucket, PREVIEW_OUTPUT_KEY if mode == "preview" else RUN_OUTPUT_KEY, local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        upload_s3_bytes(s3, bucket, SUMMARY_JSON_KEY, summary_path.read_bytes(), "application/json")
+        upload_s3_bytes(s3, bucket, API_LOG_KEY, api_log_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        upload_s3_bytes(s3, bucket, BID_HISTORY_KEY, bid_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        upload_s3_bytes(s3, bucket, PAUSE_HISTORY_KEY, pause_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # Copy to repository workspace for GitHub artifacts.
+        Path(local_out.name).write_bytes(local_out.read_bytes())
+        Path(summary_path.name).write_bytes(summary_path.read_bytes())
+        Path(api_log_out.name).write_bytes(api_log_out.read_bytes())
+        Path(bid_history_out.name).write_bytes(bid_history_out.read_bytes())
+        Path(pause_history_out.name).write_bytes(pause_history_out.read_bytes())
+
+        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
+def build_local_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="WB Ads Manager FIX46 decision engine")
     p.add_argument("--ads", required=True, help="WB advertising Excel: Реклама_YYYY-WNN.xlsx")
     p.add_argument("--orders", required=False, default=None, help="WB orders Excel for avg finishedPrice")
@@ -1096,10 +1609,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def build_legacy_runner_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="WB Ads Manager FIX46 working S3/API runner")
+    p.add_argument("command", choices=["run", "preview"])
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--skip-price", action="store_true", help="Accepted for compatibility; price contour is absent in FIX46")
+    p.add_argument("--apply-pause", action="store_true")
+    p.add_argument("--apply-start", action="store_true")
+    p.add_argument("--night-experiment-only", action="store_true")
+    p.add_argument("--night-experiment-slot", choices=["start", "end", ""], default="")
+    return p
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
+    argv = list(argv) if argv is not None else list(os.sys.argv[1:])
+    if argv and argv[0] in {"run", "preview"}:
+        parser = build_legacy_runner_parser()
+        args = parser.parse_args(argv)
+        return run_s3_legacy(args)
+    parser = build_local_arg_parser()
     args = parser.parse_args(argv)
-    return run(args)
+    return run_local(args)
 
 
 if __name__ == "__main__":
