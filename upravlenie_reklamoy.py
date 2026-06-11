@@ -39,7 +39,8 @@ from botocore.exceptions import ClientError
 # =============================
 
 SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v30-abc-profitability-guard-2026-06-09"
+EXPECTED_REPO_SCRIPT_PATH = "upravlenie_reklamoy.py"
+SCRIPT_VERSION = "strict-drr-v33-working-replace-upravlenie-2026-06-11"
 STORE_NAME = "TOPFACE"
 DRR_LIMIT_PCT = 10.0
 TECHNICAL_BID_FLOOR_RUB = 1.0
@@ -65,7 +66,8 @@ RAMP_TARGET_IMPRESSIONS_PER_DAY = float(os.environ.get("WB_RAMP_TARGET_IMPRESSIO
 # Базовая цель разгона: довести расход примерно до 500 ₽/день. До этого экономика не является стоп-фактором.
 RAMP_TARGET_SPEND_PER_DAY = float(os.environ.get("WB_RAMP_TARGET_SPEND_PER_DAY", "500") or 500)
 # Если после выхода на 500 ₽/день ДРР < 15% и условная ВП после рекламы положительная,
-# разрешаем масштабировать разгон до 1000 ₽/день. Выше 1000 ₽/день ставку не растим.
+# разрешаем масштабировать разгон до 1000 ₽/день. Разгон — отдельный временный алгоритм,
+# ABC-рентабельность не применяется как стоп-фактор до завершения RAMP_CHECK_DAYS.
 RAMP_SCALE_MAX_SPEND_PER_DAY = float(os.environ.get("WB_RAMP_SCALE_MAX_SPEND_PER_DAY", "1000") or 1000)
 RAMP_MAX_SPEND_PER_DAY = RAMP_SCALE_MAX_SPEND_PER_DAY
 RAMP_OVERSPEND_PER_DAY = float(os.environ.get("WB_RAMP_OVERSPEND_PER_DAY", str(int(RAMP_SCALE_MAX_SPEND_PER_DAY))) or RAMP_SCALE_MAX_SPEND_PER_DAY)
@@ -119,6 +121,10 @@ ABC_REPORT_PREFIXES = [
 ABC_PROFITABILITY_MIN_PCT = float(os.environ.get("WB_ABC_PROFITABILITY_MIN_PCT", "15") or 15)
 # Зона неоднозначного ДРР: около лимита используем рентабельность ABC как решающий фильтр.
 ABC_DRR_UNCERTAINTY_PP = float(os.environ.get("WB_ABC_DRR_UNCERTAINTY_PP", "2") or 2)
+# Если ставка не менялась заданное число дней, используем 7д сравнение: нет роста заказов/ВП — тестируем повышение;
+# заказы/ВП держатся или растут — можно тестировать снижение для экономии бюджета.
+STABLE_BID_DAYS = int(os.environ.get("WB_STABLE_BID_DAYS", "7") or 7)
+STABLE_ORDER_GP_DELTA_FLAT_PCT = float(os.environ.get("WB_STABLE_ORDER_GP_DELTA_FLAT_PCT", "5") or 5)
 PRICE_HISTORY_KEY = SERVICE_PREFIX + "История_изменений_цен.xlsx"
 ONE_CAMPAIGN_EXPERIMENT_HISTORY_KEY = SERVICE_PREFIX + "История_эксперимента_1РК.xlsx"
 
@@ -282,7 +288,7 @@ BID_RAMP_MONITOR_COLUMNS = [
     "current_bid_rub", "min_bid_rub", "new_bid_rub", "api_status",
     "reason_code", "reason_text",
     "wait_status", "wait_rule", "wait_until_date", "wait_days_left",
-    "last_bid_change_date", "last_bid_change_old_bid", "last_bid_change_new_bid", "last_bid_change_reason_code",
+    "last_bid_change_date", "days_since_last_bid_change", "last_bid_change_old_bid", "last_bid_change_new_bid", "last_bid_change_reason_code",
     "impressions", "avg_impressions_per_day", "spend", "avg_spend_per_day", "orders", "revenue",
     "campaign_drr_pct", "drr_limit_pct", "last21_impressions", "last21_drr_pct",
     "keyword_profile_status", "keyword_guard_status", "current_core80_clicks_per_day", "base_core80_clicks_per_day",
@@ -422,6 +428,7 @@ DECISION_COLUMNS = [
     "postcheck_status",
     "last_bid_change_event_id",
     "last_bid_change_date",
+    "days_since_last_bid_change",
     "last_bid_change_old_bid",
     "last_bid_change_new_bid",
     "last_bid_change_direction",
@@ -486,6 +493,7 @@ class RunContext:
     apply_price: bool
     apply_experiment: bool
     night_experiment_only: bool
+    night_experiment_slot: str
     run_datetime: datetime
     mature_end: date
     current_start: date
@@ -1747,6 +1755,13 @@ def parse_abc_export_timestamp_from_key(key: Any) -> datetime:
         return datetime.min
 
 
+def is_closed_abc_week(start: Optional[date], end: Optional[date]) -> bool:
+    """ABC для ставок должен быть закрытой неделей Пн-Вс, а не дневным/MTD файлом."""
+    if start is None or end is None:
+        return False
+    return (end - start).days == 6 and start.weekday() == 0 and end.weekday() == 6
+
+
 def latest_abc_report_key(s3_client, config: Config) -> str:
     keys: List[str] = []
     for prefix in ABC_REPORT_PREFIXES:
@@ -1754,7 +1769,8 @@ def latest_abc_report_key(s3_client, config: Config) -> str:
             keys.extend(list_s3_keys(s3_client, config.yc_bucket_name, prefix))
         except Exception as exc:
             print(f"Предупреждение ABC: не удалось просканировать {prefix}: {exc}", flush=True)
-    candidates = []
+    closed_week_candidates = []
+    fallback_candidates = []
     for key in sorted(set(keys)):
         name = str(key).split("/")[-1]
         low = name.lower()
@@ -1765,11 +1781,23 @@ def latest_abc_report_key(s3_client, config: Config) -> str:
         start, end = parse_abc_period_from_key(key)
         if start is None or end is None:
             continue
-        candidates.append((end, start, parse_abc_export_timestamp_from_key(key), key))
-    if not candidates:
-        return ""
-    candidates.sort()
-    return candidates[-1][3]
+        export_ts = parse_abc_export_timestamp_from_key(key)
+        record = (end, start, export_ts, key)
+        if is_closed_abc_week(start, end):
+            closed_week_candidates.append(record)
+        else:
+            fallback_candidates.append(record)
+    if closed_week_candidates:
+        closed_week_candidates.sort()
+        chosen = closed_week_candidates[-1][3]
+        print(f"Диагностика ABC-рентабельности: выбран закрытый недельный ABC Пн-Вс: {chosen}", flush=True)
+        return chosen
+    if fallback_candidates:
+        fallback_candidates.sort()
+        chosen = fallback_candidates[-1][3]
+        print(f"Предупреждение ABC-рентабельности: закрытая неделя Пн-Вс не найдена, fallback на последний файл: {chosen}", flush=True)
+        return chosen
+    return ""
 
 
 def normalize_abc_profitability_report(df: pd.DataFrame, source_key: str, source_sheet: str = "") -> pd.DataFrame:
@@ -2506,6 +2534,9 @@ def build_windows(run_date: Optional[date] = None) -> Tuple[date, date, date, da
 
 def build_run_context(args: argparse.Namespace) -> RunContext:
     mature_end, current_start, current_end, base_start, base_end = build_windows()
+    night_slot = _clean_text_value(getattr(args, "night_experiment_slot", "") or os.environ.get("WB_NIGHT_EXPERIMENT_SLOT", "")).lower()
+    if night_slot not in {"start", "end"}:
+        night_slot = "auto"
     return RunContext(
         mode=args.command,
         dry_run=bool(args.dry_run),
@@ -2514,6 +2545,7 @@ def build_run_context(args: argparse.Namespace) -> RunContext:
         apply_price=bool(getattr(args, "apply_price", False)),
         apply_experiment=bool(getattr(args, "apply_experiment", False)),
         night_experiment_only=bool(getattr(args, "night_experiment_only", False)),
+        night_experiment_slot=night_slot,
         run_datetime=datetime.now(),
         mature_end=mature_end,
         current_start=current_start,
@@ -3604,6 +3636,23 @@ def decide_action(
 
     step, step_reason = bid_step_rub(placement)
     current_bid_float = float(current_bid)
+    effective_min_bid = pd.to_numeric(row.get("min_bid_rub", business_min_bid_rub(placement)), errors="coerce")
+    if pd.isna(effective_min_bid) or float(effective_min_bid) <= 0:
+        effective_min_bid = business_min_bid_rub(placement)
+    effective_min_bid = max(float(effective_min_bid), business_min_bid_rub(placement))
+
+    # Жёсткий технический пол WB: combined/полки не могут работать ниже 80 ₽.
+    # Если в истории/отчёте осталась старая ставка 3-10 ₽, это не бизнес-решение, а исправление технического минимума.
+    if placement == "combined" and current_bid_float < effective_min_bid - 0.001:
+        target_bid = normalize_bid_to_api_grid(effective_min_bid, placement, "Повысить")
+        return {
+            "action": "Повысить",
+            "new_bid_rub": target_bid,
+            "reason_code": "TECHNICAL_COMBINED_MIN_BID_80_FIX",
+            "reason_text": build_reason_text(row, "Повысить", target_bid, f"combined/полки: текущая ставка {current_bid_float:.2f} ₽ ниже минимальной WB/effective {effective_min_bid:.2f} ₽; приводим к минимальной валидной ставке 80 ₽"),
+            "pause_decision": "",
+        }
+
     drr_limit = drr_limit_for_subject(row.get("subject_norm", ""))
     impressions = money_or_zero(row.get("impressions", 0))
     spend = money_or_zero(row.get("spend", 0))
@@ -3647,10 +3696,9 @@ def decide_action(
     # 3) верхний предел разгона — 1000 ₽/день, выше этого ставку не повышаем.
     if ramp_active:
         gp_after_ads = money_or_zero(row.get("gp_after_ads", 0))
-        # После 500 ₽/день разгон масштабируем только при нормальной ABC-рентабельности.
-        # Если ABC не найден, не блокируем старую логику, но в reason_text будет видно abc_margin=н/д.
-        abc_margin_scale_ok = (pd.isna(abc_margin) or abc_margin_ok)
-        economy_only_scale_ok = (drr < RAMP_SCALE_DRR_LIMIT_PCT and revenue > 0 and orders > 0 and gp_after_ads > 0 and abc_margin_scale_ok)
+        # Разгон — отдельный временный алгоритм. ABC-рентабельность здесь НЕ применяется:
+        # качество разгона контролируем только ДРР, заказами, выручкой, ВП после рекламы и CORE.
+        economy_only_scale_ok = (drr < RAMP_SCALE_DRR_LIMIT_PCT and revenue > 0 and orders > 0 and gp_after_ads > 0)
         economy_scale_ok = economy_only_scale_ok and keyword_scale_ok
         economy_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and not economy_only_scale_ok)
         keyword_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and economy_only_scale_ok and not keyword_scale_ok)
@@ -3709,7 +3757,7 @@ def decide_action(
                 "action": "Повысить",
                 "new_bid_rub": new_bid,
                 "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день уже >= {RAMP_TARGET_SPEND_PER_DAY:.0f}; экономика ОК: ДРР {drr:.2f}% < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП {gp_after_ads:.0f} ₽ > 0, ABC-рентабельность={abc_margin_text}; CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус {keyword_guard_status or 'н/д'}; разрешаем масштабироваться до {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"),
+                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день уже >= {RAMP_TARGET_SPEND_PER_DAY:.0f}; экономика разгона ОК: ДРР {drr:.2f}% < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП {gp_after_ads:.0f} ₽ > 0, выручка/заказы есть; ABC-рентабельность в разгоне не применяется. CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус {keyword_guard_status or 'н/д'}; разрешаем масштабироваться до {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"),
                 "pause_decision": "",
             }
 
@@ -3740,7 +3788,7 @@ def decide_action(
                 "action": "Снизить",
                 "new_bid_rub": new_bid,
                 "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день >= 500, но экономика не проходит масштабирование: ДРР={drr:.2f}% / лимит {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ABC-рентабельность={abc_margin_text} / минимум {ABC_PROFITABILITY_MIN_PCT:.1f}%, ВП после рекламы={gp_after_ads:.0f} ₽, выручка={revenue:.0f} ₽, заказы={orders:.0f}; возвращаемся к уровню около 500 ₽/день"),
+                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день >= 500, но экономика разгона не проходит масштабирование: ДРР={drr:.2f}% / лимит {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП после рекламы={gp_after_ads:.0f} ₽, выручка={revenue:.0f} ₽, заказы={orders:.0f}; ABC-рентабельность в разгоне не применяется; возвращаемся к уровню около 500 ₽/день"),
                 "pause_decision": "",
             }
 
@@ -3750,7 +3798,7 @@ def decide_action(
             (
                 f"разгон активен день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день; "
                 f"цель 500 ₽/день достигнута. Дальше растим только при ДРР < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}% "
-                f"и ВП после рекламы > 0, ABC-рентабельность >= {ABC_PROFITABILITY_MIN_PCT:.1f}% плюс CORE-клики должны расти/держаться; текущие ДРР={drr:.2f}%, ABC-рентабельность={abc_margin_text}, ВП={gp_after_ads:.0f} ₽, "
+                f"и ВП после рекламы > 0 плюс CORE-клики должны расти/держаться; ABC-рентабельность в разгоне не применяется; текущие ДРР={drr:.2f}%, ВП={gp_after_ads:.0f} ₽, "
                 f"выручка={revenue:.0f} ₽, заказы={orders:.0f}; CORE={keyword_guard_status or 'н/д'}, "
                 f"клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день; верхний предел={RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"
             ),
@@ -3830,8 +3878,59 @@ def decide_action(
             "pause_decision": "",
         }
 
-    # ABC-рентабельность — решающий фильтр в спорной зоне ДРР.
-    # Пример: ДРР 11%, ABC-рентабельность 14% -> ставку нужно снижать, а не терпеть из-за CORE-кликов.
+    # Если ставка долго не менялась, используем отдельное правило регулярного теста:
+    # нет роста заказов/ВП — пробуем повысить; заказы/ВП держатся или растут — можно тестово снизить,
+    # чтобы проверить, не переплачиваем ли за тот же результат. Разгон сюда не попадает.
+    latest_event_dt = pd.to_datetime((postcheck_result or {}).get("event_date", ""), errors="coerce")
+    days_since_last_change = None
+    if not pd.isna(latest_event_dt) and ctx is not None:
+        days_since_last_change = (ctx.run_datetime.date() - latest_event_dt.date()).days
+    if days_since_last_change is not None and days_since_last_change >= STABLE_BID_DAYS and final_verdict not in {"RAISE_BAD", "RAISE_NO_TRAFFIC_GROWTH", "LOWER_BAD", "LOWER_BAD_CORE_CLICK_LOSS"}:
+        base_orders = money_or_zero(row.get("base_orders", 0))
+        base_gp = money_or_zero(row.get("base_gp_after_ads", 0))
+        gp_after_ads_now = money_or_zero(row.get("gp_after_ads", 0))
+        orders_delta_pct = _safe_delta_pct(orders, base_orders)
+        gp_delta_pct = _safe_delta_pct(gp_after_ads_now, base_gp)
+        orders_delta_num = None if orders_delta_pct == "" else float(orders_delta_pct)
+        gp_delta_num = None if gp_delta_pct == "" else float(gp_delta_pct)
+        no_growth = (
+            (orders_delta_num is not None and orders_delta_num < STABLE_ORDER_GP_DELTA_FLAT_PCT)
+            or (gp_delta_num is not None and gp_delta_num < STABLE_ORDER_GP_DELTA_FLAT_PCT)
+        )
+        stable_or_growth = (
+            (orders_delta_num is None or orders_delta_num >= -STABLE_ORDER_GP_DELTA_FLAT_PCT)
+            and (gp_delta_num is None or gp_delta_num >= -STABLE_ORDER_GP_DELTA_FLAT_PCT)
+            and orders > 0 and gp_after_ads_now > 0
+        )
+        if no_growth and drr <= drr_limit + ABC_DRR_UNCERTAINTY_PP and not keyword_core_bad:
+            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
+            reason_code = "STABLE_BID_NO_ORDER_GP_GROWTH_TEST_RAISE"
+            if abc_margin_ok and drr >= drr_limit:
+                reason_code = "STABLE_BID_ABC_OK_DRR_SLIGHTLY_HIGH_TEST_RAISE"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            return {
+                "action": "Повысить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Повысить", new_bid, f"ставка не менялась {days_since_last_change} дней; заказы Δ={orders_delta_pct or 'н/д'}%, ВП после рекламы Δ={gp_delta_pct or 'н/д'}%; роста нет/он слабый — тестируем повышение, post-check должен подтвердить рост заказов и ВП"),
+                "pause_decision": "",
+            }
+        if stable_or_growth and drr <= drr_limit and current_bid_float > effective_min_bid + 0.001:
+            new_bid = next_bid_for_action(current_bid_float, placement, "lower")
+            reason_code = "STABLE_BID_ORDERS_GP_HOLD_TRY_LOWER"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            return {
+                "action": "Снизить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Снизить", new_bid, f"ставка не менялась {days_since_last_change} дней; заказы/ВП держатся или растут: заказы Δ={orders_delta_pct or 'н/д'}%, ВП Δ={gp_delta_pct or 'н/д'}%; тестово снижаем, чтобы проверить, можно ли сохранить результат дешевле"),
+                "pause_decision": "",
+            }
+
+    # ABC-рентабельность используется как запас для роста в обычном режиме после разгона.
+    # Если рентабельность >=15%, можно аккуратно выходить за лимит ДРР, но только при заказах и ВП.
     drr_in_uncertain_zone = drr <= (drr_limit + ABC_DRR_UNCERTAINTY_PP)
 
     if drr >= drr_limit:
@@ -3884,10 +3983,25 @@ def decide_action(
         }
 
     if abc_margin_low:
+        gp_after_ads = money_or_zero(row.get("gp_after_ads", 0))
+        # Низкая ABC-рентабельность не является абсолютным запретом роста при ДРР ниже лимита:
+        # смотрим фактическую ВП после рекламы. Если рост ставки не даст прирост заказов/ВП — post-check откатит.
+        if revenue > 0 and orders > 0 and gp_after_ads > 0 and not keyword_core_bad:
+            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
+            reason_code = "DRR_LT_LIMIT_LOW_ABC_PROFITABILITY_GP_OK_TEST_GROW"
+            if step_reason:
+                reason_code += f"__{step_reason}"
+            return {
+                "action": "Повысить",
+                "new_bid_rub": new_bid,
+                "reason_code": reason_code,
+                "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%, ABC-рентабельность {abc_margin_text} < {ABC_PROFITABILITY_MIN_PCT:.1f}%, но ВП после рекламы={gp_after_ads:.0f} ₽ > 0 и заказы есть; тестируем аккуратный рост, post-check должен подтвердить рост заказов и ВП, иначе откат"),
+                "pause_decision": "",
+            }
         return technical_hold(
-            "DRR_LT_LIMIT_BUT_ABC_PROFITABILITY_LOW_HOLD",
+            "DRR_LT_LIMIT_LOW_ABC_PROFITABILITY_GP_NOT_OK_HOLD",
             row,
-            f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%, но ABC-рентабельность {abc_margin_text} < {ABC_PROFITABILITY_MIN_PCT:.1f}%; ставку не повышаем, чтобы не разгонять низкорентабельный товар"
+            f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%, ABC-рентабельность {abc_margin_text} < {ABC_PROFITABILITY_MIN_PCT:.1f}%, но ВП после рекламы={gp_after_ads:.0f} ₽ / заказы={orders:.0f}; роста ставки не делаем до подтверждения экономики"
         )
 
     new_bid = next_bid_for_action(current_bid_float, placement, "raise")
@@ -3900,7 +4014,7 @@ def decide_action(
         "action": "Повысить",
         "new_bid_rub": new_bid,
         "reason_code": reason_code,
-        "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%; ABC-рентабельность={abc_margin_text}; рост разрешён только если рентабельность не ниже {ABC_PROFITABILITY_MIN_PCT:.1f}% или ABC недоступен"),
+        "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%; ABC-рентабельность={abc_margin_text}; если рентабельность >= {ABC_PROFITABILITY_MIN_PCT:.1f}%, товар имеет запас для роста ставки, post-check контролирует заказы и ВП"),
         "pause_decision": "",
     }
 
@@ -3919,7 +4033,22 @@ def moscow_now(ctx: Optional[RunContext] = None) -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
 
 
-def is_night_experiment_window(ctx: Optional[RunContext] = None) -> bool:
+def night_experiment_slot(ctx: Optional[RunContext] = None) -> str:
+    """Слот ночного запуска из YAML.
+
+    Почему это нужно:
+    GitHub Actions schedule иногда стартует с задержкой. Раньше код проверял только
+    фактический час МСК, поэтому scheduled job для 01:00 мог стартовать позже и
+    не применить Эксперимент 1/2. Теперь YAML явно передаёт слот:
+    - start: применить ночные минимальные ставки и ночные паузы;
+    - end: вернуть кампании после ночной паузы;
+    - auto: старая логика по фактическому времени МСК.
+    """
+    slot = _clean_text_value(getattr(ctx, "night_experiment_slot", "") if ctx is not None else os.environ.get("WB_NIGHT_EXPERIMENT_SLOT", "")).lower()
+    return slot if slot in {"start", "end"} else "auto"
+
+
+def is_night_experiment_window_by_clock(ctx: Optional[RunContext] = None) -> bool:
     if not NIGHT_EXPERIMENTS_ENABLED:
         return False
     hour = moscow_now(ctx).hour
@@ -3928,6 +4057,17 @@ def is_night_experiment_window(ctx: Optional[RunContext] = None) -> bool:
     if start < end:
         return start <= hour < end
     return hour >= start or hour < end
+
+
+def is_night_experiment_window(ctx: Optional[RunContext] = None) -> bool:
+    if not NIGHT_EXPERIMENTS_ENABLED:
+        return False
+    slot = night_experiment_slot(ctx)
+    if slot == "start":
+        return True
+    if slot == "end":
+        return False
+    return is_night_experiment_window_by_clock(ctx)
 
 
 def night_experiment_window_text() -> str:
@@ -4247,6 +4387,10 @@ def build_decisions(
         decision = decide_action(row, pending_event=pending, postcheck_result=latest_result, ramp_state=ramp_state, ctx=ctx)
         previous_event_id = _clean_text_value((latest_result or {}).get("event_id", ""))
         postcheck_status = _clean_text_value((latest_result or {}).get("postcheck_status", ""))
+        days_since_last_bid_change = ""
+        last_change_dt = pd.to_datetime((reference_event or {}).get("event_date", ""), errors="coerce") if reference_event else pd.NaT
+        if not pd.isna(last_change_dt) and ctx is not None:
+            days_since_last_bid_change = max((ctx.run_datetime.date() - last_change_dt.date()).days, 0)
         wait_info = pending_wait_info(reference_event, ctx) if reference_event else {
             "wait_rule": "", "wait_until_date": "", "wait_days_left": "", "wait_status": "NO_PREVIOUS_EVENT"
         }
@@ -4311,6 +4455,7 @@ def build_decisions(
             "postcheck_status": postcheck_status,
             "last_bid_change_event_id": _clean_text_value(reference_event.get("event_id", "")) if reference_event else "",
             "last_bid_change_date": _clean_text_value(reference_event.get("event_date", "")) if reference_event else "",
+            "days_since_last_bid_change": days_since_last_bid_change,
             "last_bid_change_old_bid": reference_event.get("old_bid_rub", "") if reference_event else "",
             "last_bid_change_new_bid": reference_event.get("new_bid_rub", "") if reference_event else "",
             "last_bid_change_direction": _clean_text_value(reference_event.get("direction", "")) if reference_event else "",
@@ -5699,6 +5844,7 @@ def build_bid_ramp_monitor(decisions: pd.DataFrame) -> pd.DataFrame:
             "wait_until_date": row.get("wait_until_date", ""),
             "wait_days_left": row.get("wait_days_left", ""),
             "last_bid_change_date": row.get("last_bid_change_date", ""),
+            "days_since_last_bid_change": row.get("days_since_last_bid_change", ""),
             "last_bid_change_old_bid": row.get("last_bid_change_old_bid", ""),
             "last_bid_change_new_bid": row.get("last_bid_change_new_bid", ""),
             "last_bid_change_reason_code": row.get("last_bid_change_reason_code", ""),
@@ -6445,6 +6591,8 @@ def write_outputs(
     summary["Окно ночных экспериментов МСК"] = night_experiment_window_text()
     summary["Окно ночных экспериментов сейчас"] = "активно" if is_night_experiment_window(ctx) else "не активно"
     summary["Режим только ночных экспериментов"] = "да" if bool(getattr(ctx, "night_experiment_only", False)) else "нет"
+    summary["Ночной слот YAML"] = night_experiment_slot(ctx)
+    summary["Окно по фактическому времени МСК"] = "активно" if is_night_experiment_window_by_clock(ctx) else "не активно"
     if decisions is not None and not decisions.empty and "reason_code" in decisions.columns:
         summary["Эксперимент 1: строк минимальной ночной ставки"] = int(decisions["reason_code"].astype(str).eq(EXPERIMENT_1_REASON_CODE).sum())
     if pause_candidates is not None and not pause_candidates.empty and "reason_code" in pause_candidates.columns:
@@ -6503,7 +6651,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     preview = subparsers.add_parser("preview", help="Предпросмотр без отправки изменений ставок")
-    preview.set_defaults(dry_run=False, apply_pause=False, apply_start=False, apply_price=False, apply_experiment=False, skip_price=False, night_experiment_only=False)
+    preview.set_defaults(dry_run=False, apply_pause=False, apply_start=False, apply_price=False, apply_experiment=False, skip_price=False, night_experiment_only=False, night_experiment_slot="auto")
 
     run = subparsers.add_parser("run", help="Боевой расчёт и отправка изменений ставок")
     run.add_argument("--dry-run", action="store_true", help="Расчёт run-режима без реальных API-вызовов")
@@ -6513,6 +6661,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     run.add_argument("--apply-experiment", action="store_true", help="Разрешить применение экспериментального блока 1 РК на товарную группу")
     run.add_argument("--skip-price", action="store_true", help="Не строить контур цен в этом запуске")
     run.add_argument("--night-experiment-only", action="store_true", help="Ночной режим: отправлять только действия Эксперимент 1/2, без обычных изменений ставок")
+    run.add_argument("--night-experiment-slot", choices=["auto", "start", "end"], default=os.environ.get("WB_NIGHT_EXPERIMENT_SLOT", "auto"), help="Слот ночного запуска: start=01:00, end=05:00, auto=по фактическому времени МСК")
     return parser.parse_args(argv)
 
 
@@ -6528,7 +6677,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ctx = build_run_context(args)
     s3_client = make_s3_client(config)
 
-    print(f"[{ctx.run_datetime:%Y-%m-%d %H:%M:%S}] Старт {SCRIPT_NAME}: версия={SCRIPT_VERSION}, режим={ctx.mode}, dry_run={ctx.dry_run}, night_experiment_only={ctx.night_experiment_only}")
+    print(f"[{ctx.run_datetime:%Y-%m-%d %H:%M:%S}] Старт {SCRIPT_NAME}: версия={SCRIPT_VERSION}, режим={ctx.mode}, dry_run={ctx.dry_run}, night_experiment_only={ctx.night_experiment_only}, night_experiment_slot={ctx.night_experiment_slot}")
     print(f"Окна: база {ctx.base_start}..{ctx.base_end}; текущее {ctx.current_start}..{ctx.current_end}; mature_end={ctx.mature_end}")
 
     ads_df = load_ads_report(s3_client, config)
