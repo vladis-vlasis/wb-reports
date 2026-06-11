@@ -1,12 +1,11 @@
-
 name: TOPFACE download Torgstat ABC
-# FIX37_READY_GITHUB_UPLOAD_20260611: active ABC workflow. Upload as .github/workflows/download_torgstat_abc.yml
+# FIX45_ABC_1800_REPORT_1900_WAIT_ABC_20260611: active ABC workflow. Upload as .github/workflows/download_torgstat_abc.yml
 
 on:
   schedule:
-    # Каждый день в 13:30 по Москве / 10:30 UTC.
+    # Каждый день в 18:00 по Москве / 15:00 UTC.
     # В режиме auto: только daily; по понедельникам дополнительно закрытая неделя Mon-Sun. MTD 01.MM-факт день больше не выгружаем.
-    - cron: "30 10 * * *"
+    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -69,7 +68,7 @@ jobs:
           set -euo pipefail
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-          echo "Workflow cron must be 30 10 * * * = 13:30 MSK"
+          echo "Workflow cron must be 0 15 * * * = 18:00 MSK"
 
       - name: Download and upload ABC
         shell: bash
