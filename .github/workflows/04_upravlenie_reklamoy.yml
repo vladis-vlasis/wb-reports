@@ -25,7 +25,7 @@ on:
     # GitHub Actions cron работает в UTC. Москва = UTC+3.
     - cron: "0 22 * * *"  # 01:00 МСК — Эксперимент 1: минимальные ставки; Эксперимент 2: pause combined с ДРР > 15%
     - cron: "0 2 * * *"   # 05:00 МСК — Эксперимент 2: включить обратно ночные паузы
-    - cron: "0 9 * * *"   # 12:00 МСК — основной дневной запуск алгоритма
+    - cron: "0 11 * * *"  # 14:00 МСК — основной дневной запуск алгоритма
 
 concurrency:
   group: topface-wb-ads-manager
@@ -189,8 +189,8 @@ jobs:
           if not vm:
               raise SystemExit(f"ERROR: Неизвестный формат SCRIPT_VERSION: {version}")
           vnum = int(vm.group(1))
-          if vnum < 30:
-              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v30+")
+          if vnum < 32:
+              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v32+ с принудительным ночным слотом")
 
           markers = [
               "night_experiment_only",
@@ -198,11 +198,12 @@ jobs:
               "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE",
               "ABC_PROFITABILITY_MIN_PCT",
               "abc_profitability_pct",
+              "night_experiment_slot",
           ]
           missing = [marker for marker in markers if marker not in text]
           if missing:
               raise SystemExit("ERROR: В коде нет обязательных маркеров: " + ", ".join(missing))
-          print("Code marker check OK: v30+, night experiments, ABC profitability present.")
+          print("Code marker check OK: v32+, forced night slot, night experiments, ABC profitability present.")
           PY
 
           echo "=== Script SHA256 ==="
@@ -229,13 +230,13 @@ jobs:
             case "$SCHEDULE_CRON" in
               "0 22 * * *")
                 SLOT="night_start"
-                CMD="$BASE_CMD --night-experiment-only --apply-pause"
+                CMD="$BASE_CMD --night-experiment-only --night-experiment-slot start --apply-pause"
                 ;;
               "0 2 * * *")
                 SLOT="night_end"
-                CMD="$BASE_CMD --night-experiment-only --apply-start"
+                CMD="$BASE_CMD --night-experiment-only --night-experiment-slot end --apply-start"
                 ;;
-              "0 9 * * *")
+              "0 11 * * *")
                 SLOT="main"
                 CMD="$BASE_CMD"
                 ;;
@@ -248,11 +249,11 @@ jobs:
             case "$INPUT_RUN_SLOT" in
               "night_start")
                 SLOT="night_start"
-                CMD="$BASE_CMD --night-experiment-only --apply-pause"
+                CMD="$BASE_CMD --night-experiment-only --night-experiment-slot start --apply-pause"
                 ;;
               "night_end")
                 SLOT="night_end"
-                CMD="$BASE_CMD --night-experiment-only --apply-start"
+                CMD="$BASE_CMD --night-experiment-only --night-experiment-slot end --apply-start"
                 ;;
               "main"|"")
                 SLOT="main"
