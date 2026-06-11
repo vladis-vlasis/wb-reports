@@ -1,6899 +1,9716 @@
+# VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
+# PATCH: FIX31_1500_MSK_ZERODIV_SCHEDULE_20260608
+# INTERNAL_FIX: FIX30_STRICT_1330_NO_MTD_WEEKLY_DAILY_GP_20260604
+# CALC_REPAIR: 2026-06-02 nmId canonical article + May closed month + orders-rub card
+# FIX27: weekly page-1 cards + demand fallback for missing day + money dynamics for orders-rub cards
+# FIX39: Telegram sends all-category daily summaries by manager using ABC Ваша категория
+# FIX40: advertising sources are store-scoped; Telegram/PDF can use filtered ads_daily when category sheet is absent
+# FIX41: Telegram manager ads uses current-date all-category manager_ads_daily_source; stale category sheet no longer zeros spend; ads_daily keeps subject for new nmId fallback
+# FIX42: Telegram manager GP is taken strictly from exact daily ABC rows using raw Ваша категория; no model/reference remapping
+# FIX43: Telegram manager order_sum was temporarily taken from daily ABC gross_revenue
+# FIX44: Telegram order_sum is from WB Orders; gross_profit remains from exact daily ABC; ads from safe TOPFACE daily ads
+# FIX38: advertising truth uses category-level ad report only; raw campaign rows are not allowed for PDF/Telegram totals
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-assistant_wb_ads_manager.py
+WB TOPFACE analytics report.
 
-Новый скрипт управления рекламными ставками WB для магазина TOPFACE.
+Main goals:
+- оперативная валовая прибыль по заказам с корректным % выкупа WB = buyouts / (buyouts + cancels);
+- недельный факторный анализ по товарам и артикулам;
+- средние и целевые значения за 90 дней;
+- анализ рекламы manual/unified;
+- поисковые запросы, % трафика, ядро ключей 80% заказов, позиции и рейтинги;
+- точки входа / каналы продаж;
+- локализация по складам с региональными заменами;
+- выводы о причинах отклонения от плана/цели.
 
-Логика принятия решений строго бинарная:
-- ДРР кампании >= 10.0% -> снизить ставку;
-- ДРР кампании < 10.0% -> повысить ставку.
-
-Активная управляемая строка ставки не удерживается без действия, кроме технических
-исключений с фиксированным reason_code.
+Outputs are overwritten every run:
+1. Отчёты/Объединенный отчет/TOPFACE/Объединенный_отчет_TOPFACE.xlsx
+2. Отчёты/Объединенный отчет/TOPFACE/Технические_расчеты_TOPFACE.xlsx
+3. Отчёты/Объединенный отчет/TOPFACE/Пример_расчета_901_TOPFACE.xlsx
+4. Отчёты/Объединенный отчет/TOPFACE/Средние_и_целевые_значения_TOPFACE.xlsx
+5. Отчёты/Объединенный отчет/TOPFACE/Каналы_продаж_и_реклама_TOPFACE.xlsx
+6. Отчёты/Объединенный отчет/TOPFACE/Поисковые_запросы_и_позиции_TOPFACE.xlsx
+7. Отчёты/Объединенный отчет/TOPFACE/Локализация_TOPFACE.xlsx
+8. Отчёты/Объединенный отчет/TOPFACE/Выводы_по_причинам_TOPFACE.xlsx
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import io
-import json
 import math
 import os
 import re
-import sys
-import time
-import uuid
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import hashlib
+import shutil
+import zipfile
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import boto3
+import numpy as np
 import pandas as pd
-import requests
-from botocore.exceptions import ClientError
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
+TARGET_SUBJECTS = [
+    "Кисти косметические",
+    "Помады",
+    "Блески",
+    "Косметические карандаши",
+]
 
-# =============================
-# Константы проекта
-# =============================
+# Global approved product -> category mapping for all operational reports.
+# This prevents liquid eyeliners / liners (405/406/552) and service/stock-only
+# products from leaking into "Косметические карандаши" through nmId dictionary joins.
+# 158 is a lipstick family and must stay in "Помады".
+VALID_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = {
+    "901": "Кисти косметические",
+    "605": "Косметические карандаши",
+    "611": "Косметические карандаши",
+    "613": "Косметические карандаши",
+    "614": "Косметические карандаши",
+    "617": "Косметические карандаши",
+    "618": "Косметические карандаши",
+    "154": "Помады",
+    "155": "Помады",
+    "156": "Помады",
+    "157": "Помады",
+    "158": "Помады",
+    "206": "Помады",
+    "207": "Блески",
+    "209": "Блески",
+    "210": "Блески",
+    "211": "Блески",
+}
+VALID_PRODUCT_CODES = set(VALID_PRODUCT_CATEGORY_REFERENCE)
 
-SCRIPT_NAME = "assistant_wb_ads_manager.py"
-SCRIPT_VERSION = "strict-drr-v32-forced-night-slot-2026-06-10"
-STORE_NAME = "TOPFACE"
-DRR_LIMIT_PCT = 10.0
-TECHNICAL_BID_FLOOR_RUB = 1.0
-ANALYSIS_WINDOW_DAYS = 5
-
-# ДРР теперь не общий для всех: для помад, блесков и косметических карандашей допустимый порог 15%.
-SUBJECT_DRR_LIMITS = {
-    "кисти косметические": 10.0,
-    "помады": 15.0,
-    "блески": 15.0,
-    "косметические карандаши": 15.0,
+EXCLUDE_ARTICLES_UPPER = {
+    "CZ420", "CZ420БРОВИ", "CZ420ГЛАЗА", "DE49", "DE49ГЛАЗА", "PT901",
 }
 
-# Пауза запрещена для кистей. Пауза разрешена только для этих предметов и только при достаточной статистике.
-PAUSE_ALLOWED_SUBJECTS = {"помады", "блески", "косметические карандаши"}
-PAUSE_MIN_IMPRESSIONS = int(os.environ.get("WB_PAUSE_MIN_IMPRESSIONS", "10000") or 10000)
-PAUSE_ANALYSIS_DAYS = int(os.environ.get("WB_PAUSE_ANALYSIS_DAYS", "21") or 21)
-AUTO_APPLY_PAUSE_REASON_CODES = {"PAUSE_MIN_BID_HIGH_DRR_21D_10000", "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE"}
-AUTO_APPLY_START_REASON_CODES = {"START_AFTER_ECONOMY_RECOVERY_D7", "START_AFTER_ECONOMY_RECOVERY_D14", "ROLLBACK_WRONG_SUBJECT_PAUSE", "EXPERIMENT_2_NIGHT_WINDOW_END_START"}
+EXAMPLE_ARTICLES = ["901/5", "901/8", "901/14", "901/18"]
 
-# Разгон слабых кампаний: цель — дать карточке трафик и проверить, будут ли заказы.
-RAMP_TARGET_IMPRESSIONS_PER_DAY = float(os.environ.get("WB_RAMP_TARGET_IMPRESSIONS_PER_DAY", "1000") or 1000)
-# Базовая цель разгона: довести расход примерно до 500 ₽/день. До этого экономика не является стоп-фактором.
-RAMP_TARGET_SPEND_PER_DAY = float(os.environ.get("WB_RAMP_TARGET_SPEND_PER_DAY", "500") or 500)
-# Если после выхода на 500 ₽/день ДРР < 15% и условная ВП после рекламы положительная,
-# разрешаем масштабировать разгон до 1000 ₽/день. Разгон — отдельный временный алгоритм,
-# ABC-рентабельность не применяется как стоп-фактор до завершения RAMP_CHECK_DAYS.
-RAMP_SCALE_MAX_SPEND_PER_DAY = float(os.environ.get("WB_RAMP_SCALE_MAX_SPEND_PER_DAY", "1000") or 1000)
-RAMP_MAX_SPEND_PER_DAY = RAMP_SCALE_MAX_SPEND_PER_DAY
-RAMP_OVERSPEND_PER_DAY = float(os.environ.get("WB_RAMP_OVERSPEND_PER_DAY", str(int(RAMP_SCALE_MAX_SPEND_PER_DAY))) or RAMP_SCALE_MAX_SPEND_PER_DAY)
-RAMP_SCALE_DRR_LIMIT_PCT = float(os.environ.get("WB_RAMP_SCALE_DRR_LIMIT_PCT", "15") or 15)
-# Контроль качества трафика: клики/переходы по CORE_80 важнее краткосрочного ДРР,
-# потому что заказы могут доезжать спустя 1-2 недели после рекламного клика.
-KEYWORD_CORE_CLICK_GUARD_ENABLED = str(os.environ.get("WB_KEYWORD_CORE_CLICK_GUARD_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "нет"}
-KEYWORD_CORE_CLICK_RISK_DROP_PCT = float(os.environ.get("WB_KEYWORD_CORE_CLICK_RISK_DROP_PCT", "15") or 15)
-KEYWORD_CORE_CLICK_BAD_DROP_PCT = float(os.environ.get("WB_KEYWORD_CORE_CLICK_BAD_DROP_PCT", "20") or 20)
-KEYWORD_CORE_MIN_CLICKS_PER_DAY = float(os.environ.get("WB_KEYWORD_CORE_MIN_CLICKS_PER_DAY", "20") or 20)
-KEYWORD_CORE_POSITION_RISK_DELTA = float(os.environ.get("WB_KEYWORD_CORE_POSITION_RISK_DELTA", "3") or 3)
-KEYWORD_CORE_VISIBILITY_RISK_DROP_PP = float(os.environ.get("WB_KEYWORD_CORE_VISIBILITY_RISK_DROP_PP", "5") or 5)
-KEYWORD_HARD_REDUCE_EXTRA_DRR_PP = float(os.environ.get("WB_KEYWORD_HARD_REDUCE_EXTRA_DRR_PP", "5") or 5)
-RAMP_CHECK_DAYS = int(os.environ.get("WB_RAMP_CHECK_DAYS", "14") or 14)
+OUT_DIR = "Отчёты/Объединенный отчет/TOPFACE"
+MAIN_REPORT_NAME = "Объединенный_отчет_TOPFACE.xlsx"
+TECH_REPORT_NAME = "Технические_расчеты_TOPFACE.xlsx"
+EXAMPLE_REPORT_NAME = "Пример_расчета_901_TOPFACE.xlsx"
+POTENTIAL_REPORT_NAME = "Средние_и_целевые_значения_TOPFACE.xlsx"
+CHANNEL_REPORT_NAME = "Каналы_продаж_и_реклама_TOPFACE.xlsx"
+SEARCH_REPORT_NAME = "Поисковые_запросы_и_позиции_TOPFACE.xlsx"
+LOCALIZATION_REPORT_NAME = "Локализация_TOPFACE.xlsx"
+CONCLUSIONS_REPORT_NAME = "Выводы_по_причинам_TOPFACE.xlsx"
 
-# Эксперимент: одна лучшая РК на товарную группу для помад/блесков/карандашей.
-ONE_CAMPAIGN_EXPERIMENT_SUBJECTS = {"помады", "блески", "косметические карандаши"}
-ONE_CAMPAIGN_TARGET_POSITION = int(os.environ.get("WB_ONE_CAMPAIGN_TARGET_POSITION", "10") or 10)
-ONE_CAMPAIGN_CHECK_DAYS = (7, 10, 14)
+HEADER_FILL = PatternFill("solid", fgColor="17365D")
+HEADER_FONT = Font(color="FFFFFF", bold=True)
+TITLE_FILL = PatternFill("solid", fgColor="1F4E79")
+SECTION_FILL = PatternFill("solid", fgColor="D9EAF7")
+SUBSECTION_FILL = PatternFill("solid", fgColor="EAF4FF")
+GOOD_FILL = PatternFill("solid", fgColor="C6EFCE")
+WARN_FILL = PatternFill("solid", fgColor="FFF2CC")
+BAD_FILL = PatternFill("solid", fgColor="FFC7CE")
+THIN = Side(style="thin", color="D9D9D9")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-MANAGED_SUBJECTS = {
-    "кисти косметические",
-    "помады",
-    "блески",
-    "косметические карандаши",
+WEEKDAY_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MONTH_RU = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 5: "Май", 6: "Июнь",
+    7: "Июль", 8: "Август", 9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
 }
 
-SERVICE_PREFIX = "Служебные файлы/Ассистент WB/TOPFACE/"
-ADS_MAIN_KEY = "Отчёты/Реклама/TOPFACE/Анализ рекламы.xlsx"
-ADS_WEEKLY_PREFIX = "Отчёты/Реклама/TOPFACE/Недельные/"
+# Broad alias dictionary. The code never fails because of one missing cosmetic column: it writes diagnostics instead.
+ALIASES: Dict[str, Sequence[str]] = {
+    "day": ["Дата", "Дата заказа", "Дата сбора", "Дата запроса", "dt", "date", "День"],
+    "nm_id": ["Артикул WB", "Артикул ВБ", "Артикул ВБ", "nmID", "nmId", "nm_id", "Артикул WB", "Номенклатура", "Артикул ВБ"],
+    "supplier_article": ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "Артикул WB продавца"],
+    "subject": ["Предмет", "subject", "Название предмета", "Категория", "category"],
+    "brand": ["Бренд", "brand"],
+    "manager": ["Ваша категория", "Менеджер", "manager", "owner", "Ответственный"],
+    "title": ["Название", "Название товара", "Товар", "Наименование"],
+    "warehouse": ["Склад", "warehouseName", "warehouse"],
+    "orders": ["Заказы", "orders", "ordersCount", "Количество заказов", "Кол-во заказов", "Заказали товаров, шт", "Заказали, шт", "Заказали"],
+    "order_sum": ["Сумма заказов", "ordersSumRub", "ordersSum", "Сумма заказов, руб", "Сумма заказов со скидкой", "Сумма заказов (со скидкой)", "Заказали на сумму", "Заказали, руб", "Сумма", "Итого"],
+    "is_cancel": ["isCancel", "is_cancel", "Отменен", "Отменён", "Отмена", "Отменено", "Заказ отменен", "Заказ отменён"],
+    "cancel_date": ["cancelDate", "cancel_date", "Дата отмены", "Дата отмены заказа", "Дата отмены/возврата"],
+    "order_status": ["Статус", "status", "Статус заказа", "Статус товара", "Состояние"],
+    "open_cards": ["Открытия карточки", "openCardCount", "Переходы в карточку", "Клики", "Клики карточки"],
+    "add_to_cart": ["Добавления в корзину", "addToCartCount", "Корзины", "ATBS"],
+    "cart_conv": ["Конверсия в корзину", "addToCartConversion", "Конверсия в корзину %"],
+    "order_conv": ["Конверсия в заказ", "cartToOrderConversion", "Конверсия в заказ %"],
+    "buyouts_count": ["buyoutsCount", "Выкупы", "Выкупили, шт", "Выкупили", "Кол-во выкупов"],
+    "buyout_sum": ["buyoutsSumRub", "Выкупили, руб", "Сумма выкупов"],
+    "cancels_count": ["cancelCount", "cancelsCount", "Отменили, шт", "Отменили", "Отмены", "Отменено"],
+    "finished_price": ["finishedPrice", "Средняя конечная цена", "Средняя цена покупателя", "Цена покупателя", "Цена с учетом всех скидок, кроме суммы по WB Кошельку"],
+    "price_with_disc": ["priceWithDisc", "Цена продажи", "Средняя цена продажи", "Цена со скидкой продавца, в том числе со скидкой WB Клуба"],
+    "spp": ["СПП, %", "SPP", "Скидка WB, %", "spp"],
+    "spend": ["Расход", "spend", "Продвижение", "Затраты", "Расходы"],
+    "impressions": ["Показы", "shows", "views", "impressions"],
+    "clicks": ["Клики", "Клики РК", "clicks", "clicksCount", "Переходы в карточку"],
+    "ctr": ["CTR", "CTR РК", "ctr"],
+    "cpc": ["CPC", "cpc"],
+    "cr": ["CR", "cr"],
+    "ad_orders": ["Заказы", "Заказы РК", "Заказы из рекламы", "orders"],
+    "ad_order_sum": ["Сумма заказов", "Сумма заказов РК", "ordersSumRub"],
+    "drr": ["ДРР", "ДРР, %", "drr", "drr_pct"],
+    "campaign_id": ["ID кампании", "advertId", "campaignId"],
+    "bid_type": ["Тип ставки", "bidType"],
+    "search_query": ["Поисковый запрос", "Запрос", "Ключевой запрос", "Ключевая фраза", "keyword", "query"],
+    "filter": ["Фильтр"],
+    "frequency": ["Частота запросов", "Частотность", "Частота", "frequency"],
+    "median_position": ["Медианная позиция", "medianPosition"],
+    "avg_position": ["Средняя позиция", "averagePosition"],
+    "visibility": ["Видимость %", "Видимость", "visibility"],
+    "rating_card": ["Рейтинг карточки"],
+    "rating_reviews": ["Рейтинг отзывов"],
+    "entry_section": ["Раздел", "Источник", "Группа источника"],
+    "entry_point": ["Точка входа", "Канал", "Источник перехода"],
+    "stock": ["Доступно для продажи", "Остаток", "Остатки", "Доступный остаток", "Остаток, шт", "Количество", "Полное количество", "Всего", "stock", "quantity", "qty"],
+    "gross_profit": ["Валовая прибыль", "Валовая прибыль, руб", "Валовая прибыль, руб/ед"],
+    "gross_revenue": ["Валовая выручка", "Валовая выручка, руб", "Выручка"],
+    "margin_pct": ["Рентабельность, %", "Рентабельность", "margin_pct"],
+    "commission_amount": ["Комиссия", "Комиссия WB", "Комиссия ВБ"],
+    "acquiring_amount": ["Эквайринг", "Эквайринг WB"],
+    "commission_pct": ["Комиссия WB, %", "Комиссия ВБ, %", "Комиссия, %"],
+    "acquiring_pct": ["Эквайринг, %", "Эквайринг WB, %"],
+    "logistics_direct": ["Логистика прямая, руб/ед", "Логистика прямая"],
+    "logistics_return": ["Логистика обратная, руб/ед", "Логистика обратная"],
+    "storage": ["Хранение, руб/ед", "Хранение"],
+    "other_costs": ["Прочие расходы, руб/ед", "Прочие расходы"],
+    "cost": ["Себестоимость, руб", "Себестоимость", "Себестоимость, руб/ед"],
+    "week": ["Неделя", "week", "week_code"],
+}
 
-BID_HISTORY_KEY = SERVICE_PREFIX + "История_ставок.xlsx"
-PAUSE_HISTORY_KEY = SERVICE_PREFIX + "История_пауз.xlsx"
-RUN_OUTPUT_KEY = SERVICE_PREFIX + "Итог_последнего_запуска.xlsx"
-PREVIEW_OUTPUT_KEY = SERVICE_PREFIX + "Предпросмотр_последнего_запуска.xlsx"
-SUMMARY_JSON_KEY = SERVICE_PREFIX + "Сводка_последнего_запуска.json"
-API_LOG_KEY = SERVICE_PREFIX + "Лог_API.xlsx"
+REGIONAL_REPLACEMENT_POOLS = {
+    "ЦФО": ["КОЛЕДИНО", "ЭЛЕКТРОСТАЛ", "БЕЛАЯ ДАЧ", "ВЕШК", "ВЁШК", "РЯЗАН", "ТУЛ", "АЛЕКСИН", "ВЛАДИМИР", "КОТОВСК", "ВОРОНЕЖ"],
+    "ЮГ": ["КРАСНОДАР", "НЕВИННОМЫССК", "ВОЛГОГРАД", "РОСТОВ", "АКСАЙ"],
+    "ПОВОЛЖЬЕ": ["КАЗАН", "ПЕНЗ", "САРАПУЛ", "НОВОСЕМЕЙКИНО", "САМАР"],
+    "СЗФО": ["ШУШАР", "САНКТ", "ПЕТЕРБУРГ", "УТКИН", "СПБ"],
+    "УРАЛ": ["ЕКАТЕРИНБУРГ", "ЧЕЛЯБИНСК", "ПЕРМ"],
+    "СИБИРЬ": ["НОВОСИБИРСК", "КРАСНОЯРСК", "КЕМЕРОВО"],
+}
 
-KEYWORDS_WEEKLY_PREFIX = "Отчёты/Поисковые запросы/TOPFACE/Недельные/"
-FUNNEL_KEY = "Отчёты/Воронка продаж/TOPFACE/Воронка продаж.xlsx"
-ECONOMICS_KEY = "Отчёты/Финансовые показатели/TOPFACE/Экономика.xlsx"
-# ABC / АБС анализ ТОРГСТАТ: источник рентабельности по SKU.
-# Основной путь в S3: Отчёты/ABC/wb_abc_report_goods__DD.MM.YYYY-DD.MM.YYYY__at_YYYY-MM-DD_HH-MM.xlsx
-ABC_REPORT_PREFIXES = [
-    "Отчёты/ABC/",
-    "Отчёты/ABC/TOPFACE/",
-    "Отчёты/АБС/",
-    "Отчёты/АБС анализ/",
-    "Отчёты/АБС анализ/TOPFACE/",
-]
-ABC_PROFITABILITY_MIN_PCT = float(os.environ.get("WB_ABC_PROFITABILITY_MIN_PCT", "15") or 15)
-# Зона неоднозначного ДРР: около лимита используем рентабельность ABC как решающий фильтр.
-ABC_DRR_UNCERTAINTY_PP = float(os.environ.get("WB_ABC_DRR_UNCERTAINTY_PP", "2") or 2)
-# Если ставка не менялась заданное число дней, используем 7д сравнение: нет роста заказов/ВП — тестируем повышение;
-# заказы/ВП держатся или растут — можно тестировать снижение для экономии бюджета.
-STABLE_BID_DAYS = int(os.environ.get("WB_STABLE_BID_DAYS", "7") or 7)
-STABLE_ORDER_GP_DELTA_FLAT_PCT = float(os.environ.get("WB_STABLE_ORDER_GP_DELTA_FLAT_PCT", "5") or 5)
-PRICE_HISTORY_KEY = SERVICE_PREFIX + "История_изменений_цен.xlsx"
-ONE_CAMPAIGN_EXPERIMENT_HISTORY_KEY = SERVICE_PREFIX + "История_эксперимента_1РК.xlsx"
-
-WB_PRICES_BASE_URL = "https://discounts-prices-api.wildberries.ru"
-WB_PRICES_LIST_ENDPOINT = "/api/v2/list/goods/filter"
-WB_PRICE_UPLOAD_ENDPOINT = "/api/v2/upload/task"
-
-DEFAULT_SELLER_DISCOUNT_PCT = 26
-DEFAULT_PRICE_RAISE_STEP_PP = 1
-DEFAULT_MIN_SELLER_DISCOUNT_PCT = int(os.environ.get("WB_PRICE_MIN_SELLER_DISCOUNT_PCT", "25") or 25)
-PRICE_TEST_SUBJECTS = {"помады", "блески", "косметические карандаши"}
-MAX_PRICE_TEST_ITEMS_PER_RUN = int(os.environ.get("WB_MAX_PRICE_TEST_ITEMS_PER_RUN", "30") or 30)
-
-# Контур корректировки цен отключён: цены сейчас ведёт внешний автоматический репрайсер.
-# Даже если передать --apply-price, скрипт не должен читать Discounts & Prices API,
-# не должен формировать ценовые рекомендации и не должен перезаписывать историю цен.
-PRICE_CORRECTION_ENABLED = False
-
-# Защита от резкого скачка CPM/полок с 2-7 ₽ сразу до минимума WB 80 ₽,
-# если текущая короткая экономика уже показывает плохой тест.
-CPM_MIN_JUMP_DRR_BLOCK_PCT = 15.0
-CPM_MIN_JUMP_NO_REVENUE_CLICKS_BLOCK = 20
-CPM_MIN_JUMP_NO_REVENUE_SPEND_BLOCK_RUB = 100.0
-
-# Ночные эксперименты по Москве. GitHub Actions обычно живёт в UTC, поэтому окно считаем явно в MSK = UTC+3.
-NIGHT_EXPERIMENTS_ENABLED = str(os.environ.get("WB_NIGHT_EXPERIMENTS_ENABLED", "1")).strip().lower() not in {"0", "false", "no", "нет"}
-NIGHT_EXPERIMENT_START_HOUR_MSK = int(os.environ.get("WB_NIGHT_EXPERIMENT_START_HOUR_MSK", "1") or 1)
-NIGHT_EXPERIMENT_END_HOUR_MSK = int(os.environ.get("WB_NIGHT_EXPERIMENT_END_HOUR_MSK", "5") or 5)
-EXPERIMENT_1_ARTICLES = {"901/6", "901/2", "901/8"}
-EXPERIMENT_1_REASON_CODE = "EXPERIMENT_1_NIGHT_MIN_BID_MSK_1_5"
-EXPERIMENT_2_REASON_CODE = "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE"
-EXPERIMENT_2_START_REASON_CODE = "EXPERIMENT_2_NIGHT_WINDOW_END_START"
-EXPERIMENT_2_DRR_LIMIT_PCT = float(os.environ.get("WB_EXPERIMENT_2_DRR_LIMIT_PCT", "15") or 15)
-
-# Условная ВП после рекламы: вычитаем себестоимость, если она есть в Экономике.
-ECONOMICS_SUBTRACT_COGS = str(os.environ.get("WB_ECONOMICS_SUBTRACT_COGS", "1")).strip().lower() not in {"0", "false", "no", "нет"}
+# ------------------------- helpers -------------------------
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
-WB_ADVERT_BASE_URL = "https://advert-api.wildberries.ru"
-WB_BIDS_ENDPOINT = "/api/advert/v1/bids"
-WB_BIDS_MIN_ENDPOINT = "/api/advert/v1/bids/min"
+def normalize_text(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return re.sub(r"\s+", " ", str(value).replace("\xa0", " ").strip())
 
-MIN_BID_COLUMNS = [
-    "run_datetime",
-    "campaign_id",
-    "nm_id",
-    "placement",
-    "payment_type",
-    "min_bid_rub",
-    "api_status",
-    "response_text",
-]
 
-RENAME_CAMPAIGN_COLUMNS = [
-    "run_datetime",
-    "campaign_id",
-    "current_name",
-    "target_name",
-    "supplier_article",
-    "nm_ids",
-    "subjects",
-    "rename_action",
-    "reason_code",
-    "api_status",
-    "response_text",
-]
-WB_PAUSE_ENDPOINT = "/adv/v0/pause"
-WB_START_ENDPOINT = "/adv/v0/start"
-WB_RENAME_ENDPOINT = "/adv/v0/rename"
+def norm_key(value: Any) -> str:
+    text = normalize_text(value).lower().replace("ё", "е")
+    text = re.sub(r"[^a-zа-я0-9%]+", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
 
-BID_HISTORY_COLUMNS = [
-    "event_id",
-    "run_datetime",
-    "event_date",
-    "campaign_id",
-    "nm_id",
-    "supplier_article",
-    "subject_norm",
-    "placement",
-    "old_bid_rub",
-    "new_bid_rub",
-    "direction",
-    "reason_code",
-    "spend_before",
-    "revenue_before",
-    "orders_before",
-    "impressions_before",
-    "clicks_before",
-    "drr_before",
-    "gp_before",
-    "postcheck_status",
-    "final_verdict",
-    "d1_verdict",
-    "d3_verdict",
-    "d1_check_date",
-    "d3_check_date",
-    "d7_verdict",
-    "d7_check_date",
-]
 
-KEYWORD_POSITION_COLUMNS = [
-    "date", "nm_id", "supplier_article", "subject_norm", "query_text", "filter_type",
-    "query_freq", "median_position", "visibility_pct", "clicks_to_card", "keyword_orders",
-    "keyword_group", "orders_share", "orders_cum_share",
-]
-
-KEYWORD_EFFECT_COLUMNS = [
-    "event_id", "campaign_id", "nm_id", "supplier_article", "placement", "direction", "event_date",
-    "keyword_group", "queries_count",
-    "position_before", "position_d1", "position_d3", "position_delta_d1", "position_delta_d3",
-    "visibility_before", "visibility_d1", "visibility_d3", "visibility_delta_d1", "visibility_delta_d3",
-    "clicks_before", "clicks_d1", "clicks_d3", "clicks_delta_d1_pct", "clicks_delta_d3_pct",
-    "keyword_orders_before", "keyword_orders_d1", "keyword_orders_d3",
-    "query_freq_before", "query_freq_d1", "query_freq_d3",
-    "keyword_verdict_d1", "keyword_verdict_d3", "keyword_comment",
-]
-
-KEYWORD_TRAFFIC_GUARD_COLUMNS = [
-    "nm_id", "supplier_article", "subject_norm",
-    "keyword_profile_status", "keyword_guard_status",
-    "core80_queries_count",
-    "base_core80_clicks", "current_core80_clicks",
-    "base_core80_clicks_per_day", "current_core80_clicks_per_day", "core80_clicks_delta_pct",
-    "base_core80_orders", "current_core80_orders", "core80_orders_delta_pct",
-    "base_core80_avg_position", "current_core80_avg_position", "core80_position_delta",
-    "base_core80_visibility_pct", "current_core80_visibility_pct", "core80_visibility_delta_pp",
-    "base_tail_clicks", "current_tail_clicks", "tail_clicks_delta_pct",
-    "core_click_guard_comment",
-]
-
-KEYWORD_LOSS_DETAIL_COLUMNS = [
-    "nm_id", "supplier_article", "subject_norm", "query_text", "keyword_group",
-    "orders_share", "orders_cum_share",
-    "base_clicks", "current_clicks", "clicks_delta", "clicks_delta_pct",
-    "base_orders", "current_orders", "orders_delta", "orders_delta_pct",
-    "base_position", "current_position", "position_delta",
-    "base_visibility_pct", "current_visibility_pct", "visibility_delta_pp",
-    "risk_status",
-]
-
-PRICE_HISTORY_COLUMNS = [
-    "price_event_id", "run_datetime", "event_date", "nm_id", "supplier_article", "subject_norm",
-    "old_discount", "new_discount", "direction", "reason_code",
-    "orders_before", "impressions_before", "clicks_before", "ctr_before",
-    "card_views_before", "add_to_cart_before", "funnel_orders_before",
-    "add_to_cart_conv_before", "cart_to_order_conv_before", "funnel_missing",
-    "postcheck_status", "final_verdict", "d2_verdict", "d2_check_date",
-    "api_status", "api_response",
-]
-
-PRICE_DECISION_COLUMNS = [
-    "nm_id", "supplier_article", "subject_norm", "current_discount", "new_discount", "price_action",
-    "reason_code", "reason_text", "orders", "impressions", "clicks", "ctr_pct",
-    "card_views", "add_to_cart", "funnel_orders", "add_to_cart_conv", "cart_to_order_conv", "funnel_missing",
-    "previous_price_event_id", "price_postcheck_status",
-]
-
-BID_RAMP_MONITOR_COLUMNS = [
-    "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "campaign_status",
-    "ramp_candidate", "ramp_mode_status", "ramp_applied_in_current_run", "ramp_reason_group",
-    "current_bid_rub", "min_bid_rub", "new_bid_rub", "api_status",
-    "reason_code", "reason_text",
-    "wait_status", "wait_rule", "wait_until_date", "wait_days_left",
-    "last_bid_change_date", "days_since_last_bid_change", "last_bid_change_old_bid", "last_bid_change_new_bid", "last_bid_change_reason_code",
-    "impressions", "avg_impressions_per_day", "spend", "avg_spend_per_day", "orders", "revenue",
-    "campaign_drr_pct", "drr_limit_pct", "last21_impressions", "last21_drr_pct",
-    "keyword_profile_status", "keyword_guard_status", "current_core80_clicks_per_day", "base_core80_clicks_per_day",
-    "core80_clicks_delta_pct", "core80_position_delta", "core80_visibility_delta_pp", "core_click_guard_comment",
-    "target_impressions_per_day", "target_spend_per_day", "overspend_per_day", "max_spend_per_day", "check_days",
-    "ramp_lifecycle_status", "ramp_start_date", "ramp_day", "ramp_days_left", "monitor_status",
-]
-
-RAMP_SELECTION_COLUMNS = [
-    "subject_norm", "control_product", "placement",
-    "selected_campaign_id", "selected_nm_id", "selected_supplier_article",
-    "selected_current_bid_rub", "selected_min_bid_rub", "selected_new_bid_rub",
-    "selected_avg_spend_per_day", "selected_avg_impressions_per_day",
-    "selected_clicks", "selected_orders", "selected_ctr_pct", "selected_conversion_pct",
-    "selected_drr_pct", "selected_gp_after_ads", "selected_score", "selected_sample_tier",
-    "selection_status", "reason_text", "blocked_campaign_ids",
-]
-
-BID_CAMPAIGN_COMPARE_COLUMNS = [
-    "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "campaign_status",
-    "economics_match_method", "economics_product_group", "economics_avg_price", "economics_commission_pct",
-    "economics_acquiring_pct", "economics_vat_per_unit", "economics_logistics_per_unit", "economics_cogs_per_unit",
-    "comparison_status", "last_bid_change_date", "old_bid_rub", "new_bid_rub", "bid_change_reason_code",
-    "before_period", "after_period", "before_days", "after_days",
-    "current_action", "current_reason_code", "current_reason_text",
-    "postcheck_status", "final_verdict", "target_bid_action", "target_bid_action_text", "recommended_next_bid_rub",
-    "before_impressions", "after_impressions", "before_impressions_per_day", "after_impressions_per_day", "impressions_delta_pct",
-    "before_clicks", "after_clicks", "before_clicks_per_day", "after_clicks_per_day", "clicks_delta_pct",
-    "before_ctr_pct", "after_ctr_pct", "ctr_delta_pp",
-    "before_orders_qty", "after_orders_qty", "before_orders_qty_per_day", "after_orders_qty_per_day", "orders_qty_delta_pct",
-    "before_orders_sum_rub", "after_orders_sum_rub", "before_orders_sum_rub_per_day", "after_orders_sum_rub_per_day", "orders_sum_delta_pct",
-    "before_gp_after_ads_rub", "after_gp_after_ads_rub", "before_gp_after_ads_rub_per_day", "after_gp_after_ads_rub_per_day", "gp_after_ads_delta_pct",
-    "before_ad_spend_rub", "after_ad_spend_rub", "before_ad_spend_rub_per_day", "after_ad_spend_rub_per_day", "ad_spend_delta_pct",
-    "before_drr_pct", "after_drr_pct", "drr_delta_pp",
-    "core80_queries_count",
-    "before_core80_avg_position", "after_core80_avg_position", "core80_position_delta",
-    "before_core80_visibility_pct", "after_core80_visibility_pct", "core80_visibility_delta_pp",
-    "before_core80_query_freq", "after_core80_query_freq",
-    "before_card_views", "after_card_views", "before_card_views_per_day", "after_card_views_per_day",
-    "before_traffic_share_pct", "after_traffic_share_pct", "traffic_share_delta_pp",
-    "diagnostic_conclusion",
-]
-
-ONE_CAMPAIGN_EXPERIMENT_COLUMNS = [
-    "experiment_id", "run_datetime", "subject_norm", "product_group",
-    "selected_campaign_id", "selected_nm_id", "selected_supplier_article", "selected_placement",
-    "selected_bid_rub", "recommended_new_bid_rub", "selection_basis",
-    "group_campaigns_count", "campaigns_to_pause", "pause_campaign_ids",
-    "group_gp_before", "group_orders_before", "group_revenue_before", "group_spend_before",
-    "group_impressions_before", "group_clicks_before", "group_ctr_before", "group_conversion_before",
-    "selected_gp_before", "selected_orders_before", "selected_revenue_before", "selected_spend_before",
-    "selected_impressions_before", "selected_clicks_before", "selected_ctr_before", "selected_conversion_before",
-    "core_queries_count", "core_median_position", "core_target_position",
-    "recommended_action", "reason_code", "reason_text", "check_days",
-]
-
-PAUSE_HISTORY_COLUMNS = [
-    "pause_event_id",
-    "pause_date",
-    "campaign_id",
-    "nm_id",
-    "placement",
-    "supplier_article",
-    "subject_norm",
-    "reason_code",
-    "impressions_before_pause",
-    "clicks_before_pause",
-    "spend_before_pause",
-    "revenue_before_pause",
-    "orders_before_pause",
-    "drr_before_pause",
-    "gp_before_pause",
-    "status",
-    "next_check_date",
-    "api_status",
-]
-
-DECISION_COLUMNS = [
-    "campaign_id",
-    "nm_id",
-    "supplier_article",
-    "subject_norm",
-    "placement",
-    "campaign_status",
-    "current_bid_rub",
-    "min_bid_rub",
-    "drr_limit_pct",
-    "avg_impressions_per_day",
-    "avg_spend_per_day",
-    "last21_impressions",
-    "last21_spend",
-    "last21_revenue",
-    "last21_orders",
-    "last21_drr_pct",
-    "last21_avg_impressions_per_day",
-    "last21_avg_spend_per_day",
-    "new_bid_rub",
-    "action",
-    "reason_code",
-    "reason_text",
-    "spend",
-    "revenue",
-    "orders",
-    "impressions",
-    "clicks",
-    "campaign_drr_pct",
-    "cpo",
-    "ctr_pct",
-    "gp_after_ads",
-    "abc_profitability_pct",
-    "abc_profitability_status",
-    "abc_drr_pct",
-    "abc_gross_profit",
-    "abc_gross_revenue",
-    "abc_period_start",
-    "abc_period_end",
-    "abc_source_file",
-    "abc_match_method",
-    "keyword_profile_status",
-    "keyword_guard_status",
-    "core80_queries_count",
-    "base_core80_clicks_per_day",
-    "current_core80_clicks_per_day",
-    "core80_clicks_delta_pct",
-    "base_core80_orders",
-    "current_core80_orders",
-    "core80_orders_delta_pct",
-    "base_core80_avg_position",
-    "current_core80_avg_position",
-    "core80_position_delta",
-    "base_core80_visibility_pct",
-    "current_core80_visibility_pct",
-    "core80_visibility_delta_pp",
-    "tail_clicks_delta_pct",
-    "core_click_guard_comment",
-    "previous_event_id",
-    "postcheck_status",
-    "last_bid_change_event_id",
-    "last_bid_change_date",
-    "days_since_last_bid_change",
-    "last_bid_change_old_bid",
-    "last_bid_change_new_bid",
-    "last_bid_change_direction",
-    "last_bid_change_reason_code",
-    "wait_rule",
-    "wait_until_date",
-    "wait_days_left",
-    "wait_status",
-    "pause_decision",
-    "ramp_candidate",
-    "ramp_status",
-    "ramp_lifecycle_status",
-    "ramp_start_date",
-    "ramp_day",
-    "ramp_days_left",
-    "ramp_applied_in_current_run",
-    "ramp_api_status",
-    "experiment_label",
-    "experiment_id",
-    "experiment_window_msk",
-]
-
-COLUMN_ALIASES: Dict[str, List[str]] = {
-    "date": ["Дата", "date", "day", "День"],
-    "campaign_id": ["ID кампании", "advertId", "advert_id", "campaign_id", "Кампания ID"],
-    "campaign_name": ["Название", "Название кампании", "name", "campaign_name"],
-    "campaign_status": ["Статус", "status", "Статус кампании"],
-    "nm_id": ["nmId", "nm_id", "Номенклатура WB", "Артикул WB", "Товар"],
-    "supplier_article": ["Артикул продавца", "supplier_article", "supplierArticle", "Артикул"],
-    "subject_norm": ["Предмет", "subject", "subject_norm", "Название предмета"],
-    "placement": ["Плейсмент", "placement", "Тип кампании", "Место размещения", "placement_norm"],
-    "current_bid_rub": ["Текущая ставка, ₽", "Текущая ставка", "Ставка", "Ставка в поиске (руб)", "Ставка в рекомендациях (руб)", "bid", "cpc", "cpm"],
-    "impressions": ["Показы", "views", "impressions"],
-    "clicks": ["Клики", "clicks"],
-    "orders": ["Заказы РК", "Заказы", "orders"],
-    "spend": ["Расход", "Расходы", "Затраты", "Расход РК", "ad_spend"],
-    "revenue": ["Выручка РК", "Продажи РК", "Сумма заказов", "Сумма заказов, ₽", "Заказано на сумму", "Заказано на сумму, ₽", "ordersSumRub", "sum_price", "sumPrice", "sales", "revenue", "GMV"],
-    "gp_after_ads": ["ВП кампании", "Валовая прибыль после рекламы", "ВП после рекламы", "gross_profit"],
+SUBJECT_CANON_MAP = {
+    "кисти косметические": "Кисти косметические",
+    "помады": "Помады",
+    "блески": "Блески",
+    "косметические карандаши": "Косметические карандаши",
 }
 
 
-# =============================
-# Конфигурация и S3
-# =============================
-
-@dataclass
-class Config:
-    yc_access_key_id: str
-    yc_secret_access_key: str
-    yc_bucket_name: str
-    wb_promo_key: str
-    s3_endpoint_url: str = "https://storage.yandexcloud.net"
-    wb_base_url: str = WB_ADVERT_BASE_URL
+def canonical_subject(value: Any) -> str:
+    key = norm_key(value)
+    return SUBJECT_CANON_MAP.get(key, normalize_text(value))
 
 
-@dataclass
-class RunContext:
-    mode: str
-    dry_run: bool
-    apply_pause: bool
-    apply_start: bool
-    apply_price: bool
-    apply_experiment: bool
-    night_experiment_only: bool
-    night_experiment_slot: str
-    run_datetime: datetime
-    mature_end: date
-    current_start: date
-    current_end: date
-    base_start: date
-    base_end: date
+def approved_subject_for_product(product: Any) -> str:
+    code = normalize_text(product).upper().replace(" ", "")
+    return VALID_PRODUCT_CATEGORY_REFERENCE.get(code, "")
 
 
-def require_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Не задан обязательный secret/env: {name}")
-    return value
+def is_approved_product_subject(product: Any, subject: Any) -> bool:
+    code = normalize_text(product).upper().replace(" ", "")
+    subj = canonical_subject(subject)
+    return bool(code and VALID_PRODUCT_CATEGORY_REFERENCE.get(code) == subj)
 
 
-def load_config() -> Config:
-    return Config(
-        yc_access_key_id=require_env("YC_ACCESS_KEY_ID"),
-        yc_secret_access_key=require_env("YC_SECRET_ACCESS_KEY"),
-        yc_bucket_name=require_env("YC_BUCKET_NAME"),
-        wb_promo_key=require_env("WB_PROMO_KEY_TOPFACE"),
-    )
-
-
-def make_s3_client(config: Config):
-    return boto3.client(
-        "s3",
-        endpoint_url=config.s3_endpoint_url,
-        aws_access_key_id=config.yc_access_key_id,
-        aws_secret_access_key=config.yc_secret_access_key,
-    )
-
-
-def s3_key_exists(s3_client, bucket: str, key: str) -> bool:
-    try:
-        s3_client.head_object(Bucket=bucket, Key=key)
-        return True
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code in {"404", "NoSuchKey", "NotFound"}:
-            return False
-        raise
-
-
-def read_s3_bytes(s3_client, bucket: str, key: str) -> bytes:
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
-    return obj["Body"].read()
-
-
-def upload_s3_bytes(s3_client, bucket: str, key: str, payload: bytes, content_type: Optional[str] = None) -> None:
-    extra: Dict[str, Any] = {}
-    if content_type:
-        extra["ContentType"] = content_type
-    s3_client.put_object(Bucket=bucket, Key=key, Body=payload, **extra)
-
-
-def list_s3_keys(s3_client, bucket: str, prefix: str) -> List[str]:
-    keys: List[str] = []
-    continuation_token: Optional[str] = None
-    while True:
-        kwargs: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
-        if continuation_token:
-            kwargs["ContinuationToken"] = continuation_token
-        resp = s3_client.list_objects_v2(**kwargs)
-        for item in resp.get("Contents", []):
-            key = item.get("Key", "")
-            if key:
-                keys.append(key)
-        if not resp.get("IsTruncated"):
-            break
-        continuation_token = resp.get("NextContinuationToken")
-    return keys
-
-
-# =============================
-# Helper-функции колонок
-# =============================
-
-def _norm_col_name(value: Any) -> str:
-    text = str(value).strip().lower()
-    text = re.sub(r"\s+", " ", text)
-    text = text.replace("ё", "е")
+def clean_article(value: Any) -> str:
+    text = normalize_text(value)
+    if text.lower() in {"", "nan", "none", "null"}:
+        return ""
     return text
 
 
-def find_col(df: pd.DataFrame, aliases: Iterable[str]) -> Optional[str]:
-    """Возвращает имя первой найденной колонки из списка aliases или None."""
-    if df is None or df.empty and len(df.columns) == 0:
-        return None
-    by_norm = {_norm_col_name(col): col for col in df.columns}
-    for alias in aliases:
-        found = by_norm.get(_norm_col_name(alias))
-        if found is not None:
-            return found
-    return None
+def article_upper(value: Any) -> str:
+    return clean_article(value).upper().replace(" ", "")
 
 
-def series_or_default(df: pd.DataFrame, aliases: Iterable[str], default: Any = "") -> pd.Series:
-    """Всегда возвращает pandas.Series длины len(df), даже если колонка отсутствует."""
-    col = find_col(df, aliases)
-    if col is None:
-        return pd.Series([default] * len(df), index=df.index)
-    return df[col]
+def product_code(article: Any) -> str:
+    text = article_upper(article).replace("_", "/")
+    if not text or text in EXCLUDE_ARTICLES_UPPER:
+        return ""
+    m = re.match(r"^PT(\d+)", text)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(\d+)", text)
+    if m:
+        return m.group(1)
+    m = re.match(r"^([A-ZА-Я]+\d+)", text)
+    if m:
+        return m.group(1)
+    return text.split("/")[0].split(".")[0]
 
 
-def numeric_series(df: pd.DataFrame, aliases: Iterable[str], default: float = 0.0) -> pd.Series:
-    """Возвращает числовой Series; все нечисловые значения -> default."""
-    src = series_or_default(df, aliases, default=default)
-    text = src.astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
-    text = text.str.replace(",", ".", regex=False)
-    text = text.str.replace(r"[^0-9.\-]", "", regex=True)
-    num = pd.to_numeric(text, errors="coerce")
-    return num.fillna(default).astype(float)
-
-
-def parse_date_series(values: pd.Series) -> pd.Series:
-    """Без warning разбирает даты из WB-отчётов: ISO, dd.mm.yyyy и Excel datetime."""
-    if not isinstance(values, pd.Series):
-        values = pd.Series(values)
-    raw = values.copy()
-    result = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
-    text = raw.astype(str).str.strip()
-
-    iso_mask = text.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)
-    if iso_mask.any():
-        result.loc[iso_mask] = pd.to_datetime(text.loc[iso_mask], format="%Y-%m-%d", errors="coerce")
-
-    dot_mask = result.isna() & text.str.fullmatch(r"\d{2}\.\d{2}\.\d{4}", na=False)
-    if dot_mask.any():
-        result.loc[dot_mask] = pd.to_datetime(text.loc[dot_mask], format="%d.%m.%Y", errors="coerce")
-
-    slash_mask = result.isna() & text.str.fullmatch(r"\d{2}/\d{2}/\d{4}", na=False)
-    if slash_mask.any():
-        result.loc[slash_mask] = pd.to_datetime(text.loc[slash_mask], format="%d/%m/%Y", errors="coerce")
-
-    remaining = result.isna() & raw.notna() & text.ne("") & text.ne("NaT") & text.ne("nan")
-    if remaining.any():
-        result.loc[remaining] = pd.to_datetime(raw.loc[remaining], errors="coerce")
-    return result.dt.date
-
-
-def _clean_id_value(value: Any) -> str:
+def to_number(value: Any) -> float:
     if value is None:
-        return ""
-    if isinstance(value, float) and math.isnan(value):
-        return ""
-    text = str(value).strip()
-    if not text or text.lower() in {"nan", "none", "nat"}:
-        return ""
-    text = text.replace("\u00a0", " ").strip()
-    if re.fullmatch(r"\d+\.0", text):
-        text = text[:-2]
-    return text
+        return np.nan
+    if isinstance(value, str):
+        value = value.replace("\xa0", " ").replace(" ", "").replace("₽", "").replace("%", "").replace(",", ".")
+    return pd.to_numeric(value, errors="coerce")
 
 
-def _text_series(df: pd.DataFrame, aliases: Iterable[str], default: str = "") -> pd.Series:
-    src = series_or_default(df, aliases, default=default)
-    return src.map(_clean_text_value)
+def num_series(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype=float)
+    return series.map(to_number)
 
 
-def _clean_text_value(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, float) and math.isnan(value):
-        return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "nat"}:
-        return ""
-    return re.sub(r"\s+", " ", text)
+def date_series(series: pd.Series) -> pd.Series:
+    """Parse dates safely: ISO yyyy-mm-dd as ISO, Russian dd.mm.yyyy as day-first."""
+    def parse_one(v: Any) -> Any:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return pd.NaT
+        if isinstance(v, (pd.Timestamp, datetime, date)):
+            return pd.Timestamp(v).normalize()
+        txt = normalize_text(v)
+        if not txt or txt.lower() in {"nan", "none", "null"}:
+            return pd.NaT
+        try:
+            if re.match(r"^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", txt):
+                return pd.to_datetime(txt, errors="coerce", dayfirst=False).normalize()
+            if re.match(r"^\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}", txt):
+                return pd.to_datetime(txt, errors="coerce", dayfirst=True).normalize()
+            return pd.to_datetime(txt, errors="coerce").normalize()
+        except Exception:
+            return pd.NaT
+    return series.map(parse_one)
 
 
-def normalize_subject_value(value: Any) -> str:
-    text = _clean_text_value(value).replace("ё", "е").strip()
-    return re.sub(r"\s+", " ", text)
+def safe_div(a: Any, b: Any, default: float = np.nan) -> float:
+    a = to_number(a)
+    b = to_number(b)
+    if pd.isna(a) or pd.isna(b) or b == 0:
+        return default
+    return float(a) / float(b)
 
 
-def normalize_placement_value(value: Any) -> str:
-    text = _clean_text_value(value).replace("ё", "е").lower()
-    if not text:
-        return ""
-    if "search" in text or "поиск" in text:
-        return "search"
-    if "recommend" in text or "рекоменд" in text:
-        return "recommendations"
-    if "combined" in text or "комбин" in text or "cpm" in text:
-        return "combined"
-    return text
+def safe_div_series(numer: Any, denom: Any, default: float = 0.0) -> pd.Series:
+    """Vector division without eager zero-division from np.where.
 
-
-def normalize_columns(df: pd.DataFrame, source_type: str) -> pd.DataFrame:
-    """Создаёт канонические поля и не удаляет исходные колонки."""
-    result = df.copy()
-    result["source_type"] = source_type
-    result["_row_id"] = range(len(result))
-
-    date_src = series_or_default(result, COLUMN_ALIASES["date"], default=pd.NaT)
-    result["date"] = parse_date_series(date_src)
-
-    result["campaign_id"] = series_or_default(result, COLUMN_ALIASES["campaign_id"], default="").map(_clean_id_value)
-    result["campaign_name"] = _text_series(result, COLUMN_ALIASES["campaign_name"], default="")
-    result["campaign_status"] = _text_series(result, COLUMN_ALIASES["campaign_status"], default="")
-    result["nm_id"] = series_or_default(result, COLUMN_ALIASES["nm_id"], default="").map(_clean_id_value)
-    result["supplier_article"] = _text_series(result, COLUMN_ALIASES["supplier_article"], default="")
-    result["subject_norm"] = series_or_default(result, COLUMN_ALIASES["subject_norm"], default="").map(normalize_subject_value)
-    result["placement"] = series_or_default(result, COLUMN_ALIASES["placement"], default="").map(normalize_placement_value)
-
-    for metric in ["current_bid_rub", "impressions", "clicks", "orders", "spend", "revenue"]:
-        result[metric] = numeric_series(result, COLUMN_ALIASES[metric], default=0.0)
-
-    gp_col = find_col(result, COLUMN_ALIASES["gp_after_ads"])
-    if gp_col is None:
-        result["gp_after_ads"] = pd.Series([float("nan")] * len(result), index=result.index)
-    else:
-        gp_text = result[gp_col].astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
-        gp_text = gp_text.str.replace(",", ".", regex=False)
-        gp_text = gp_text.str.replace(r"[^0-9.\-]", "", regex=True)
-        result["gp_after_ads"] = pd.to_numeric(gp_text, errors="coerce")
-
-    return result
-
-
-# =============================
-# Загрузка Excel-данных
-# =============================
-
-def read_excel_bytes_as_sheets(payload: bytes) -> Dict[str, pd.DataFrame]:
-    xls = pd.ExcelFile(io.BytesIO(payload))
-    return {sheet_name: pd.read_excel(io.BytesIO(payload), sheet_name=sheet_name) for sheet_name in xls.sheet_names}
-
-
-def first_sheet_by_name(sheets: Dict[str, pd.DataFrame], wanted_name: str) -> pd.DataFrame:
-    wanted_norm = _norm_col_name(wanted_name)
-    for name, df in sheets.items():
-        if _norm_col_name(name) == wanted_norm:
-            return df.copy()
-    return pd.DataFrame()
-
-
-def read_excel_sheets_as_frame(sheets: Dict[str, pd.DataFrame], source_name: str) -> pd.DataFrame:
-    frames: List[pd.DataFrame] = []
-    for sheet_name, sheet_df in sheets.items():
-        if sheet_df is None or sheet_df.empty:
-            continue
-        local_df = sheet_df.copy()
-        local_df["source_file"] = source_name
-        local_df["source_sheet"] = str(sheet_name)
-        frames.append(local_df)
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True, sort=False)
-
-
-def read_excel_bytes_as_frame(payload: bytes, source_name: str) -> pd.DataFrame:
-    sheets = read_excel_bytes_as_sheets(payload)
-    return read_excel_sheets_as_frame(sheets, source_name)
-
-
-def derive_campaign_placement_and_bid(campaigns_norm: pd.DataFrame, campaigns_raw: pd.DataFrame) -> pd.DataFrame:
-    result = campaigns_norm.copy()
-    search_bid = numeric_series(campaigns_raw, [
-        "Ставка в поиске (руб)", "Ставка поиск, руб", "Ставка поиск", "bid_search_rub", "search_bid",
-        "Ставка в поиске", "Ставка в поиске ₽",
-    ], default=0.0)
-    reco_bid = numeric_series(campaigns_raw, [
-        "Ставка в рекомендациях (руб)", "Ставка рекомендации, руб", "Ставка рекомендации", "bid_reco_rub",
-        "reco_bid", "recommendation_bid", "Ставка в рекомендациях", "Ставка в рекомендациях ₽",
-    ], default=0.0)
-    direct_bid = numeric_series(campaigns_raw, COLUMN_ALIASES["current_bid_rub"], default=0.0)
-
-    placements: List[str] = []
-    bids: List[float] = []
-    for idx in result.index:
-        placement_raw = result.at[idx, "placement"] if "placement" in result.columns else ""
-        placement = normalize_placement_value(placement_raw)
-        s_bid = float(search_bid.loc[idx] if idx in search_bid.index else 0.0)
-        r_bid = float(reco_bid.loc[idx] if idx in reco_bid.index else 0.0)
-        d_bid = float(direct_bid.loc[idx] if idx in direct_bid.index else 0.0)
-
-        if not placement:
-            if s_bid > 0 and r_bid > 0:
-                placement = "combined"
-            elif s_bid > 0:
-                placement = "search"
-            elif r_bid > 0:
-                placement = "recommendations"
-            else:
-                placement = "search"
-        if placement == "recommendation":
-            placement = "recommendations"
-
-        if placement == "recommendations" and r_bid > 0:
-            bid = r_bid
-        elif placement in {"search", "combined"} and s_bid > 0:
-            bid = s_bid
-        elif d_bid > 0:
-            bid = d_bid
-        elif s_bid > 0:
-            bid = s_bid
-        else:
-            bid = r_bid
-
-        placements.append(placement)
-        bids.append(float(bid or 0.0))
-    result["placement"] = placements
-    result["current_bid_rub"] = bids
-    return result
-
-
-def normalize_ads_analysis_sheets(sheets: Dict[str, pd.DataFrame], source_name: str) -> pd.DataFrame:
-    """Специально читает Анализ рекламы.xlsx: метрики из Статистика_Ежедневно, ставки/status из Список_кампаний."""
-    daily_raw = first_sheet_by_name(sheets, "Статистика_Ежедневно")
-    campaigns_raw = first_sheet_by_name(sheets, "Список_кампаний")
-
-    if daily_raw.empty:
-        combined = read_excel_sheets_as_frame(sheets, source_name)
-        return normalize_columns(combined, source_type="ads_generic")
-
-    daily = normalize_columns(daily_raw, source_type="ads_daily")
-    daily["source_file"] = source_name
-    daily["source_sheet"] = "Статистика_Ежедневно"
-
-    if "revenue" in daily.columns and float(pd.to_numeric(daily["revenue"], errors="coerce").fillna(0).sum()) == 0:
-        sum_orders_col = find_col(daily_raw, ["Сумма заказов", "Сумма заказов, ₽", "Заказано на сумму", "Заказано на сумму, ₽"])
-        if sum_orders_col:
-            daily["revenue"] = numeric_series(daily_raw, [sum_orders_col], default=0.0)
-
-    if campaigns_raw.empty:
-        if daily["campaign_status"].astype(str).str.strip().eq("").all():
-            daily["campaign_status"] = "Активна"
-        if daily["placement"].astype(str).str.strip().eq("").all():
-            daily["placement"] = "search"
-        return daily
-
-    campaigns = normalize_columns(campaigns_raw, source_type="ads_campaigns")
-    campaigns = derive_campaign_placement_and_bid(campaigns, campaigns_raw)
-    campaigns["source_file"] = source_name
-    campaigns["source_sheet"] = "Список_кампаний"
-
-    keep_cols = [
-        "campaign_id", "nm_id", "placement", "campaign_status", "campaign_name",
-        "current_bid_rub", "supplier_article", "subject_norm",
-    ]
-    for col in keep_cols:
-        if col not in campaigns.columns:
-            campaigns[col] = ""
-
-    campaigns_dim = campaigns[keep_cols].copy()
-    campaigns_dim = campaigns_dim[
-        campaigns_dim["campaign_id"].map(_clean_id_value).ne("")
-        & campaigns_dim["nm_id"].map(_clean_id_value).ne("")
-    ].copy()
-    if not campaigns_dim.empty:
-        campaigns_dim["campaign_id"] = campaigns_dim["campaign_id"].map(_clean_id_value)
-        campaigns_dim["nm_id"] = campaigns_dim["nm_id"].map(_clean_id_value)
-        campaigns_dim["placement"] = campaigns_dim["placement"].map(normalize_placement_value).replace({"recommendation": "recommendations"})
-        campaigns_dim["_status_rank"] = campaigns_dim["campaign_status"].map(lambda x: 1 if is_active_campaign(x) else 0)
-        campaigns_dim = campaigns_dim.sort_values(["campaign_id", "nm_id", "_status_rank"], ascending=[True, True, False])
-        campaigns_dim = campaigns_dim.drop_duplicates(["campaign_id", "nm_id", "placement"], keep="first")
-        campaigns_dim = campaigns_dim.drop(columns=["_status_rank"], errors="ignore")
-
-    daily["campaign_id"] = daily["campaign_id"].map(_clean_id_value)
-    daily["nm_id"] = daily["nm_id"].map(_clean_id_value)
-
-    if campaigns_dim.empty:
-        if daily["campaign_status"].astype(str).str.strip().eq("").all():
-            daily["campaign_status"] = "Активна"
-        if daily["placement"].astype(str).str.strip().eq("").all():
-            daily["placement"] = "search"
-        return daily
-
-    metric_cols = ["date", "campaign_id", "nm_id", "impressions", "clicks", "orders", "spend", "revenue", "gp_after_ads", "_row_id", "source_file", "source_sheet"]
-    for col in ["supplier_article", "subject_norm", "campaign_name", "campaign_status", "placement", "current_bid_rub"]:
-        if col not in daily.columns:
-            daily[col] = "" if col != "current_bid_rub" else 0.0
-    metric_cols.extend(["supplier_article", "subject_norm", "campaign_name", "campaign_status", "placement", "current_bid_rub"])
-    metric_cols = [c for c in metric_cols if c in daily.columns]
-
-    merged = daily[metric_cols].merge(
-        campaigns_dim,
-        on=["campaign_id", "nm_id"],
-        how="left",
-        suffixes=("", "_campaign"),
-    )
-
-    for col in ["placement", "campaign_status", "campaign_name", "supplier_article", "subject_norm"]:
-        camp_col = f"{col}_campaign"
-        if camp_col in merged.columns:
-            base = merged[col].fillna("").astype(str) if col in merged.columns else pd.Series([""] * len(merged), index=merged.index)
-            camp = merged[camp_col].fillna("").astype(str)
-            merged[col] = base.where(base.str.strip().ne(""), camp)
-    if "current_bid_rub_campaign" in merged.columns:
-        base_bid = pd.to_numeric(merged.get("current_bid_rub", 0), errors="coerce").fillna(0.0)
-        camp_bid = pd.to_numeric(merged["current_bid_rub_campaign"], errors="coerce").fillna(0.0)
-        merged["current_bid_rub"] = base_bid.where(base_bid > 0, camp_bid)
-
-    drop_cols = [c for c in merged.columns if c.endswith("_campaign")]
-    merged = merged.drop(columns=drop_cols, errors="ignore")
-    merged["placement"] = merged["placement"].map(normalize_placement_value).replace({"recommendation": "recommendations"})
-    return merged
-
-
-def load_ads_report(s3_client, config: Config) -> pd.DataFrame:
-    if s3_key_exists(s3_client, config.yc_bucket_name, ADS_MAIN_KEY):
-        payload = read_s3_bytes(s3_client, config.yc_bucket_name, ADS_MAIN_KEY)
-        sheets = read_excel_bytes_as_sheets(payload)
-        raw_all = normalize_ads_analysis_sheets(sheets, ADS_MAIN_KEY)
-        if raw_all.empty:
-            raise RuntimeError(f"Основной рекламный отчёт пустой: {ADS_MAIN_KEY}")
-        before_subjects = raw_all.get("subject_norm", pd.Series(dtype=str)).map(str).value_counts().head(20).to_dict()
-        raw = filter_managed_subject_rows(raw_all)
-        if raw.empty:
-            raise RuntimeError(
-                "После фильтра 4 управляемых предметов не осталось строк. "
-                f"Проверь поле subject_norm/Предмет в {ADS_MAIN_KEY}. Предметы в файле: {before_subjects}"
-            )
-        after_subjects = raw.get("subject_norm", pd.Series(dtype=str)).map(str).value_counts().to_dict()
-        print(
-            "Диагностика загрузки рекламы: "
-            f"листы={list(sheets.keys())}; "
-            f"строк после нормализации={len(raw_all)}; "
-            f"строк после фильтра 4 предметов={len(raw)}; "
-            f"предметы после фильтра={json.dumps(after_subjects, ensure_ascii=False)}; "
-            f"валидных campaign_id={raw['campaign_id'].map(_clean_id_value).ne('').sum() if 'campaign_id' in raw.columns else 0}; "
-            f"валидных nm_id={raw['nm_id'].map(_clean_id_value).ne('').sum() if 'nm_id' in raw.columns else 0}; "
-            f"валидных placement={raw['placement'].astype(str).str.strip().ne('').sum() if 'placement' in raw.columns else 0}; "
-            f"валидных ставок={(pd.to_numeric(raw['current_bid_rub'], errors='coerce').fillna(0) > 0).sum() if 'current_bid_rub' in raw.columns else 0}; "
-            f"активных={raw['campaign_status'].map(is_active_campaign).sum() if 'campaign_status' in raw.columns else 0}",
-            flush=True,
-        )
-        return raw
-
-    weekly_keys = [
-        key for key in list_s3_keys(s3_client, config.yc_bucket_name, ADS_WEEKLY_PREFIX)
-        if key.lower().endswith(".xlsx") and not key.endswith("/~$")
-    ]
-    weekly_keys = sorted(weekly_keys, reverse=True)[:8]
-    frames: List[pd.DataFrame] = []
-    for key in weekly_keys:
-        payload = read_s3_bytes(s3_client, config.yc_bucket_name, key)
-        sheets = read_excel_bytes_as_sheets(payload)
-        raw = normalize_ads_analysis_sheets(sheets, key)
-        if not raw.empty:
-            frames.append(raw)
-    if not frames:
-        raise RuntimeError(
-            "Не найден основной рекламный отчёт и нет непустых fallback-файлов: "
-            f"{ADS_MAIN_KEY}; {ADS_WEEKLY_PREFIX}"
-        )
-    result_all = pd.concat(frames, ignore_index=True, sort=False)
-    result = filter_managed_subject_rows(result_all)
-    print(
-        f"Диагностика fallback-рекламы: файлов={len(frames)}, "
-        f"строк до фильтра={len(result_all)}, строк после фильтра 4 предметов={len(result)}",
-        flush=True,
-    )
-    if result.empty:
-        raise RuntimeError("Fallback-реклама найдена, но после фильтра 4 управляемых предметов строк не осталось")
-    return result
-
-
-def coerce_history_columns_object(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    Pandas/NumPy evaluates both branches of np.where before applying the mask.
+    If the denominator is object/Decimal and contains zero, expressions like
+    np.where(den > 0, numer / den, 0) can still raise ZeroDivisionError.
+    This helper divides only on a non-zero mask.
     """
-    Pandas 3.x не разрешает записывать текстовый verdict/status в колонку,
-    которую Excel прочитал как float64 из-за пустых ячеек.
-    Исторические журналы содержат смешанные поля: числа, даты, статусы, ответы API.
-    Для безопасного дозаполнения приводим колонки журнала к object.
-    Числовые расчёты ниже всё равно выполняются через pd.to_numeric(...).
-    """
-    if df is None or not isinstance(df, pd.DataFrame):
-        return pd.DataFrame(columns=columns).astype({c: "object" for c in columns})
-    out = df.copy()
-    for col in columns:
-        if col not in out.columns:
-            out[col] = pd.Series([""] * len(out), index=out.index, dtype="object")
-        else:
-            out[col] = out[col].astype("object")
+    n = pd.to_numeric(numer, errors="coerce")
+    d = pd.to_numeric(denom, errors="coerce")
+    if not isinstance(n, pd.Series):
+        n = pd.Series(n)
+    if not isinstance(d, pd.Series):
+        d = pd.Series(d, index=n.index)
+    n = n.reindex(d.index)
+    out = pd.Series(default, index=d.index, dtype="float64")
+    mask = n.notna() & d.notna() & (d.abs() > 1e-12)
+    out.loc[mask] = n.loc[mask].astype(float) / d.loc[mask].astype(float)
     return out
 
 
-def load_excel_table_from_s3(s3_client, config: Config, key: str, columns: List[str]) -> pd.DataFrame:
-    if not s3_key_exists(s3_client, config.yc_bucket_name, key):
-        return coerce_history_columns_object(pd.DataFrame(columns=columns), columns)
-    payload = read_s3_bytes(s3_client, config.yc_bucket_name, key)
-    try:
-        df = pd.read_excel(io.BytesIO(payload))
-    except Exception:
-        return coerce_history_columns_object(pd.DataFrame(columns=columns), columns)
-    return coerce_history_columns_object(df, columns)
+def money_format() -> str:
+    return '# ##0 ₽;[Red]-# ##0 ₽;0 ₽'
 
 
-def load_bid_history(s3_client, config: Config) -> pd.DataFrame:
-    return load_excel_table_from_s3(s3_client, config, BID_HISTORY_KEY, BID_HISTORY_COLUMNS)
+def pct_format() -> str:
+    return '0.0%'
 
 
-def load_pause_history(s3_client, config: Config) -> pd.DataFrame:
-    return load_excel_table_from_s3(s3_client, config, PAUSE_HISTORY_KEY, PAUSE_HISTORY_COLUMNS)
+def parse_week_from_name(name: str) -> Optional[str]:
+    m = re.search(r"(\d{4})-W(\d{2})", name)
+    if m:
+        return f"{m.group(1)}-W{m.group(2)}"
+    return None
 
 
-
-# =============================
-# Мониторинг ключевых фраз для оценки эффекта ставок
-# =============================
-
-def _keyword_numeric(df: pd.DataFrame, aliases: Iterable[str], default: float = 0.0) -> pd.Series:
-    return numeric_series(df, aliases, default=default)
-
-
-def _keyword_text(df: pd.DataFrame, aliases: Iterable[str], default: str = "") -> pd.Series:
-    return _text_series(df, aliases, default=default)
+def week_bounds(week_code: str) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    m = re.match(r"^(\d{4})-W(\d{2})$", str(week_code))
+    if not m:
+        return None, None
+    start = pd.Timestamp(date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1))
+    return start, start + pd.Timedelta(days=6)
 
 
-def normalize_keyword_positions(df: pd.DataFrame, source_name: str, sheet_name: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=KEYWORD_POSITION_COLUMNS)
-    result = pd.DataFrame(index=df.index)
-    result["source_file"] = source_name
-    result["source_sheet"] = sheet_name
-    result["date"] = parse_date_series(series_or_default(df, ["Дата", "date", "День", "day"], default=pd.NaT))
-    result["nm_id"] = series_or_default(df, ["Артикул WB", "nmID", "nmId", "nm_id", "Номенклатура WB"], default="").map(_clean_id_value)
-    result["supplier_article"] = _keyword_text(df, ["Артикул продавца", "supplierArticle", "Артикул", "vendorCode"], default="")
-    result["subject_norm"] = series_or_default(df, ["Предмет", "Название предмета", "subject", "subject_norm"], default="").map(normalize_subject_value)
-    result["query_text"] = _keyword_text(df, ["Поисковый запрос", "Запрос", "Ключевая фраза", "Ключевая фраза/слово", "keyword", "query", "search_query"], default="")
-    result["filter_type"] = _keyword_text(df, ["Фильтр", "filter", "Тип", "type"], default="")
-    result["query_freq"] = _keyword_numeric(df, ["Частота запросов", "Частота за неделю", "Частотность", "query_freq", "demand_week"], default=0.0)
-    result["median_position"] = _keyword_numeric(df, ["Медианная позиция", "Позиция", "median_position", "position"], default=0.0)
-    result["visibility_pct"] = _keyword_numeric(df, ["Видимость %", "Видимость, %", "visibility_pct", "visibility"], default=0.0)
-    result["clicks_to_card"] = _keyword_numeric(df, ["Переходы в карточку", "Переходы", "clicks_to_card", "clicks"], default=0.0)
-    result["keyword_orders"] = _keyword_numeric(df, ["Заказы", "Заказы по запросу", "keyword_orders", "orders"], default=0.0)
-    result["query_text_norm"] = result["query_text"].astype(str).str.strip().str.lower().str.replace("ё", "е", regex=False)
-    result = result[result["nm_id"].map(_clean_id_value).ne("") & result["query_text_norm"].ne("")].copy()
-    result = filter_managed_subject_rows(result)
-    return result
+def week_code(ts: Any) -> str:
+    if pd.isna(ts):
+        return ""
+    d = pd.Timestamp(ts)
+    iso = d.isocalendar()
+    return f"{int(iso.year)}-W{int(iso.week):02d}"
 
 
-def load_keyword_positions(s3_client, config: Config) -> pd.DataFrame:
-    keys = [k for k in list_s3_keys(s3_client, config.yc_bucket_name, KEYWORDS_WEEKLY_PREFIX) if k.lower().endswith(".xlsx")]
-    keys = sorted(keys, reverse=True)[:8]
-    frames: List[pd.DataFrame] = []
-    for key in keys:
-        try:
-            payload = read_s3_bytes(s3_client, config.yc_bucket_name, key)
-            sheets = read_excel_bytes_as_sheets(payload)
-            target_sheets = []
-            for sh_name, sh_df in sheets.items():
-                sh_norm = _norm_col_name(sh_name)
-                if "позиции" in sh_norm or "ключ" in sh_norm or "запрос" in sh_norm:
-                    target_sheets.append((sh_name, sh_df))
-            if not target_sheets and sheets:
-                first_name = next(iter(sheets.keys()))
-                target_sheets = [(first_name, sheets[first_name])]
-            for sh_name, sh_df in target_sheets:
-                norm = normalize_keyword_positions(sh_df, key, str(sh_name))
-                if not norm.empty:
-                    frames.append(norm)
-        except Exception as exc:
-            print(f"Предупреждение: не удалось прочитать поисковые запросы {key}: {exc}", flush=True)
-            continue
-    if not frames:
-        return pd.DataFrame(columns=KEYWORD_POSITION_COLUMNS)
-    result = pd.concat(frames, ignore_index=True, sort=False)
-    result = result.drop_duplicates(subset=["date", "nm_id", "supplier_article", "query_text_norm", "filter_type"], keep="last")
-    return result
-
-
-def classify_core_keywords(keyword_df: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    if keyword_df is None or keyword_df.empty:
-        return pd.DataFrame(columns=KEYWORD_POSITION_COLUMNS)
-    local = keyword_df.copy()
-    if has_valid_dates(local):
-        # Берём базу классификации: последние зрелые данные до текущего mature_end.
-        local = local[local["date"].notna() & (local["date"] <= ctx.mature_end)].copy()
-    if local.empty:
-        return pd.DataFrame(columns=KEYWORD_POSITION_COLUMNS)
-    grp = local.groupby(["nm_id", "supplier_article", "subject_norm", "query_text_norm"], dropna=False).agg(
-        query_text=("query_text", "last"),
-        keyword_orders=("keyword_orders", "sum"),
-        query_freq=("query_freq", "sum"),
-        median_position=("median_position", "median"),
-        visibility_pct=("visibility_pct", "mean"),
-        clicks_to_card=("clicks_to_card", "sum"),
-    ).reset_index()
-    grp["keyword_group"] = "TAIL_20"
-    grp["orders_share"] = 0.0
-    grp["orders_cum_share"] = 0.0
-    out_frames: List[pd.DataFrame] = []
-    for _, g in grp.groupby(["nm_id", "supplier_article"], dropna=False):
-        g = g.sort_values(["keyword_orders", "query_freq", "clicks_to_card"], ascending=False).copy()
-        total_orders = float(g["keyword_orders"].sum())
-        if total_orders > 0:
-            g["orders_share"] = g["keyword_orders"] / total_orders
-            g["orders_cum_share"] = g["orders_share"].cumsum()
-            # CORE_80: фразы до достижения 80% заказов + первая фраза, которая пересекла порог.
-            g["keyword_group"] = "TAIL_20"
-            core_mask = g["orders_cum_share"] <= 0.80
-            if not core_mask.any() and len(g) > 0:
-                core_mask.iloc[0] = True
-            elif core_mask.any():
-                first_tail_idx = g.index[~core_mask]
-                if len(first_tail_idx) > 0:
-                    core_mask.loc[first_tail_idx[0]] = True
-            g.loc[core_mask, "keyword_group"] = "CORE_80"
-        else:
-            # Если заказов нет, CORE_80 не назначаем, чтобы не имитировать продающие запросы.
-            g["keyword_group"] = "TAIL_20"
-        out_frames.append(g)
-    result = pd.concat(out_frames, ignore_index=True, sort=False)
-    return result
-
-
-
-
-def _keyword_pct_delta(current: Any, base: Any) -> Optional[float]:
-    base_f = money_or_zero(base)
-    current_f = money_or_zero(current)
-    if abs(base_f) < 1e-9:
-        return None
-    return (current_f / base_f - 1.0) * 100.0
-
-
-def _keyword_weighted_avg(df: pd.DataFrame, value_col: str, weight_col: str = "query_freq") -> float:
-    if df is None or df.empty or value_col not in df.columns:
-        return 0.0
-    vals = pd.to_numeric(df[value_col], errors="coerce")
-    weights = pd.to_numeric(df.get(weight_col, pd.Series([1.0] * len(df), index=df.index)), errors="coerce").fillna(0.0)
-    mask = vals.notna() & (vals > 0) & (weights > 0)
-    if mask.any() and float(weights.loc[mask].sum()) > 0:
-        return float((vals.loc[mask] * weights.loc[mask]).sum() / weights.loc[mask].sum())
-    vals = vals[vals.notna() & (vals > 0)]
-    return float(vals.mean()) if not vals.empty else 0.0
-
-
-def _keyword_with_core_group(keyword_df: pd.DataFrame, core_map: pd.DataFrame) -> pd.DataFrame:
-    """Добавляет к недельным/дневным строкам запросов группу CORE_80/TAIL_20.
-
-    CORE_80 строится на исторической доле заказов по SKU и запросу. Это нужно, чтобы
-    отличать потерю целевых кликов от отсечения хвостового нерелевантного трафика.
-    """
-    if keyword_df is None or keyword_df.empty:
-        return pd.DataFrame()
-    work = keyword_df.copy()
-    if "query_text_norm" not in work.columns and "query_text" in work.columns:
-        work["query_text_norm"] = work["query_text"].astype(str).str.strip().str.lower().str.replace("ё", "е", regex=False)
-    if core_map is None or core_map.empty:
-        work["keyword_group"] = "TAIL_20"
-        work["orders_share"] = 0.0
-        work["orders_cum_share"] = 0.0
-        return work
-    core_cols = [c for c in ["nm_id", "query_text_norm", "keyword_group", "orders_share", "orders_cum_share"] if c in core_map.columns]
-    if "nm_id" not in core_cols or "query_text_norm" not in core_cols:
-        work["keyword_group"] = "TAIL_20"
-        work["orders_share"] = 0.0
-        work["orders_cum_share"] = 0.0
-        return work
-    grouped = core_map[core_cols].drop_duplicates(["nm_id", "query_text_norm"], keep="last").copy()
-    result = work.merge(grouped, on=["nm_id", "query_text_norm"], how="left", suffixes=("", "_core"))
-    result["keyword_group"] = result.get("keyword_group", pd.Series(dtype=str)).fillna("TAIL_20")
-    result["orders_share"] = pd.to_numeric(result.get("orders_share", 0), errors="coerce").fillna(0.0)
-    result["orders_cum_share"] = pd.to_numeric(result.get("orders_cum_share", 0), errors="coerce").fillna(0.0)
-    return result
-
-
-def _keyword_current_base_parts(keyword_df: pd.DataFrame, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame, float, float, str]:
-    """Возвращает current/base части поисковых запросов.
-
-    Основной режим — даты из ctx. Если недельный файл содержит только одну дату на неделю
-    и окна не совпали, fallback берёт две последние даты: последнюю как current, предыдущую как base.
-    """
-    if keyword_df is None or keyword_df.empty:
-        return pd.DataFrame(), pd.DataFrame(), 1.0, 1.0, "NO_KEYWORD_DATA"
-    local = keyword_df.copy()
-    if has_valid_dates(local):
-        local = local[local["date"].notna() & (local["date"] <= ctx.mature_end)].copy()
-        current = local[(local["date"] >= ctx.current_start) & (local["date"] <= ctx.current_end)].copy()
-        base = local[(local["date"] >= ctx.base_start) & (local["date"] <= ctx.base_end)].copy()
-        mode = "CTX_WINDOWS"
-        if current.empty or base.empty:
-            dates = sorted(local["date"].dropna().unique())
-            if len(dates) >= 2:
-                current = local[local["date"].eq(dates[-1])].copy()
-                base = local[local["date"].eq(dates[-2])].copy()
-                mode = "LAST_TWO_KEYWORD_DATES"
-            elif len(dates) == 1:
-                current = local[local["date"].eq(dates[-1])].copy()
-                base = local.iloc[0:0].copy()
-                mode = "ONLY_LAST_KEYWORD_DATE"
-        current_days = max(float(current["date"].nunique()), 1.0) if not current.empty and "date" in current.columns else 1.0
-        base_days = max(float(base["date"].nunique()), 1.0) if not base.empty and "date" in base.columns else 1.0
-        return current, base, current_days, base_days, mode
-    return local.copy(), local.iloc[0:0].copy(), float(ANALYSIS_WINDOW_DAYS), float(ANALYSIS_WINDOW_DAYS), "NO_DATES_CURRENT_ONLY"
-
-
-def _aggregate_keyword_group(part: pd.DataFrame) -> Dict[str, float]:
-    if part is None or part.empty:
-        return {"clicks": 0.0, "orders": 0.0, "query_freq": 0.0, "position": 0.0, "visibility": 0.0, "queries": 0.0}
-    return {
-        "clicks": float(pd.to_numeric(part.get("clicks_to_card", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
-        "orders": float(pd.to_numeric(part.get("keyword_orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
-        "query_freq": float(pd.to_numeric(part.get("query_freq", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
-        "position": _keyword_weighted_avg(part, "median_position", "query_freq"),
-        "visibility": float(pd.to_numeric(part.get("visibility_pct", pd.Series(dtype=float)), errors="coerce").fillna(0).mean()) if len(part) else 0.0,
-        "queries": float(part.get("query_text_norm", pd.Series(dtype=str)).astype(str).nunique()) if "query_text_norm" in part.columns else 0.0,
-    }
-
-
-def _classify_keyword_guard(core_current: Dict[str, float], core_base: Dict[str, float], current_days: float, base_days: float) -> Tuple[str, str]:
-    base_clicks_day = float(core_base.get("clicks", 0.0) or 0.0) / max(base_days, 1.0)
-    current_clicks_day = float(core_current.get("clicks", 0.0) or 0.0) / max(current_days, 1.0)
-    delta_pct = _keyword_pct_delta(current_clicks_day, base_clicks_day)
-    pos_base = float(core_base.get("position", 0.0) or 0.0)
-    pos_current = float(core_current.get("position", 0.0) or 0.0)
-    pos_delta = (pos_current - pos_base) if pos_base > 0 and pos_current > 0 else 0.0
-    vis_delta = float(core_current.get("visibility", 0.0) or 0.0) - float(core_base.get("visibility", 0.0) or 0.0)
-
-    if float(core_base.get("queries", 0.0) or 0.0) <= 0:
-        return "NO_CORE_KEYWORDS", "нет CORE_80 запросов: нельзя оценить качество кликов"
-    if base_clicks_day < KEYWORD_CORE_MIN_CLICKS_PER_DAY and current_clicks_day < KEYWORD_CORE_MIN_CLICKS_PER_DAY:
-        return "LOW_CORE_VOLUME", f"мало CORE-кликов для уверенного вывода: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день"
-    if delta_pct is not None and delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT:
-        return "CORE_CLICK_BAD_LOSS", f"критичная потеря CORE-кликов: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}%)"
-    if pos_delta >= KEYWORD_CORE_POSITION_RISK_DELTA:
-        return "CORE_POSITION_BAD_LOSS", f"ухудшение позиции CORE_80: {pos_base:.1f}→{pos_current:.1f} (Δ={pos_delta:.1f})"
-    if vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP:
-        return "CORE_VISIBILITY_BAD_LOSS", f"падение видимости CORE_80: {vis_delta:.1f} п.п."
-    if delta_pct is not None and delta_pct <= -KEYWORD_CORE_CLICK_RISK_DROP_PCT:
-        return "CORE_CLICK_RISK", f"риск потери CORE-кликов: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}%)"
-    if delta_pct is not None and delta_pct >= 0:
-        return "CORE_CLICK_GROWING", f"CORE-клики растут/держатся: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}%)"
-    return "CORE_CLICK_STABLE", f"CORE-клики без критичной просадки: {base_clicks_day:.1f}→{current_clicks_day:.1f}/день ({delta_pct:.1f}% if delta known)".replace(" if delta known", "")
-
-
-def build_keyword_traffic_guard(keyword_df: pd.DataFrame, keyword_core_df: pd.DataFrame, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Собирает SKU-level контроль целевых кликов и детальную таблицу потерянных CORE-запросов.
-
-    Используется для двух решений:
-    - не снижать ставку, если ДРР краткосрочно улучшился, но CORE-клики падают;
-    - после 500 ₽/день в разгоне масштабировать только если растут/держатся целевые CORE-клики.
-    """
-    empty_profile = pd.DataFrame(columns=KEYWORD_TRAFFIC_GUARD_COLUMNS)
-    empty_detail = pd.DataFrame(columns=KEYWORD_LOSS_DETAIL_COLUMNS)
-    if keyword_df is None or keyword_df.empty:
-        return empty_profile, empty_detail
-    work = _keyword_with_core_group(keyword_df, keyword_core_df)
-    work = filter_managed_subject_rows(work) if "subject_norm" in work.columns else work.copy()
-    if work.empty:
-        return empty_profile, empty_detail
-    current, base, current_days, base_days, mode = _keyword_current_base_parts(work, ctx)
-    rows: List[Dict[str, Any]] = []
-    details: List[Dict[str, Any]] = []
-    nm_ids = sorted(set(work["nm_id"].map(_clean_id_value).tolist()))
-    for nm_id in nm_ids:
-        if not nm_id:
-            continue
-        cur_nm = current[current["nm_id"].map(_clean_id_value).eq(nm_id)].copy() if not current.empty else current.copy()
-        base_nm = base[base["nm_id"].map(_clean_id_value).eq(nm_id)].copy() if not base.empty else base.copy()
-        all_nm = work[work["nm_id"].map(_clean_id_value).eq(nm_id)].copy()
-        supplier_article = ""
-        subject_norm = ""
-        for source in [cur_nm, base_nm, all_nm]:
-            if source is not None and not source.empty:
-                vals = [_clean_text_value(x) for x in source.get("supplier_article", pd.Series(dtype=str)).tolist() if _clean_text_value(x)]
-                if vals and not supplier_article:
-                    supplier_article = vals[-1]
-                subs = [normalize_subject_value(x) for x in source.get("subject_norm", pd.Series(dtype=str)).tolist() if normalize_subject_value(x)]
-                if subs and not subject_norm:
-                    subject_norm = subs[-1]
-        cur_core = cur_nm[cur_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not cur_nm.empty else pd.DataFrame()
-        base_core = base_nm[base_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not base_nm.empty else pd.DataFrame()
-        cur_tail = cur_nm[~cur_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not cur_nm.empty else pd.DataFrame()
-        base_tail = base_nm[~base_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy() if not base_nm.empty else pd.DataFrame()
-        cur_core_agg = _aggregate_keyword_group(cur_core)
-        base_core_agg = _aggregate_keyword_group(base_core)
-        cur_tail_agg = _aggregate_keyword_group(cur_tail)
-        base_tail_agg = _aggregate_keyword_group(base_tail)
-        guard_status, comment = _classify_keyword_guard(cur_core_agg, base_core_agg, current_days, base_days)
-        base_core_day = base_core_agg["clicks"] / max(base_days, 1.0)
-        current_core_day = cur_core_agg["clicks"] / max(current_days, 1.0)
-        pos_delta = (cur_core_agg["position"] - base_core_agg["position"]) if cur_core_agg["position"] > 0 and base_core_agg["position"] > 0 else 0.0
-        vis_delta = cur_core_agg["visibility"] - base_core_agg["visibility"]
-        rows.append({
-            "nm_id": nm_id, "supplier_article": supplier_article, "subject_norm": subject_norm,
-            "keyword_profile_status": mode, "keyword_guard_status": guard_status,
-            "core80_queries_count": int(base_core_agg.get("queries", 0) or cur_core_agg.get("queries", 0) or 0),
-            "base_core80_clicks": base_core_agg["clicks"], "current_core80_clicks": cur_core_agg["clicks"],
-            "base_core80_clicks_per_day": base_core_day, "current_core80_clicks_per_day": current_core_day,
-            "core80_clicks_delta_pct": _keyword_pct_delta(current_core_day, base_core_day),
-            "base_core80_orders": base_core_agg["orders"], "current_core80_orders": cur_core_agg["orders"],
-            "core80_orders_delta_pct": _keyword_pct_delta(cur_core_agg["orders"], base_core_agg["orders"]),
-            "base_core80_avg_position": base_core_agg["position"], "current_core80_avg_position": cur_core_agg["position"], "core80_position_delta": pos_delta,
-            "base_core80_visibility_pct": base_core_agg["visibility"], "current_core80_visibility_pct": cur_core_agg["visibility"], "core80_visibility_delta_pp": vis_delta,
-            "base_tail_clicks": base_tail_agg["clicks"], "current_tail_clicks": cur_tail_agg["clicks"],
-            "tail_clicks_delta_pct": _keyword_pct_delta(cur_tail_agg["clicks"], base_tail_agg["clicks"]),
-            "core_click_guard_comment": comment,
-        })
-
-        # Детализация по запросам: показываем прежде всего потери CORE-запросов.
-        core_queries = set(all_nm[all_nm.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].get("query_text_norm", pd.Series(dtype=str)).astype(str).tolist())
-        for q in sorted(core_queries):
-            if not q:
-                continue
-            bq = base_core[base_core.get("query_text_norm", pd.Series(dtype=str)).astype(str).eq(q)].copy() if not base_core.empty else pd.DataFrame()
-            cq = cur_core[cur_core.get("query_text_norm", pd.Series(dtype=str)).astype(str).eq(q)].copy() if not cur_core.empty else pd.DataFrame()
-            ba = _aggregate_keyword_group(bq)
-            ca = _aggregate_keyword_group(cq)
-            clicks_delta = ca["clicks"] - ba["clicks"]
-            clicks_delta_pct = _keyword_pct_delta(ca["clicks"], ba["clicks"])
-            orders_delta = ca["orders"] - ba["orders"]
-            orders_delta_pct = _keyword_pct_delta(ca["orders"], ba["orders"])
-            qmeta = all_nm[all_nm.get("query_text_norm", pd.Series(dtype=str)).astype(str).eq(q)].tail(1)
-            query_text = _clean_text_value(qmeta.iloc[0].get("query_text", q)) if not qmeta.empty else q
-            orders_share = float(pd.to_numeric(pd.Series([qmeta.iloc[0].get("orders_share", 0) if not qmeta.empty else 0]), errors="coerce").fillna(0).iloc[0])
-            orders_cum = float(pd.to_numeric(pd.Series([qmeta.iloc[0].get("orders_cum_share", 0) if not qmeta.empty else 0]), errors="coerce").fillna(0).iloc[0])
-            q_pos_delta = (ca["position"] - ba["position"]) if ca["position"] > 0 and ba["position"] > 0 else 0.0
-            q_vis_delta = ca["visibility"] - ba["visibility"]
-            if ba["clicks"] >= KEYWORD_CORE_MIN_CLICKS_PER_DAY and clicks_delta_pct is not None and clicks_delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT:
-                risk = "CORE_QUERY_BAD_CLICK_LOSS"
-            elif ba["clicks"] >= KEYWORD_CORE_MIN_CLICKS_PER_DAY and clicks_delta_pct is not None and clicks_delta_pct <= -KEYWORD_CORE_CLICK_RISK_DROP_PCT:
-                risk = "CORE_QUERY_CLICK_RISK"
-            elif q_pos_delta >= KEYWORD_CORE_POSITION_RISK_DELTA or q_vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP:
-                risk = "CORE_QUERY_POSITION_VISIBILITY_RISK"
-            else:
-                risk = "CORE_QUERY_OK"
-            details.append({
-                "nm_id": nm_id, "supplier_article": supplier_article, "subject_norm": subject_norm,
-                "query_text": query_text, "keyword_group": "CORE_80",
-                "orders_share": orders_share, "orders_cum_share": orders_cum,
-                "base_clicks": ba["clicks"], "current_clicks": ca["clicks"], "clicks_delta": clicks_delta, "clicks_delta_pct": clicks_delta_pct,
-                "base_orders": ba["orders"], "current_orders": ca["orders"], "orders_delta": orders_delta, "orders_delta_pct": orders_delta_pct,
-                "base_position": ba["position"], "current_position": ca["position"], "position_delta": q_pos_delta,
-                "base_visibility_pct": ba["visibility"], "current_visibility_pct": ca["visibility"], "visibility_delta_pp": q_vis_delta,
-                "risk_status": risk,
-            })
-    profile = pd.DataFrame(rows, columns=KEYWORD_TRAFFIC_GUARD_COLUMNS)
-    detail = pd.DataFrame(details, columns=KEYWORD_LOSS_DETAIL_COLUMNS)
-    if not detail.empty:
-        detail = detail.sort_values(["risk_status", "clicks_delta", "orders_share"], ascending=[True, True, False]).head(2000)
-    return profile, detail
-
-
-def enrich_metrics_with_keyword_traffic_guard(metrics_df: pd.DataFrame, keyword_guard_df: pd.DataFrame) -> pd.DataFrame:
-    if metrics_df is None or metrics_df.empty:
-        return metrics_df if metrics_df is not None else pd.DataFrame()
-    result = metrics_df.copy()
-    if keyword_guard_df is not None and not keyword_guard_df.empty:
-        guard = keyword_guard_df.copy()
-        guard["nm_id"] = guard["nm_id"].map(_clean_id_value)
-        result["nm_id"] = result["nm_id"].map(_clean_id_value)
-        merge_cols = [c for c in KEYWORD_TRAFFIC_GUARD_COLUMNS if c in guard.columns and c not in {"supplier_article", "subject_norm"}]
-        result = result.merge(guard[merge_cols], on="nm_id", how="left")
-    for col in KEYWORD_TRAFFIC_GUARD_COLUMNS:
-        if col in {"nm_id", "supplier_article", "subject_norm"}:
-            continue
-        if col not in result.columns:
-            result[col] = "" if col in {"keyword_profile_status", "keyword_guard_status", "core_click_guard_comment"} else float("nan")
-    return result
-
-
-def apply_keyword_effect_risk_to_bid_history(bid_history: pd.DataFrame, keyword_effects_df: pd.DataFrame) -> pd.DataFrame:
-    """Переписывает verdict снижения ставки, если после снижения просели CORE_80 клики.
-
-    Логика нужна из-за лага заказов: ДРР может временно улучшиться, пока заказы ещё доезжают
-    со старого трафика, но потеря CORE-кликов уже означает риск будущей выручки.
-    """
-    if bid_history is None or bid_history.empty or keyword_effects_df is None or keyword_effects_df.empty:
-        return bid_history if bid_history is not None else pd.DataFrame(columns=BID_HISTORY_COLUMNS)
-    result = coerce_history_columns_object(bid_history.copy(), BID_HISTORY_COLUMNS)
-    core = keyword_effects_df[keyword_effects_df.get("keyword_group", pd.Series(dtype=str)).astype(str).eq("CORE_80")].copy()
-    if core.empty:
-        return result[BID_HISTORY_COLUMNS]
-    core_by_event = {str(r.get("event_id", "")): r for _, r in core.iterrows() if _clean_text_value(r.get("event_id", ""))}
-    for idx, row in result.iterrows():
-        event_id = _clean_text_value(row.get("event_id", ""))
-        direction = _clean_text_value(row.get("direction", "")).lower()
-        if direction != "lower" or event_id not in core_by_event:
-            continue
-        eff = core_by_event[event_id]
-        clicks_before = money_or_zero(eff.get("clicks_before", 0))
-        delta_pct_raw = pd.to_numeric(pd.Series([eff.get("clicks_delta_d3_pct")]), errors="coerce").iloc[0]
-        pos_delta = money_or_zero(eff.get("position_delta_d3", 0))  # положительное = позиция улучшилась в старой функции; отрицательное = хуже
-        vis_delta = money_or_zero(eff.get("visibility_delta_d3", 0))
-        if pd.isna(delta_pct_raw) or clicks_before < KEYWORD_CORE_MIN_CLICKS_PER_DAY:
-            continue
-        delta_pct = float(delta_pct_raw)
-        current_verdict = _clean_text_value(row.get("final_verdict", ""))
-        if delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT or pos_delta <= -KEYWORD_CORE_POSITION_RISK_DELTA or vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP:
-            result.at[idx, "final_verdict"] = "LOWER_BAD_CORE_CLICK_LOSS"
-            result.at[idx, "postcheck_status"] = "resolved"
-            result.at[idx, "d3_verdict"] = "LOWER_BAD_CORE_CLICK_LOSS"
-        elif delta_pct <= -KEYWORD_CORE_CLICK_RISK_DROP_PCT and current_verdict in {"LOWER_GOOD", "LOWER_D3_MIXED", ""}:
-            result.at[idx, "final_verdict"] = "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK"
-            result.at[idx, "postcheck_status"] = "resolved"
-            result.at[idx, "d3_verdict"] = "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK"
-    return result[BID_HISTORY_COLUMNS]
-
-def _keyword_window_agg(keyword_df: pd.DataFrame, core_map: pd.DataFrame, nm_id: str, supplier_article: str, start_date: date, end_date: date, group_name: str) -> Dict[str, float]:
-    empty = {"queries_count": 0.0, "position": 0.0, "visibility": 0.0, "clicks_to_card": 0.0, "keyword_orders": 0.0, "query_freq": 0.0}
-    if keyword_df is None or keyword_df.empty or core_map is None or core_map.empty:
-        return empty
-    core = core_map[(core_map["nm_id"].astype(str) == str(nm_id)) & (core_map["keyword_group"] == group_name)].copy()
-    if supplier_article:
-        core_art = core[core["supplier_article"].astype(str) == str(supplier_article)]
-        if not core_art.empty:
-            core = core_art
-    if core.empty:
-        return empty
-    queries = set(core["query_text_norm"].astype(str).tolist())
-    part = keyword_df[(keyword_df["nm_id"].astype(str) == str(nm_id)) & (keyword_df["query_text_norm"].astype(str).isin(queries))].copy()
-    if supplier_article:
-        part_art = part[part["supplier_article"].astype(str) == str(supplier_article)]
-        if not part_art.empty:
-            part = part_art
-    if has_valid_dates(part):
-        part = part[(part["date"] >= start_date) & (part["date"] <= end_date)].copy()
-    if part.empty:
-        return {"queries_count": float(len(queries)), "position": 0.0, "visibility": 0.0, "clicks_to_card": 0.0, "keyword_orders": 0.0, "query_freq": 0.0}
-    # Для позиции меньше = лучше. Берём медиану по фразам/дням.
-    pos = pd.to_numeric(part["median_position"], errors="coerce")
-    pos = pos[pos > 0]
-    return {
-        "queries_count": float(len(queries)),
-        "position": float(pos.median()) if not pos.empty else 0.0,
-        "visibility": float(pd.to_numeric(part["visibility_pct"], errors="coerce").fillna(0).mean()),
-        "clicks_to_card": float(pd.to_numeric(part.get("clicks_to_card", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
-        "keyword_orders": float(pd.to_numeric(part["keyword_orders"], errors="coerce").fillna(0).sum()),
-        "query_freq": float(pd.to_numeric(part["query_freq"], errors="coerce").fillna(0).sum()),
-    }
-
-
-def _position_delta(after: float, before: float) -> float:
-    before = float(before or 0)
-    after = float(after or 0)
-    if before == 0 or after == 0:
-        return 0.0
-    # Положительное значение = позиция улучшилась, потому что число позиции уменьшилось.
-    return before - after
-
-
-def _keyword_verdict(direction: str, before: Dict[str, float], after: Dict[str, float], horizon: str) -> Tuple[str, str]:
-    if before.get("queries_count", 0) <= 0:
-        return "NO_CORE_KEYWORDS", "нет классифицированных продающих фраз"
-    pos_delta = _position_delta(after.get("position", 0), before.get("position", 0))
-    vis_delta = float(after.get("visibility", 0) or 0) - float(before.get("visibility", 0) or 0)
-    clicks_before = float(before.get("clicks_to_card", 0) or 0)
-    clicks_after = float(after.get("clicks_to_card", 0) or 0)
-    clicks_delta_pct = _keyword_pct_delta(clicks_after, clicks_before)
-    orders_before = float(before.get("keyword_orders", 0) or 0)
-    orders_after = float(after.get("keyword_orders", 0) or 0)
-    direction = str(direction or "").lower()
-    if direction == "raise":
-        if (clicks_delta_pct is not None and clicks_delta_pct >= 0) or pos_delta > 0 or vis_delta >= 2 or (orders_before == 0 and orders_after > 0) or orders_after >= orders_before:
-            return f"RAISE_KEYWORDS_OK_{horizon}", f"CORE_80: клики {clicks_before:.0f}->{clicks_after:.0f} ({clicks_delta_pct if clicks_delta_pct is not None else 0:.1f}%), позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п., заказы {orders_before:.0f}->{orders_after:.0f}"
-        return f"RAISE_KEYWORDS_WEAK_{horizon}", f"нет улучшения CORE_80: клики {clicks_before:.0f}->{clicks_after:.0f}, позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
-    if direction == "lower":
-        if (clicks_before >= KEYWORD_CORE_MIN_CLICKS_PER_DAY and clicks_delta_pct is not None and clicks_delta_pct <= -KEYWORD_CORE_CLICK_BAD_DROP_PCT) or pos_delta < -KEYWORD_CORE_POSITION_RISK_DELTA or vis_delta <= -KEYWORD_CORE_VISIBILITY_RISK_DROP_PP or (orders_before > 0 and orders_after < orders_before * 0.80):
-            return f"LOWER_KEYWORDS_RISK_{horizon}", f"просадка CORE_80: клики {clicks_before:.0f}->{clicks_after:.0f} ({clicks_delta_pct if clicks_delta_pct is not None else 0:.1f}%), позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п., заказы {orders_before:.0f}->{orders_after:.0f}"
-        return f"LOWER_KEYWORDS_OK_{horizon}", f"CORE_80 без критичной просадки: клики {clicks_before:.0f}->{clicks_after:.0f}, позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
-    return f"KEYWORDS_MONITOR_{horizon}", f"позиция Δ={pos_delta:.2f}, видимость Δ={vis_delta:.2f} п.п."
-
-
-def build_keyword_effects(bid_history: pd.DataFrame, keyword_df: pd.DataFrame, core_map: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    if bid_history is None or bid_history.empty:
-        return pd.DataFrame(columns=KEYWORD_EFFECT_COLUMNS)
-    rows: List[Dict[str, Any]] = []
-    for _, event in bid_history.iterrows():
-        event_date = pd.to_datetime(event.get("event_date"), errors="coerce")
-        if pd.isna(event_date):
-            continue
-        event_day = event_date.date()
-        nm_id = _clean_id_value(event.get("nm_id", ""))
-        supplier_article = _clean_text_value(event.get("supplier_article", ""))
-        direction = _clean_text_value(event.get("direction", "")).lower()
-        before_start = event_day - timedelta(days=5)
-        before_end = event_day - timedelta(days=1)
-        d1_day = event_day + timedelta(days=1)
-        d3_start = event_day + timedelta(days=1)
-        d3_end = event_day + timedelta(days=3)
-        for group_name in ["CORE_80", "TAIL_20"]:
-            before = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, before_start, before_end, group_name)
-            d1 = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, d1_day, d1_day, group_name) if ctx.mature_end >= d1_day else {"queries_count": before.get("queries_count", 0), "position": 0, "visibility": 0, "clicks_to_card": 0, "keyword_orders": 0, "query_freq": 0}
-            d3 = _keyword_window_agg(keyword_df, core_map, nm_id, supplier_article, d3_start, d3_end, group_name) if ctx.mature_end >= d3_end else {"queries_count": before.get("queries_count", 0), "position": 0, "visibility": 0, "clicks_to_card": 0, "keyword_orders": 0, "query_freq": 0}
-            v1, c1 = _keyword_verdict(direction, before, d1, "D1") if ctx.mature_end >= d1_day else ("WAIT_D1", "зрелый D+1 ещё не доступен")
-            v3, c3 = _keyword_verdict(direction, before, d3, "D3") if ctx.mature_end >= d3_end else ("WAIT_D3", "зрелый D+3 ещё не доступен")
-            rows.append({
-                "event_id": event.get("event_id", ""),
-                "campaign_id": event.get("campaign_id", ""),
-                "nm_id": nm_id,
-                "supplier_article": supplier_article,
-                "placement": event.get("placement", ""),
-                "direction": direction,
-                "event_date": event.get("event_date", ""),
-                "keyword_group": group_name,
-                "queries_count": int(before.get("queries_count", 0) or 0),
-                "position_before": before.get("position", 0),
-                "position_d1": d1.get("position", 0),
-                "position_d3": d3.get("position", 0),
-                "position_delta_d1": _position_delta(d1.get("position", 0), before.get("position", 0)),
-                "position_delta_d3": _position_delta(d3.get("position", 0), before.get("position", 0)),
-                "visibility_before": before.get("visibility", 0),
-                "visibility_d1": d1.get("visibility", 0),
-                "visibility_d3": d3.get("visibility", 0),
-                "visibility_delta_d1": float(d1.get("visibility", 0) or 0) - float(before.get("visibility", 0) or 0),
-                "visibility_delta_d3": float(d3.get("visibility", 0) or 0) - float(before.get("visibility", 0) or 0),
-                "clicks_before": before.get("clicks_to_card", 0),
-                "clicks_d1": d1.get("clicks_to_card", 0),
-                "clicks_d3": d3.get("clicks_to_card", 0),
-                "clicks_delta_d1_pct": _keyword_pct_delta(d1.get("clicks_to_card", 0), before.get("clicks_to_card", 0)),
-                "clicks_delta_d3_pct": _keyword_pct_delta(d3.get("clicks_to_card", 0), before.get("clicks_to_card", 0)),
-                "keyword_orders_before": before.get("keyword_orders", 0),
-                "keyword_orders_d1": d1.get("keyword_orders", 0),
-                "keyword_orders_d3": d3.get("keyword_orders", 0),
-                "query_freq_before": before.get("query_freq", 0),
-                "query_freq_d1": d1.get("query_freq", 0),
-                "query_freq_d3": d3.get("query_freq", 0),
-                "keyword_verdict_d1": v1,
-                "keyword_verdict_d3": v3,
-                "keyword_comment": c3 if not str(v3).startswith("WAIT") else c1,
-            })
-    return pd.DataFrame(rows, columns=KEYWORD_EFFECT_COLUMNS)
-
-
-def enrich_effects_with_keyword_monitoring(effect_df: pd.DataFrame, keyword_effects: pd.DataFrame) -> pd.DataFrame:
-    if effect_df is None or effect_df.empty or keyword_effects is None or keyword_effects.empty:
-        return effect_df if effect_df is not None else pd.DataFrame()
-    core = keyword_effects[keyword_effects["keyword_group"] == "CORE_80"].copy()
-    if core.empty:
-        return effect_df
-    cols = [
-        "event_id", "queries_count", "position_before", "position_d1", "position_d3", "position_delta_d1", "position_delta_d3",
-        "visibility_before", "visibility_d1", "visibility_d3", "visibility_delta_d1", "visibility_delta_d3",
-        "clicks_before", "clicks_d1", "clicks_d3", "clicks_delta_d1_pct", "clicks_delta_d3_pct",
-        "keyword_orders_before", "keyword_orders_d1", "keyword_orders_d3", "keyword_verdict_d1", "keyword_verdict_d3", "keyword_comment",
+def parse_period_from_name(name: str) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    patterns = [
+        r"(\d{2})\.(\d{2})\.(\d{4})-(\d{2})\.(\d{2})\.(\d{4})",
+        r"(\d{2})-(\d{2})-(\d{4}).*?(\d{2})-(\d{2})-(\d{4})",
+        r"(\d{4})-(\d{2})-(\d{2}).*?(\d{4})-(\d{2})-(\d{2})",
     ]
-    core = core[cols].drop_duplicates(subset=["event_id"], keep="last")
-    renamed = {c: f"core80_{c}" for c in cols if c != "event_id"}
-    core = core.rename(columns=renamed)
-    return effect_df.merge(core, on="event_id", how="left")
+    for p in patterns:
+        m = re.search(p, name)
+        if not m:
+            continue
+        if len(m.group(1)) == 4:
+            return pd.Timestamp(date(int(m.group(1)), int(m.group(2)), int(m.group(3)))), pd.Timestamp(date(int(m.group(4)), int(m.group(5)), int(m.group(6))))
+        return pd.Timestamp(date(int(m.group(3)), int(m.group(2)), int(m.group(1)))), pd.Timestamp(date(int(m.group(6)), int(m.group(5)), int(m.group(4))))
+    # Russian month period names, for example: "ABC 1-27 мая.xlsx" or "АБС анализ 01-27 мая 2026".
+    months_ru = {
+        "январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6,
+        "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+    }
+    txt = normalize_text(name).lower().replace("ё", "е")
+    m_ru = re.search(r"(?:^|[^0-9])(\d{1,2})\s*[-–—]\s*(\d{1,2})\s+([а-я]+)(?:\s+(20\d{2}))?", txt)
+    if m_ru:
+        d1, d2 = int(m_ru.group(1)), int(m_ru.group(2))
+        mon_word = m_ru.group(3)
+        yy = int(m_ru.group(4)) if m_ru.group(4) else datetime.today().year
+        mon = None
+        for prefix, mm in months_ru.items():
+            if mon_word.startswith(prefix):
+                mon = mm
+                break
+        if mon:
+            try:
+                return pd.Timestamp(date(yy, mon, d1)), pd.Timestamp(date(yy, mon, d2))
+            except Exception:
+                pass
+    wk = parse_week_from_name(name)
+    if wk:
+        return week_bounds(wk)
+    return None, None
 
 
-# =============================
-# Контур изменения цены через скидку продавца
-# =============================
-
-def load_price_history(s3_client, config: Config) -> pd.DataFrame:
-    return load_excel_table_from_s3(s3_client, config, PRICE_HISTORY_KEY, PRICE_HISTORY_COLUMNS)
 
 
-def normalize_funnel_report(df: pd.DataFrame) -> pd.DataFrame:
+def parse_abc_source_timestamp(name: Any) -> pd.Timestamp:
+    """Parse Torgstat file suffix __at_YYYY-MM-DD_HH-MM for duplicate ABC period control.
+
+    When the same daily/weekly/monthly ABC period is downloaded several times,
+    report calculations must use the latest export only, not sum all copies.
     """
-    Нормализует файл воронки.
-
-    Важно: воронку НЕ фильтруем по subject_norm внутри этой функции.
-    В реальном файле воронки предмета может не быть или он может называться иначе.
-    Если здесь применить filter_managed_subject_rows(), строки с пустым subject_norm
-    полностью исчезают, и ценовой блок ошибочно уходит в режим funnel_missing=True.
-    Предмет подтягивается позже через nm_id из рекламных метрик / price API.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    result = pd.DataFrame(index=df.index)
-    result["date"] = parse_date_series(series_or_default(df, ["Дата", "date", "dt", "day", "День"], default=pd.NaT))
-    result["nm_id"] = series_or_default(df, ["Артикул WB", "Номенклатура WB", "nmID", "nmId", "nm_id", "nm", "НМ"], default="").map(_clean_id_value)
-    result["supplier_article"] = _text_series(df, ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "vendorCode", "vendor_code"], default="")
-    result["subject_norm"] = series_or_default(df, ["Предмет", "Название предмета", "subject", "subject_norm"], default="").map(normalize_subject_value)
-    result["card_views"] = numeric_series(df, [
-        "Переходы в карточку", "Переходы", "Просмотры карточки", "Просмотры карточек",
-        "Карточку посмотрели", "openCardCount", "open_card_count", "openCard", "open_card"
-    ], default=0.0)
-    result["add_to_cart"] = numeric_series(df, [
-        "Добавления в корзину", "Добавили в корзину", "Корзины", "В корзину",
-        "addToCartCount", "add_to_cart_count", "addToCart", "add_to_cart"
-    ], default=0.0)
-    result["funnel_orders"] = numeric_series(df, [
-        "Заказы", "Заказали", "Заказано", "ordersCount", "orders_count", "orders"
-    ], default=0.0)
-    # Если конверсии есть в отчёте, используем их; иначе считаем ниже.
-    result["add_to_cart_conv"] = numeric_series(df, [
-        "Конверсия в корзину", "Конверсия в корзину %", "Конверсия корзины",
-        "addToCartConversion", "add_to_cart_conversion"
-    ], default=0.0)
-    result["cart_to_order_conv"] = numeric_series(df, [
-        "Конверсия в заказ", "Конверсия корзина-заказ", "Конверсия корзины в заказ",
-        "cartToOrderConversion", "cart_to_order_conversion"
-    ], default=0.0)
-    result = result[result["nm_id"].map(_clean_id_value).ne("")].copy()
-    result["add_to_cart_conv"] = result.apply(lambda r: safe_ctr_pct(r.get("add_to_cart", 0), r.get("card_views", 0)) if float(r.get("add_to_cart_conv", 0) or 0) == 0 else float(r.get("add_to_cart_conv", 0) or 0), axis=1)
-    result["cart_to_order_conv"] = result.apply(lambda r: safe_ctr_pct(r.get("funnel_orders", 0), r.get("add_to_cart", 0)) if float(r.get("cart_to_order_conv", 0) or 0) == 0 else float(r.get("cart_to_order_conv", 0) or 0), axis=1)
-    return result
-
-
-def load_funnel_report(s3_client, config: Config) -> pd.DataFrame:
-    if not s3_key_exists(s3_client, config.yc_bucket_name, FUNNEL_KEY):
-        print(f"Диагностика воронки: файл не найден: {FUNNEL_KEY}", flush=True)
-        return pd.DataFrame()
-    try:
-        payload = read_s3_bytes(s3_client, config.yc_bucket_name, FUNNEL_KEY)
-        sheets = read_excel_bytes_as_sheets(payload)
-        frames: List[pd.DataFrame] = []
-        diag_rows: List[Dict[str, Any]] = []
-        for sheet_name, df in sheets.items():
-            raw_rows = 0 if df is None else len(df)
-            norm = normalize_funnel_report(df)
-            diag_rows.append({
-                "sheet": sheet_name,
-                "raw_rows": raw_rows,
-                "normalized_rows": len(norm),
-                "rows_with_nm_id": int(norm["nm_id"].map(_clean_id_value).ne("").sum()) if not norm.empty and "nm_id" in norm.columns else 0,
-                "rows_with_date": int(norm["date"].notna().sum()) if not norm.empty and "date" in norm.columns else 0,
-                "card_views_sum": float(pd.to_numeric(norm.get("card_views", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not norm.empty else 0.0,
-                "add_to_cart_sum": float(pd.to_numeric(norm.get("add_to_cart", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not norm.empty else 0.0,
-                "orders_sum": float(pd.to_numeric(norm.get("funnel_orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not norm.empty else 0.0,
-            })
-            if not norm.empty:
-                norm["source_sheet"] = sheet_name
-                frames.append(norm)
-        if diag_rows:
-            total_norm = sum(int(r["normalized_rows"]) for r in diag_rows)
-            total_views = sum(float(r["card_views_sum"]) for r in diag_rows)
-            total_cart = sum(float(r["add_to_cart_sum"]) for r in diag_rows)
-            total_orders = sum(float(r["orders_sum"]) for r in diag_rows)
-            print(
-                f"Диагностика воронки: файл найден; листов={len(diag_rows)}; строк после нормализации={total_norm}; "
-                f"переходы={total_views:.0f}; корзины={total_cart:.0f}; заказы={total_orders:.0f}",
-                flush=True,
-            )
-        return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-    except Exception as exc:
-        print(f"Предупреждение: не удалось прочитать воронку {FUNNEL_KEY}: {exc}", flush=True)
-        return pd.DataFrame()
-
-
-
-
-# =============================
-# Экономика: условная ВП после рекламы для диагностики ставок
-# =============================
-
-def normalize_economics_report(df: pd.DataFrame, source_sheet: str = "") -> pd.DataFrame:
-    """Нормализует файл Экономика.xlsx.
-
-    Для управления ставками нужна не точная бухгалтерская прибыль, а устойчивые параметры юнит-экономики:
-    комиссия WB %, эквайринг %, НДС/ед, средняя логистика/ед, себестоимость/ед и средняя цена.
-    Если точного артикула нет, ниже используется fallback по товарной группе: 901/5 -> среднее по 901.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    result = pd.DataFrame(index=df.index)
-    result["source_sheet"] = source_sheet
-    result["week"] = _text_series(df, ["Неделя", "week"], default="")
-    result["nm_id"] = series_or_default(df, ["Артикул WB", "nmID", "nmId", "nm_id", "Номенклатура WB"], default="").map(_clean_id_value)
-    result["supplier_article"] = _text_series(df, ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "vendorCode"], default="")
-    result["subject_norm"] = series_or_default(df, ["Предмет", "Название предмета", "subject", "subject_norm"], default="").map(normalize_subject_value)
-    result["sales_qty"] = numeric_series(df, ["Чистые продажи, шт", "Продажи, шт", "sales_qty", "quantity"], default=0.0)
-
-    gross_revenue = numeric_series(df, ["Валовая выручка", "Выручка", "revenue"], default=0.0)
-    avg_price = numeric_series(df, ["Средняя цена продажи", "avg_price", "Средняя цена"], default=0.0)
-    result["avg_price"] = avg_price
-    mask_price = (result["avg_price"] <= 0) & (result["sales_qty"] > 0) & (gross_revenue > 0)
-    result.loc[mask_price, "avg_price"] = gross_revenue.loc[mask_price] / result.loc[mask_price, "sales_qty"]
-
-    commission_pct = numeric_series(df, ["Комиссия WB, %", "Комиссия WB %", "commission_pct"], default=0.0)
-    commission_total = numeric_series(df, ["Комиссия WB", "commission"], default=0.0)
-    result["commission_pct"] = commission_pct
-    mask_comm = (result["commission_pct"] <= 0) & (gross_revenue > 0) & (commission_total > 0)
-    result.loc[mask_comm, "commission_pct"] = commission_total.loc[mask_comm] / gross_revenue.loc[mask_comm] * 100.0
-
-    acquiring_pct = numeric_series(df, ["Эквайринг, %", "Эквайринг %", "acquiring_pct"], default=0.0)
-    acquiring_total = numeric_series(df, ["Эквайринг", "acquiring"], default=0.0)
-    result["acquiring_pct"] = acquiring_pct
-    mask_acq = (result["acquiring_pct"] <= 0) & (gross_revenue > 0) & (acquiring_total > 0)
-    result.loc[mask_acq, "acquiring_pct"] = acquiring_total.loc[mask_acq] / gross_revenue.loc[mask_acq] * 100.0
-
-    vat_per_unit = numeric_series(df, ["НДС, руб/ед", "НДС руб/ед", "vat_per_unit"], default=0.0)
-    vat_total = numeric_series(df, ["НДС", "vat"], default=0.0)
-    result["vat_per_unit"] = vat_per_unit
-    mask_vat = (result["vat_per_unit"] <= 0) & (result["sales_qty"] > 0) & (vat_total > 0)
-    result.loc[mask_vat, "vat_per_unit"] = vat_total.loc[mask_vat] / result.loc[mask_vat, "sales_qty"]
-
-    logistics_direct_unit = numeric_series(df, ["Логистика прямая, руб/ед", "Логистика прямая руб/ед"], default=0.0)
-    logistics_return_unit = numeric_series(df, ["Логистика обратная, руб/ед", "Логистика обратная руб/ед"], default=0.0)
-    logistics_direct_total = numeric_series(df, ["Логистика прямая"], default=0.0)
-    logistics_return_total = numeric_series(df, ["Логистика обратная"], default=0.0)
-    result["logistics_per_unit"] = logistics_direct_unit + logistics_return_unit
-    mask_log = (result["logistics_per_unit"] <= 0) & (result["sales_qty"] > 0) & ((logistics_direct_total + logistics_return_total) > 0)
-    result.loc[mask_log, "logistics_per_unit"] = (logistics_direct_total.loc[mask_log] + logistics_return_total.loc[mask_log]) / result.loc[mask_log, "sales_qty"]
-
-    cogs_per_unit = numeric_series(df, ["Себестоимость, руб", "Себестоимость", "cogs_per_unit"], default=0.0)
-    cogs_total = numeric_series(df, ["Себестоимость всего", "cogs_total"], default=0.0)
-    result["cogs_per_unit"] = cogs_per_unit
-    mask_cogs = (result["cogs_per_unit"] <= 0) & (result["sales_qty"] > 0) & (cogs_total > 0)
-    result.loc[mask_cogs, "cogs_per_unit"] = cogs_total.loc[mask_cogs] / result.loc[mask_cogs, "sales_qty"]
-
-    result["product_group"] = result["supplier_article"].map(product_group_from_article)
-    result = result[(result["nm_id"].ne("") | result["supplier_article"].map(_clean_text_value).ne(""))].copy()
-    for col in ["avg_price", "commission_pct", "acquiring_pct", "vat_per_unit", "logistics_per_unit", "cogs_per_unit", "sales_qty"]:
-        result[col] = pd.to_numeric(result[col], errors="coerce").fillna(0.0)
-    return result
-
-
-def load_economics_report(s3_client, config: Config) -> pd.DataFrame:
-    if not s3_key_exists(s3_client, config.yc_bucket_name, ECONOMICS_KEY):
-        print(f"Диагностика экономики: файл не найден: {ECONOMICS_KEY}", flush=True)
-        return pd.DataFrame()
-    try:
-        payload = read_s3_bytes(s3_client, config.yc_bucket_name, ECONOMICS_KEY)
-        sheets = read_excel_bytes_as_sheets(payload)
-        frames: List[pd.DataFrame] = []
-        for sheet_name, df in sheets.items():
-            sh_norm = _norm_col_name(sheet_name)
-            if not ("юнит" in sh_norm or "общий факт" in sh_norm):
-                continue
-            norm = normalize_economics_report(df, source_sheet=str(sheet_name))
-            if not norm.empty:
-                frames.append(norm)
-        result = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-        if not result.empty:
-            print(
-                "Диагностика экономики: "
-                f"файл найден; листов использовано={len(frames)}; строк={len(result)}; "
-                f"nm_id={result['nm_id'].map(_clean_id_value).ne('').sum()}; "
-                f"групп={result['product_group'].map(_clean_text_value).ne('').sum()}",
-                flush=True,
-            )
-        else:
-            print("Диагностика экономики: файл найден, но нужные листы/строки не распознаны", flush=True)
-        return result
-    except Exception as exc:
-        print(f"Предупреждение: не удалось прочитать экономику {ECONOMICS_KEY}: {exc}", flush=True)
-        return pd.DataFrame()
-
-
-
-
-# =============================
-# ABC / АБС: рентабельность товара для страховки решений по ставкам
-# =============================
-
-def parse_abc_period_from_key(key: Any) -> Tuple[Optional[date], Optional[date]]:
-    """Парсит период из имени ABC-файла вида DD.MM.YYYY-DD.MM.YYYY."""
-    name = str(key).split("/")[-1]
-    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})-(\d{2})\.(\d{2})\.(\d{4})", name)
-    if not m:
-        return None, None
-    try:
-        start = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-        end = date(int(m.group(6)), int(m.group(5)), int(m.group(4)))
-        return start, end
-    except Exception:
-        return None, None
-
-
-def parse_abc_export_timestamp_from_key(key: Any) -> datetime:
-    """Берём последнюю выгрузку по суффиксу __at_YYYY-MM-DD_HH-MM."""
-    name = str(key).split("/")[-1]
-    m = re.search(r"__at_(\d{4})-(\d{2})-(\d{2})[_\s-](\d{2})-(\d{2})", name)
-    if not m:
-        return datetime.min
-    try:
-        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
-    except Exception:
-        return datetime.min
-
-
-def is_closed_abc_week(start: Optional[date], end: Optional[date]) -> bool:
-    """ABC для ставок должен быть закрытой неделей Пн-Вс, а не дневным/MTD файлом."""
-    if start is None or end is None:
-        return False
-    return (end - start).days == 6 and start.weekday() == 0 and end.weekday() == 6
-
-
-def latest_abc_report_key(s3_client, config: Config) -> str:
-    keys: List[str] = []
-    for prefix in ABC_REPORT_PREFIXES:
+    text = normalize_text(Path(str(name)).name)
+    m = re.search(r"__at_(\d{4})-(\d{2})-(\d{2})[_\s-](\d{2})-(\d{2})", text)
+    if m:
         try:
-            keys.extend(list_s3_keys(s3_client, config.yc_bucket_name, prefix))
-        except Exception as exc:
-            print(f"Предупреждение ABC: не удалось просканировать {prefix}: {exc}", flush=True)
-    closed_week_candidates = []
-    fallback_candidates = []
-    for key in sorted(set(keys)):
-        name = str(key).split("/")[-1]
-        low = name.lower()
-        if not low.endswith((".xlsx", ".xlsm")) or name.startswith("~$"):
-            continue
-        if not any(token in low for token in ["abc", "абс", "авс"]):
-            continue
-        start, end = parse_abc_period_from_key(key)
+            return pd.Timestamp(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5))))
+        except Exception:
+            return pd.Timestamp.min
+    return pd.Timestamp.min
+
+
+def dedupe_abc_period_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep one valid Torgstat ABC export per analytical period and SKU.
+
+    Important business rule:
+    S3 may contain several ABC files for the same month, for example:
+    01.05-25.05, 01.05-26.05, ..., 01.05-31.05.
+    These files are cumulative MTD exports and must NOT be summed together.
+    For a month we keep only the latest period_end per SKU/month.
+    For the same exact period we keep the latest re-export by __at_ timestamp.
+    Daily ABC files remain daily facts; weekly ABC files remain weekly facts.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+
+    for col in ["period_start", "period_end", "nm_id", "supplier_article", "subject", "product", "source_file"]:
+        if col not in out.columns:
+            if col in {"period_start", "period_end"}:
+                out[col] = pd.NaT
+            elif col == "nm_id":
+                out[col] = np.nan
+            else:
+                out[col] = ""
+
+    out["period_start"] = pd.to_datetime(out["period_start"], errors="coerce").dt.normalize()
+    out["period_end"] = pd.to_datetime(out["period_end"], errors="coerce").dt.normalize()
+    out = out[out["period_start"].notna() & out["period_end"].notna()].copy()
+    if out.empty:
+        return out.drop(columns=[c for c in ["_abc_source_ts", "_abc_period_days", "_abc_is_month_family"] if c in out.columns], errors="ignore")
+
+    out["supplier_article"] = out["supplier_article"].map(clean_article)
+    out["subject"] = out["subject"].map(canonical_subject)
+    out["product"] = out["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+    out["nm_id"] = num_series(out["nm_id"])
+    out["month_key"] = out["period_start"].dt.strftime("%Y-%m")
+    out["_abc_source_ts"] = out.get("source_file", "").map(parse_abc_source_timestamp)
+    out["_abc_period_days"] = (out["period_end"] - out["period_start"]).dt.days + 1
+    # Cumulative monthly-family files are only multi-day periods that start at day 1,
+    # BUT an exact closed Monday-Sunday week may also start on the 1st day of a month
+    # (example: 01.06.2026-07.06.2026). Such files are weekly ABC facts, not MTD.
+    # A real daily ABC for the 1st day of a month must also remain a daily fact.
+    out["_abc_is_closed_week"] = (
+        out["_abc_period_days"].eq(7)
+        & out["period_start"].dt.weekday.eq(0)
+        & out["period_end"].dt.weekday.eq(6)
+    )
+    out["_abc_is_month_family"] = (
+        out["_abc_period_days"].gt(1)
+        & out["period_start"].dt.day.eq(1)
+        & out["period_start"].dt.year.eq(out["period_end"].dt.year)
+        & out["period_start"].dt.month.eq(out["period_end"].dt.month)
+        & ~out["_abc_is_closed_week"]
+    )
+
+    # 1) Exact same period + SKU can be re-exported several times. Keep latest export only.
+    exact_key = ["period_start", "period_end", "supplier_article", "nm_id", "subject", "product"]
+    out = out.sort_values(exact_key + ["_abc_source_ts", "source_file"], na_position="first")
+    before_exact = len(out)
+    out = out.drop_duplicates(exact_key, keep="last").copy()
+
+    # 2) Monthly / MTD files are cumulative. Keep only the latest period_end per month + SKU.
+    month_key_cols = ["month_key", "supplier_article", "nm_id", "subject", "product"]
+    month_part = out[out["_abc_is_month_family"]].copy()
+    other_part = out[~out["_abc_is_month_family"]].copy()
+    before_month = len(month_part)
+    if not month_part.empty:
+        month_part = month_part.sort_values(
+            month_key_cols + ["period_end", "_abc_source_ts", "source_file"],
+            na_position="first",
+        )
+        month_part = month_part.drop_duplicates(month_key_cols, keep="last").copy()
+
+    out = pd.concat([other_part, month_part], ignore_index=True) if not month_part.empty else other_part
+
+    removed_exact = before_exact - (len(other_part) + before_month)
+    removed_month = before_month - len(month_part)
+    if removed_exact or removed_month:
+        log(
+            "abc_dedupe: removed exact_duplicates=%s, cumulative_month_duplicates=%s; "
+            "monthly MTD files are not summed" % (removed_exact, removed_month)
+        )
+
+    out = out.drop(columns=["_abc_source_ts", "_abc_period_days", "_abc_is_month_family", "_abc_is_closed_week"], errors="ignore")
+    return out
+
+
+def filter_recent_report_files(files: List[str], latest_day: pd.Timestamp, lookback_days: int = 110, keep_unknown: bool = True) -> List[str]:
+    """Keep report files whose period intersects the requested lookback window.
+    This avoids parsing old weekly search/stock/entry reports from S3.
+    """
+    if latest_day is None or pd.isna(latest_day):
+        return sorted(set(files))
+    cutoff = pd.Timestamp(latest_day).normalize() - pd.Timedelta(days=lookback_days)
+    out: List[str] = []
+    skipped_old = 0
+    skipped_unknown = 0
+    for f in sorted(set(files)):
+        start, end = parse_period_from_name(Path(f).name)
         if start is None or end is None:
+            if keep_unknown:
+                out.append(f)
+            else:
+                skipped_unknown += 1
             continue
-        export_ts = parse_abc_export_timestamp_from_key(key)
-        record = (end, start, export_ts, key)
-        if is_closed_abc_week(start, end):
-            closed_week_candidates.append(record)
+        if pd.Timestamp(end).normalize() >= cutoff and pd.Timestamp(start).normalize() <= pd.Timestamp(latest_day).normalize():
+            out.append(f)
         else:
-            fallback_candidates.append(record)
-    if closed_week_candidates:
-        closed_week_candidates.sort()
-        chosen = closed_week_candidates[-1][3]
-        print(f"Диагностика ABC-рентабельности: выбран закрытый недельный ABC Пн-Вс: {chosen}", flush=True)
-        return chosen
-    if fallback_candidates:
-        fallback_candidates.sort()
-        chosen = fallback_candidates[-1][3]
-        print(f"Предупреждение ABC-рентабельности: закрытая неделя Пн-Вс не найдена, fallback на последний файл: {chosen}", flush=True)
-        return chosen
+            skipped_old += 1
+    if skipped_old or skipped_unknown:
+        log(f"recent_file_filter: input={len(set(files))}, kept={len(out)}, skipped_old={skipped_old}, skipped_unknown={skipped_unknown}, cutoff={cutoff.date()}")
+    return out
+
+
+
+def limit_recent_report_files(files: List[str], max_files: int) -> List[str]:
+    """Keep unknown support files and the newest dated report files by parsed period end.
+
+    Using lexical sorting for names like "7-4-2026 ..." and "29-3-2026 ..." can pull
+    old weeks instead of the latest ones. This helper uses dates parsed from the file
+    name, so max-file limits reduce runtime without accidentally keeping older reports.
+    """
+    unique = sorted(set(files))
+    if max_files is None or int(max_files) <= 0 or len(unique) <= int(max_files):
+        known = []
+        unknown = []
+        for f in unique:
+            start, end = parse_period_from_name(Path(f).name)
+            if start is None or end is None:
+                unknown.append(f)
+            else:
+                known.append((pd.Timestamp(end).normalize(), pd.Timestamp(start).normalize(), f))
+        return sorted(unknown) + [f for _, _, f in sorted(known)]
+
+    max_files = int(max_files)
+    known = []
+    unknown = []
+    for f in unique:
+        start, end = parse_period_from_name(Path(f).name)
+        if start is None or end is None:
+            unknown.append(f)
+        else:
+            known.append((pd.Timestamp(end).normalize(), pd.Timestamp(start).normalize(), f))
+    known_sorted = [f for _, _, f in sorted(known)]
+
+    # Preserve service/reference files without dates when possible; use the remaining
+    # quota for the latest dated weekly/monthly files.
+    if len(unknown) >= max_files:
+        return sorted(unknown)[-max_files:]
+    keep_known = max_files - len(unknown)
+    return sorted(unknown) + known_sorted[-keep_known:]
+
+def is_month_file(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    if start is None or end is None or pd.isna(start) or pd.isna(end):
+        return False
+    return start.day == 1 and start.year == end.year and start.month == end.month and end.day == calendar.monthrange(start.year, start.month)[1]
+
+
+def month_key(ts: Any) -> str:
+    d = pd.Timestamp(ts)
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def unwrap_excel_bytes(data: bytes) -> bytes:
+    """If uploaded report is a zip with xlsx inside, return the first xlsx bytes."""
+    if data[:2] != b"PK":
+        return data
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = [n for n in zf.namelist() if n.lower().endswith((".xlsx", ".xlsm")) and not Path(n).name.startswith("~$")]
+            if names:
+                # prefer files not inside __MACOSX
+                names = sorted(names, key=lambda x: ("__MACOSX" in x, len(x)))
+                return zf.read(names[0])
+    except zipfile.BadZipFile:
+        pass
+    return data
+
+
+def get_col(df: pd.DataFrame, logical_name: str) -> pd.Series:
+    if logical_name in df.columns:
+        return df[logical_name]
+    return pd.Series([np.nan] * len(df))
+
+
+def add_alias_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    col_by_key = {norm_key(c): c for c in out.columns}
+    for target, variants in ALIASES.items():
+        if target in out.columns:
+            continue
+        found = None
+        for v in variants:
+            key = norm_key(v)
+            if key in col_by_key:
+                found = col_by_key[key]
+                break
+        out[target] = out[found] if found is not None else np.nan
+    return out
+
+
+def read_excel_table(data: bytes, preferred_sheet: Optional[str] = None, header_rows: Iterable[int] = (0, 1, 2, 3, 4)) -> pd.DataFrame:
+    data = unwrap_excel_bytes(data)
+    xl = pd.ExcelFile(io.BytesIO(data))
+    if preferred_sheet and preferred_sheet in xl.sheet_names:
+        sheets = [preferred_sheet]
+    else:
+        sheets = xl.sheet_names
+    best_df = None
+    best_score = -1.0
+    for sheet in sheets:
+        for h in header_rows:
+            try:
+                df = xl.parse(sheet_name=sheet, header=h, dtype=object)
+            except Exception:
+                continue
+            df = df.dropna(how="all").dropna(axis=1, how="all")
+            if df.empty:
+                continue
+            df.columns = [normalize_text(c) or f"col_{i}" for i, c in enumerate(df.columns)]
+            aliased = add_alias_columns(df)
+            score = min(len(df.columns), 50) / 100
+            for c in ["day", "nm_id", "supplier_article", "subject", "orders", "order_sum", "search_query", "entry_section", "spend", "stock", "gross_profit"]:
+                if c in aliased.columns and not aliased[c].isna().all():
+                    score += 1
+            if score > best_score:
+                best_score = score
+                aliased.attrs["source_sheet"] = sheet
+                aliased.attrs["header_row_0based"] = h
+                aliased.attrs["header_row_excel"] = h + 1
+                best_df = aliased
+    if best_df is None:
+        return pd.DataFrame()
+    return best_df
+
+
+def _source_column_name(df: pd.DataFrame, logical_name: str) -> str:
+    """Return the original source column name used for a logical alias when possible."""
+    if df is None or df.empty:
+        return ""
+    variants = ALIASES.get(logical_name, []) + [logical_name]
+    by_key = {norm_key(c): c for c in df.columns}
+    # Prefer non-canonical original columns, then canonical alias.
+    for v in variants:
+        k = norm_key(v)
+        if k in by_key and by_key[k] != logical_name:
+            return by_key[k]
+    if logical_name in df.columns:
+        return logical_name
+    for v in variants:
+        k = norm_key(v)
+        if k in by_key:
+            return by_key[k]
     return ""
 
 
-def normalize_abc_profitability_report(df: pd.DataFrame, source_key: str, source_sheet: str = "") -> pd.DataFrame:
-    """Нормализует ABC ТОРГСТАТ до рентабельности по nm_id / артикулу."""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    result = pd.DataFrame(index=df.index)
-    start, end = parse_abc_period_from_key(source_key)
-    result["abc_source_file"] = source_key
-    result["abc_source_sheet"] = source_sheet
-    result["abc_period_start"] = start.isoformat() if start else ""
-    result["abc_period_end"] = end.isoformat() if end else ""
-    result["nm_id"] = series_or_default(df, ["Артикул WB", "Артикул ВБ", "nmID", "nmId", "nm_id", "Номенклатура WB"], default="").map(_clean_id_value)
-    result["supplier_article"] = _text_series(df, ["Артикул продавца", "supplierArticle", "supplier_article", "Артикул", "vendorCode"], default="")
-    result["subject_norm"] = series_or_default(df, ["Предмет", "Название предмета", "subject", "subject_norm", "Категория"], default="").map(normalize_subject_value)
-    result["abc_profitability_pct"] = numeric_series(df, ["Рентабельность, %", "Рентабельность", "profitability_pct", "abc_profitability_pct", "margin_pct"], default=float("nan"))
-    result["abc_drr_pct"] = numeric_series(df, ["ДРР, %", "ДРР", "abc_drr_pct", "drr_pct"], default=float("nan"))
-    result["abc_gross_profit"] = numeric_series(df, ["Валовая прибыль", "Валовая прибыль, руб", "gross_profit"], default=0.0)
-    result["abc_gross_revenue"] = numeric_series(df, ["Валовая выручка", "Валовая выручка, руб", "gross_revenue", "Выручка"], default=0.0)
-    result = result[(result["nm_id"].map(_clean_id_value).ne("") | result["supplier_article"].map(_clean_text_value).ne(""))].copy()
-    result = filter_managed_subject_rows(result)
-    result = result[pd.to_numeric(result["abc_profitability_pct"], errors="coerce").notna()].copy()
-    return result
+def _source_cell_ref(df: pd.DataFrame, logical_name: str, row_index: Any) -> str:
+    """Return Excel-like cell reference for a logical value after read_excel_table.
 
-
-def load_abc_profitability_report(s3_client, config: Config) -> pd.DataFrame:
-    key = latest_abc_report_key(s3_client, config)
-    if not key:
-        print("Диагностика ABC-рентабельности: файл ABC/АБС не найден", flush=True)
-        return pd.DataFrame()
+    Header detection is done by read_excel_table; row_index is the parsed dataframe row index.
+    This is used only for audit/debug logs, not for calculations.
+    """
     try:
-        payload = read_s3_bytes(s3_client, config.yc_bucket_name, key)
-        sheets = read_excel_bytes_as_sheets(payload)
-        frames: List[pd.DataFrame] = []
-        for sheet_name, df in sheets.items():
-            norm = normalize_abc_profitability_report(df, key, str(sheet_name))
-            if not norm.empty:
-                frames.append(norm)
-        result = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
-        if result.empty:
-            print(f"Диагностика ABC-рентабельности: файл найден, но рентабельность не распознана: {key}", flush=True)
-            return result
-        result["_sort_revenue"] = pd.to_numeric(result.get("abc_gross_revenue", 0), errors="coerce").fillna(0.0)
-        result["_sort_gp"] = pd.to_numeric(result.get("abc_gross_profit", 0), errors="coerce").fillna(0.0)
-        result = result.sort_values(["nm_id", "supplier_article", "_sort_revenue", "_sort_gp"], ascending=[True, True, False, False])
-        result = result.drop_duplicates(["nm_id", "supplier_article"], keep="first").drop(columns=["_sort_revenue", "_sort_gp"], errors="ignore")
-        ok_count = int((pd.to_numeric(result["abc_profitability_pct"], errors="coerce") >= ABC_PROFITABILITY_MIN_PCT).sum())
-        print(
-            f"Диагностика ABC-рентабельности: файл={key}; строк={len(result)}; "
-            f"рентабельность >= {ABC_PROFITABILITY_MIN_PCT:.1f}%: {ok_count}",
-            flush=True,
-        )
-        return result
-    except Exception as exc:
-        print(f"Предупреждение: не удалось прочитать ABC-рентабельность {key}: {exc}", flush=True)
-        return pd.DataFrame()
+        col_name = _source_column_name(df, logical_name)
+        if not col_name or col_name not in df.columns:
+            return ""
+        col_no = list(df.columns).index(col_name) + 1
+        h0 = int(df.attrs.get("header_row_0based", 0) or 0)
+        # pandas row index starts from 0 for the first data row after the header.
+        excel_row = int(row_index) + h0 + 2
+        return f"{get_column_letter(col_no)}{excel_row}"
+    except Exception:
+        return ""
 
 
-def enrich_metrics_with_abc_profitability(metrics_df: pd.DataFrame, abc_df: pd.DataFrame) -> pd.DataFrame:
-    """Добавляет к campaign metrics рентабельность ABC по SKU."""
-    if metrics_df is None or metrics_df.empty:
-        return metrics_df if metrics_df is not None else pd.DataFrame()
-    result = metrics_df.copy()
-    default_cols = {
-        "abc_profitability_pct": float("nan"),
-        "abc_profitability_status": "ABC_NOT_FOUND",
-        "abc_drr_pct": float("nan"),
-        "abc_gross_profit": float("nan"),
-        "abc_gross_revenue": float("nan"),
-        "abc_period_start": "",
-        "abc_period_end": "",
-        "abc_source_file": "",
-        "abc_match_method": "",
-    }
-    for col, default in default_cols.items():
-        if col not in result.columns:
-            result[col] = default
-    if abc_df is None or abc_df.empty:
-        return result
-
-    abc_cols = ["nm_id", "supplier_article", "abc_profitability_pct", "abc_drr_pct", "abc_gross_profit", "abc_gross_revenue", "abc_period_start", "abc_period_end", "abc_source_file"]
-    abc = abc_df[[c for c in abc_cols if c in abc_df.columns]].copy()
-    for col in abc_cols:
-        if col not in abc.columns:
-            abc[col] = "" if col in {"nm_id", "supplier_article", "abc_period_start", "abc_period_end", "abc_source_file"} else float("nan")
-    abc["nm_id"] = abc["nm_id"].map(_clean_id_value)
-    abc["article_norm"] = abc["supplier_article"].map(normalize_article_for_campaign_name)
-    result["_row_order_for_abc"] = range(len(result))
-    result["nm_id"] = result["nm_id"].map(_clean_id_value)
-    result["article_norm"] = result.get("supplier_article", pd.Series([""] * len(result), index=result.index)).map(normalize_article_for_campaign_name)
-
-    by_nm = abc[abc["nm_id"].map(_clean_id_value).ne("")].drop_duplicates("nm_id", keep="first").copy()
-    by_nm = by_nm.drop(columns=["supplier_article", "article_norm"], errors="ignore")
-    result = result.merge(by_nm.add_suffix("_abc_nm"), left_on="nm_id", right_on="nm_id_abc_nm", how="left")
-    matched_nm = result["abc_profitability_pct_abc_nm"].notna() if "abc_profitability_pct_abc_nm" in result.columns else pd.Series(False, index=result.index)
-    for col in ["abc_profitability_pct", "abc_drr_pct", "abc_gross_profit", "abc_gross_revenue", "abc_period_start", "abc_period_end", "abc_source_file"]:
-        src_col = f"{col}_abc_nm"
-        if src_col in result.columns:
-            result[col] = result[col].where(~matched_nm, result[src_col])
-    result.loc[matched_nm, "abc_match_method"] = "exact_nm_id"
-
-    by_art = abc[abc["article_norm"].map(_clean_text_value).ne("")].drop_duplicates("article_norm", keep="first").copy()
-    by_art = by_art.drop(columns=["nm_id", "supplier_article"], errors="ignore")
-    result = result.merge(by_art.add_suffix("_abc_art"), left_on="article_norm", right_on="article_norm_abc_art", how="left")
-    not_matched = result["abc_match_method"].map(_clean_text_value).eq("")
-    if "abc_profitability_pct_abc_art" in result.columns:
-        matched_art = not_matched & result["abc_profitability_pct_abc_art"].notna()
-    else:
-        matched_art = pd.Series(False, index=result.index)
-    for col in ["abc_profitability_pct", "abc_drr_pct", "abc_gross_profit", "abc_gross_revenue", "abc_period_start", "abc_period_end", "abc_source_file"]:
-        src_col = f"{col}_abc_art"
-        if src_col in result.columns:
-            result[col] = result[col].where(~matched_art, result[src_col])
-    result.loc[matched_art, "abc_match_method"] = "exact_supplier_article"
-
-    result["abc_profitability_pct"] = pd.to_numeric(result["abc_profitability_pct"], errors="coerce")
-    result["abc_profitability_status"] = "ABC_NOT_FOUND"
-    result.loc[result["abc_profitability_pct"].notna() & (result["abc_profitability_pct"] >= ABC_PROFITABILITY_MIN_PCT), "abc_profitability_status"] = "PROFITABILITY_OK_GE_15"
-    result.loc[result["abc_profitability_pct"].notna() & (result["abc_profitability_pct"] < ABC_PROFITABILITY_MIN_PCT), "abc_profitability_status"] = "PROFITABILITY_LOW_LT_15"
-    result = result.sort_values("_row_order_for_abc") if "_row_order_for_abc" in result.columns else result
-    cleanup_cols = [c for c in result.columns if c.endswith("_abc_nm") or c.endswith("_abc_art")] + ["article_norm", "_row_order_for_abc"]
-    return result.drop(columns=cleanup_cols, errors="ignore")
+def safe_sheet_name(name: str, used: set) -> str:
+    raw = re.sub(r"[\\/*?:\[\]]", "_", normalize_text(name))[:31] or "Sheet"
+    name = raw
+    i = 1
+    while name in used:
+        suffix = f"_{i}"
+        name = raw[:31 - len(suffix)] + suffix
+        i += 1
+    used.add(name)
+    return name
 
 
-def abc_profitability_value(row: pd.Series | Dict[str, Any]) -> float:
-    value = pd.to_numeric(pd.Series([row.get("abc_profitability_pct", float("nan"))]), errors="coerce").iloc[0]
-    return float(value) if not pd.isna(value) else float("nan")
+def clean_warehouse_name(name: Any) -> str:
+    return normalize_text(name).upper().replace("Ё", "Е")
 
 
-def abc_profitability_is_low(row: pd.Series | Dict[str, Any]) -> bool:
-    value = abc_profitability_value(row)
-    return (not pd.isna(value)) and value < ABC_PROFITABILITY_MIN_PCT
+def warehouse_pool(name: Any) -> str:
+    n = clean_warehouse_name(name)
+    for pool, keys in REGIONAL_REPLACEMENT_POOLS.items():
+        if any(k in n for k in keys):
+            return pool
+    return "ДРУГИЕ"
 
 
-def abc_profitability_is_ok(row: pd.Series | Dict[str, Any]) -> bool:
-    value = abc_profitability_value(row)
-    return (not pd.isna(value)) and value >= ABC_PROFITABILITY_MIN_PCT
-
-def _weighted_mean_numeric(df: pd.DataFrame, value_col: str, weight_col: str = "sales_qty") -> float:
-    if df is None or df.empty or value_col not in df.columns:
-        return 0.0
-    vals = pd.to_numeric(df[value_col], errors="coerce")
-    weights = pd.to_numeric(df.get(weight_col, pd.Series([1.0] * len(df), index=df.index)), errors="coerce").fillna(0.0)
-    mask = vals.notna() & (weights > 0)
-    if mask.any() and float(weights.loc[mask].sum()) > 0:
-        return float((vals.loc[mask] * weights.loc[mask]).sum() / weights.loc[mask].sum())
-    vals = vals.dropna()
-    return float(vals.mean()) if not vals.empty else 0.0
+def weighted_mean(values: pd.Series, weights: pd.Series) -> float:
+    v = pd.to_numeric(values, errors="coerce")
+    w = pd.to_numeric(weights, errors="coerce").fillna(0)
+    mask = v.notna() & (w > 0)
+    if mask.any():
+        return float(np.average(v[mask], weights=w[mask]))
+    if v.notna().any():
+        return float(v.mean())
+    return np.nan
 
 
-def _economics_metric_from_group(g: pd.DataFrame, method: str) -> Dict[str, Any]:
-    if g is None or g.empty:
-        return {}
-    supplier_article = _clean_text_value(g["supplier_article"].dropna().astype(str).iloc[0]) if "supplier_article" in g.columns and not g["supplier_article"].dropna().empty else ""
-    product_group = _clean_text_value(g["product_group"].dropna().astype(str).iloc[0]) if "product_group" in g.columns and not g["product_group"].dropna().empty else product_group_from_article(supplier_article)
-    return {
-        "economics_match_method": method,
-        "supplier_article_from_economics": normalize_article_for_campaign_name(supplier_article) or supplier_article,
-        "economics_product_group": product_group,
-        "economics_avg_price": _weighted_mean_numeric(g, "avg_price"),
-        "economics_commission_pct": _weighted_mean_numeric(g, "commission_pct"),
-        "economics_acquiring_pct": _weighted_mean_numeric(g, "acquiring_pct"),
-        "economics_vat_per_unit": _weighted_mean_numeric(g, "vat_per_unit"),
-        "economics_logistics_per_unit": _weighted_mean_numeric(g, "logistics_per_unit"),
-        "economics_cogs_per_unit": _weighted_mean_numeric(g, "cogs_per_unit") if ECONOMICS_SUBTRACT_COGS else 0.0,
-    }
+def classify_ad_type(value: Any) -> str:
+    t = norm_key(value)
+    if "manual" in t or "руч" in t or "поиск" in t or "каталог" in t:
+        return "manual"
+    if "unified" in t or "авто" in t or "един" in t or "карточ" in t or "полк" in t or "рекомен" in t:
+        return "unified"
+    return "unknown"
 
 
-def build_economics_lookup(economics_df: pd.DataFrame) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    lookup: Dict[str, Dict[str, Dict[str, Any]]] = {"nm": {}, "article": {}, "group": {}}
-    if economics_df is None or economics_df.empty:
-        return lookup
-    local = economics_df.copy()
-    # Обычно файл недельный. Берём последнюю неделю, чтобы не усреднять старые условия комиссии/логистики.
-    if "week" in local.columns and local["week"].map(_clean_text_value).ne("").any():
-        latest_week = sorted(local["week"].map(_clean_text_value).dropna().unique())[-1]
-        local = local[local["week"].map(_clean_text_value).eq(latest_week)].copy()
-    for nm_id, g in local[local["nm_id"].map(_clean_id_value).ne("")].groupby("nm_id", dropna=False):
-        lookup["nm"][_clean_id_value(nm_id)] = _economics_metric_from_group(g, "exact_nm_id")
-    tmp = local.copy()
-    tmp["article_norm"] = tmp["supplier_article"].map(normalize_article_for_campaign_name)
-    for art, g in tmp[tmp["article_norm"].map(_clean_text_value).ne("")].groupby("article_norm", dropna=False):
-        lookup["article"][_clean_text_value(art)] = _economics_metric_from_group(g, "exact_supplier_article")
-    for grp, g in local[local["product_group"].map(_clean_text_value).ne("")].groupby("product_group", dropna=False):
-        lookup["group"][_clean_text_value(grp)] = _economics_metric_from_group(g, "avg_product_group")
-    return lookup
+# ------------------------- business cleanup helpers -------------------------
+# Prefix exclusions are only for real excluded article families.
+# PT901.Fxx are valid brush articles and must not be filtered as the raw PT901 service code.
+EXCLUDE_ARTICLE_PREFIXES = ("CZ420", "DE49")
+EXCLUDE_ARTICLE_EXACT = {"PT901"}
+EXCLUDE_PRODUCT_PREFIXES = ("CZ420", "DE49", "FL", "PE")
+WAREHOUSE_EXCLUDE_KEYWORDS = (
+    "ВИРТУАЛ", "АСТАН", "АЛМАТ", "АТАКЕНТ", "КАРАГАНД", "КАЗАХ", "БЕЛАРУС", "МИНСК",
+    "ДАЛЬНЕГОРСК", "МАХАЧКАЛА ВИРТ", "ВИРТУАЛЬНЫЙ",
+)
 
 
-def lookup_economics_metrics(economics_lookup: Dict[str, Dict[str, Dict[str, Any]]], nm_id: Any, supplier_article: Any) -> Dict[str, Any]:
-    nm = _clean_id_value(nm_id)
-    art = normalize_article_for_campaign_name(supplier_article) or _clean_text_value(supplier_article)
-    grp = product_group_from_article(art or supplier_article)
-    if nm and nm in economics_lookup.get("nm", {}):
-        return economics_lookup["nm"][nm]
-    if art and art in economics_lookup.get("article", {}):
-        return economics_lookup["article"][art]
-    if grp and grp in economics_lookup.get("group", {}):
-        return economics_lookup["group"][grp]
-    return {}
+def is_excluded_article(value: Any) -> bool:
+    t = article_upper(value)
+    if not t:
+        return True
+    if t in EXCLUDE_ARTICLE_EXACT:
+        return True
+    return any(t.startswith(prefix) for prefix in EXCLUDE_ARTICLE_PREFIXES)
 
 
-def estimate_gp_after_ads_from_economics(revenue: Any, orders: Any, ad_spend: Any, econ: Dict[str, Any]) -> float:
-    revenue_f = money_or_zero(revenue)
-    orders_f = money_or_zero(orders)
-    spend_f = money_or_zero(ad_spend)
-    if not econ or revenue_f <= 0:
-        return float("nan")
-    avg_price = float(econ.get("economics_avg_price", 0) or 0)
-    units = orders_f
-    if units <= 0 and avg_price > 0:
-        units = revenue_f / avg_price
-    commission = revenue_f * float(econ.get("economics_commission_pct", 0) or 0) / 100.0
-    acquiring = revenue_f * float(econ.get("economics_acquiring_pct", 0) or 0) / 100.0
-    vat = units * float(econ.get("economics_vat_per_unit", 0) or 0)
-    logistics = units * float(econ.get("economics_logistics_per_unit", 0) or 0)
-    cogs = units * float(econ.get("economics_cogs_per_unit", 0) or 0)
-    return float(revenue_f - commission - acquiring - vat - logistics - cogs - spend_f)
+def is_valid_product_code(value: Any) -> bool:
+    t = normalize_text(value).upper().replace(" ", "")
+    if not t:
+        return False
+    if any(t.startswith(prefix) for prefix in EXCLUDE_PRODUCT_PREFIXES):
+        return False
+    # For management reports we keep only product families approved in the global mapping.
+    # This removes 405/406/552/620/622 from target reports unless explicitly added above.
+    return t in VALID_PRODUCT_CODES
 
 
-def enrich_ads_with_estimated_gp(ads_df: pd.DataFrame, economics_df: pd.DataFrame) -> pd.DataFrame:
-    """Добавляет условную ВП после рекламы в рекламные дневные строки.
-
-    Формула: сумма заказов - комиссия WB% - эквайринг% - НДС/ед*заказы - логистика/ед*заказы
-    - себестоимость/ед*заказы - расход рекламы. Если точного SKU нет, берём среднее по группе артикула
-    (например, 901/5 -> среднее по всем 901).
-    """
-    if ads_df is None or ads_df.empty:
-        return ads_df if ads_df is not None else pd.DataFrame()
-    result = ads_df.copy()
-    for col in ["economics_match_method", "economics_product_group", "economics_avg_price", "economics_commission_pct", "economics_acquiring_pct", "economics_vat_per_unit", "economics_logistics_per_unit", "economics_cogs_per_unit"]:
-        if col not in result.columns:
-            result[col] = "" if col in {"economics_match_method", "economics_product_group"} else float("nan")
-    lookup = build_economics_lookup(economics_df)
-    if not any(lookup.values()):
-        print("Диагностика экономики: lookup пустой, ВП после рекламы не рассчитана", flush=True)
-        return result
-    matched = 0
-    gp_values: List[float] = []
-    for idx, row in result.iterrows():
-        econ = lookup_economics_metrics(lookup, row.get("nm_id", ""), row.get("supplier_article", ""))
-        gp = estimate_gp_after_ads_from_economics(row.get("revenue", 0), row.get("orders", 0), row.get("spend", 0), econ)
-        gp_values.append(gp)
-        if econ:
-            matched += 1
-            if not _clean_text_value(row.get("supplier_article", "")) and _clean_text_value(econ.get("supplier_article_from_economics", "")):
-                result.at[idx, "supplier_article"] = econ.get("supplier_article_from_economics", "")
-            for col in ["economics_match_method", "economics_product_group", "economics_avg_price", "economics_commission_pct", "economics_acquiring_pct", "economics_vat_per_unit", "economics_logistics_per_unit", "economics_cogs_per_unit"]:
-                result.at[idx, col] = econ.get(col, "")
-    result["estimated_gp_after_ads"] = gp_values
-    # Заполняем gp_after_ads условной экономикой, если в рекламном отчёте ВП нет или она пустая.
-    if "gp_after_ads" not in result.columns:
-        result["gp_after_ads"] = result["estimated_gp_after_ads"]
-    else:
-        existing = pd.to_numeric(result["gp_after_ads"], errors="coerce")
-        estimated = pd.to_numeric(result["estimated_gp_after_ads"], errors="coerce")
-        result["gp_after_ads"] = existing.where(existing.notna(), estimated)
-    print(
-        f"Диагностика экономики: ВП после рекламы рассчитана для {matched} из {len(result)} строк рекламы; "
-        f"себестоимость вычитаем={'да' if ECONOMICS_SUBTRACT_COGS else 'нет'}",
-        flush=True,
-    )
-    return result
+def canonical_warehouse_name(name: Any) -> str:
+    n = clean_warehouse_name(name)
+    rules = [
+        ("КОЛЕДИНО", "Коледино"), ("ЭЛЕКТРОСТАЛ", "Электросталь"), ("БЕЛАЯ ДАЧ", "Белая Дача"),
+        ("ВЕШК", "Вёшки"), ("ВЁШК", "Вёшки"), ("РЯЗАН", "Рязань"), ("ТУЛ", "Тула"), ("АЛЕКСИН", "Тула"),
+        ("ВЛАДИМИР", "Владимир"), ("КОТОВСК", "Котовск"), ("ВОРОНЕЖ", "Воронеж"),
+        ("КРАСНОДАР", "Краснодар"), ("НЕВИННОМЫССК", "Невинномысск"), ("ВОЛГОГРАД", "Волгоград"),
+        ("РОСТОВ", "Ростов/Аксай"), ("АКСАЙ", "Ростов/Аксай"),
+        ("КАЗАН", "Казань"), ("ПЕНЗ", "Пенза"), ("САРАПУЛ", "Сарапул"), ("НОВОСЕМЕЙКИНО", "Новосемейкино"), ("САМАР", "Самара"),
+        ("ШУШАР", "СПБ Шушары"), ("УТКИН", "СПБ Уткина Заводь"), ("САНКТ", "Санкт-Петербург"), ("ПЕТЕРБУРГ", "Санкт-Петербург"),
+        ("ЕКАТЕРИНБУРГ", "Екатеринбург"), ("ЧЕЛЯБИНСК", "Челябинск"), ("ПЕРМ", "Пермь"),
+        ("НОВОСИБИРСК", "Новосибирск"), ("КРАСНОЯРСК", "Красноярск"), ("КЕМЕРОВО", "Кемерово"),
+    ]
+    for key, canon in rules:
+        if key in n:
+            return canon
+    return normalize_text(name)
 
 
-def enrich_supplier_articles_from_economics(df: pd.DataFrame, economics_df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or economics_df is None or economics_df.empty or "nm_id" not in df.columns:
-        return df if df is not None else pd.DataFrame()
-    lookup = build_economics_lookup(economics_df)
-    result = df.copy()
-    if "supplier_article" not in result.columns:
-        result["supplier_article"] = ""
-    for idx, row in result.iterrows():
-        if _clean_text_value(row.get("supplier_article", "")):
-            continue
-        econ = lookup_economics_metrics(lookup, row.get("nm_id", ""), "")
-        art = _clean_text_value(econ.get("supplier_article_from_economics", "")) if econ else ""
-        if art:
-            result.at[idx, "supplier_article"] = art
-    return result
+def is_relevant_warehouse(name: Any) -> bool:
+    n = clean_warehouse_name(name)
+    if not n:
+        return False
+    if any(k in n for k in WAREHOUSE_EXCLUDE_KEYWORDS):
+        return False
+    return True
 
 
-def _economics_info_for_key(ads_df: pd.DataFrame, key: Tuple[str, str, str]) -> Dict[str, Any]:
-    empty = {
-        "economics_match_method": "", "economics_product_group": "", "economics_avg_price": "",
-        "economics_commission_pct": "", "economics_acquiring_pct": "", "economics_vat_per_unit": "",
-        "economics_logistics_per_unit": "", "economics_cogs_per_unit": "",
-    }
-    if ads_df is None or ads_df.empty:
-        return empty
-    campaign_id, nm_id, placement = key
-    part = ads_df[
-        (ads_df["campaign_id"].astype(str).map(_clean_id_value).eq(campaign_id))
-        & (ads_df["nm_id"].astype(str).map(_clean_id_value).eq(nm_id))
-        & (ads_df["placement"].astype(str).map(normalize_placement_value).eq(placement))
-    ].copy()
-    if part.empty:
-        return empty
-    for col in empty:
-        if col in part.columns:
-            vals = [_clean_text_value(x) for x in part[col].tolist() if _clean_text_value(x)]
-            if vals:
-                empty[col] = vals[-1]
-    return empty
-
-def aggregate_funnel_metrics(funnel_df: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
-    cols = ["nm_id", "card_views", "add_to_cart", "funnel_orders", "add_to_cart_conv", "cart_to_order_conv"]
-    if funnel_df is None or funnel_df.empty:
-        return pd.DataFrame(columns=cols)
-    part = funnel_df.copy()
-    if has_valid_dates(part):
-        part = part[(part["date"] >= start_date) & (part["date"] <= end_date)].copy()
-    if part.empty:
-        return pd.DataFrame(columns=cols)
-    agg = part.groupby("nm_id", dropna=False).agg(
-        card_views=("card_views", "sum"),
-        add_to_cart=("add_to_cart", "sum"),
-        funnel_orders=("funnel_orders", "sum"),
-    ).reset_index()
-    agg["add_to_cart_conv"] = [safe_ctr_pct(a, v) for a, v in zip(agg["add_to_cart"], agg["card_views"])]
-    agg["cart_to_order_conv"] = [safe_ctr_pct(o, a) for o, a in zip(agg["funnel_orders"], agg["add_to_cart"])]
-    return agg
+def classify_entry_channel(section: Any, point: Any = "") -> str:
+    t = norm_key(f"{section} {point}")
+    if "поиск" in t or "каталог" in t:
+        return "Поиск/Каталог"
+    if "карточ" in t or "полк" in t or "рекомен" in t:
+        return "Карточка товара / полки"
+    if "реклам" in t:
+        return "Реклама / прочее"
+    if "внеш" in t:
+        return "Внешние переходы"
+    return "Другие точки входа"
 
 
-def fetch_current_goods_prices(config: Config, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    url = WB_PRICES_BASE_URL + WB_PRICES_LIST_ENDPOINT
-    rows: List[Dict[str, Any]] = []
-    logs: List[Dict[str, Any]] = []
-    limit = 1000
-    offset = 0
-    if ctx.mode == "preview" or ctx.dry_run:
-        # Список текущих цен нужен даже в dry-run, это чтение без изменения данных.
-        pass
-    for page in range(1, 50):
-        params = {"limit": limit, "offset": offset}
-        endpoint = f"{WB_PRICES_LIST_ENDPOINT}?limit={limit}&offset={offset}"
+def pct_gap(fact: Any, target: Any) -> float:
+    f = to_number(fact)
+    t = to_number(target)
+    if pd.isna(f) or pd.isna(t) or t == 0:
+        return np.nan
+    return (f / t - 1) * 100
+
+
+
+@dataclass
+class Diagnostics:
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+
+    def add(self, level: str, source: str, message: str, details: Any = "") -> None:
+        self.rows.append({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "level": level,
+            "source": source,
+            "message": message,
+            "details": normalize_text(details),
+        })
+
+    def frame(self) -> pd.DataFrame:
+        return pd.DataFrame(self.rows, columns=["timestamp", "level", "source", "message", "details"])
+
+
+# ------------------------- storage -------------------------
+class Storage:
+    is_s3 = False
+    def list_files(self, prefix: str) -> List[str]:
+        raise NotImplementedError
+    def read_bytes(self, key: str) -> bytes:
+        raise NotImplementedError
+    def write_bytes(self, key: str, data: bytes) -> None:
+        raise NotImplementedError
+    def delete_file(self, key: str) -> None:
+        raise NotImplementedError
+    def exists(self, key: str) -> bool:
+        raise NotImplementedError
+
+
+class LocalStorage(Storage):
+    def __init__(self, root: str):
+        self.root = Path(root)
+    def _full(self, key: str) -> Path:
+        return self.root / key
+    def list_files(self, prefix: str) -> List[str]:
+        prefix = prefix.replace("\\", "/").strip("/")
+        start = self._full(prefix)
+        base = start if start.is_dir() else start.parent
+        if not base.exists():
+            return []
+        out = []
+        for p in base.rglob("*"):
+            if p.is_file():
+                rel = str(p.relative_to(self.root)).replace("\\", "/")
+                if rel.startswith(prefix) and not Path(rel).name.startswith("~$"):
+                    out.append(rel)
+        return sorted(out)
+    def read_bytes(self, key: str) -> bytes:
+        return self._full(key).read_bytes()
+    def write_bytes(self, key: str, data: bytes) -> None:
+        p = self._full(key)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+    def delete_file(self, key: str) -> None:
+        p = self._full(key)
         try:
-            resp = requests.get(url, params=params, headers=wb_headers(config), timeout=90)
-            logs.append(api_log_row(ctx.run_datetime, "GET", endpoint, "", str(resp.status_code), resp.text[:4000]))
-            if resp.status_code != 200:
+            if p.exists() and p.is_file():
+                p.unlink()
+        except Exception as exc:
+            log(f"WARN cleanup local delete failed: {key}: {exc}")
+    def exists(self, key: str) -> bool:
+        return self._full(key).exists()
+
+
+class S3Storage(Storage):
+    is_s3 = True
+    def __init__(self, bucket: str, access_key: str, secret_key: str, endpoint_url: str):
+        self.bucket = bucket
+        self.client = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
+    def list_files(self, prefix: str) -> List[str]:
+        out = []
+        token = None
+        while True:
+            kwargs = {"Bucket": self.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = self.client.list_objects_v2(**kwargs)
+            for item in resp.get("Contents", []):
+                key = item.get("Key", "")
+                if key and not key.endswith("/") and not Path(key).name.startswith("~$"):
+                    out.append(key)
+            if not resp.get("IsTruncated"):
                 break
-            payload = resp.json()
-            data = payload.get("data", payload) if isinstance(payload, dict) else payload
-            if isinstance(data, dict):
-                items = data.get("listGoods") or data.get("goods") or data.get("items") or data.get("data") or []
-            elif isinstance(data, list):
-                items = data
-            else:
-                items = []
-            if not items:
-                break
-            for item in items:
-                sizes = item.get("sizes") if isinstance(item.get("sizes"), list) else []
-                first_size = sizes[0] if sizes else {}
-                rows.append({
-                    "nm_id": _clean_id_value(item.get("nmID") or item.get("nmId") or item.get("nm_id")),
-                    "supplier_article_api": _clean_text_value(item.get("vendorCode") or item.get("supplierArticle") or item.get("article") or ""),
-                    "current_wb_price": float(pd.to_numeric(pd.Series([item.get("price", first_size.get("price", 0))]), errors="coerce").fillna(0).iloc[0]),
-                    "current_discount": float(pd.to_numeric(pd.Series([item.get("discount", first_size.get("discount", 0))]), errors="coerce").fillna(0).iloc[0]),
+            token = resp.get("NextContinuationToken")
+        return sorted(out)
+    def read_bytes(self, key: str) -> bytes:
+        return self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+    def write_bytes(self, key: str, data: bytes) -> None:
+        self.client.put_object(Bucket=self.bucket, Key=key, Body=data)
+    def delete_file(self, key: str) -> None:
+        self.client.delete_object(Bucket=self.bucket, Key=key)
+    def exists(self, key: str) -> bool:
+        try:
+            self.client.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
+
+def make_storage(root: str) -> Storage:
+    bucket = os.getenv("YC_BUCKET_NAME", "").strip()
+    access = os.getenv("YC_ACCESS_KEY_ID", "").strip()
+    secret = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
+    endpoint = os.getenv("YC_ENDPOINT_URL", "").strip() or "https://storage.yandexcloud.net"
+    # FIX_MARKER_20260525_ENDPOINT_FALLBACK: empty YC_ENDPOINT_URL must not break boto3.
+    if bucket and access and secret:
+        log(f"Storage: Yandex Object Storage bucket={bucket}; endpoint={endpoint}")
+        return S3Storage(bucket, access, secret, endpoint)
+    log(f"Storage: local root={Path(root).resolve()}")
+    return LocalStorage(root)
+
+
+# ------------------------- loader -------------------------
+@dataclass
+class DataPack:
+    orders: pd.DataFrame
+    funnel: pd.DataFrame
+    ads_daily: pd.DataFrame
+    ads_raw: pd.DataFrame
+    ads_category: pd.DataFrame
+    campaigns: pd.DataFrame
+    search_queries: pd.DataFrame
+    entry_points: pd.DataFrame
+    stock: pd.DataFrame
+    abc_weekly: pd.DataFrame
+    abc_monthly: pd.DataFrame
+    economics: pd.DataFrame
+    latest_day: pd.Timestamp
+    diagnostics: Diagnostics
+
+
+class Loader:
+    def __init__(self, storage: Storage, reports_root: str, store: str, diagnostics: Diagnostics):
+        self.storage = storage
+        self.reports_root = reports_root.strip("/")
+        self.store = store
+        self.diag = diagnostics
+        self.current_week_only = os.getenv("WB_CURRENT_WEEK_ONLY", "0").strip().lower() in {"1", "true", "yes", "y"}
+        target_raw = os.getenv("WB_DAILY_TARGET_DATE", "").strip()
+        if target_raw:
+            self.daily_target_day = pd.Timestamp(target_raw).normalize()
+        else:
+            # GitHub run at 12:00 MSK should take yesterday as the latest completed day.
+            self.daily_target_day = pd.Timestamp(datetime.now().date()).normalize() - pd.Timedelta(days=1)
+
+    def _filter_current_week_files(self, files: List[str], keep_unparsed: bool = False, fallback_tail: int = 1) -> List[str]:
+        if not self.current_week_only:
+            return files
+        target = self.daily_target_day
+        week_start = target - pd.Timedelta(days=int(target.weekday()))
+        week_end = week_start + pd.Timedelta(days=6)
+        selected, unparsed = [], []
+        for key in files:
+            start, end = parse_period_from_name(Path(key).name)
+            if start is None or end is None:
+                unparsed.append(key)
+                continue
+            start = pd.Timestamp(start).normalize(); end = pd.Timestamp(end).normalize()
+            if start <= week_end and end >= week_start:
+                selected.append(key)
+        if selected:
+            log(f"current_week_only: selected {len(selected)}/{len(files)} files for week {week_start.date()}..{week_end.date()}")
+            return sorted(set(selected))
+        if keep_unparsed and unparsed:
+            log(f"current_week_only: no dated files found, using {min(fallback_tail, len(unparsed))} unparsed/latest files")
+            return sorted(set(unparsed))[-fallback_tail:]
+        return sorted(set(files))[-fallback_tail:]
+
+    def path(self, *parts: str) -> str:
+        return "/".join([self.reports_root, *parts]).replace("//", "/")
+
+    def list_reports(self, *parts: str) -> List[str]:
+        prefix = self.path(*parts)
+        files = self.storage.list_files(prefix)
+        return [f for f in files if f.lower().endswith((".xlsx", ".xlsm", ".zip")) and not Path(f).name.startswith("~$")]
+
+    def _store_norm(self, value: Any) -> str:
+        return re.sub(r"[^A-ZА-Я0-9]+", "", normalize_text(value).upper().replace("Ё", "Е"))
+
+    def _filter_store_scoped_files(self, files: List[str], source: str) -> List[str]:
+        """Remove files that clearly belong to another store.
+
+        Broad scans such as ``Отчёты/Реклама`` are useful because old exports may be
+        uploaded outside the canonical TOPFACE folder, but they also catch
+        ``Отчёты/Реклама/MISSTAIS/...``. That was the reason current-day ad spend
+        could be inflated by another store. Keep files under the requested store,
+        keep storeless legacy files, and drop files explicitly scoped to another store.
+        """
+        if not files:
+            return files
+        store_norm = self._store_norm(self.store)
+        known_store_norms = {"TOPFACE", "MISSTAIS", "MISSTAIS", "MISS ТAIS", "MISSTAIS", "MT", "МТ"}
+        # Normalize a couple of human spellings into the same token.
+        known_store_norms = {self._store_norm(x) for x in known_store_norms if self._store_norm(x)}
+        kept: List[str] = []
+        removed: List[str] = []
+        for key in sorted(set(files)):
+            parts = [self._store_norm(p) for p in str(key).replace("\\", "/").split("/") if p]
+            explicit_store_segments = [p for p in parts if p in known_store_norms]
+            has_target = store_norm in explicit_store_segments
+            has_other = any(p != store_norm for p in explicit_store_segments)
+            if has_other and not has_target:
+                removed.append(key)
+                continue
+            kept.append(key)
+        if removed:
+            sample = "; ".join(removed[:5])
+            log(f"{source}: store_scope_filter removed_other_store={len(removed)}, kept={len(kept)}, store={self.store}; sample={sample}")
+        return kept
+
+    def _log(self, name: str, df: pd.DataFrame, date_col: Optional[str] = None) -> None:
+        if date_col and not df.empty and date_col in df.columns:
+            mn, mx = pd.to_datetime(df[date_col], errors="coerce").min(), pd.to_datetime(df[date_col], errors="coerce").max()
+            log(f"{name}: rows={len(df):,}, dates={mn.date() if pd.notna(mn) else '-'}..{mx.date() if pd.notna(mx) else '-'}")
+        else:
+            log(f"{name}: rows={len(df):,}")
+
+    def _read_candidates(self, paths: Iterable[str]) -> Iterable[Tuple[str, bytes]]:
+        for key in sorted(set(paths)):
+            try:
+                yield key, self.storage.read_bytes(key)
+            except Exception as exc:
+                self.diag.add("ERROR", "read", f"Не удалось прочитать {key}", exc)
+
+    def load_orders(self) -> pd.DataFrame:
+        """Load WB orders as the only source of orders/order_sum.
+
+        Hard business rule 2026-05-27:
+        - order_sum is taken only from the Orders report data; if WB does not export a separate
+          order_sum column, the script uses priceWithDisc from the same Orders file as sales/order amount;
+          finishedPrice is buyer price and is not used for order_sum;
+        - technical zero cancellation dates like 0001-01-01 are not treated as cancellations;
+        - funnel is not allowed to replace orders/order_sum later.
+        """
+        files = self.list_reports("Заказы", self.store, "Недельные")
+        files = self._filter_current_week_files(files, keep_unparsed=False, fallback_tail=1)
+        frames = []
+
+        def _cancel_mask(src: pd.DataFrame) -> pd.Series:
+            mask = pd.Series(False, index=src.index)
+            # Boolean/text cancel flags.
+            if "is_cancel" in src.columns:
+                flag = src["is_cancel"].map(normalize_text).str.lower().str.replace("ё", "е")
+                mask = mask | flag.isin({"1", "true", "да", "yes", "y", "отменен", "отмена", "отменено"})
+                mask = mask | flag.str.contains("отмен|cancel", na=False)
+            # Cancellation date: only real non-empty business dates count.
+            # WB active rows often contain technical dates like 0001-01-01T00:00:00;
+            # these must not exclude the whole Orders file.
+            if "cancel_date" in src.columns:
+                raw = src["cancel_date"].map(normalize_text).str.lower()
+                raw_bad = raw.isin({"", "nan", "none", "null", "0"}) | raw.str.contains(r"^0+|0001[-/.]01[-/.]01|1970[-/.]01[-/.]01", na=False)
+                dt = date_series(src["cancel_date"])
+                real_cancel_date = dt.notna() & (dt >= pd.Timestamp("2000-01-01")) & ~raw_bad
+                mask = mask | real_cancel_date
+            # Status field fallback.
+            if "order_status" in src.columns:
+                st = src["order_status"].map(normalize_text).str.lower().str.replace("ё", "е")
+                mask = mask | st.str.contains("отмен|cancel", na=False)
+            return mask.fillna(False)
+
+        for key, data in self._read_candidates(files):
+            try:
+                df = read_excel_table(data, "Заказы")
+                if df.empty:
+                    continue
+                df = add_alias_columns(df)
+                rows_before = len(df)
+                cancel_mask = _cancel_mask(df)
+                df_active = df.loc[~cancel_mask].copy()
+                rows_cancelled = int(cancel_mask.sum())
+
+                orders_series = num_series(get_col(df_active, "orders"))
+                if orders_series.isna().all():
+                    orders_series = pd.Series(1.0, index=df_active.index)
+                orders_series = orders_series.fillna(1.0)
+
+                finished_price_series = num_series(get_col(df_active, "finished_price"))
+                price_with_disc_series = num_series(get_col(df_active, "price_with_disc"))
+                order_sum_series = num_series(get_col(df_active, "order_sum"))
+                order_sum_col = _source_column_name(df_active, "order_sum")
+                if order_sum_series.isna().all():
+                    # Still Orders-only: fallback is from the same WB Orders file, never from Funnel.
+                    # Business rule: priceWithDisc is the sale price / order amount.
+                    # finishedPrice is buyer price and must not be used as order_sum.
+                    fallback_price = price_with_disc_series.copy()
+                    fallback_col = _source_column_name(df_active, "price_with_disc")
+                    if fallback_price.isna().all():
+                        # Last-resort diagnostic fallback only when WB Orders has no priceWithDisc at all.
+                        fallback_price = finished_price_series.copy()
+                        fallback_col = _source_column_name(df_active, "finished_price")
+                        self.diag.add("WARN", "orders", f"В файле заказов нет priceWithDisc: {key}", "использую finishedPrice только как аварийный fallback; проверь структуру Orders")
+                    if not fallback_price.isna().all():
+                        order_sum_series = fallback_price * orders_series
+                        order_sum_col = f"{fallback_col or 'price_with_disc'} × orders (Orders file)"
+                        self.diag.add("WARN", "orders", f"В файле заказов нет отдельной колонки суммы заказов: {key}", f"использую {order_sum_col}; источник всё равно Orders")
+                        log(f"orders: no explicit order_sum in {Path(key).name}; use {order_sum_col}")
+                    else:
+                        order_sum_col = ""
+                        self.diag.add("ERROR", "orders", f"В файле заказов не распознана ни сумма, ни цена продажи priceWithDisc: {key}", "продажи из воронки запрещены")
+                        log(f"orders: ERROR no order_sum/priceWithDisc column recognized in {Path(key).name}; Funnel fallback is forbidden")
+
+                out = pd.DataFrame({
+                    "day": date_series(get_col(df_active, "day")),
+                    "nm_id": num_series(get_col(df_active, "nm_id")),
+                    "supplier_article": get_col(df_active, "supplier_article").map(clean_article),
+                    "subject": get_col(df_active, "subject").map(canonical_subject),
+                    "warehouse": get_col(df_active, "warehouse").map(normalize_text),
+                    "orders": orders_series,
+                    "order_sum": order_sum_series,
+                    "finished_price": finished_price_series,
+                    "price_with_disc": price_with_disc_series,
+                    "spp": num_series(get_col(df_active, "spp")),
+                    "source_file": key,
+                    "source_sheet": df.attrs.get("source_sheet", ""),
+                    "source_order_sum_col": order_sum_col,
                 })
-            if len(items) < limit:
-                break
-            offset += limit
-            time.sleep(0.4)
-        except Exception as exc:
-            logs.append(api_log_row(ctx.run_datetime, "GET", endpoint, "", "exception", repr(exc)))
-            break
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df[df["nm_id"].map(_clean_id_value).ne("")].drop_duplicates(subset=["nm_id"], keep="last")
-    return df, pd.DataFrame(logs)
+                # Missing sums become 0 and are visible in diagnostics; sales never come from Funnel.
+                missing_sum_rows = int(out["order_sum"].isna().sum())
+                out["order_sum"] = out["order_sum"].fillna(0.0)
+                out = out[out["day"].notna()].copy()
+                frames.append(out)
+                log(
+                    "orders: file=%s sheet=%s rows_before=%s cancelled_excluded=%s rows_after=%s order_sum_col=%s sum=%s" % (
+                        Path(key).name,
+                        df.attrs.get("source_sheet", ""),
+                        rows_before,
+                        rows_cancelled,
+                        len(out),
+                        order_sum_col or "NOT_FOUND",
+                        f"{pd.to_numeric(out['order_sum'], errors='coerce').fillna(0).sum():.2f}",
+                    )
+                )
+                if missing_sum_rows:
+                    self.diag.add("WARN", "orders", f"В файле заказов есть строки без суммы заказов: {key}", f"rows={missing_sum_rows}; fallback запрещён")
+            except Exception as exc:
+                self.diag.add("ERROR", "orders", f"Не прочитан файл заказов {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        self._log("orders", out, "day")
+        return out
 
+    def load_funnel(self) -> pd.DataFrame:
+        files = []
+        direct = self.path("Воронка продаж", self.store, "Воронка продаж.xlsx")
+        if self.storage.exists(direct):
+            files.append(direct)
+        files += self.list_reports("Воронка продаж", self.store)
+        files += self.list_reports("Воронка продаж")
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=1)
+        frames = []
+        for key, data in self._read_candidates(files):
+            try:
+                period_start, period_end = parse_period_from_name(Path(key).name)
+                preferred = "Воронка продаж"
+                df = read_excel_table(data, preferred)
+                if df.empty:
+                    continue
+                day = date_series(get_col(df, "day"))
+                if day.isna().all() and period_end is not None:
+                    day = pd.Series([period_end] * len(df))
+                out = pd.DataFrame({
+                    "day": day,
+                    "nm_id": num_series(get_col(df, "nm_id")),
+                    "supplier_article": get_col(df, "supplier_article").map(clean_article),
+                    "subject": get_col(df, "subject").map(canonical_subject),
+                    "orders": num_series(get_col(df, "orders")),
+                    "order_sum": num_series(get_col(df, "order_sum")),
+                    "open_cards": num_series(get_col(df, "open_cards")),
+                    "add_to_cart": num_series(get_col(df, "add_to_cart")),
+                    "cart_conv_pct": num_series(get_col(df, "cart_conv")),
+                    "order_conv_pct": num_series(get_col(df, "order_conv")),
+                    "buyouts_count": num_series(get_col(df, "buyouts_count")),
+                    "buyout_sum": num_series(get_col(df, "buyout_sum")),
+                    "cancels_count": num_series(get_col(df, "cancels_count")),
+                    "finished_price": num_series(get_col(df, "finished_price")),
+                    "spp": num_series(get_col(df, "spp")),
+                    "source_file": key,
+                })
+                out = out[out["nm_id"].notna()]
+                out = out[out["day"].notna()]
+                frames.append(out)
+            except Exception as exc:
+                self.diag.add("ERROR", "funnel", f"Не прочитана воронка {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        self._log("funnel", out, "day")
+        return out
 
-def _price_pending_events(price_history: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
-    if price_history is None or price_history.empty:
-        return {}
-    local = price_history.copy()
-    for col in PRICE_HISTORY_COLUMNS:
-        if col not in local.columns:
-            local[col] = ""
-    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce")
-    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
-    local = local.sort_values(["event_date_parsed", "run_dt_parsed"], na_position="first")
-    out: Dict[str, Dict[str, Any]] = {}
-    for _, row in local.iterrows():
-        status = _clean_text_value(row.get("postcheck_status", "")).lower()
-        if status != "resolved":
-            out[_clean_id_value(row.get("nm_id", ""))] = row.to_dict()
-    return out
-
-
-def evaluate_price_postchecks(price_history: pd.DataFrame, ads_df: pd.DataFrame, funnel_df: pd.DataFrame, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if price_history is None or price_history.empty:
-        return pd.DataFrame(columns=PRICE_HISTORY_COLUMNS), pd.DataFrame()
-    updated = coerce_history_columns_object(price_history.copy(), PRICE_HISTORY_COLUMNS)
-    for col in PRICE_HISTORY_COLUMNS:
-        if col not in updated.columns:
-            updated[col] = pd.Series([""] * len(updated), index=updated.index, dtype="object")
+    def load_ads(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        # Реклама часто лежит в разных вариантах пути на S3:
+        # 1) Отчёты/Реклама/TOPFACE/Недельные/Реклама_2026-W22.xlsx
+        # 2) Отчёты/Реклама/TOPFACE/Реклама_2026-W22.xlsx
+        # 3) Отчёты/Реклама/Реклама_2026-W22.xlsx
+        # Раньше читался только вариант (1). Из-за этого свежий файл с 28.05 мог лежать на диске,
+        # но отчет видел старый источник до 26.05 и писал «нет данных РК».
+        files: List[str] = []
+        for parts in [
+            ("Реклама", self.store, "Недельные"),
+            ("Реклама", self.store),
+            ("Реклама", "Недельные", self.store),
+            ("Реклама",),
+        ]:
+            try:
+                files += self.list_reports(*parts)
+            except Exception as exc:
+                self.diag.add("WARN", "ads", f"Не удалось просканировать путь {'/'.join(parts)}", exc)
+        consolidated = self.path("Реклама", self.store, "Анализ рекламы.xlsx")
+        if self.storage.exists(consolidated):
+            files.append(consolidated)
+        # Убираем явные временные/архивные файлы и дубли ключей. Broad scan оставляем только для текущей недели.
+        files = sorted(set(f for f in files if f and not Path(f).name.startswith("~$")))
+        files = self._filter_store_scoped_files(files, "ads_scan")
+        if files:
+            log(f"ads_scan: candidates before current-week filter={len(files)}; sample=" + "; ".join(Path(x).name for x in files[-8:]))
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=6)
+        if files:
+            log(f"ads_scan: selected files={len(files)}; " + "; ".join(files))
+        raw_frames, campaign_frames = [], []
+        for key, data in self._read_candidates(files):
+            try:
+                book = pd.ExcelFile(io.BytesIO(unwrap_excel_bytes(data)))
+                if "Список_кампаний" in book.sheet_names:
+                    camp = read_excel_table(data, "Список_кампаний")
+                    if not camp.empty:
+                        cdf = pd.DataFrame({
+                            "campaign_id": get_col(camp, "campaign_id").map(lambda x: str(int(x)) if pd.notna(to_number(x)) else normalize_text(x)),
+                            "nm_id": num_series(get_col(camp, "nm_id")),
+                            "subject": get_col(camp, "subject").map(normalize_text),
+                            "bid_type_raw": get_col(camp, "bid_type").map(normalize_text),
+                            "source_file": key,
+                        })
+                        cdf["ad_type"] = cdf["bid_type_raw"].map(classify_ad_type)
+                        campaign_frames.append(cdf[cdf["campaign_id"].ne("")])
+                sheets = ["Статистика_Ежедневно"] if "Статистика_Ежедневно" in book.sheet_names else book.sheet_names
+                for sheet in sheets:
+                    df = read_excel_table(data, sheet)
+                    if df.empty or get_col(df, "spend").isna().all():
+                        continue
+                    out = pd.DataFrame({
+                        "day": date_series(get_col(df, "day")),
+                        "campaign_id": get_col(df, "campaign_id").map(lambda x: str(int(x)) if pd.notna(to_number(x)) else normalize_text(x)),
+                        "nm_id": num_series(get_col(df, "nm_id")),
+                        "subject": get_col(df, "subject").map(canonical_subject),
+                        "impressions": num_series(get_col(df, "impressions")).fillna(0),
+                        "clicks": num_series(get_col(df, "clicks")).fillna(0),
+                        "orders": num_series(get_col(df, "ad_orders")).fillna(0),
+                        "order_sum": num_series(get_col(df, "ad_order_sum")).fillna(0),
+                        "spend": num_series(get_col(df, "spend")).fillna(0),
+                        "ctr_pct_src": num_series(get_col(df, "ctr")),
+                        "cpc_src": num_series(get_col(df, "cpc")),
+                        "cr_pct_src": num_series(get_col(df, "cr")),
+                        "drr_pct_src": num_series(get_col(df, "drr")),
+                        "source_file": key,
+                        "source_sheet": sheet,
+                    })
+                    raw_frames.append(out[out["day"].notna() & out["nm_id"].notna()])
+            except Exception as exc:
+                self.diag.add("ERROR", "ads", f"Не прочитана реклама {key}", exc)
+        raw = pd.concat(raw_frames, ignore_index=True) if raw_frames else pd.DataFrame()
+        if not raw.empty:
+            before_dedup = len(raw)
+            dedup_cols = [c for c in ["day", "campaign_id", "nm_id", "impressions", "clicks", "orders", "order_sum", "spend"] if c in raw.columns]
+            raw = raw.drop_duplicates(subset=dedup_cols).copy()
+            if len(raw) != before_dedup:
+                log(f"ads: removed duplicated source rows {before_dedup - len(raw):,}; weekly/consolidated overlap")
+        campaigns = pd.concat(campaign_frames, ignore_index=True) if campaign_frames else pd.DataFrame(columns=["campaign_id", "nm_id", "subject", "ad_type"])
+        if not campaigns.empty:
+            before_camp_dedup = len(campaigns)
+            campaigns = campaigns.drop_duplicates(["campaign_id", "nm_id", "ad_type", "bid_type_raw"]).copy()
+            if len(campaigns) != before_camp_dedup:
+                log(f"ads: removed duplicated campaign rows {before_camp_dedup - len(campaigns):,}")
+        if not raw.empty:
+            if not campaigns.empty:
+                cmap = campaigns.drop_duplicates(["campaign_id", "nm_id"])[["campaign_id", "nm_id", "ad_type", "bid_type_raw"]]
+                raw = raw.merge(cmap, on=["campaign_id", "nm_id"], how="left")
+            raw["ad_type"] = raw.get("ad_type", "unknown")
+            raw["ad_type"] = raw["ad_type"].fillna("unknown").replace("", "unknown")
+            raw["ctr_pct"] = np.where(raw["impressions"] > 0, raw["clicks"] / raw["impressions"] * 100, raw["ctr_pct_src"])
+            raw["cpc"] = np.where(raw["clicks"] > 0, raw["spend"] / raw["clicks"], raw["cpc_src"])
+            raw["cr_pct"] = np.where(raw["clicks"] > 0, raw["orders"] / raw["clicks"] * 100, raw["cr_pct_src"])
+            raw["drr_pct"] = np.where(raw["order_sum"] > 0, raw["spend"] / raw["order_sum"] * 100, raw["drr_pct_src"])
+            # FIX41: keep subject in grouped daily ads.
+            # New campaign nmIds may be absent from the last closed ABC manager reference;
+            # subject fallback is then needed, for example new liquid eyeliner articles -> Игорь.
+            if "subject" not in raw.columns:
+                raw["subject"] = ""
+            daily = raw.groupby(["day", "nm_id", "subject", "ad_type"], dropna=False, as_index=False).agg(
+                impressions=("impressions", "sum"), clicks=("clicks", "sum"), orders=("orders", "sum"),
+                order_sum=("order_sum", "sum"), spend=("spend", "sum"),
+            )
+            daily["ctr_pct"] = np.where(daily["impressions"] > 0, daily["clicks"] / daily["impressions"] * 100, np.nan)
+            daily["cpc"] = np.where(daily["clicks"] > 0, daily["spend"] / daily["clicks"], np.nan)
+            daily["cr_pct"] = np.where(daily["clicks"] > 0, daily["orders"] / daily["clicks"] * 100, np.nan)
+            daily["drr_pct"] = np.where(daily["order_sum"] > 0, daily["spend"] / daily["order_sum"] * 100, np.nan)
         else:
-            updated[col] = updated[col].astype("object")
-    rows: List[Dict[str, Any]] = []
-    funnel_by_day = funnel_df if funnel_df is not None else pd.DataFrame()
-    for idx, row in updated.iterrows():
-        event_dt = pd.to_datetime(row.get("event_date"), errors="coerce")
-        if pd.isna(event_dt):
-            continue
-        event_day = event_dt.date()
-        d2_end = event_day + timedelta(days=2)
-        nm_id = _clean_id_value(row.get("nm_id", ""))
-        if ctx.mature_end < d2_end:
-            continue
-        before_days = 5.0
-        after_days = 2.0
-        before = {
-            "orders": float(pd.to_numeric(pd.Series([row.get("orders_before", 0)]), errors="coerce").fillna(0).iloc[0]) / before_days,
-            "impressions": float(pd.to_numeric(pd.Series([row.get("impressions_before", 0)]), errors="coerce").fillna(0).iloc[0]) / before_days,
-            "clicks": float(pd.to_numeric(pd.Series([row.get("clicks_before", 0)]), errors="coerce").fillna(0).iloc[0]) / before_days,
-            "ctr": float(pd.to_numeric(pd.Series([row.get("ctr_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "card_views": float(pd.to_numeric(pd.Series([row.get("card_views_before", 0)]), errors="coerce").fillna(0).iloc[0]) / before_days,
-            "add_to_cart_conv": float(pd.to_numeric(pd.Series([row.get("add_to_cart_conv_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-            "cart_to_order_conv": float(pd.to_numeric(pd.Series([row.get("cart_to_order_conv_before", 0)]), errors="coerce").fillna(0).iloc[0]),
-        }
-        ad_after = ads_df[(ads_df["nm_id"].astype(str) == str(nm_id))].copy() if ads_df is not None and not ads_df.empty else pd.DataFrame()
-        if not ad_after.empty and has_valid_dates(ad_after):
-            ad_after = ad_after[(ad_after["date"] >= event_day + timedelta(days=1)) & (ad_after["date"] <= d2_end)].copy()
-        after_orders = float(pd.to_numeric(ad_after.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) / after_days if not ad_after.empty else 0.0
-        after_impressions = float(pd.to_numeric(ad_after.get("impressions", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) / after_days if not ad_after.empty else 0.0
-        after_clicks = float(pd.to_numeric(ad_after.get("clicks", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) / after_days if not ad_after.empty else 0.0
-        after_ctr = safe_ctr_pct(after_clicks, after_impressions)
-        f_after = funnel_by_day[funnel_by_day["nm_id"].astype(str) == str(nm_id)].copy() if not funnel_by_day.empty else pd.DataFrame()
-        if not f_after.empty and has_valid_dates(f_after):
-            f_after = f_after[(f_after["date"] >= event_day + timedelta(days=1)) & (f_after["date"] <= d2_end)].copy()
-        card_views_after = float(pd.to_numeric(f_after.get("card_views", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) / after_days if not f_after.empty else 0.0
-        add_to_cart_after = float(pd.to_numeric(f_after.get("add_to_cart", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) / after_days if not f_after.empty else 0.0
-        funnel_orders_after = float(pd.to_numeric(f_after.get("funnel_orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) / after_days if not f_after.empty else 0.0
-        add_to_cart_conv_after = safe_ctr_pct(add_to_cart_after, card_views_after)
-        cart_to_order_conv_after = safe_ctr_pct(funnel_orders_after, add_to_cart_after)
-        funnel_missing_event = str(row.get("funnel_missing", "")).strip().lower() in {"true", "1", "yes", "да"}
-        has_funnel_after = not f_after.empty and (card_views_after > 0 or add_to_cart_after > 0 or funnel_orders_after > 0)
-        use_funnel_verdict = (not funnel_missing_event) and has_funnel_after and before["card_views"] > 0
-        traffic_ratio = (card_views_after / before["card_views"]) if before["card_views"] > 0 else ((after_clicks / before["clicks"]) if before["clicks"] > 0 else 1.0)
-        orders_ratio = (after_orders / before["orders"]) if before["orders"] > 0 else (1.0 if after_orders > 0 else 0.0)
-        clicks_ratio = (after_clicks / before["clicks"]) if before["clicks"] > 0 else (1.0 if after_clicks > 0 else 0.0)
-        ctr_ratio = (after_ctr / before["ctr"]) if before["ctr"] > 0 else 1.0
-        atc_conv_ratio = (add_to_cart_conv_after / before["add_to_cart_conv"]) if before["add_to_cart_conv"] > 0 else 1.0
-        cto_conv_ratio = (cart_to_order_conv_after / before["cart_to_order_conv"]) if before["cart_to_order_conv"] > 0 else 1.0
-        if use_funnel_verdict:
-            if orders_ratio >= 0.95 and atc_conv_ratio >= 0.90 and cto_conv_ratio >= 0.90:
-                verdict = "PRICE_RAISE_GOOD"
-                comment = "цена повышена, заказы и конверсии удержались"
-            elif orders_ratio < 0.90 and traffic_ratio < 0.85 and atc_conv_ratio >= 0.90 and cto_conv_ratio >= 0.90:
-                verdict = "PRICE_RAISE_TRAFFIC_DROP"
-                comment = "заказы просели на фоне падения трафика; конверсии не доказывают вред цены"
-            elif orders_ratio < 0.90 and (atc_conv_ratio < 0.90 or cto_conv_ratio < 0.90) and traffic_ratio >= 0.85:
-                verdict = "PRICE_RAISE_BAD_CONVERSION_DROP"
-                comment = "трафик удержался, но конверсия упала; нужен откат скидки"
-            else:
-                verdict = "PRICE_RAISE_MIXED"
-                comment = "смешанный эффект; без нового повышения до следующей проверки"
-        else:
-            if before["orders"] <= 0 and before["clicks"] < 20:
-                verdict = "PRICE_CHECK_NOT_ENOUGH_DATA"
-                comment = "воронка отсутствует и мало рекламных данных; цену не откатываем автоматически"
-            elif orders_ratio >= 0.95 and ctr_ratio >= 0.90:
-                verdict = "PRICE_RAISE_GOOD_ADS_ONLY"
-                comment = "воронка отсутствует; по рекламе заказы/CTR удержались"
-            elif orders_ratio < 0.90 and clicks_ratio < 0.85 and ctr_ratio >= 0.90:
-                verdict = "PRICE_EFFECT_UNCLEAR_TRAFFIC_DROP"
-                comment = "воронка отсутствует; падение заказов совпало с падением кликов/трафика, откат не автоматический"
-            elif orders_ratio < 0.80 and clicks_ratio >= 0.85:
-                verdict = "PRICE_RAISE_BAD_ADS_ORDERS_DROP"
-                comment = "воронка отсутствует; трафик удержался, но заказы просели, нужен откат скидки"
-            else:
-                verdict = "PRICE_RAISE_MIXED_ADS_ONLY"
-                comment = "воронка отсутствует; смешанный эффект по рекламе, без нового повышения"
-        updated.at[idx, "postcheck_status"] = "resolved"
-        updated.at[idx, "final_verdict"] = verdict
-        updated.at[idx, "d2_verdict"] = verdict
-        updated.at[idx, "d2_check_date"] = str(ctx.mature_end)
-        rows.append({
-            "price_event_id": row.get("price_event_id", ""), "nm_id": nm_id, "supplier_article": row.get("supplier_article", ""),
-            "subject_norm": row.get("subject_norm", ""), "event_date": row.get("event_date", ""),
-            "old_discount": row.get("old_discount", ""), "new_discount": row.get("new_discount", ""),
-            "orders_before_daily": before["orders"], "orders_after_daily": after_orders, "orders_ratio": orders_ratio,
-            "traffic_ratio": traffic_ratio, "ctr_before": before["ctr"], "ctr_after": after_ctr,
-            "card_views_before_daily": before["card_views"], "card_views_after_daily": card_views_after,
-            "add_to_cart_conv_before": before["add_to_cart_conv"], "add_to_cart_conv_after": add_to_cart_conv_after, "add_to_cart_conv_ratio": atc_conv_ratio,
-            "cart_to_order_conv_before": before["cart_to_order_conv"], "cart_to_order_conv_after": cart_to_order_conv_after, "cart_to_order_conv_ratio": cto_conv_ratio,
-            "funnel_missing": (not use_funnel_verdict),
-            "verdict": verdict, "comment": comment,
-        })
-    return updated[PRICE_HISTORY_COLUMNS], pd.DataFrame(rows)
+            daily = pd.DataFrame()
+        self._log("ads_raw", raw, "day")
+        self._log("ads_daily", daily, "day")
+        return raw, daily, campaigns
 
+    def load_ads_category(self) -> pd.DataFrame:
+        """Read category-level advertising spend from WB advertising report.
 
-def build_price_decisions(metrics_df: pd.DataFrame, funnel_current: pd.DataFrame, goods_prices: pd.DataFrame, price_history: pd.DataFrame, config: Config, ctx: RunContext) -> pd.DataFrame:
-    """Формирует решения по тестовому повышению цены через скидку продавца.
+        FIX38:
+        Category ad spend is the only safe source for PDF/Telegram advertising totals.
+        Raw campaign/article sheets can duplicate one campaign spend across multiple nmId rows,
+        which inflates current-week spend and DRR. Therefore the category sheet must be searched
+        in the same broad set of S3 folders as raw advertising files.
+        """
+        files: List[str] = []
+        for parts in [
+            ("Реклама", self.store, "Недельные"),
+            ("Реклама", self.store),
+            ("Реклама", "Недельные", self.store),
+            ("Реклама",),
+        ]:
+            try:
+                files += self.list_reports(*parts)
+            except Exception as exc:
+                self.diag.add("WARN", "ads_category", f"Не удалось просканировать путь {'/'.join(parts)}", exc)
+        consolidated = self.path("Реклама", self.store, "Анализ рекламы.xlsx")
+        if self.storage.exists(consolidated):
+            files.append(consolidated)
+        files = sorted(set(f for f in files if f and not Path(f).name.startswith("~$")))
+        files = self._filter_store_scoped_files(files, "ads_category_scan")
+        if files:
+            log(f"ads_category_scan: candidates before current-week filter={len(files)}; sample=" + "; ".join(Path(x).name for x in files[-8:]))
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=6)
+        if files:
+            log(f"ads_category_scan: selected files={len(files)}; " + "; ".join(files))
+        frames = []
+        wanted_sheets = {"отчет_по_категории", "отчет по категории", "отчет_по_категории_итог", "отчет по категории итог", "отчёт_по_категории", "отчёт по категории", "отчёт_по_категории_итог", "отчёт по категории итог"}
+        for key, data in self._read_candidates(files):
+            try:
+                raw_bytes = unwrap_excel_bytes(data)
+                book = pd.ExcelFile(io.BytesIO(raw_bytes))
+                period_start, period_end = parse_period_from_name(Path(key).name)
+                for sheet in book.sheet_names:
+                    if norm_key(sheet).replace(" ", "_") not in {s.replace(" ", "_") for s in wanted_sheets} and norm_key(sheet) not in wanted_sheets:
+                        continue
+                    df = read_excel_table(raw_bytes, sheet)
+                    if df.empty:
+                        continue
+                    day = date_series(get_col(df, "day"))
+                    if day.isna().all() and period_end is not None:
+                        day = pd.Series([period_end] * len(df), index=df.index)
+                    out = pd.DataFrame({
+                        "day": day,
+                        "subject": get_col(df, "subject").map(canonical_subject),
+                        "spend": num_series(get_col(df, "spend")).fillna(0.0),
+                        "clicks": num_series(get_col(df, "clicks")).fillna(0.0),
+                        "impressions": num_series(get_col(df, "impressions")).fillna(0.0),
+                        "orders": num_series(get_col(df, "ad_orders")).fillna(0.0),
+                        "order_sum": num_series(get_col(df, "ad_order_sum")).fillna(0.0),
+                        "source_file": key,
+                        "source_sheet": sheet,
+                    })
+                    out = out[out["day"].notna()].copy()
+                    # FIX39: keep all advertising categories here. PDF/old TOPFACE blocks filter
+                    # their own four-category contour later, while Telegram manager summaries
+                    # need Тени/Подводки/Гели/Лаки/Пудры/Тон/etc. from ABC manager mapping.
+                    out = out[out["subject"].map(normalize_text).ne("")].copy()
+                    if out.empty:
+                        continue
+                    frames.append(out)
+                    log(f"ads_category: file={Path(key).name} sheet={sheet} rows={len(out):,} spend={out['spend'].sum():.2f}")
+            except Exception as exc:
+                self.diag.add("ERROR", "ads_category", f"Не прочитан категорийный лист рекламы {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if not out.empty:
+            # First sum rows only inside the same physical source. Then if the same day/category
+            # exists in several files (weekly file + consolidated "Анализ рекламы.xlsx"), do NOT
+            # sum the files together; keep the latest/most authoritative source.
+            out["_source_priority"] = out["source_file"].map(lambda s: 3 if "Анализ рекламы.xlsx" in str(s) else 2)
+            out["_source_ts"] = out["source_file"].map(parse_abc_source_timestamp)
+            src_group = out.groupby(["source_file", "source_sheet", "day", "subject"], dropna=False, as_index=False).agg(
+                spend=("spend", "sum"),
+                clicks=("clicks", "sum"),
+                impressions=("impressions", "sum"),
+                orders=("orders", "sum"),
+                order_sum=("order_sum", "sum"),
+                _source_priority=("_source_priority", "max"),
+                _source_ts=("_source_ts", "max"),
+            )
+            before_ads_cat = len(src_group)
+            src_group = src_group.sort_values(["day", "subject", "_source_priority", "_source_ts", "source_file"], na_position="first")
+            out = src_group.drop_duplicates(["day", "subject"], keep="last").copy()
+            removed_ads_cat = before_ads_cat - len(out)
+            if removed_ads_cat:
+                log(f"ads_category: removed duplicated day/category rows from overlapping files: {removed_ads_cat:,}")
+            out = out.drop(columns=["_source_priority", "_source_ts"], errors="ignore")
+        self._log("ads_category", out, "day")
+        return out
 
-    Правила:
-    - работаем только с Помадами, Блесками и Косметическими карандашами;
-    - текущую скидку продавца берём только из WB Discounts & Prices API;
-    - если скидка из API не получена, цену не меняем;
-    - повышение цены = снижение фактической скидки продавца на 1 п.п.;
-    - ниже DEFAULT_MIN_SELLER_DISCOUNT_PCT не опускаемся;
-    - если воронки нет, ценовой тест разрешён ограниченно: оцениваем по рекламе/заказам, а в отчётах ставим funnel_missing=True;
-    - не больше MAX_PRICE_TEST_ITEMS_PER_RUN новых price-test за один запуск; по умолчанию 30, можно переопределить env WB_MAX_PRICE_TEST_ITEMS_PER_RUN;
-    - если есть незавершённый price post-check, товар не трогаем.
-    """
-    if metrics_df is None or metrics_df.empty:
-        return pd.DataFrame(columns=PRICE_DECISION_COLUMNS)
+    def load_search_queries(self, latest_day: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+        files_all = self.list_reports("Поисковые запросы", self.store, "Недельные")
+        files = filter_recent_report_files(files_all, latest_day, lookback_days=110, keep_unknown=False)
+        max_files = int(os.getenv("WB_MAX_SEARCH_QUERY_FILES", "8"))
+        files = limit_recent_report_files(files, max_files)
+        log(f"search_queries: start, files_all={len(files_all)}, files_to_read={len(files)}")
+        frames = []
+        for idx, (key, data) in enumerate(self._read_candidates(files), start=1):
+            log(f"search_queries: reading {idx}/{len(files)} {Path(key).name}")
+            try:
+                df = read_excel_table(data, "Позиции по Ключам")
+                if df.empty:
+                    continue
+                out = pd.DataFrame({
+                    "day": date_series(get_col(df, "day")),
+                    "nm_id": num_series(get_col(df, "nm_id")),
+                    "supplier_article": get_col(df, "supplier_article").map(clean_article),
+                    "subject": get_col(df, "subject").map(canonical_subject),
+                    "search_query": get_col(df, "search_query").map(normalize_text),
+                    "filter": get_col(df, "filter").map(normalize_text),
+                    "frequency": num_series(get_col(df, "frequency")),
+                    "median_position": num_series(get_col(df, "median_position")),
+                    "avg_position": num_series(get_col(df, "avg_position")),
+                    "transitions": num_series(get_col(df, "open_cards")).fillna(num_series(get_col(df, "clicks"))).fillna(0),
+                    "add_to_cart": num_series(get_col(df, "add_to_cart")).fillna(0),
+                    "orders": num_series(get_col(df, "orders")).fillna(0),
+                    "cart_conv_pct": num_series(get_col(df, "cart_conv")),
+                    "order_conv_pct": num_series(get_col(df, "order_conv")),
+                    "rating_card": num_series(get_col(df, "rating_card")),
+                    "rating_reviews": num_series(get_col(df, "rating_reviews")),
+                    "visibility_pct": num_series(get_col(df, "visibility")),
+                    "source_file": key,
+                })
+                out = out[out["day"].notna() & out["search_query"].ne("")]
+                # Deduplicate same query due to filters: frequency once, commercial metrics summed.
+                group_cols = ["day", "nm_id", "supplier_article", "subject", "search_query"]
+                agg = out.groupby(group_cols, dropna=False, as_index=False).agg(
+                    frequency=("frequency", "max"),
+                    transitions=("transitions", "sum"), add_to_cart=("add_to_cart", "sum"), orders=("orders", "sum"),
+                    median_position=("median_position", "mean"), avg_position=("avg_position", "mean"),
+                    cart_conv_pct=("cart_conv_pct", "mean"), order_conv_pct=("order_conv_pct", "mean"),
+                    rating_card=("rating_card", "mean"), rating_reviews=("rating_reviews", "mean"),
+                    visibility_pct=("visibility_pct", "mean"), source_file=("source_file", "first"),
+                )
+                agg["traffic_capture_pct"] = np.where(agg["frequency"] > 0, agg["transitions"] / agg["frequency"] * 100, np.nan)
+                frames.append(agg)
+            except Exception as exc:
+                self.diag.add("ERROR", "search_queries", f"Не прочитан файл поисковых запросов {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        self._log("search_queries", out, "day")
+        return out
 
-    base = metrics_df[["nm_id", "supplier_article", "subject_norm", "orders", "impressions", "clicks", "ctr_pct"]].copy()
-    base["subject_norm"] = base["subject_norm"].map(lambda x: normalize_subject_value(x).lower())
-    base = base[base["subject_norm"].isin(PRICE_TEST_SUBJECTS)].copy()
-    if base.empty:
-        return pd.DataFrame(columns=PRICE_DECISION_COLUMNS)
+    def load_entry_points(self, latest_day: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+        files_all = []
+        files_all += self.list_reports("Точки входа", self.store)
+        files_all += self.list_reports("Портрет покупателя", self.store)
+        # Broad fallback is expensive on S3, so it is used only when targeted folders are empty.
+        if not files_all:
+            files_all += [f for f in self.storage.list_files(self.reports_root) if "Точки входа" in f and f.lower().endswith((".xlsx", ".zip"))]
+        files = filter_recent_report_files(files_all, latest_day, lookback_days=110, keep_unknown=True)
+        max_files = int(os.getenv("WB_MAX_ENTRY_POINT_FILES", "8"))
+        files = limit_recent_report_files(files, max_files)
+        log(f"entry_points: start, files_all={len(files_all)}, files_to_read={len(files)}")
+        frames = []
+        for idx, (key, data) in enumerate(self._read_candidates(files), start=1):
+            log(f"entry_points: reading {idx}/{len(files)} {Path(key).name}")
+            try:
+                _, period_end = parse_period_from_name(Path(key).name)
+                df = read_excel_table(data, "Детализация по артикулам")
+                if df.empty or get_col(df, "entry_section").isna().all():
+                    continue
+                day = date_series(get_col(df, "day")) if "day" in df.columns else pd.Series([period_end] * len(df))
+                if day.isna().all() and period_end is not None:
+                    day = pd.Series([period_end] * len(df))
+                out = pd.DataFrame({
+                    "day": day,
+                    "entry_section": get_col(df, "entry_section").map(normalize_text),
+                    "entry_point": get_col(df, "entry_point").map(normalize_text),
+                    "nm_id": num_series(get_col(df, "nm_id")),
+                    "supplier_article": get_col(df, "supplier_article").map(clean_article),
+                    "subject": get_col(df, "subject").map(canonical_subject),
+                    "impressions": num_series(get_col(df, "impressions")).fillna(0),
+                    "transitions": num_series(get_col(df, "open_cards")).fillna(0),
+                    "ctr_pct": num_series(get_col(df, "ctr")),
+                    "add_to_cart": num_series(get_col(df, "add_to_cart")).fillna(0),
+                    "cart_conv_pct": num_series(get_col(df, "cart_conv")),
+                    "orders": num_series(get_col(df, "orders")).fillna(0),
+                    "order_conv_pct": num_series(get_col(df, "order_conv")),
+                    "source_file": key,
+                })
+                out = out[out["nm_id"].notna() | out["supplier_article"].ne("")]
+                frames.append(out)
+            except Exception as exc:
+                self.diag.add("ERROR", "entry_points", f"Не прочитаны точки входа {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        self._log("entry_points", out, "day")
+        return out
 
-    base = base.groupby(["nm_id", "supplier_article", "subject_norm"], dropna=False).agg(
-        orders=("orders", "sum"),
-        impressions=("impressions", "sum"),
-        clicks=("clicks", "sum"),
-        ctr_pct=("ctr_pct", "mean"),
-    ).reset_index()
+    def load_stock(self, latest_day: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+        files_all = []
+        for parts in [("Остатки", self.store), ("Остатки", self.store, "Недельные"), ("Остатки",), ("Остатки и товары в пути", self.store), ("Остатки и товары в пути",)]:
+            files_all += self.list_reports(*parts)
+        files = filter_recent_report_files(files_all, latest_day, lookback_days=110, keep_unknown=True)
+        max_files = int(os.getenv("WB_MAX_STOCK_FILES", "10"))
+        files = limit_recent_report_files(files, max_files)
+        log(f"stock: start, files_all={len(files_all)}, files_to_read={len(files)}")
+        frames = []
+        for idx, (key, data) in enumerate(self._read_candidates(files), start=1):
+            log(f"stock: reading {idx}/{len(files)} {Path(key).name}")
+            try:
+                _, period_end = parse_period_from_name(Path(key).name)
+                df = read_excel_table(data)
+                if df.empty:
+                    continue
+                day = date_series(get_col(df, "day"))
+                if day.isna().all() and period_end is not None:
+                    day = pd.Series([period_end] * len(df))
+                out = pd.DataFrame({
+                    "day": day,
+                    "nm_id": num_series(get_col(df, "nm_id")),
+                    "supplier_article": get_col(df, "supplier_article").map(clean_article),
+                    "subject": get_col(df, "subject").map(canonical_subject),
+                    "warehouse": get_col(df, "warehouse").map(normalize_text),
+                    "stock": num_series(get_col(df, "stock")).fillna(0),
+                    "source_file": key,
+                })
+                out = out[(out["nm_id"].notna() | out["supplier_article"].ne("")) & out["warehouse"].ne("")]
+                frames.append(out)
+            except Exception as exc:
+                self.diag.add("ERROR", "stock", f"Не прочитаны остатки {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        self._log("stock", out, "day")
+        return out
 
-    has_funnel = funnel_current is not None and not funnel_current.empty
-    if has_funnel:
-        base = base.merge(funnel_current, on="nm_id", how="left")
-
-    for col in ["card_views", "add_to_cart", "funnel_orders", "add_to_cart_conv", "cart_to_order_conv"]:
-        if col not in base.columns:
-            base[col] = 0.0
-        base[col] = pd.to_numeric(base[col], errors="coerce").fillna(0.0)
-
-    if goods_prices is not None and not goods_prices.empty:
-        gp = goods_prices[["nm_id", "current_discount", "current_wb_price"]].copy()
-        gp["current_discount"] = pd.to_numeric(gp["current_discount"], errors="coerce")
-        gp["current_wb_price"] = pd.to_numeric(gp["current_wb_price"], errors="coerce")
-        base = base.merge(gp, on="nm_id", how="left")
-    else:
-        base["current_discount"] = float("nan")
-        base["current_wb_price"] = float("nan")
-
-    pending = _price_pending_events(price_history)
-    rows: List[Dict[str, Any]] = []
-    candidate_indices: List[int] = []
-
-    # Сначала строим все строки и помечаем потенциальные новые тесты.
-    for idx, row in base.iterrows():
-        nm_id = _clean_id_value(row.get("nm_id", ""))
-        subject_norm = normalize_subject_value(row.get("subject_norm", "")).lower()
-        current_discount_raw = pd.to_numeric(pd.Series([row.get("current_discount")]), errors="coerce").iloc[0]
-        current_discount = float(current_discount_raw) if not pd.isna(current_discount_raw) else float("nan")
-        action = "Без изменений"
-        reason_code = "PRICE_MONITOR_ONLY"
-        new_discount: Optional[float] = None
-        prev_event_id = ""
-        post_status = ""
-        pending_event = pending.get(nm_id)
-
-        if subject_norm not in PRICE_TEST_SUBJECTS:
-            reason_code = "PRICE_NOT_TARGET_SUBJECT"
-        elif pd.isna(current_discount) or current_discount <= 0:
-            reason_code = "NO_CURRENT_DISCOUNT_FROM_WB_API"
-        elif pending_event:
-            prev_event_id = _clean_text_value(pending_event.get("price_event_id", ""))
-            post_status = _clean_text_value(pending_event.get("postcheck_status", "pending")) or "pending"
-            reason_code = "PRICE_WAIT_D2_POSTCHECK"
-        else:
-            latest_bad = None
-            if price_history is not None and not price_history.empty:
-                ph = price_history[price_history["nm_id"].astype(str) == str(nm_id)].copy()
-                if not ph.empty:
-                    ph["run_dt"] = pd.to_datetime(ph["run_datetime"], errors="coerce")
-                    ph = ph.sort_values("run_dt")
-                    last = ph.tail(1).iloc[0]
-                    if _clean_text_value(last.get("final_verdict", "")) == "PRICE_RAISE_BAD_CONVERSION_DROP":
-                        latest_bad = last
-            if latest_bad is not None:
-                old_discount = float(pd.to_numeric(pd.Series([latest_bad.get("old_discount", current_discount)]), errors="coerce").fillna(current_discount).iloc[0])
-                if current_discount < old_discount:
-                    action = "Вернуть скидку"
-                    new_discount = old_discount
-                    reason_code = "PRICE_RAISE_BAD_REVERT"
-                else:
-                    reason_code = "PRICE_ALREADY_REVERTED_AFTER_BAD"
-            elif current_discount <= DEFAULT_MIN_SELLER_DISCOUNT_PCT:
-                reason_code = "PRICE_MIN_DISCOUNT_REACHED"
-            elif float(row.get("orders", 0) or 0) <= 0:
-                reason_code = "PRICE_NO_ORDERS_FOR_TEST"
-            else:
-                action = "Повысить цену"
-                new_discount = max(DEFAULT_MIN_SELLER_DISCOUNT_PCT, current_discount - DEFAULT_PRICE_RAISE_STEP_PP)
-                reason_code = "PRICE_RAISE_1PP_TEST" if has_funnel else "PRICE_RAISE_1PP_TEST_NO_FUNNEL"
-
-        reason_text = (
-            f"скидка_WB_API={current_discount if not pd.isna(current_discount) else 'н/д'}%; "
-            f"скидка по умолчанию={DEFAULT_SELLER_DISCOUNT_PCT}%; новая скидка={new_discount if new_discount is not None else 'н/д'}; "
-            f"предмет={subject_norm}; заказы={float(row.get('orders',0) or 0):.0f}; показы={float(row.get('impressions',0) or 0):.0f}; "
-            f"клики={float(row.get('clicks',0) or 0):.0f}; CTR={float(row.get('ctr_pct',0) or 0):.2f}%; "
-            f"просмотры карточки={float(row.get('card_views',0) or 0):.0f}; add_to_cart_conv={float(row.get('add_to_cart_conv',0) or 0):.2f}%; "
-            f"cart_to_order_conv={float(row.get('cart_to_order_conv',0) or 0):.2f}%; "
-            f"funnel_missing={str(not has_funnel).lower()}"
-        )
-        rows.append({
-            "nm_id": nm_id,
-            "supplier_article": row.get("supplier_article", ""),
-            "subject_norm": subject_norm,
-            "current_discount": current_discount,
-            "new_discount": new_discount,
-            "price_action": action,
-            "reason_code": reason_code,
-            "reason_text": reason_text,
-            "orders": row.get("orders", 0),
-            "impressions": row.get("impressions", 0),
-            "clicks": row.get("clicks", 0),
-            "ctr_pct": row.get("ctr_pct", 0),
-            "card_views": row.get("card_views", 0),
-            "add_to_cart": row.get("add_to_cart", 0),
-            "funnel_orders": row.get("funnel_orders", 0),
-            "add_to_cart_conv": row.get("add_to_cart_conv", 0),
-            "cart_to_order_conv": row.get("cart_to_order_conv", 0),
-            "funnel_missing": bool(not has_funnel),
-            "previous_price_event_id": prev_event_id,
-            "price_postcheck_status": post_status,
-        })
-        if action == "Повысить цену" and reason_code in {"PRICE_RAISE_1PP_TEST", "PRICE_RAISE_1PP_TEST_NO_FUNNEL"}:
-            candidate_indices.append(len(rows) - 1)
-
-    # Ограничиваем новые ценовые тесты за запуск, чтобы не менять 85 товаров одним пакетом.
-    if len(candidate_indices) > MAX_PRICE_TEST_ITEMS_PER_RUN:
-        # Оставляем товары с наибольшим числом заказов, остальным ставим ожидание лимита.
-        ranked = sorted(candidate_indices, key=lambda i: float(rows[i].get("orders", 0) or 0), reverse=True)
-        allowed = set(ranked[:MAX_PRICE_TEST_ITEMS_PER_RUN])
-        for i in candidate_indices:
-            if i not in allowed:
-                rows[i]["price_action"] = "Без изменений"
-                rows[i]["new_discount"] = None
-                rows[i]["reason_code"] = "PRICE_TEST_LIMIT_PER_RUN"
-                rows[i]["reason_text"] += f"; лимит новых price-test за запуск={MAX_PRICE_TEST_ITEMS_PER_RUN}"
-
-    return pd.DataFrame(rows, columns=PRICE_DECISION_COLUMNS)
-
-
-def apply_price_changes(price_decisions: pd.DataFrame, goods_prices: pd.DataFrame, config: Config, ctx: RunContext, apply_price: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if price_decisions is None or price_decisions.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    to_send = price_decisions[price_decisions["price_action"].isin(["Повысить цену", "Вернуть скидку"])].copy()
-    if to_send.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    payload_rows: List[Dict[str, Any]] = []
-    prices_map = {}
-    if goods_prices is not None and not goods_prices.empty:
-        prices_map = dict(zip(goods_prices["nm_id"].astype(str), goods_prices.get("current_wb_price", pd.Series(dtype=float))))
-    sent_rows: List[Dict[str, Any]] = []
-    for _, row in to_send.iterrows():
-        nm_id_int = to_int_id(row.get("nm_id"))
-        new_discount = int(round(float(row.get("new_discount")))) if pd.notna(row.get("new_discount")) else None
-        price = prices_map.get(str(row.get("nm_id")), 0)
-        price_int = int(round(float(price or 0)))
-        if nm_id_int is None or new_discount is None or price_int <= 0:
-            continue
-        payload_rows.append({"nmID": nm_id_int, "price": price_int, "discount": new_discount})
-        sent_rows.append(row.to_dict())
-    if not payload_rows:
-        return pd.DataFrame(), pd.DataFrame()
-    api_logs: List[Dict[str, Any]] = []
-    if ctx.mode == "preview" or ctx.dry_run or not apply_price:
-        api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_PRICE_UPLOAD_ENDPOINT, {"rows": len(payload_rows)}, "not_sent", "Цены не отправлялись: preview/dry-run или apply_price=False"))
-        return pd.DataFrame(), pd.DataFrame(api_logs)
-    url = WB_PRICES_BASE_URL + WB_PRICE_UPLOAD_ENDPOINT
-    for start in range(0, len(payload_rows), 1000):
-        batch = payload_rows[start:start+1000]
-        payload = {"data": batch}
-        try:
-            resp = requests.post(url, headers=wb_headers(config), json=payload, timeout=120)
-            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_PRICE_UPLOAD_ENDPOINT, json.dumps(payload, ensure_ascii=False), str(resp.status_code), resp.text[:4000]))
-            status = str(resp.status_code)
-            response = resp.text[:1000]
-        except Exception as exc:
-            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_PRICE_UPLOAD_ENDPOINT, json.dumps(payload, ensure_ascii=False), "exception", repr(exc)))
-            status = "exception"
-            response = repr(exc)
-        for r in sent_rows[start:start+len(batch)]:
-            r["api_status"] = status
-            r["api_response"] = response
-    return pd.DataFrame(sent_rows), pd.DataFrame(api_logs)
-
-
-def record_price_events(applied_price_changes: pd.DataFrame, price_history: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    if price_history is None or price_history.empty:
-        history = pd.DataFrame(columns=PRICE_HISTORY_COLUMNS)
-    else:
-        history = price_history.copy()
-    if applied_price_changes is None or applied_price_changes.empty:
-        return history[PRICE_HISTORY_COLUMNS]
-    rows: List[Dict[str, Any]] = []
-    for _, row in applied_price_changes.iterrows():
-        status = _clean_text_value(row.get("api_status", ""))
-        is_success = status.isdigit() and 200 <= int(status) < 300
-        if status == "dry_run_or_not_applied":
-            continue
-        if not is_success:
-            continue
-        direction = "price_raise" if row.get("price_action") == "Повысить цену" else "price_rollback"
-        rows.append({
-            "price_event_id": str(uuid.uuid4()), "run_datetime": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"), "event_date": ctx.run_datetime.date().isoformat(),
-            "nm_id": row.get("nm_id", ""), "supplier_article": row.get("supplier_article", ""), "subject_norm": row.get("subject_norm", ""),
-            "old_discount": row.get("current_discount", ""), "new_discount": row.get("new_discount", ""), "direction": direction, "reason_code": row.get("reason_code", ""),
-            "orders_before": row.get("orders", 0), "impressions_before": row.get("impressions", 0), "clicks_before": row.get("clicks", 0), "ctr_before": row.get("ctr_pct", 0),
-            "card_views_before": row.get("card_views", 0), "add_to_cart_before": row.get("add_to_cart", 0), "funnel_orders_before": row.get("funnel_orders", 0),
-            "add_to_cart_conv_before": row.get("add_to_cart_conv", 0), "cart_to_order_conv_before": row.get("cart_to_order_conv", 0),
-            "funnel_missing": row.get("funnel_missing", False),
-            "postcheck_status": "pending", "final_verdict": "", "d2_verdict": "", "d2_check_date": "", "api_status": row.get("api_status", ""), "api_response": row.get("api_response", ""),
-        })
-    if rows:
-        history = pd.concat([history, pd.DataFrame(rows)], ignore_index=True, sort=False)
-    for col in PRICE_HISTORY_COLUMNS:
-        if col not in history.columns:
-            history[col] = ""
-    return history[PRICE_HISTORY_COLUMNS]
-
-
-# =============================
-# Окна, агрегация и метрики
-# =============================
-
-def build_windows(run_date: Optional[date] = None) -> Tuple[date, date, date, date, date]:
-    today = run_date or date.today()
-    mature_end = today - timedelta(days=3)
-    current_start = mature_end - timedelta(days=4)
-    current_end = mature_end
-    base_end = current_start - timedelta(days=1)
-    base_start = base_end - timedelta(days=4)
-    return mature_end, current_start, current_end, base_start, base_end
-
-
-def build_run_context(args: argparse.Namespace) -> RunContext:
-    mature_end, current_start, current_end, base_start, base_end = build_windows()
-    night_slot = _clean_text_value(getattr(args, "night_experiment_slot", "") or os.environ.get("WB_NIGHT_EXPERIMENT_SLOT", "")).lower()
-    if night_slot not in {"start", "end"}:
-        night_slot = "auto"
-    return RunContext(
-        mode=args.command,
-        dry_run=bool(args.dry_run),
-        apply_pause=bool(args.apply_pause),
-        apply_start=bool(args.apply_start),
-        apply_price=bool(getattr(args, "apply_price", False)),
-        apply_experiment=bool(getattr(args, "apply_experiment", False)),
-        night_experiment_only=bool(getattr(args, "night_experiment_only", False)),
-        night_experiment_slot=night_slot,
-        run_datetime=datetime.now(),
-        mature_end=mature_end,
-        current_start=current_start,
-        current_end=current_end,
-        base_start=base_start,
-        base_end=base_end,
-    )
-
-
-def has_valid_dates(df: pd.DataFrame) -> bool:
-    return "date" in df.columns and df["date"].notna().any()
-
-
-def filter_by_date_window(df: pd.DataFrame, start_date: date, end_date: date) -> pd.DataFrame:
-    if not has_valid_dates(df):
-        return df.copy()
-    mask = (df["date"] >= start_date) & (df["date"] <= end_date)
-    return df.loc[mask].copy()
-
-
-def latest_nonempty_value(df: pd.DataFrame, group_keys: List[str], col: str) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=group_keys + [col])
-    local = df[group_keys + ["date", "_row_id", col]].copy()
-    local["_has_value"] = local[col].map(lambda x: _clean_text_value(x) != "" if not isinstance(x, (int, float)) else not pd.isna(x))
-    local = local.sort_values(group_keys + ["_has_value", "date", "_row_id"])
-    latest = local.groupby(group_keys, dropna=False).tail(1)
-    return latest[group_keys + [col]]
-
-
-def latest_numeric_value(df: pd.DataFrame, group_keys: List[str], col: str) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=group_keys + [col])
-    local = df[group_keys + ["date", "_row_id", col]].copy()
-    local = local.sort_values(group_keys + ["date", "_row_id"])
-    latest = local.groupby(group_keys, dropna=False).tail(1)
-    return latest[group_keys + [col]]
-
-
-def aggregate_window_metrics(df: pd.DataFrame, group_keys: List[str], prefix: str = "") -> pd.DataFrame:
-    if df.empty:
-        cols = group_keys + [
-            f"{prefix}spend",
-            f"{prefix}revenue",
-            f"{prefix}orders",
-            f"{prefix}impressions",
-            f"{prefix}clicks",
-            f"{prefix}gp_after_ads",
+    def load_abc(self, current_year: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        # ABC/АБС reports may be uploaded into different folders by hand.
+        # Read both Latin ABC and Russian АБС/ABS-analysis folders; current-month partial files
+        # such as "1-27 мая" are intentionally treated as monthly facts for page 3.
+        abc_prefixes = [
+            "ABC", "ABS", "ABC анализ", "ABS анализ",
+            "АБС", "АБС анализ", "АБС Анализ", "АБС-анализ", "АБС анализа",
+            "Абс", "Абс анализ", "АВС", "АВС анализ",
         ]
-        return pd.DataFrame(columns=cols)
+        files: List[str] = []
+        for pref in abc_prefixes:
+            files += self.list_reports(pref)
+        files = sorted(set(files))
+        weekly_frames, monthly_frames = [], []
+        for key, data in self._read_candidates(files):
+            key_l = key.lower()
+            if not any(token in key_l for token in ["abc", "abs", "абс", "авс"]):
+                continue
+            start, end = parse_period_from_name(Path(key).name)
+            if start is None or end is None:
+                continue
+            try:
+                df = read_excel_table(data)
+                if df.empty:
+                    continue
+                source_sheet = df.attrs.get("source_sheet", "")
+                header_row_excel = df.attrs.get("header_row_excel", "")
+                source_rows = pd.Series(df.index, index=df.index).map(lambda i: int(i) + int(df.attrs.get("header_row_0based", 0) or 0) + 2)
+                out = pd.DataFrame({
+                    "period_start": start,
+                    "period_end": end,
+                    "week_code": week_code(start),
+                    "week_label": f"{start.strftime('%d.%m')}-{end.strftime('%d.%m')}",
+                    "month_key": month_key(start),
+                    "nm_id": num_series(get_col(df, "nm_id")),
+                    "supplier_article": get_col(df, "supplier_article").map(clean_article),
+                    "subject": get_col(df, "subject").map(canonical_subject),
+                    "manager_raw": get_col(df, "manager").map(normalize_text),
+                    "manager": get_col(df, "manager").map(normalize_text),
+                    "gross_profit": num_series(get_col(df, "gross_profit")).fillna(0),
+                    "gross_revenue": num_series(get_col(df, "gross_revenue")).fillna(0),
+                    "orders": num_series(get_col(df, "orders")).fillna(0),
+                    "abc_margin_pct": num_series(get_col(df, "margin_pct")),
+                    "abc_drr_pct": num_series(get_col(df, "drr")),
+                    "abc_commission_amount": num_series(get_col(df, "commission_amount")).fillna(0),
+                    "abc_acquiring_amount": num_series(get_col(df, "acquiring_amount")).fillna(0),
+                    "source_file": key,
+                    "source_sheet": source_sheet,
+                    "header_row_excel": header_row_excel,
+                    "source_row_excel": source_rows,
+                    "cell_gross_profit": [_source_cell_ref(df, "gross_profit", i) for i in df.index],
+                    "cell_gross_revenue": [_source_cell_ref(df, "gross_revenue", i) for i in df.index],
+                    "cell_orders": [_source_cell_ref(df, "orders", i) for i in df.index],
+                    "cell_margin_pct": [_source_cell_ref(df, "margin_pct", i) for i in df.index],
+                    "cell_drr_pct": [_source_cell_ref(df, "drr", i) for i in df.index],
+                })
+                out["product"] = out["supplier_article"].map(product_code)
 
-    agg = df.groupby(group_keys, dropna=False).agg(
-        spend=("spend", "sum"),
-        revenue=("revenue", "sum"),
-        orders=("orders", "sum"),
-        impressions=("impressions", "sum"),
-        clicks=("clicks", "sum"),
-        gp_after_ads=("gp_after_ads", "sum"),
-    ).reset_index()
+                # STRICT RULE 2026-06-04:
+                # Do not use cumulative MTD ABC files like 01.MM-факт день.
+                # Current-month gross profit is built from exact weekly ABC + daily ABC for an incomplete week.
+                # Monthly bucket is only for fully closed calendar months.
+                period_days = (pd.Timestamp(end).normalize() - pd.Timestamp(start).normalize()).days + 1
+                month_last_day = calendar.monthrange(int(start.year), int(start.month))[1] if start is not None else 31
+                is_daily_abc = bool(pd.Timestamp(start).normalize() == pd.Timestamp(end).normalize())
+                is_full_closed_month = (
+                    period_days > 1
+                    and int(start.day) == 1
+                    and int(start.month) == int(end.month)
+                    and int(start.year) == int(end.year)
+                    and int(end.day) == int(month_last_day)
+                )
+                is_closed_week = (
+                    period_days == 7
+                    and pd.Timestamp(start).normalize().weekday() == 0
+                    and pd.Timestamp(end).normalize().weekday() == 6
+                )
+                is_partial_mtd = (
+                    period_days > 1
+                    and int(start.day) == 1
+                    and int(start.month) == int(end.month)
+                    and int(start.year) == int(end.year)
+                    and not is_full_closed_month
+                    and not is_closed_week
+                )
 
-    # Если ВП отсутствует во всех строках группы, sum даёт 0. Возвращаем NaN для таких групп.
-    gp_present = df.groupby(group_keys, dropna=False)["gp_after_ads"].apply(lambda s: s.notna().any()).reset_index(name="_gp_present")
-    agg = agg.merge(gp_present, on=group_keys, how="left")
-    agg.loc[~agg["_gp_present"].fillna(False), "gp_after_ads"] = float("nan")
-    agg = agg.drop(columns=["_gp_present"])
+                if is_full_closed_month:
+                    monthly_frames.append(out)
+                elif is_partial_mtd:
+                    self.diag.add(
+                        "WARN",
+                        "abc",
+                        "Пропущен накопительный MTD ABC 01.MM-факт день",
+                        f"{Path(key).name}: {start:%d.%m.%Y}-{end:%d.%m.%Y}",
+                    )
+                    continue
+                else:
+                    # Includes normal weekly ABC and real daily ABC, including the 1st day of a month.
+                    weekly_frames.append(out)
+            except Exception as exc:
+                self.diag.add("ERROR", "abc", f"Не прочитан ABC {key}", exc)
+        weekly = pd.concat(weekly_frames, ignore_index=True) if weekly_frames else pd.DataFrame()
+        monthly = pd.concat(monthly_frames, ignore_index=True) if monthly_frames else pd.DataFrame()
+        weekly = dedupe_abc_period_rows(weekly)
+        monthly = dedupe_abc_period_rows(monthly)
+        self._log("abc_weekly", weekly, "period_start")
+        self._log("abc_monthly", monthly, "period_start")
+        return weekly, monthly
 
-    if prefix:
-        rename_map = {col: f"{prefix}{col}" for col in ["spend", "revenue", "orders", "impressions", "clicks", "gp_after_ads"]}
-        agg = agg.rename(columns=rename_map)
-    return agg
+    def load_economics(self) -> pd.DataFrame:
+        candidates = [
+            self.path("Финансовые показатели", self.store, "Экономика.xlsx"),
+            self.path("Финансовые показатели", self.store, "Недельные", "Экономика.xlsx"),
+        ]
+        files = [f for f in candidates if self.storage.exists(f)]
+        frames = []
+        for key, data in self._read_candidates(files):
+            try:
+                df = read_excel_table(data, "Юнит экономика")
+                if df.empty:
+                    continue
+                out = pd.DataFrame({
+                    "week_code": get_col(df, "week").map(normalize_text),
+                    "nm_id": num_series(get_col(df, "nm_id")),
+                    "supplier_article": get_col(df, "supplier_article").map(clean_article),
+                    "subject": get_col(df, "subject").map(canonical_subject),
+                    "commission_pct": num_series(get_col(df, "commission_pct")),
+                    "acquiring_pct": num_series(get_col(df, "acquiring_pct")),
+                    "logistics_direct": num_series(get_col(df, "logistics_direct")),
+                    "logistics_return": num_series(get_col(df, "logistics_return")),
+                    "storage": num_series(get_col(df, "storage")),
+                    "other_costs": num_series(get_col(df, "other_costs")),
+                    "cost": num_series(get_col(df, "cost")),
+                    "source_file": key,
+                })
+                out["product"] = out["supplier_article"].map(product_code)
+                frames.append(out)
+            except Exception as exc:
+                self.diag.add("ERROR", "economics", f"Не прочитана экономика {key}", exc)
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        self._log("economics", out)
+        return out
 
+    def load_all(self) -> DataPack:
+        orders = self.load_orders()
+        funnel = self.load_funnel()
+        ads_raw, ads_daily, campaigns = self.load_ads()
+        ads_category = self.load_ads_category()
 
-def safe_drr_pct(spend: float, revenue: float) -> float:
-    spend = float(spend or 0)
-    revenue = float(revenue or 0)
-    if revenue == 0 and spend > 0:
-        return 999.0
-    if revenue == 0 and spend == 0:
-        return 0.0
-    return spend / revenue * 100.0
+        # Preliminary latest date is known before heavy Stage 2 sources.
+        # Use it to read only the recent 90-110 day window and avoid silent 20+ minute parsing of old files.
+        pre_candidates = []
+        for df, col in [(orders, "day"), (funnel, "day"), (ads_daily, "day")]:
+            if not df.empty and col in df.columns:
+                mx = pd.to_datetime(df[col], errors="coerce").max()
+                if pd.notna(mx):
+                    pre_candidates.append(pd.Timestamp(mx).normalize())
+        preliminary_latest_day = max(pre_candidates) if pre_candidates else pd.Timestamp(datetime.today().date())
+        log(f"preliminary_latest_day: {preliminary_latest_day.date()}")
 
-
-def safe_cpo(spend: float, orders: float) -> float:
-    spend = float(spend or 0)
-    orders = float(orders or 0)
-    if orders == 0 and spend > 0:
-        return 999999.0
-    if orders == 0:
-        return 0.0
-    return spend / orders
-
-
-def safe_ctr_pct(clicks: float, impressions: float) -> float:
-    clicks = float(clicks or 0)
-    impressions = float(impressions or 0)
-    if impressions == 0:
-        return 0.0
-    return clicks / impressions * 100.0
-
-
-def growth_pct_or_status(current: float, base: float) -> Tuple[Optional[float], str]:
-    """Безопасный расчёт изменения к базе.
-
-    Для обычных неотрицательных метрик возвращает % роста.
-    Для ВП/GP база может быть 0 или отрицательной: в этих случаях процент
-    классической формулой current / base считать нельзя — иначе получаем
-    division by zero или вводящий в заблуждение знак. Поэтому возвращаем
-    None и статус, а в отчёте показываем причину.
-    """
-    current_num = pd.to_numeric(pd.Series([current]), errors="coerce").iloc[0]
-    base_num = pd.to_numeric(pd.Series([base]), errors="coerce").iloc[0]
-    current = 0.0 if pd.isna(current_num) else float(current_num)
-    base = 0.0 if pd.isna(base_num) else float(base_num)
-
-    if abs(base) < 1e-9:
-        if abs(current) < 1e-9:
-            return None, "ZERO_BASE"
-        if current > 0:
-            return None, "NEW_ACTIVITY"
-        return None, "NEGATIVE_CURRENT_ZERO_BASE"
-
-    # Для отрицательной базы процент роста ВП не интерпретируем как обычный growth %.
-    if base < 0:
-        if current >= 0:
-            return None, "FROM_NEGATIVE_TO_NONNEGATIVE"
-        return ((current - base) / abs(base)) * 100.0, "NEGATIVE_BASE"
-
-    return (current / base - 1.0) * 100.0, "OK"
-
-
-def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    result["campaign_drr_pct"] = [safe_drr_pct(s, r) for s, r in zip(result["spend"], result["revenue"])]
-    result["cpo"] = [safe_cpo(s, o) for s, o in zip(result["spend"], result["orders"])]
-    result["ctr_pct"] = [safe_ctr_pct(c, i) for c, i in zip(result["clicks"], result["impressions"])]
-
-    for metric in ["spend", "revenue", "orders", "impressions", "clicks", "gp_after_ads"]:
-        base_col = f"base_{metric}"
-        if base_col in result.columns:
-            growth_values: List[Optional[float]] = []
-            growth_statuses: List[str] = []
-            for current_value, base_value in zip(result[metric], result[base_col]):
-                if pd.isna(current_value):
-                    current_value = 0.0
-                if pd.isna(base_value):
-                    base_value = 0.0
-                growth, status = growth_pct_or_status(float(current_value), float(base_value))
-                growth_values.append(growth)
-                growth_statuses.append(status)
-            result[f"{metric}_growth_pct"] = growth_values
-            result[f"{metric}_growth_status"] = growth_statuses
-    return result
-
-
-def aggregate_campaign_metrics(ads_df: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    ads_df = filter_managed_subject_rows(ads_df)
-    group_keys = ["campaign_id", "nm_id", "placement"]
-    current_df = filter_by_date_window(ads_df, ctx.current_start, ctx.current_end)
-    base_df = filter_by_date_window(ads_df, ctx.base_start, ctx.base_end)
-
-    if current_df.empty and not ads_df.empty and not has_valid_dates(ads_df):
-        current_df = ads_df.copy()
-
-    current_metrics = aggregate_window_metrics(current_df, group_keys, prefix="")
-    base_metrics = aggregate_window_metrics(base_df, group_keys, prefix="base_")
-
-    pause21_start = ctx.mature_end - timedelta(days=PAUSE_ANALYSIS_DAYS - 1)
-    pause21_df = filter_by_date_window(ads_df, pause21_start, ctx.mature_end) if has_valid_dates(ads_df) else ads_df.copy()
-    pause21_metrics = aggregate_window_metrics(pause21_df, group_keys, prefix="last21_")
-
-    if current_metrics.empty:
-        return pd.DataFrame(columns=DECISION_COLUMNS)
-
-    result = current_metrics.merge(base_metrics, on=group_keys, how="left")
-    result = result.merge(pause21_metrics, on=group_keys, how="left")
-
-    source_for_dims = current_df if not current_df.empty else ads_df
-    for col in ["campaign_name", "campaign_status", "supplier_article", "subject_norm"]:
-        result = result.merge(latest_nonempty_value(source_for_dims, group_keys, col), on=group_keys, how="left")
-    result = result.merge(latest_numeric_value(source_for_dims, group_keys, "current_bid_rub"), on=group_keys, how="left")
-
-    for metric in ["base_spend", "base_revenue", "base_orders", "base_impressions", "base_clicks",
-                   "last21_spend", "last21_revenue", "last21_orders", "last21_impressions", "last21_clicks"]:
-        if metric not in result.columns:
-            result[metric] = 0.0
-        result[metric] = pd.to_numeric(result[metric], errors="coerce").fillna(0.0)
-
-    if "base_gp_after_ads" not in result.columns:
-        result["base_gp_after_ads"] = float("nan")
-
-    result = compute_metrics(result)
-    result["drr_limit_pct"] = result["subject_norm"].map(drr_limit_for_subject)
-    days = safe_window_days(ctx)
-    result["avg_impressions_per_day"] = pd.to_numeric(result.get("impressions", 0), errors="coerce").fillna(0.0) / days
-    result["avg_spend_per_day"] = pd.to_numeric(result.get("spend", 0), errors="coerce").fillna(0.0) / days
-    result["last21_drr_pct"] = [safe_drr_pct(s, r) for s, r in zip(result.get("last21_spend", pd.Series([0]*len(result))), result.get("last21_revenue", pd.Series([0]*len(result))))]
-    result["last21_avg_impressions_per_day"] = pd.to_numeric(result.get("last21_impressions", 0), errors="coerce").fillna(0.0) / float(PAUSE_ANALYSIS_DAYS)
-    result["last21_avg_spend_per_day"] = pd.to_numeric(result.get("last21_spend", 0), errors="coerce").fillna(0.0) / float(PAUSE_ANALYSIS_DAYS)
-    return result
-
-
-# =============================
-# Post-check изменений ставки
-# =============================
-
-def make_key(row: pd.Series | Dict[str, Any]) -> Tuple[str, str, str]:
-    return (
-        _clean_id_value(row.get("campaign_id", "")),
-        _clean_id_value(row.get("nm_id", "")),
-        normalize_placement_value(row.get("placement", "")),
-    )
-
-
-def is_ramp_event_reason(reason_code: Any) -> bool:
-    text = _clean_text_value(reason_code).upper()
-    return text.startswith("RAMP_") or text.startswith("LOW_BID_NO_SPEND_NO_ORDERS_RAMP")
-
-
-def wait_days_for_event(row: pd.Series | Dict[str, Any]) -> int:
-    reason_code = _clean_text_value(row.get("reason_code", ""))
-    return int(RAMP_CHECK_DAYS) if is_ramp_event_reason(reason_code) else 3
-
-
-def wait_rule_for_event(row: pd.Series | Dict[str, Any]) -> str:
-    reason_code = _clean_text_value(row.get("reason_code", ""))
-    direction = _clean_text_value(row.get("direction", "")).lower()
-    if is_ramp_event_reason(reason_code):
-        return f"WAIT_D{int(RAMP_CHECK_DAYS)}_RAMP_CHECK"
-    if direction == "raise":
-        return "WAIT_D3_RAISE_CHECK"
-    if direction == "lower":
-        return "WAIT_D3_LOWER_CHECK"
-    return "WAIT_D3_BID_CHECK"
+        search_queries = self.load_search_queries(preliminary_latest_day)
+        if self.current_week_only:
+            entry_points = pd.DataFrame()
+            stock = pd.DataFrame()
+            economics = pd.DataFrame()
+            log("current_week_only: skip entry_points/stock/economics/ABC; daily mode updates only current-week operational block")
+        else:
+            entry_points = self.load_entry_points(preliminary_latest_day)
+            stock = self.load_stock(preliminary_latest_day)
+            economics = self.load_economics()
+        candidates = []
+        for df, col in [(orders, "day"), (funnel, "day"), (ads_daily, "day"), (search_queries, "day"), (stock, "day")]:
+            if not df.empty and col in df.columns:
+                mx = pd.to_datetime(df[col], errors="coerce").max()
+                if pd.notna(mx):
+                    candidates.append(pd.Timestamp(mx).normalize())
+        latest_day = max(candidates) if candidates else preliminary_latest_day
+        # ABC is needed even in current_week mode: daily ВП comes from daily ABC,
+        # and the comparison base is the average daily ВП of the last closed month.
+        abc_weekly, abc_monthly = self.load_abc(latest_day.year)
+        if not abc_weekly.empty:
+            _mx_abc_weekly = pd.to_datetime(abc_weekly["period_end"], errors="coerce").max()
+            if pd.notna(_mx_abc_weekly) and not self.current_week_only:
+                latest_day = max(latest_day, _mx_abc_weekly)
+        return DataPack(
+            orders=orders, funnel=funnel, ads_daily=ads_daily, ads_raw=ads_raw, ads_category=ads_category, campaigns=campaigns,
+            search_queries=search_queries, entry_points=entry_points, stock=stock, abc_weekly=abc_weekly,
+            abc_monthly=abc_monthly, economics=economics, latest_day=pd.Timestamp(latest_day).normalize(), diagnostics=self.diag,
+        )
 
 
-def pending_wait_info(row: pd.Series | Dict[str, Any], ctx: Optional[RunContext] = None) -> Dict[str, Any]:
-    event_dt = pd.to_datetime(row.get("event_date", ""), errors="coerce")
-    wait_days = wait_days_for_event(row)
-    wait_rule = wait_rule_for_event(row)
-    if pd.isna(event_dt):
-        return {
-            "active_wait": False,
-            "wait_rule": wait_rule,
-            "wait_until_date": "",
-            "wait_days_left": 0,
-            "wait_status": "NO_EVENT_DATE",
+# ------------------------- analytics -------------------------
+class AnalyticsBuilder:
+    def __init__(self, pack: DataPack):
+        self.pack = pack
+        self.diag = pack.diagnostics
+        self.latest_day = pack.latest_day
+        self.cutoff_90 = self.latest_day - pd.Timedelta(days=89)
+        # Last full week. If latest day is Sunday, current week is full; otherwise previous Mon-Sun.
+        last_monday = self.latest_day - pd.Timedelta(days=int(self.latest_day.weekday()))
+        if self.latest_day.weekday() == 6:
+            self.week_start = last_monday
+            self.week_end = self.latest_day
+        else:
+            self.week_start = last_monday - pd.Timedelta(days=7)
+            self.week_end = last_monday - pd.Timedelta(days=1)
+        self.dictionary = self.build_dictionary()
+
+    def build_dictionary(self) -> pd.DataFrame:
+        frames = []
+        for name in ["orders", "funnel", "ads_raw", "search_queries", "entry_points", "stock", "abc_weekly", "abc_monthly", "economics"]:
+            df = getattr(self.pack, name)
+            if df is None or df.empty:
+                continue
+            x = df.copy()
+            for col in ["subject", "product", "supplier_article", "nm_id"]:
+                if col not in x.columns:
+                    x[col] = "" if col != "nm_id" else np.nan
+            x["supplier_article"] = x["supplier_article"].map(clean_article)
+            x["subject"] = x["subject"].map(canonical_subject)
+            x["nm_id"] = num_series(x["nm_id"])
+            x["product"] = x["supplier_article"].map(product_code).where(x["product"].map(normalize_text).eq(""), x["product"].map(normalize_text))
+            x["product"] = x["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+            x["source"] = name
+            frames.append(x[["subject", "product", "supplier_article", "nm_id", "source"]])
+        if not frames:
+            return pd.DataFrame(columns=["subject", "product", "supplier_article", "nm_id", "source"])
+        d = pd.concat(frames, ignore_index=True)
+        d = d[d["subject"].isin(TARGET_SUBJECTS)]
+        d = d[d["supplier_article"].ne("") & d["product"].ne("")]
+        d = d[~d["supplier_article"].map(is_excluded_article)]
+        d = d[d["product"].map(is_valid_product_code)]
+        d = d[d.apply(lambda r: is_approved_product_subject(r.get("product"), r.get("subject")), axis=1)]
+
+        # FIX 2026-06-02: one WB nmId must have one canonical seller article across ALL sources.
+        # WB files can disagree on article spelling: e.g. the same nmId is seen as
+        # 901/20 in Orders and as 901_/20 in ads/economics/ABC. If we keep both labels,
+        # sales and GP fall into 901/20 while ad spend/economics fall into 901_/20,
+        # producing impossible rows with 0 ₽ ads and 100% margin.
+        # Prefer the clean business label without underscore; tie-break by source priority.
+        source_priority = {
+            "orders": 0, "funnel": 1, "abc_weekly": 2, "abc_monthly": 3,
+            "ads_raw": 4, "search_queries": 5, "entry_points": 6,
+            "stock": 7, "economics": 8,
         }
-    event_day = event_dt.date()
-    wait_until = event_day + timedelta(days=wait_days)
-    mature_end = ctx.mature_end if ctx is not None else date.today()
-    active_wait = mature_end < wait_until
-    days_left = max((wait_until - mature_end).days, 0)
-    return {
-        "active_wait": bool(active_wait),
-        "wait_rule": wait_rule,
-        "wait_until_date": wait_until.isoformat(),
-        "wait_days_left": int(days_left),
-        "wait_status": "WAIT_ACTIVE" if active_wait else "WAIT_EXPIRED",
-    }
+        d["_source_priority"] = d["source"].map(source_priority).fillna(99).astype(int)
+        d["_has_underscore"] = d["supplier_article"].astype(str).str.contains("_", regex=False).astype(int)
+        d["_is_pt"] = d["supplier_article"].astype(str).str.upper().str.startswith("PT").astype(int)
+        d["_article_len"] = d["supplier_article"].astype(str).str.len()
+
+        with_nm = d[d["nm_id"].notna()].copy()
+        without_nm = d[d["nm_id"].isna()].copy()
+        if not with_nm.empty:
+            with_nm = with_nm.sort_values(
+                ["nm_id", "_has_underscore", "_is_pt", "_source_priority", "_article_len", "supplier_article"],
+                ascending=[True, True, True, True, True, True],
+                na_position="last",
+            ).drop_duplicates("nm_id", keep="first")
+        if not without_nm.empty:
+            without_nm = without_nm.sort_values(
+                ["supplier_article", "_has_underscore", "_is_pt", "_source_priority", "_article_len"],
+                ascending=[True, True, True, True, True],
+                na_position="last",
+            ).drop_duplicates(["supplier_article", "subject", "product"], keep="first")
+
+        d = pd.concat([with_nm, without_nm], ignore_index=True, sort=False)
+        d = d.drop(columns=["_source_priority", "_has_underscore", "_is_pt", "_article_len"], errors="ignore")
+        log(f"dictionary: rows={len(d):,}, articles={d['supplier_article'].nunique():,}, nm_ids={d['nm_id'].nunique(dropna=True):,}; canonicalized by nmId")
+        return d
+
+    def enrich(self, df: pd.DataFrame, source: str = "") -> pd.DataFrame:
+        """
+        Add subject/product/supplier_article to source rows using nm_id dictionary.
+
+        HARD FIX 2026-05-26: this function must never crash with
+        KeyError: 'product' on advertising sources. Some sources arrive without
+        product/supplier_article and some pandas merge/filter paths can leave
+        the canonical columns in an unsafe state. We therefore build canonical
+        Series first, remove any old/duplicate canonical columns, reinsert clean
+        columns, and use local Series for all filters.
+        """
+        if df is None or df.empty:
+            return pd.DataFrame(columns=list(df.columns) if isinstance(df, pd.DataFrame) else [])
+
+        out = df.copy()
+
+        def _series(frame: pd.DataFrame, name: str, default="") -> pd.Series:
+            """Return a 1-D Series even if duplicate column labels exist."""
+            if name in frame.columns:
+                value = frame[name]
+                if isinstance(value, pd.DataFrame):
+                    value = value.iloc[:, 0]
+                return value
+            return pd.Series(default, index=frame.index, dtype="object")
+
+        # Ensure merge keys exist before dictionary merge.
+        if "nm_id" not in out.columns:
+            out["nm_id"] = np.nan
+        if "subject" not in out.columns:
+            out["subject"] = ""
+        if "product" not in out.columns:
+            out["product"] = ""
+        if "supplier_article" not in out.columns:
+            out["supplier_article"] = ""
+
+        if not self.dictionary.empty:
+            d_nm = (
+                self.dictionary.dropna(subset=["nm_id"])
+                .drop_duplicates("nm_id")[["nm_id", "subject", "product", "supplier_article"]]
+            )
+            out = out.merge(d_nm, on="nm_id", how="left", suffixes=("", "_dict"))
+
+        # Canonical values are calculated as local Series. Never use direct
+        # out["product"] in filters because it can fail when the label is missing
+        # or duplicated in rare pandas states.
+        subject_raw = _series(out, "subject").map(canonical_subject)
+        subject_dict = _series(out, "subject_dict").map(canonical_subject)
+        # Prefer dictionary values by nmId. This keeps category/product stable when
+        # different source files use different seller-article spellings for the same nmId.
+        subject_clean = subject_dict.where(subject_dict.ne(""), subject_raw)
+
+        article_raw = _series(out, "supplier_article").map(clean_article)
+        article_dict = _series(out, "supplier_article_dict").map(clean_article)
+        # Main FIX: canonical seller article comes from nmId dictionary when available.
+        # Raw article is used only when nmId is absent from the dictionary.
+        article_clean = article_dict.where(article_dict.ne(""), article_raw)
+
+        product_raw = _series(out, "product").map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        product_dict = _series(out, "product_dict").map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        product_clean = product_dict.where(product_dict.ne(""), product_raw)
+        product_clean = product_clean.where(product_clean.ne(""), article_clean.map(product_code))
+        product_clean = product_clean.map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        ref_subject = product_clean.map(approved_subject_for_product)
+        # If the source subject is empty, use the approved reference category.
+        # If the source subject is present, it must still match the approved pair below.
+        subject_clean = subject_clean.where(subject_clean.ne(""), ref_subject)
+
+        # Drop old canonical/dict columns, including duplicates, and reinsert clean canonical columns.
+        drop_cols = [c for c in out.columns if str(c) in {"subject", "product", "supplier_article", "subject_dict", "product_dict", "supplier_article_dict"}]
+        out = out.drop(columns=drop_cols, errors="ignore")
+        out.insert(0, "subject", subject_clean.values)
+        out.insert(1, "product", product_clean.values)
+        out.insert(2, "supplier_article", article_clean.values)
+
+        mask = (
+            subject_clean.isin(TARGET_SUBJECTS)
+            & article_clean.ne("")
+            & product_clean.ne("")
+            & (~article_clean.map(is_excluded_article))
+            & product_clean.map(is_valid_product_code)
+            & product_clean.combine(subject_clean, lambda p, s: VALID_PRODUCT_CATEGORY_REFERENCE.get(str(p)) == s)
+        )
+        out = out.loc[mask.values].copy()
+        return out
+
+    def buyout_rates(self) -> pd.DataFrame:
+        f = self.enrich(self.pack.funnel, "funnel")
+        if f.empty:
+            return pd.DataFrame()
+        f90 = f[(f["day"] >= self.cutoff_90) & (f["day"] <= self.latest_day)].copy()
+        g = f90.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            orders_90=("orders", "sum"), buyouts_90=("buyouts_count", "sum"), cancels_90=("cancels_count", "sum"),
+        )
+        g["resolved_90"] = g["buyouts_90"].fillna(0) + g["cancels_90"].fillna(0)
+        g["buyout_pct_90"] = np.where(g["resolved_90"] > 0, g["buyouts_90"] / g["resolved_90"], np.nan)
+        g["buyout_pct_wrong_orders"] = np.where(g["orders_90"] > 0, g["buyouts_90"] / g["orders_90"], np.nan)
+        # fallback by product, then category.
+        prod = g.groupby(["subject", "product"], as_index=False).agg(prod_buyouts=("buyouts_90", "sum"), prod_cancels=("cancels_90", "sum"))
+        prod["product_buyout_pct_90"] = np.where(prod["prod_buyouts"] + prod["prod_cancels"] > 0, prod["prod_buyouts"] / (prod["prod_buyouts"] + prod["prod_cancels"]), np.nan)
+        cat = g.groupby(["subject"], as_index=False).agg(cat_buyouts=("buyouts_90", "sum"), cat_cancels=("cancels_90", "sum"))
+        cat["category_buyout_pct_90"] = np.where(cat["cat_buyouts"] + cat["cat_cancels"] > 0, cat["cat_buyouts"] / (cat["cat_buyouts"] + cat["cat_cancels"]), np.nan)
+        g = g.merge(prod[["subject", "product", "product_buyout_pct_90"]], on=["subject", "product"], how="left").merge(cat[["subject", "category_buyout_pct_90"]], on="subject", how="left")
+        g["used_buyout_pct_90"] = g["buyout_pct_90"].fillna(g["product_buyout_pct_90"]).fillna(g["category_buyout_pct_90"]).fillna(1.0)
+        g["used_buyout_pct_90"] = g["used_buyout_pct_90"].clip(0, 1)
+        return g
+
+    def order_prices_daily(self) -> pd.DataFrame:
+        orders = self.enrich(self.pack.orders, "orders")
+        if orders.empty:
+            return pd.DataFrame()
+        orders = orders[(orders["day"] >= self.cutoff_90) & (orders["day"] <= self.latest_day)].copy()
+        if "order_sum" not in orders.columns:
+            orders["order_sum"] = 0.0
+        # Prices and SPP must come from WB Orders, not from ABC revenue allocation.
+        # In WB Orders a row is normally one ordered item, but keep weights for safety.
+        for _c in ["orders", "order_sum", "finished_price", "price_with_disc", "spp"]:
+            if _c not in orders.columns:
+                orders[_c] = np.nan
+            orders[_c] = pd.to_numeric(orders[_c], errors="coerce")
+        orders["orders"] = orders["orders"].fillna(1.0)
+        _w_qty = orders["orders"].where(orders["orders"] > 0, 1.0).fillna(1.0)
+        _w_money = orders["order_sum"].where(orders["order_sum"] > 0, _w_qty).fillna(_w_qty)
+        orders["_price_with_disc_num"] = orders["price_with_disc"].where(orders["price_with_disc"].notna(), np.nan) * _w_qty
+        orders["_price_with_disc_den"] = np.where(orders["price_with_disc"].notna(), _w_qty, 0.0)
+        orders["_finished_price_num"] = orders["finished_price"].where(orders["finished_price"].notna(), np.nan) * _w_qty
+        orders["_finished_price_den"] = np.where(orders["finished_price"].notna(), _w_qty, 0.0)
+        # СПП is a discount percentage; average it by order money when available.
+        orders["_spp_num"] = orders["spp"].where(orders["spp"].notna(), np.nan) * _w_money
+        orders["_spp_den"] = np.where(orders["spp"].notna(), _w_money, 0.0)
+        g = orders.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            orders=("orders", "sum"),
+            orders_rows=("orders", "sum"),
+            order_sum=("order_sum", "sum"),
+            _price_with_disc_num=("_price_with_disc_num", "sum"),
+            _price_with_disc_den=("_price_with_disc_den", "sum"),
+            _finished_price_num=("_finished_price_num", "sum"),
+            _finished_price_den=("_finished_price_den", "sum"),
+            _spp_num=("_spp_num", "sum"),
+            _spp_den=("_spp_den", "sum"),
+        )
+        g["price_with_disc"] = np.where(g["_price_with_disc_den"] > 0, g["_price_with_disc_num"] / g["_price_with_disc_den"], np.nan)
+        g["finished_price"] = np.where(g["_finished_price_den"] > 0, g["_finished_price_num"] / g["_finished_price_den"], np.nan)
+        g["spp"] = np.where(g["_spp_den"] > 0, g["_spp_num"] / g["_spp_den"], np.nan)
+        return g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
+
+    def funnel_daily(self) -> pd.DataFrame:
+        f = self.enrich(self.pack.funnel, "funnel")
+        if f.empty:
+            return pd.DataFrame()
+        f = f[(f["day"] >= self.cutoff_90) & (f["day"] <= self.latest_day)].copy()
+        g = f.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            orders=("orders", "sum"), order_sum=("order_sum", "sum"), open_cards=("open_cards", "sum"),
+            add_to_cart=("add_to_cart", "sum"), buyouts_count=("buyouts_count", "sum"), cancels_count=("cancels_count", "sum"),
+            finished_price_funnel=("finished_price", "mean"), spp_funnel=("spp", "mean"),
+        )
+        g["cart_conv_pct"] = np.where(g["open_cards"] > 0, g["add_to_cart"] / g["open_cards"] * 100, np.nan)
+        g["order_conv_pct"] = np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan)
+        return g
+
+    def ads_daily_pivot(self) -> pd.DataFrame:
+        ads = self.enrich(self.pack.ads_daily, "ads")
+        if ads.empty:
+            return pd.DataFrame()
+        ads = ads[(ads["day"] >= self.cutoff_90) & (ads["day"] <= self.latest_day)].copy()
+        # pivot manual/unified/unknown into columns.
+        grouped = ads.groupby(["day", "subject", "product", "supplier_article", "nm_id", "ad_type"], dropna=False, as_index=False).agg(
+            impressions=("impressions", "sum"), clicks=("clicks", "sum"), orders=("orders", "sum"),
+            order_sum=("order_sum", "sum"), spend=("spend", "sum"),
+        )
+        rows = []
+        for keys, part in grouped.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False):
+            rec = dict(zip(["day", "subject", "product", "supplier_article", "nm_id"], keys))
+            for typ in ["manual", "unified", "unknown"]:
+                p = part[part["ad_type"] == typ]
+                imps, clicks, orders, order_sum, spend = [float(p[c].sum()) for c in ["impressions", "clicks", "orders", "order_sum", "spend"]]
+                rec[f"{typ}_impressions"] = imps
+                rec[f"{typ}_clicks"] = clicks
+                rec[f"{typ}_orders"] = orders
+                rec[f"{typ}_order_sum"] = order_sum
+                rec[f"{typ}_spend"] = spend
+                rec[f"{typ}_ctr_pct"] = clicks / imps * 100 if imps else np.nan
+                rec[f"{typ}_cpc"] = spend / clicks if clicks else np.nan
+                rec[f"{typ}_cr_pct"] = orders / clicks * 100 if clicks else np.nan
+                rec[f"{typ}_drr_pct"] = spend / order_sum * 100 if order_sum else np.nan
+            rows.append(rec)
+        out = pd.DataFrame(rows)
+        return out
+
+    def search_daily_summary(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        q = self.enrich(self.pack.search_queries, "search_queries")
+        if q.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        q = q[(q["day"] >= self.cutoff_90) & (q["day"] <= self.latest_day)].copy()
+        # Query data is already deduped by loader. Article-day summary.
+        summary = q.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            search_frequency=("frequency", "sum"), search_transitions=("transitions", "sum"),
+            search_add_to_cart=("add_to_cart", "sum"), search_orders=("orders", "sum"),
+            search_avg_position=("avg_position", lambda s: weighted_mean(s, q.loc[s.index, "orders"].fillna(0) + q.loc[s.index, "frequency"].fillna(0) / 1000)),
+            search_median_position=("median_position", "mean"),
+            rating_card=("rating_card", "mean"), rating_reviews=("rating_reviews", "mean"), visibility_pct=("visibility_pct", "mean"),
+        )
+        summary["search_traffic_capture_pct"] = np.where(summary["search_frequency"] > 0, summary["search_transitions"] / summary["search_frequency"] * 100, np.nan)
+        # Core queries that give 80%+ orders over period.
+        core_rows = []
+        for keys, part in q.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            part2 = part.groupby("search_query", as_index=False).agg(
+                frequency=("frequency", "sum"), transitions=("transitions", "sum"), add_to_cart=("add_to_cart", "sum"), orders=("orders", "sum"),
+                avg_position=("avg_position", lambda s: weighted_mean(s, part.loc[s.index, "orders"].fillna(0) + part.loc[s.index, "frequency"].fillna(0) / 1000)),
+                median_position=("median_position", "mean"), rating_card=("rating_card", "mean"), rating_reviews=("rating_reviews", "mean"),
+                visibility_pct=("visibility_pct", "mean"),
+            ).sort_values("orders", ascending=False)
+            total_orders = part2["orders"].sum()
+            part2["orders_share_pct"] = np.where(total_orders > 0, part2["orders"] / total_orders * 100, 0)
+            part2["cum_orders_share_pct"] = part2["orders_share_pct"].cumsum()
+            if total_orders > 0:
+                core = part2[(part2["cum_orders_share_pct"] <= 80) | (part2["orders_share_pct"] == part2["orders_share_pct"].max())].copy()
+                # Ensure the row crossing 80 is included.
+                crossing = part2[part2["cum_orders_share_pct"] > 80].head(1)
+                core = pd.concat([core, crossing], ignore_index=True).drop_duplicates("search_query")
+            else:
+                core = part2.head(10).copy()
+            for _, r in core.iterrows():
+                rec = dict(zip(["subject", "product", "supplier_article", "nm_id"], keys))
+                rec.update(r.to_dict())
+                rec["traffic_capture_pct"] = r["transitions"] / r["frequency"] * 100 if r["frequency"] else np.nan
+                core_rows.append(rec)
+        core = pd.DataFrame(core_rows)
+        return summary, core
+
+    def search_unique_demand(self) -> pd.DataFrame:
+        """Unique WB demand by level from raw search queries.
+
+        Важно: спрос на уровне категории/товара нельзя считать суммой спроса по артикулам,
+        потому что один и тот же поисковый запрос встречается у нескольких карточек.
+        Поэтому считаем частотность один раз на уровне: день + уровень + нормализованный запрос.
+        Для частотности берём max по дублям, для переходов/заказов — sum.
+        """
+        q = self.enrich(self.pack.search_queries, "search_queries")
+        if q.empty:
+            return pd.DataFrame()
+        q = q[(q["day"] >= self.cutoff_90) & (q["day"] <= self.latest_day)].copy()
+        if q.empty or "search_query" not in q.columns:
+            return pd.DataFrame()
+        q["query_norm"] = (
+            q["search_query"].astype(str).str.lower().str.replace("ё", "е", regex=False)
+            .str.replace(r"\s+", " ", regex=True).str.strip()
+        )
+        q = q[q["query_norm"].ne("")].copy()
+        for col in ["frequency", "transitions", "add_to_cart", "orders"]:
+            if col not in q.columns:
+                q[col] = 0
+            q[col] = pd.to_numeric(q[col], errors="coerce").fillna(0)
+
+        def build(level: str, keys: List[str]) -> pd.DataFrame:
+            cols = ["day"] + keys + ["query_norm"]
+            x = q.groupby(cols, dropna=False, as_index=False).agg(
+                unique_frequency=("frequency", "max"),
+                query_rows=("frequency", "size"),
+                transitions=("transitions", "sum"),
+                add_to_cart=("add_to_cart", "sum"),
+                orders=("orders", "sum"),
+            )
+            g = x.groupby(["day"] + keys, dropna=False, as_index=False).agg(
+                unique_search_frequency=("unique_frequency", "sum"),
+                unique_search_queries=("query_norm", "nunique"),
+                raw_query_rows=("query_rows", "sum"),
+                transitions=("transitions", "sum"),
+                add_to_cart=("add_to_cart", "sum"),
+                orders=("orders", "sum"),
+            )
+            g["duplicate_query_rows_removed"] = g["raw_query_rows"] - g["unique_search_queries"]
+            g["level"] = level
+            return g
+
+        frames = [
+            build("category", ["subject"]),
+            build("product", ["subject", "product"]),
+            build("article", ["subject", "product", "supplier_article", "nm_id"]),
+        ]
+        out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return out
+
+    def search_query_gp_position(self, daily: pd.DataFrame) -> pd.DataFrame:
+        """Raw query rows with estimated GP contribution for PDF metric:
+        average position for search queries that generate 80% of gross profit.
+
+        Query files contain query-level orders/positions, but not ABC GP by query.
+        We allocate article-day gross profit to queries proportionally through query orders:
+        query_gp_est = query_orders × (article_day_gross_profit_model / article_day_orders).
+        The metric is used as a ranking/diagnostic signal, not as accounting GP.
+        """
+        q = self.enrich(self.pack.search_queries, "search_queries")
+        if q.empty or daily is None or daily.empty:
+            return pd.DataFrame()
+        q = q[(q["day"] >= self.cutoff_90) & (q["day"] <= self.latest_day)].copy()
+        if q.empty:
+            return pd.DataFrame()
+        base_cols = ["day", "subject", "product", "supplier_article", "nm_id", "orders", "gross_profit_model", "order_sum"]
+        base = daily[[c for c in base_cols if c in daily.columns]].copy()
+        for c in base_cols:
+            if c not in base.columns:
+                base[c] = 0.0 if c in {"orders", "gross_profit_model", "order_sum"} else ""
+        base["orders"] = pd.to_numeric(base["orders"], errors="coerce").fillna(0.0)
+        base["gross_profit_model"] = pd.to_numeric(base["gross_profit_model"], errors="coerce").fillna(0.0)
+        base["order_sum"] = pd.to_numeric(base["order_sum"], errors="coerce").fillna(0.0)
+        base = base.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            article_orders=("orders", "sum"),
+            article_gp=("gross_profit_model", "sum"),
+            article_order_sum=("order_sum", "sum"),
+        )
+        base["gp_per_order"] = np.where(base["article_orders"] > 0, base["article_gp"] / base["article_orders"], 0.0)
+        use_cols = ["day", "subject", "product", "supplier_article", "nm_id", "gp_per_order"]
+        q = q.merge(base[use_cols], on=["day", "subject", "product", "supplier_article", "nm_id"], how="left")
+        for c in ["orders", "frequency", "transitions", "avg_position", "median_position"]:
+            if c not in q.columns:
+                q[c] = np.nan
+            q[c] = pd.to_numeric(q[c], errors="coerce")
+        q["orders"] = q["orders"].fillna(0.0)
+        q["frequency"] = q["frequency"].fillna(0.0)
+        q["transitions"] = q["transitions"].fillna(0.0)
+        q["gp_per_order"] = pd.to_numeric(q["gp_per_order"], errors="coerce").fillna(0.0)
+        q["query_gp_est"] = q["orders"] * q["gp_per_order"]
+        keep = ["day", "subject", "product", "supplier_article", "nm_id", "search_query", "frequency", "transitions", "orders", "query_gp_est", "avg_position", "median_position"]
+        return q[[c for c in keep if c in q.columns]].copy()
+
+    def entry_points_summary(self) -> pd.DataFrame:
+        e = self.enrich(self.pack.entry_points, "entry_points")
+        if e.empty:
+            return pd.DataFrame()
+        e = e[(e["day"].isna()) | ((e["day"] >= self.cutoff_90) & (e["day"] <= self.latest_day))].copy()
+        g = e.groupby(["subject", "product", "supplier_article", "nm_id", "entry_section", "entry_point"], dropna=False, as_index=False).agg(
+            impressions=("impressions", "sum"), transitions=("transitions", "sum"), add_to_cart=("add_to_cart", "sum"), orders=("orders", "sum"),
+        )
+        g["ctr_pct"] = np.where(g["impressions"] > 0, g["transitions"] / g["impressions"] * 100, np.nan)
+        g["cart_conv_pct"] = np.where(g["transitions"] > 0, g["add_to_cart"] / g["transitions"] * 100, np.nan)
+        g["order_conv_pct"] = np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan)
+        totals = g.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False)["orders"].sum().rename("orders_total").reset_index()
+        g = g.merge(totals, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        g["orders_share_pct"] = np.where(g["orders_total"] > 0, g["orders"] / g["orders_total"] * 100, np.nan)
+        return g.sort_values(["subject", "product", "supplier_article", "orders"], ascending=[True, True, True, False])
+
+    def localization(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        stock = self.enrich(self.pack.stock, "stock")
+        orders = self.enrich(self.pack.orders, "orders")
+        if stock.empty or orders.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        orders = orders[(orders["day"] >= self.cutoff_90) & (orders["day"] <= self.latest_day)].copy()
+        orders["warehouse"] = orders["warehouse"].map(canonical_warehouse_name)
+        orders = orders[orders["warehouse"].map(is_relevant_warehouse)].copy()
+        stock["warehouse"] = stock["warehouse"].map(canonical_warehouse_name)
+        stock = stock[stock["warehouse"].map(is_relevant_warehouse)].copy()
+        if stock.empty or orders.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        weights = orders.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).agg(orders_90=("orders", "sum"))
+        totals = weights.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False)["orders_90"].sum().rename("orders_total").reset_index()
+        weights = weights.merge(totals, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        weights["warehouse_weight_pct"] = np.where(weights["orders_total"] > 0, weights["orders_90"] / weights["orders_total"] * 100, 0)
+        # Оставляем ключевые склады, которые суммарно дают 97% заказов артикула.
+        weights = weights.sort_values(["subject", "product", "supplier_article", "nm_id", "warehouse_weight_pct"], ascending=[True, True, True, True, False])
+        weights["cum_weight_pct"] = weights.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False)["warehouse_weight_pct"].cumsum()
+        weights = weights[(weights["cum_weight_pct"] <= 97) | (weights["warehouse_weight_pct"] >= 0.5)].copy()
+        weights["avg_daily_orders_wh"] = weights["orders_90"] / 90.0
+        weights["needed_stock_2d"] = weights["avg_daily_orders_wh"] * 2
+        weights["warehouse_pool"] = weights["warehouse"].map(warehouse_pool)
+        # Last stock date per article/warehouse.
+        stock = stock[stock["day"].notna()].copy()
+        stock = stock.sort_values("day").groupby(["subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).tail(1)
+        st = stock.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).agg(stock_qty=("stock", "sum"), stock_day=("day", "max"))
+        detail = weights.merge(st, on=["subject", "product", "supplier_article", "nm_id", "warehouse"], how="left")
+        detail["stock_qty"] = detail["stock_qty"].fillna(0)
+        detail["is_direct_covered"] = detail["stock_qty"] >= detail["needed_stock_2d"]
+        # Replacement: same regional pool has enough stock in aggregate.
+        pool_stock = detail.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], dropna=False)["stock_qty"].sum().rename("pool_stock_qty").reset_index()
+        pool_need = detail.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], dropna=False)["needed_stock_2d"].sum().rename("pool_need_qty").reset_index()
+        detail = detail.merge(pool_stock, on=["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], how="left").merge(pool_need, on=["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], how="left")
+        detail["is_covered_with_replacement"] = detail["is_direct_covered"] | (detail["pool_stock_qty"] >= detail["needed_stock_2d"])
+        detail["direct_coverage_weight_pct"] = np.where(detail["is_direct_covered"], detail["warehouse_weight_pct"], 0)
+        detail["replacement_coverage_weight_pct"] = np.where(detail["is_covered_with_replacement"], detail["warehouse_weight_pct"], 0)
+        summary = detail.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
+            direct_localization_pct=("direct_coverage_weight_pct", "sum"),
+            localization_with_replacements_pct=("replacement_coverage_weight_pct", "sum"),
+            stock_qty_total=("stock_qty", "sum"),
+            key_warehouses=("warehouse", "nunique"),
+            stock_day=("stock_day", "max"),
+        )
+        summary["localization_status"] = np.select(
+            [summary["localization_with_replacements_pct"] >= 85, summary["localization_with_replacements_pct"] >= 60, summary["localization_with_replacements_pct"] >= 30],
+            ["Норма", "Риск", "Плохая локализация"], default="Критично",
+        )
+        uncovered = detail[~detail["is_covered_with_replacement"]].groupby(["supplier_article", "nm_id"], dropna=False)["warehouse"].apply(lambda s: "; ".join(s.astype(str).head(8))).rename("uncovered_warehouses").reset_index()
+        summary = summary.merge(uncovered, on=["supplier_article", "nm_id"], how="left")
+        return detail, summary
+
+    def gross_profit_potential(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        abc = self.enrich(self.pack.abc_weekly, "abc_weekly")
+        if abc.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        abc = abc[(abc["period_end"] >= self.cutoff_90) & (abc["period_start"] <= self.latest_day)].copy()
+        abc["days_in_period"] = (pd.to_datetime(abc["period_end"]) - pd.to_datetime(abc["period_start"])).dt.days + 1
+        abc["gp_per_day"] = np.where(abc["days_in_period"] > 0, abc["gross_profit"] / abc["days_in_period"], np.nan)
+        weekly = abc[["subject", "product", "supplier_article", "nm_id", "week_code", "week_label", "period_start", "period_end", "gross_profit", "gp_per_day", "orders", "gross_revenue"]].copy()
+        rows = []
+        prev_month = (self.latest_day.to_period("M") - 1).strftime("%Y-%m")
+        cur_month = self.latest_day.to_period("M").strftime("%Y-%m")
+        for keys, part in weekly.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            values = part["gp_per_day"].dropna()
+            avg = values.mean() if len(values) else np.nan
+            above = values[values > avg]
+            target = above.mean() if len(above) else avg
+            best = values.max() if len(values) else np.nan
+            prev_gp = part.loc[pd.to_datetime(part["period_start"]).dt.to_period("M").astype(str) == prev_month, "gross_profit"].sum()
+            cur_gp = part.loc[pd.to_datetime(part["period_start"]).dt.to_period("M").astype(str) == cur_month, "gross_profit"].sum()
+            plan = prev_gp * 1.1 if prev_gp else cur_gp
+            elapsed = min(self.latest_day.day, calendar.monthrange(self.latest_day.year, self.latest_day.month)[1])
+            plan_to_date = plan / calendar.monthrange(self.latest_day.year, self.latest_day.month)[1] * elapsed if plan else np.nan
+            rec = dict(zip(["subject", "product", "supplier_article", "nm_id"], keys))
+            rec.update({
+                "weeks_count": part["week_code"].nunique(), "gross_profit_90d": part["gross_profit"].sum(),
+                "avg_gp_per_day": avg, "target_gp_per_day": target, "best_week_gp_per_day": best,
+                "prev_month_gross_profit": prev_gp, "plan_month": plan, "current_month_gross_profit": cur_gp,
+                "plan_completion_pct": cur_gp / plan * 100 if plan else np.nan,
+                "plan_to_date": plan_to_date,
+                "plan_to_date_completion_pct": cur_gp / plan_to_date * 100 if plan_to_date else np.nan,
+            })
+            rows.append(rec)
+        return weekly, pd.DataFrame(rows)
+
+    def article_day_fact(self) -> pd.DataFrame:
+        # HARD RULE: orders/order_sum come only from WB Orders file.
+        # Funnel is used only for traffic/conversion/buyout context and must never override sales.
+        base = self.order_prices_daily()
+        funnel = self.funnel_daily()
+        ads = self.ads_daily_pivot()
+        search_summary, _ = self.search_daily_summary()
+        loc_detail, loc_summary = self.localization()
+        gp_weekly, gp_potential = self.gross_profit_potential()
+        buyouts = self.buyout_rates()
+        keys = ["day", "subject", "product", "supplier_article", "nm_id"]
+        if base.empty:
+            if funnel is None or funnel.empty:
+                return pd.DataFrame()
+            # Keep traffic-only rows, but sales stay zero because Orders file has no row.
+            base = funnel[keys].drop_duplicates().copy()
+            base["orders"] = 0.0
+            base["orders_rows"] = 0.0
+            base["order_sum"] = 0.0
+        out = base.copy()
+        funnel_metrics = pd.DataFrame()
+        if funnel is not None and not funnel.empty:
+            drop_sales = [c for c in ["orders", "order_sum", "finished_price"] if c in funnel.columns]
+            funnel_metrics = funnel.drop(columns=drop_sales, errors="ignore").copy()
+        for df in [funnel_metrics, ads, search_summary]:
+            if df is not None and not df.empty:
+                out = out.merge(df, on=keys, how="outer", suffixes=("", "_dup"))
+                for c in [c for c in out.columns if c.endswith("_dup")]:
+                    basec = c[:-4]
+                    if basec in out.columns:
+                        out[basec] = out[basec].fillna(out[c])
+                    out = out.drop(columns=[c])
+        if not buyouts.empty:
+            out = out.merge(buyouts[["supplier_article", "nm_id", "used_buyout_pct_90", "buyout_pct_90", "buyout_pct_wrong_orders"]], on=["supplier_article", "nm_id"], how="left")
+        if not loc_summary.empty:
+            out = out.merge(loc_summary[["supplier_article", "nm_id", "direct_localization_pct", "localization_with_replacements_pct", "localization_status", "stock_qty_total"]], on=["supplier_article", "nm_id"], how="left")
+        # Sales are Orders-only. Rows created from funnel/search/ad without Orders row remain 0.
+        for _sales_col in ["orders", "orders_rows", "order_sum"]:
+            if _sales_col not in out.columns:
+                out[_sales_col] = 0.0
+            out[_sales_col] = pd.to_numeric(out[_sales_col], errors="coerce").fillna(0.0)
+        # Fill price fields
+        out["finished_price"] = out.get("finished_price", np.nan)
+        if "finished_price_funnel" in out.columns:
+            out["finished_price"] = out["finished_price"].fillna(out["finished_price_funnel"])
+        out["spp"] = out.get("spp", np.nan)
+        if "spp_funnel" in out.columns:
+            out["spp"] = out["spp"].fillna(out["spp_funnel"])
+        # General traffic capture from funnel opens vs search demand.
+        search_freq = out["search_frequency"].fillna(0) if "search_frequency" in out.columns else pd.Series([0] * len(out), index=out.index)
+        open_cards = out["open_cards"].fillna(0) if "open_cards" in out.columns else pd.Series([0] * len(out), index=out.index)
+        # % поиска по управленческой логике = все открытия карточки / спрос WB.
+        # Переходы из поиска отдельно остаются в данных, но не используются как % поиска.
+        out["total_traffic_capture_pct"] = np.where(search_freq > 0, open_cards / search_freq * 100, np.nan)
+        out["search_traffic_capture_pct"] = out["total_traffic_capture_pct"]
+        # Gross profit forecast using economics and buyout.
+        econ = self.enrich(self.pack.economics, "economics")
+        if not econ.empty:
+            econ_latest = econ.sort_values("week_code").drop_duplicates(["supplier_article", "nm_id"], keep="last")
+            out = out.merge(econ_latest[["supplier_article", "nm_id", "commission_pct", "acquiring_pct", "logistics_direct", "logistics_return", "storage", "other_costs", "cost"]], on=["supplier_article", "nm_id"], how="left")
+        for c in ["orders", "order_sum", "open_cards", "add_to_cart", "manual_spend", "unified_spend", "unknown_spend"]:
+            if c not in out.columns:
+                out[c] = 0
+        if "used_buyout_pct_90" not in out.columns:
+            out["used_buyout_pct_90"] = 1.0
+        out["used_buyout_pct_90"] = pd.to_numeric(out["used_buyout_pct_90"], errors="coerce").fillna(1.0)
+        out["buyout_qty_model"] = out["orders"].fillna(0) * out["used_buyout_pct_90"]
+        # Formula: revenue = order_sum * buyout pct. Direct logistics from all orders, others as agreed.
+        out["revenue_model"] = out["order_sum"].fillna(0) * out["used_buyout_pct_90"]
+        for c in ["commission_pct", "acquiring_pct", "logistics_direct", "logistics_return", "storage", "other_costs", "cost"]:
+            if c not in out.columns:
+                out[c] = 0
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+        out["commission_model"] = out["revenue_model"] * out["commission_pct"] / 100
+        out["acquiring_model"] = out["revenue_model"] * out["acquiring_pct"] / 100
+        out["logistics_direct_model"] = out["orders"].fillna(0) * out["logistics_direct"]
+        out["logistics_return_model"] = out["buyout_qty_model"] * out["logistics_return"]
+        out["storage_model"] = out["buyout_qty_model"] * out["storage"]
+        out["other_costs_model"] = out["buyout_qty_model"] * out["other_costs"]
+        out["cost_model"] = out["buyout_qty_model"] * out["cost"]
+        ad_spend_cols = [c for c in ["manual_spend", "unified_spend", "unknown_spend"] if c in out.columns]
+        out["ad_spend_model"] = out[ad_spend_cols].sum(axis=1) if ad_spend_cols else 0
+        out["gross_profit_model"] = out["revenue_model"] - out["commission_model"] - out["acquiring_model"] - out["logistics_direct_model"] - out["logistics_return_model"] - out["storage_model"] - out["other_costs_model"] - out["cost_model"] - out["ad_spend_model"]
+        out = out.sort_values(["subject", "product", "supplier_article", "day"])
+        return out
+
+    @staticmethod
+    def target_value(series: pd.Series) -> float:
+        s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        if s.empty:
+            return np.nan
+        avg = s.mean()
+        above = s[s > avg]
+        return float(above.mean()) if not above.empty else float(avg)
+
+    def metrics_summary(self, daily: pd.DataFrame) -> pd.DataFrame:
+        if daily.empty:
+            return pd.DataFrame()
+        metric_defs = [
+            ("orders", "Заказы в день"), ("order_sum", "Сумма заказов"), ("gross_profit_model", "Валовая прибыль модель"),
+            ("open_cards", "Открытия карточки / клики"), ("add_to_cart", "Добавления в корзину"),
+            ("cart_conv_pct", "Конверсия в корзину, %"), ("order_conv_pct", "Конверсия в заказ, %"),
+            ("price_with_disc", "priceWithDisc / цена продажи"), ("finished_price", "finishedPrice / цена покупателя"), ("spp", "СПП, %"),
+            ("manual_impressions", "manual показы"), ("manual_clicks", "manual клики"), ("manual_ctr_pct", "manual CTR, %"), ("manual_cpc", "manual CPC"), ("manual_drr_pct", "manual ДРР, %"),
+            ("unified_impressions", "unified показы"), ("unified_clicks", "unified клики"), ("unified_ctr_pct", "unified CTR, %"), ("unified_cpc", "unified CPC"), ("unified_drr_pct", "unified ДРР, %"),
+            ("search_frequency", "Спрос / частотность"), ("search_transitions", "Переходы из поиска"), ("search_traffic_capture_pct", "% поискового трафика"), ("total_traffic_capture_pct", "% общего захвата спроса"),
+            ("search_avg_position", "Средняя позиция"), ("rating_card", "Рейтинг карточки"), ("rating_reviews", "Рейтинг отзывов"),
+            ("direct_localization_pct", "Прямая локализация, %"), ("localization_with_replacements_pct", "Локализация с заменами, %"),
+        ]
+        rows = []
+        for keys, part in daily.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            avg_order_sum = pd.to_numeric(part.get("order_sum", pd.Series(dtype=float)), errors="coerce").mean()
+            best_days = part[pd.to_numeric(part.get("order_sum", 0), errors="coerce") > avg_order_sum].copy() if pd.notna(avg_order_sum) else part.iloc[0:0]
+            last_week = part[(part["day"] >= self.week_start) & (part["day"] <= self.week_end)].copy()
+            for col, label in metric_defs:
+                if col not in part.columns:
+                    continue
+                s = pd.to_numeric(part[col], errors="coerce")
+                nonzero = s.replace(0, np.nan)
+                rec = dict(zip(["subject", "product", "supplier_article", "nm_id"], keys))
+                rec.update({
+                    "metric": label,
+                    "avg_90d_all_days": s.mean(),
+                    "avg_90d_nonzero_days": nonzero.mean(),
+                    "target_above_mean_90d": self.target_value(nonzero),
+                    "best_days_avg": pd.to_numeric(best_days[col], errors="coerce").mean() if col in best_days.columns and not best_days.empty else np.nan,
+                    "last_full_week_avg": pd.to_numeric(last_week[col], errors="coerce").mean() if col in last_week.columns and not last_week.empty else np.nan,
+                    "last_full_week_sum": pd.to_numeric(last_week[col], errors="coerce").sum() if col in last_week.columns and not last_week.empty else np.nan,
+                    "days_count": part["day"].nunique(),
+                    "best_days_count": best_days["day"].nunique(),
+                })
+                target = rec["target_above_mean_90d"]
+                fact = rec["last_full_week_avg"]
+                rec["gap_to_target_pct"] = (fact / target - 1) * 100 if pd.notna(target) and target != 0 and pd.notna(fact) else np.nan
+                rows.append(rec)
+        return pd.DataFrame(rows)
+
+    def best_days(self, daily: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        if daily.empty:
+            return pd.DataFrame()
+        for keys, part in daily.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            avg_order_sum = pd.to_numeric(part["order_sum"], errors="coerce").mean() if "order_sum" in part.columns else np.nan
+            best = part[pd.to_numeric(part.get("order_sum", 0), errors="coerce") > avg_order_sum].copy() if pd.notna(avg_order_sum) else part.head(0)
+            best = best.sort_values("order_sum", ascending=False).head(15)
+            for _, r in best.iterrows():
+                rows.append({
+                    "subject": keys[0], "product": keys[1], "supplier_article": keys[2], "nm_id": keys[3],
+                    "day": r.get("day"), "orders": r.get("orders"), "order_sum": r.get("order_sum"), "gross_profit_model": r.get("gross_profit_model"),
+                    "price_with_disc": r.get("price_with_disc"), "finished_price": r.get("finished_price"), "spp": r.get("spp"), "open_cards": r.get("open_cards"), "add_to_cart": r.get("add_to_cart"),
+                    "cart_conv_pct": r.get("cart_conv_pct"), "order_conv_pct": r.get("order_conv_pct"),
+                    "manual_ctr_pct": r.get("manual_ctr_pct"), "manual_drr_pct": r.get("manual_drr_pct"),
+                    "unified_ctr_pct": r.get("unified_ctr_pct"), "unified_drr_pct": r.get("unified_drr_pct"),
+                    "search_frequency": r.get("search_frequency"), "search_traffic_capture_pct": r.get("search_traffic_capture_pct"),
+                    "total_traffic_capture_pct": r.get("total_traffic_capture_pct"), "search_avg_position": r.get("search_avg_position"),
+                    "rating_reviews": r.get("rating_reviews"), "localization_with_replacements_pct": r.get("localization_with_replacements_pct"),
+                })
+        return pd.DataFrame(rows)
+
+    def price_ranges(self, daily: pd.DataFrame) -> pd.DataFrame:
+        if daily.empty or ("price_with_disc" not in daily.columns and "order_sum" not in daily.columns):
+            return pd.DataFrame()
+        df = daily.copy()
+        if "price_with_disc" not in df.columns:
+            df["price_with_disc"] = np.nan
+        # priceWithDisc is the seller sale price. When it is absent on aggregated rows,
+        # fallback to Orders-only order_sum / orders; do not use finishedPrice for sale-price ranges.
+        orders_num = pd.to_numeric(df.get("orders", 0), errors="coerce").replace(0, np.nan)
+        order_sum_num = pd.to_numeric(df.get("order_sum", 0), errors="coerce")
+        df["sale_price_for_range"] = pd.to_numeric(df["price_with_disc"], errors="coerce").fillna(order_sum_num / orders_num)
+        def bucket(p):
+            if pd.isna(p):
+                return "нет цены"
+            step = 10 if p < 300 else 20 if p < 700 else 50
+            lo = math.floor(p / step) * step
+            hi = lo + step
+            return f"{lo:.0f}-{hi:.0f}"
+        df["price_range"] = df["sale_price_for_range"].map(bucket)
+        g = df.groupby(["subject", "product", "supplier_article", "nm_id", "price_range"], dropna=False, as_index=False).agg(
+            days=("day", "nunique"), order_sum=("order_sum", "sum"), orders=("orders", "sum"),
+            avg_finished_price=("finished_price", "mean"), avg_price_with_disc=("sale_price_for_range", "mean"), avg_gross_profit=("gross_profit_model", "mean"),
+            avg_drr_manual=("manual_drr_pct", "mean"), avg_drr_unified=("unified_drr_pct", "mean"),
+            avg_cart_conv_pct=("cart_conv_pct", "mean"), avg_order_conv_pct=("order_conv_pct", "mean"),
+        )
+        # Mark recommended range: max order_sum per article.
+        g["is_recommended"] = False
+        idx = g.groupby(["supplier_article", "nm_id"], dropna=False)["order_sum"].idxmax()
+        g.loc[idx.dropna().astype(int), "is_recommended"] = True
+        return g.sort_values(["subject", "product", "supplier_article", "order_sum"], ascending=[True, True, True, False])
+
+    def channel_summary(self, daily: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        if daily.empty:
+            return pd.DataFrame()
+        # средний чек нужен, чтобы оценить сумму заказов по точкам входа, где WB отдаёт только шт.
+        avg_check = daily.copy()
+        avg_check["avg_order_value"] = np.where(avg_check.get("orders", 0).fillna(0) > 0, avg_check.get("order_sum", 0).fillna(0) / avg_check.get("orders", 0).replace(0, np.nan), np.nan)
+        avg_check_map = avg_check.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False)["avg_order_value"].mean().to_dict()
+        ad_sums = {}
+        for keys, part in daily.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            ad_sums[keys] = {}
+            for typ, name in [("manual", "Реклама manual: Поиск/Каталог"), ("unified", "Реклама unified: Карточка товара/полки"), ("unknown", "Реклама без типа ставки")]:
+                imps = part.get(f"{typ}_impressions", pd.Series(dtype=float)).sum()
+                clicks = part.get(f"{typ}_clicks", pd.Series(dtype=float)).sum()
+                orders = part.get(f"{typ}_orders", pd.Series(dtype=float)).sum()
+                order_sum = part.get(f"{typ}_order_sum", pd.Series(dtype=float)).sum()
+                spend = part.get(f"{typ}_spend", pd.Series(dtype=float)).sum()
+                ad_sums[keys][typ] = {"spend": spend, "impressions": imps, "clicks": clicks, "orders": orders, "order_sum": order_sum}
+                rows.append({
+                    "subject": keys[0], "product": keys[1], "supplier_article": keys[2], "nm_id": keys[3], "channel": name,
+                    "channel_group": "Реклама", "impressions": imps, "clicks": clicks,
+                    "ctr_pct": clicks / imps * 100 if imps else np.nan,
+                    "orders": orders, "order_sum": order_sum, "estimated_order_sum": np.nan, "spend": spend,
+                    "cpc": spend / clicks if clicks else np.nan,
+                    "cr_pct": orders / clicks * 100 if clicks else np.nan,
+                    "drr_pct": spend / order_sum * 100 if order_sum else np.nan,
+                    "comment": "Факт по рекламному отчёту",
+                })
+        entry = self.entry_points_summary()
+        entry_agg_rows = []
+        if not entry.empty:
+            entry["entry_channel"] = entry.apply(lambda r: classify_entry_channel(r.get("entry_section"), r.get("entry_point")), axis=1)
+            # Детальные точки входа
+            for _, r in entry.iterrows():
+                keys = (r["subject"], r["product"], r["supplier_article"], r["nm_id"])
+                aov = avg_check_map.get(keys, np.nan)
+                est_sum = r["orders"] * aov if pd.notna(aov) else np.nan
+                rows.append({
+                    "subject": r["subject"], "product": r["product"], "supplier_article": r["supplier_article"], "nm_id": r["nm_id"],
+                    "channel": f"Точка входа: {r['entry_section']} / {r['entry_point']}", "channel_group": r["entry_channel"],
+                    "impressions": r["impressions"], "clicks": r["transitions"], "ctr_pct": np.nan,
+                    "orders": r["orders"], "order_sum": np.nan, "estimated_order_sum": est_sum, "spend": np.nan,
+                    "cpc": np.nan, "cr_pct": r["order_conv_pct"], "drr_pct": np.nan,
+                    "orders_share_pct": r.get("orders_share_pct", np.nan),
+                    "comment": "CTR для точек входа не сравниваем с рекламным CTR; показы/переходы могут быть разными сущностями",
+                })
+            # Агрегация каналов точек входа + привязка расходов рекламы для оценки ДРР канала
+            ep = entry.groupby(["subject", "product", "supplier_article", "nm_id", "entry_channel"], dropna=False, as_index=False).agg(
+                impressions=("impressions", "sum"), transitions=("transitions", "sum"), add_to_cart=("add_to_cart", "sum"), orders=("orders", "sum")
+            )
+            for _, r in ep.iterrows():
+                keys = (r["subject"], r["product"], r["supplier_article"], r["nm_id"])
+                aov = avg_check_map.get(keys, np.nan)
+                est_sum = r["orders"] * aov if pd.notna(aov) else np.nan
+                spend = np.nan
+                if r["entry_channel"] == "Поиск/Каталог":
+                    spend = ad_sums.get(keys, {}).get("manual", {}).get("spend", np.nan)
+                    channel = "Канал Поиск/Каталог: заказы точки входа + расход manual"
+                elif r["entry_channel"] == "Карточка товара / полки":
+                    spend = ad_sums.get(keys, {}).get("unified", {}).get("spend", np.nan)
+                    channel = "Канал Карточка товара/полки: заказы точки входа + расход unified"
+                else:
+                    channel = f"Канал {r['entry_channel']}: точки входа"
+                rows.append({
+                    "subject": r["subject"], "product": r["product"], "supplier_article": r["supplier_article"], "nm_id": r["nm_id"],
+                    "channel": channel, "channel_group": r["entry_channel"],
+                    "impressions": r["impressions"], "clicks": r["transitions"], "ctr_pct": np.nan,
+                    "orders": r["orders"], "order_sum": np.nan, "estimated_order_sum": est_sum, "spend": spend,
+                    "cpc": np.nan, "cr_pct": r["orders"] / r["transitions"] * 100 if r["transitions"] else np.nan,
+                    "drr_pct": spend / est_sum * 100 if pd.notna(spend) and pd.notna(est_sum) and est_sum else np.nan,
+                    "orders_share_pct": np.nan,
+                    "comment": "ДРР канала оценочный: сумма заказов канала = заказы канала × средний чек артикула",
+                })
+        out = pd.DataFrame(rows)
+        return out.sort_values(["subject", "product", "supplier_article", "orders"], ascending=[True, True, True, False]) if not out.empty else out
+
+    def best_day_factors(self, daily: pd.DataFrame) -> pd.DataFrame:
+        """Сравнение обычных дней и дней, где сумма заказов выше среднего."""
+        if daily.empty:
+            return pd.DataFrame()
+        factors = [
+            ("orders", "Заказы"), ("order_sum", "Сумма заказов"), ("open_cards", "Открытия карточки / клики"),
+            ("add_to_cart", "Добавления в корзину"), ("cart_conv_pct", "Конверсия в корзину, %"), ("order_conv_pct", "Конверсия в заказ, %"),
+            ("price_with_disc", "priceWithDisc / цена продажи"), ("finished_price", "finishedPrice / цена покупателя"), ("spp", "СПП, %"),
+            ("manual_impressions", "Показы manual"), ("manual_clicks", "Клики manual"), ("manual_ctr_pct", "CTR manual, %"), ("manual_drr_pct", "ДРР manual, %"),
+            ("unified_impressions", "Показы unified"), ("unified_clicks", "Клики unified"), ("unified_ctr_pct", "CTR unified, %"), ("unified_drr_pct", "ДРР unified, %"),
+            ("search_frequency", "Спрос / частотность"), ("search_transitions", "Переходы из поиска"), ("search_traffic_capture_pct", "% поискового трафика"),
+            ("total_traffic_capture_pct", "% общего захвата спроса"), ("search_avg_position", "Средняя позиция"),
+            ("rating_reviews", "Рейтинг отзывов"), ("localization_with_replacements_pct", "Локализация с заменами, %"),
+        ]
+        rows = []
+        for keys, part in daily.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            order_sum = pd.to_numeric(part.get("order_sum", 0), errors="coerce")
+            avg_order_sum = order_sum.mean()
+            best = part[order_sum > avg_order_sum].copy() if pd.notna(avg_order_sum) else part.iloc[0:0]
+            normal = part[~part.index.isin(best.index)].copy()
+            if best.empty:
+                continue
+            for col, label in factors:
+                if col not in part.columns:
+                    continue
+                best_avg = pd.to_numeric(best[col], errors="coerce").replace([np.inf, -np.inf], np.nan).mean()
+                norm_avg = pd.to_numeric(normal[col], errors="coerce").replace([np.inf, -np.inf], np.nan).mean()
+                diff = pct_gap(best_avg, norm_avg)
+                if pd.isna(diff):
+                    conclusion = "недостаточно данных"
+                elif label in ["Средняя позиция", "ДРР manual, %", "ДРР unified, %"]:
+                    conclusion = "лучше в сильные дни" if diff < -5 else "хуже в сильные дни" if diff > 5 else "примерно без изменений"
+                else:
+                    conclusion = "выше в сильные дни" if diff > 5 else "ниже в сильные дни" if diff < -5 else "примерно без изменений"
+                rows.append({
+                    "subject": keys[0], "product": keys[1], "supplier_article": keys[2], "nm_id": keys[3],
+                    "factor": label, "normal_days_avg": norm_avg, "best_days_avg": best_avg,
+                    "difference_pct": diff, "best_days_count": best["day"].nunique(), "conclusion": conclusion,
+                })
+        return pd.DataFrame(rows)
+
+    def conclusions(self, summary: pd.DataFrame, daily: pd.DataFrame, loc_summary: pd.DataFrame) -> pd.DataFrame:
+        if summary.empty:
+            return pd.DataFrame()
+        piv = summary.pivot_table(index=["subject", "product", "supplier_article", "nm_id"], columns="metric", values=["last_full_week_avg", "target_above_mean_90d", "gap_to_target_pct"], aggfunc="first")
+        piv.columns = [f"{a}__{b}" for a, b in piv.columns]
+        piv = piv.reset_index()
+        if loc_summary is not None and not loc_summary.empty:
+            piv = piv.merge(loc_summary[["supplier_article", "nm_id", "direct_localization_pct", "localization_with_replacements_pct", "localization_status", "uncovered_warehouses"]], on=["supplier_article", "nm_id"], how="left")
+        rows = []
+        for _, r in piv.iterrows():
+            sales_gap = r.get("gap_to_target_pct__Сумма заказов", np.nan)
+            if pd.notna(sales_gap) and sales_gap >= 5:
+                status = "Опережаем целевой уровень"
+            elif pd.notna(sales_gap) and sales_gap < -10:
+                status = "Отстаём от целевого уровня"
+            else:
+                status = "Около целевого уровня"
+            candidates = []
+            def add_factor(name, severity, evidence, recommendation):
+                if pd.notna(severity):
+                    candidates.append((abs(float(severity)), name, evidence, recommendation))
+            loc = r.get("localization_with_replacements_pct", np.nan)
+            if status.startswith("Отстаём"):
+                if pd.notna(loc) and loc < 85:
+                    add_factor("Локализация / остатки", 85 - loc, f"локализация с заменами {loc:.1f}%", "восстановить остатки на ключевых складах и в региональных заменителях")
+                traffic_gap = r.get("gap_to_target_pct__% поискового трафика", np.nan)
+                if pd.notna(traffic_gap) and traffic_gap < -10:
+                    add_factor("Забираем меньше поискового трафика", traffic_gap, f"% поискового трафика ниже цели на {abs(traffic_gap):.1f}%", "проверить позиции, SEO, ставки manual и релевантность ключей")
+                demand_gap = r.get("gap_to_target_pct__Спрос / частотность", np.nan)
+                if pd.notna(demand_gap) and demand_gap < -10:
+                    add_factor("Общий спрос на WB ниже", demand_gap, f"частотность ниже цели на {abs(demand_gap):.1f}%", "сравнить с категорией и не завышать план на период низкого спроса")
+                clicks_gap = r.get("gap_to_target_pct__Открытия карточки / клики", np.nan)
+                if pd.notna(clicks_gap) and clicks_gap < -10:
+                    add_factor("Меньше открытий карточки", clicks_gap, f"клики ниже цели на {abs(clicks_gap):.1f}%", "проверить выдачу, рекламу, CTR и карточку")
+                cart_gap = r.get("gap_to_target_pct__Конверсия в корзину, %", np.nan)
+                if pd.notna(cart_gap) and cart_gap < -10:
+                    add_factor("Просела конверсия в корзину", cart_gap, f"конверсия в корзину ниже цели на {abs(cart_gap):.1f}%", "проверить фото, первый экран, цену, отзывы и УТП")
+                order_gap = r.get("gap_to_target_pct__Конверсия в заказ, %", np.nan)
+                if pd.notna(order_gap) and order_gap < -10:
+                    add_factor("Просела конверсия в заказ", order_gap, f"конверсия в заказ ниже цели на {abs(order_gap):.1f}%", "проверить конечную цену, доставку, остатки и рейтинг")
+                rating_gap = r.get("gap_to_target_pct__Рейтинг отзывов", np.nan)
+                if pd.notna(rating_gap) and rating_gap < -2:
+                    add_factor("Ухудшился рейтинг отзывов", rating_gap, f"рейтинг отзывов ниже нормы на {abs(rating_gap):.1f}%", "проверить свежие отзывы и причины снижения доверия")
+            else:
+                if status.startswith("Опережаем"):
+                    add_factor("Сумма заказов выше цели", sales_gap if pd.notna(sales_gap) else 0, f"сумма заказов выше цели на {sales_gap:.1f}%" if pd.notna(sales_gap) else "сумма заказов выше цели", "зафиксировать условия лучших дней: цену, СПП, каналы, локализацию")
+                else:
+                    add_factor("Факт близок к цели", 1, "ключевые показатели около целевого уровня", "держать показатели не ниже средней планки")
+            candidates = sorted(candidates, reverse=True)
+            if candidates:
+                main = candidates[0]
+                secondary = candidates[1] if len(candidates) > 1 else None
+                main_reason = f"{main[1]}: {main[2]}"
+                second_reason = f"{secondary[1]}: {secondary[2]}" if secondary else "нет явной вторичной причины"
+                recommendation = main[3]
+                if secondary and secondary[3] != main[3]:
+                    recommendation = recommendation + "; " + secondary[3]
+            else:
+                main_reason = "отклонение без явного единственного фактора"
+                second_reason = "нужно смотреть блок факторов лучших дней"
+                recommendation = "сравнить лучшие дни с обычными: цена, трафик, реклама, локализация"
+            rec = r.to_dict()
+            rec.update({
+                "status": status,
+                "main_reason": main_reason,
+                "secondary_reason": second_reason,
+                "recommendation": recommendation,
+            })
+            rows.append(rec)
+        out = pd.DataFrame(rows)
+        first = ["subject", "product", "supplier_article", "nm_id", "status", "main_reason", "secondary_reason", "recommendation", "localization_with_replacements_pct", "localization_status", "uncovered_warehouses"]
+        # When Orders/localization are empty, these localization columns may not exist.
+        # Keep report generation stable and leave the values blank instead of crashing.
+        for col in first:
+            if col not in out.columns:
+                out[col] = np.nan
+        rest = [c for c in out.columns if c not in first]
+        return out[first + rest]
+
+    def build_all(self) -> Dict[str, pd.DataFrame]:
+        daily = self.article_day_fact()
+        metrics = self.metrics_summary(daily)
+        best = self.best_days(daily)
+        best_factors = self.best_day_factors(daily)
+        price = self.price_ranges(daily)
+        channel = self.channel_summary(daily)
+        search_summary, core_queries = self.search_daily_summary()
+        search_query_gp_position = self.search_query_gp_position(daily)
+        search_unique_demand = self.search_unique_demand()
+        entry = self.entry_points_summary()
+        loc_detail, loc_summary = self.localization()
+        gp_weekly, gp_potential = self.gross_profit_potential()
+        buyout = self.buyout_rates()
+        conclusions = self.conclusions(metrics, daily, loc_summary)
+        manager_abc_source = pd.concat([self.pack.abc_weekly, self.pack.abc_monthly], ignore_index=True, sort=False) if (self.pack.abc_weekly is not None and not self.pack.abc_weekly.empty) or (self.pack.abc_monthly is not None and not self.pack.abc_monthly.empty) else pd.DataFrame()
+        if not manager_abc_source.empty and "period_start" in manager_abc_source.columns and "period_end" in manager_abc_source.columns:
+            _ps = pd.to_datetime(manager_abc_source["period_start"], errors="coerce").dt.normalize()
+            _pe = pd.to_datetime(manager_abc_source["period_end"], errors="coerce").dt.normalize()
+            manager_abc_source["day"] = _ps.where(_ps.eq(_pe), pd.NaT)
+        manager_reference = build_manager_reference_from_abc(manager_abc_source) if 'build_manager_reference_from_abc' in globals() else pd.DataFrame()
+        return {
+            "article_day_fact": daily,
+            "manager_reference": manager_reference,
+            "manager_orders_source": self.pack.orders.copy() if isinstance(self.pack.orders, pd.DataFrame) else pd.DataFrame(),
+            "manager_search_source": self.pack.search_queries.copy() if isinstance(self.pack.search_queries, pd.DataFrame) else pd.DataFrame(),
+            "manager_ads_category_source": self.pack.ads_category.copy() if isinstance(self.pack.ads_category, pd.DataFrame) else pd.DataFrame(),
+            # FIX41: raw grouped ads daily source, all TOPFACE categories, not enriched through the 4-category PDF dictionary.
+            # This is the source for Telegram manager spend when the category sheet is absent/stale.
+            "manager_ads_daily_source": self.pack.ads_daily.copy() if isinstance(self.pack.ads_daily, pd.DataFrame) else pd.DataFrame(),
+            "manager_abc_source": manager_abc_source,
+            "metrics_summary_90d": metrics,
+            "best_days": best,
+            "best_day_factors": best_factors,
+            "price_ranges": price,
+            "channel_summary": channel,
+            # Raw ad source for PDF current-week advertising truth.
+            # article_day_fact can repeat campaign spend across articles; this source is grouped from the ad report itself.
+            "ads_category_source": self.pack.ads_category.copy() if getattr(self.pack, "ads_category", pd.DataFrame()) is not None else pd.DataFrame(),
+            "ads_raw_source": self.pack.ads_raw.copy() if getattr(self.pack, "ads_raw", pd.DataFrame()) is not None else pd.DataFrame(),
+            "ads_daily_source": self.enrich(self.pack.ads_daily, "ads_daily"),
+            "search_daily_summary": search_summary,
+            "core_queries_80": core_queries,
+            "search_query_gp_position": search_query_gp_position,
+            "search_unique_demand": search_unique_demand,
+            "entry_points_summary": entry,
+            "localization_detail": loc_detail,
+            "localization_summary": loc_summary,
+            "gp_potential_weekly_90d": gp_weekly,
+            "gp_potential_90d": gp_potential,
+            "buyout_validation": buyout,
+            "conclusions": conclusions,
+            "dictionary": self.dictionary,
+            "diagnostics": self.diag.frame(),
+        }
 
 
-def load_pending_events(bid_history: pd.DataFrame, ctx: Optional[RunContext] = None) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    """Возвращает только реально активные ожидания.
-
-    Старые записи с postcheck_status != resolved больше не должны бесконечно блокировать ставку.
-    Обычное изменение ставки ждём D+3, разгон показов ждём D+7.
-    Если срок уже наступил, строка не попадает в pending и снова идёт в обычную логику ДРР/разгона.
-    """
-    if bid_history.empty:
-        return {}
-    local = bid_history.copy()
-    for col in BID_HISTORY_COLUMNS:
-        if col not in local.columns:
-            local[col] = ""
-    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce").dt.date
-    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
-    local = local.sort_values(["event_date_parsed", "run_dt_parsed"], na_position="first")
-    pending: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for _, row in local.iterrows():
-        status = _clean_text_value(row.get("postcheck_status", "")).lower()
-        verdict = _clean_text_value(row.get("final_verdict", ""))
-        reason_code = _clean_text_value(row.get("reason_code", ""))
-        # В новом режиме разгон НЕ блокирует ставку на D+7.
-        # В течение 7 календарных дней он управляется ежедневно: ниже 500 ₽/день — повышаем,
-        # выше 600 ₽/день — немного снижаем, затем после 14 дней возвращаемся в обычную логику.
-        if is_ramp_event_reason(reason_code):
-            continue
-        if status == "resolved" or verdict in {"RAISE_NO_TRAFFIC_GROWTH"}:
-            continue
-        old_bid = pd.to_numeric(pd.Series([row.get("old_bid_rub", None)]), errors="coerce").iloc[0]
-        new_bid = pd.to_numeric(pd.Series([row.get("new_bid_rub", None)]), errors="coerce").iloc[0]
-        if pd.isna(old_bid) or pd.isna(new_bid) or float(old_bid) == float(new_bid):
-            continue
-        expected_step, _ = bid_step_rub(row.get("placement", ""))
-        if abs(abs(float(new_bid) - float(old_bid)) - float(expected_step)) > 0.05:
-            continue
-        info = pending_wait_info(row, ctx)
-        if not info.get("active_wait", False):
-            continue
-        event = row.to_dict()
-        event.update(info)
-        pending[make_key(row)] = event
-    return pending
-
-def latest_postcheck_results(bid_history: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    if bid_history.empty:
-        return {}
-    local = bid_history.copy()
-    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce").dt.date
-    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
-    local = local.sort_values(["event_date_parsed", "run_dt_parsed"], na_position="first")
-    latest: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for _, row in local.iterrows():
-        latest[make_key(row)] = row.to_dict()
-    return latest
 
 
-RAMP_TERMINAL_VERDICTS = {
-    "RAMP_FINISHED_D7_NORMAL_MODE",
-    "RAMP_FINISHED_D7_TARGET_REACHED",
-    "RAMP_FINISHED_D7_OVERSPEND",
-    "RAMP_GOOD_D7",
-    "RAMP_NEGATIVE_GP_D7",
-    "RAMP_SPEND_OVER_LIMIT_D7",
+COLUMN_RU = {
+    "subject": "Категория", "product": "Товар", "supplier_article": "Артикул продавца", "nm_id": "Артикул WB", "day": "Дата",
+    "metric": "Показатель", "avg_90d_all_days": "Среднее за 90 дней", "avg_90d_nonzero_days": "Среднее по активным дням",
+    "target_above_mean_90d": "Целевое значение", "best_days_avg": "Среднее в лучшие дни", "last_full_week_avg": "Среднее за последнюю полную неделю",
+    "last_full_week_sum": "Сумма за последнюю полную неделю", "gap_to_target_pct": "Отклонение от цели, %", "days_count": "Дней в анализе", "best_days_count": "Лучших дней",
+    "orders": "Заказы", "orders_rows": "Строк заказов", "order_sum": "Сумма заказов", "gross_profit_model": "Валовая прибыль модель",
+    "open_cards": "Открытия карточки / клики", "add_to_cart": "Добавления в корзину", "cart_conv_pct": "Конверсия в корзину, %", "order_conv_pct": "Конверсия в заказ, %",
+    "finished_price": "finishedPrice / цена покупателя", "price_with_disc": "priceWithDisc / цена продажи", "spp": "СПП, %",
+    "manual_impressions": "Показы manual", "manual_clicks": "Клики manual", "manual_orders": "Заказы manual", "manual_order_sum": "Сумма заказов manual", "manual_spend": "Расход manual", "manual_ctr_pct": "CTR manual, %", "manual_cpc": "CPC manual, ₽", "manual_cr_pct": "CR manual, %", "manual_drr_pct": "ДРР manual, %",
+    "unified_impressions": "Показы unified", "unified_clicks": "Клики unified", "unified_orders": "Заказы unified", "unified_order_sum": "Сумма заказов unified", "unified_spend": "Расход unified", "unified_ctr_pct": "CTR unified, %", "unified_cpc": "CPC unified, ₽", "unified_cr_pct": "CR unified, %", "unified_drr_pct": "ДРР unified, %",
+    "unknown_impressions": "Показы без типа", "unknown_clicks": "Клики без типа", "unknown_orders": "Заказы без типа", "unknown_order_sum": "Сумма заказов без типа", "unknown_spend": "Расход без типа", "unknown_ctr_pct": "CTR без типа, %", "unknown_cpc": "CPC без типа, ₽", "unknown_cr_pct": "CR без типа, %", "unknown_drr_pct": "ДРР без типа, %",
+    "search_frequency": "Спрос / частотность", "search_transitions": "Переходы из поиска", "search_add_to_cart": "Добавления из поиска", "search_orders": "Заказы из поиска", "search_traffic_capture_pct": "% поискового трафика", "total_traffic_capture_pct": "% общего захвата спроса",
+    "search_avg_position": "Средняя позиция", "search_median_position": "Медианная позиция", "visibility_pct": "Видимость, %", "rating_card": "Рейтинг карточки", "rating_reviews": "Рейтинг отзывов",
+    "direct_localization_pct": "Прямая локализация, %", "localization_with_replacements_pct": "Локализация с заменами, %", "localization_status": "Статус локализации", "stock_qty_total": "Остаток всего", "uncovered_warehouses": "Непокрытые склады", "key_warehouses": "Ключевых складов", "stock_day": "Дата остатков",
+    "price_range": "Диапазон priceWithDisc", "days": "Дней", "avg_finished_price": "Средний finishedPrice / цена покупателя", "avg_price_with_disc": "Средний priceWithDisc / цена продажи", "avg_gross_profit": "Средняя валовая прибыль", "avg_drr_manual": "Средний ДРР manual, %", "avg_drr_unified": "Средний ДРР unified, %", "avg_cart_conv_pct": "Средняя конверсия в корзину, %", "avg_order_conv_pct": "Средняя конверсия в заказ, %", "is_recommended": "Рекомендуемый диапазон",
+    "channel": "Канал", "channel_group": "Группа канала", "impressions": "Показы", "clicks": "Клики / переходы", "ctr_pct": "CTR, %", "spend": "Расход", "cpc": "CPC, ₽", "cr_pct": "CR, %", "drr_pct": "ДРР, %", "orders_share_pct": "Доля заказов, %", "estimated_order_sum": "Оценочная сумма заказов", "comment": "Комментарий",
+    "entry_section": "Раздел", "entry_point": "Точка входа", "transitions": "Переходы", "frequency": "Частотность", "search_query": "Поисковый запрос", "traffic_capture_pct": "% трафика", "orders_share_pct": "Доля заказов, %", "cum_orders_share_pct": "Накопленная доля заказов, %", "avg_position": "Средняя позиция", "median_position": "Медианная позиция",
+    "warehouse": "Склад", "orders_90": "Заказы за 90 дней", "orders_total": "Заказы всего", "warehouse_weight_pct": "Вес склада, %", "cum_weight_pct": "Накопленный вес, %", "avg_daily_orders_wh": "Средние заказы склада в день", "needed_stock_2d": "Нужно остатка на 2 дня", "warehouse_pool": "Региональный пул", "stock_qty": "Остаток", "is_direct_covered": "Покрыт напрямую", "is_covered_with_replacement": "Покрыт с заменой", "pool_stock_qty": "Остаток пула", "pool_need_qty": "Потребность пула", "direct_coverage_weight_pct": "Вклад прямого покрытия, %", "replacement_coverage_weight_pct": "Вклад покрытия с заменой, %",
+    "week_code": "Неделя", "week_label": "Период недели", "period_start": "Начало периода", "period_end": "Конец периода", "gross_profit": "Валовая прибыль", "gross_revenue": "Валовая выручка", "gp_per_day": "ВП в день", "weeks_count": "Недель в анализе", "gross_profit_90d": "ВП за 90 дней", "avg_gp_per_day": "Средняя ВП/день", "target_gp_per_day": "Целевая ВП/день", "best_week_gp_per_day": "Лучшая неделя ВП/день", "prev_month_gross_profit": "ВП прошлого месяца", "plan_month": "План месяца", "current_month_gross_profit": "ВП текущего месяца", "plan_completion_pct": "Выполнение плана, %", "plan_to_date": "План на дату", "plan_to_date_completion_pct": "Выполнение плана на дату, %",
+    "orders_90": "Заказали за 90 дней", "buyouts_90": "Выкупили за 90 дней", "cancels_90": "Отменили за 90 дней", "resolved_90": "Завершённые заказы", "buyout_pct_90": "% выкупа правильный", "buyout_pct_wrong_orders": "% выкупа старый ошибочный", "product_buyout_pct_90": "% выкупа товара", "category_buyout_pct_90": "% выкупа категории", "used_buyout_pct_90": "Использованный % выкупа",
+    "factor": "Фактор", "normal_days_avg": "Обычные дни", "best_days_avg": "Лучшие дни", "difference_pct": "Разница, %", "conclusion": "Вывод",
+    "status": "Статус", "main_reason": "Главная причина", "secondary_reason": "Вторичная причина", "recommendation": "Рекомендация",
+    "manager": "Менеджер", "manager_raw": "Ваша категория", "manager_source": "Источник менеджера", "manager_weight": "Вес менеджера", "manager_weight_source": "Источник веса менеджера",
+    "source": "Источник", "source_file": "Файл-источник", "timestamp": "Время", "level": "Уровень", "message": "Сообщение", "details": "Детали",
 }
 
 
-def build_ramp_lifecycle_states(bid_history: pd.DataFrame, ctx: RunContext) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    """Строит состояние 14-дневного разгона по каждой РК.
-
-    Разгон теперь не является post-check ожиданием. Это отдельный 14-дневный режим:
-    - каждый календарный день можно менять ставку;
-    - базовая цель расхода: около 500 ₽/день;
-    - после 500 ₽/день масштабируем до 1000 ₽/день только если ДРР < 15% и условная ВП после рекламы > 0;
-    - выше 1000 ₽/день ставку не растим;
-    - после 14 дней РК возвращается в обычную логику ДРР.
-
-    Состояние строится по истории ставок. Если у РК уже была ramp-сессия и прошло больше 14 дней,
-    возвращаем completed, чтобы код не начинал разгон заново автоматически.
-    """
-    states: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    if bid_history is None or bid_history.empty:
-        return states
-    local = bid_history.copy()
-    for col in BID_HISTORY_COLUMNS:
-        if col not in local.columns:
-            local[col] = ""
-    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce").dt.date
-    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
-    local = local[local["event_date_parsed"].notna()].copy()
-    if local.empty:
-        return states
-    local = local.sort_values(["campaign_id", "nm_id", "placement", "event_date_parsed", "run_dt_parsed"], na_position="first")
-    today = ctx.run_datetime.date()
-    for key, grp in local.groupby(["campaign_id", "nm_id", "placement"], dropna=False):
-        key_norm = (_clean_id_value(key[0]), _clean_id_value(key[1]), normalize_placement_value(key[2]))
-        if not all(key_norm):
-            continue
-        ramp_rows: List[pd.Series] = []
-        # Берём последнюю ramp-сессию после последнего terminal ramp-verdict.
-        for _, r in grp.iterrows():
-            reason = _clean_text_value(r.get("reason_code", ""))
-            verdict = _clean_text_value(r.get("final_verdict", ""))
-            if is_ramp_event_reason(reason):
-                # Даже если старые D+7 проверки уже resolved, сохраняем первый день сессии:
-                # иначе ежедневные изменения могли бы сдвигать старт и бесконечно продлевать разгон.
-                ramp_rows.append(r)
-        if not ramp_rows:
-            continue
-        start_day = min(r.get("event_date_parsed") for r in ramp_rows if r.get("event_date_parsed") is not None)
-        last_row = sorted(ramp_rows, key=lambda r: (r.get("event_date_parsed"), pd.to_datetime(r.get("run_datetime"), errors="coerce")))[-1]
-        last_day = last_row.get("event_date_parsed")
-        ramp_day = max((today - start_day).days + 1, 1)
-        active = ramp_day <= int(RAMP_CHECK_DAYS)
-        states[key_norm] = {
-            "active": bool(active),
-            "completed": bool(not active),
-            "ramp_lifecycle_status": "RAMP_ACTIVE_DAILY_CONTROL" if active else "RAMP_FINISHED_NORMAL_MODE",
-            "ramp_start_date": start_day.isoformat(),
-            "ramp_day": int(min(ramp_day, int(RAMP_CHECK_DAYS) + 1)),
-            "ramp_days_left": int(max(int(RAMP_CHECK_DAYS) - ramp_day, 0)),
-            "last_event_id": _clean_text_value(last_row.get("event_id", "")),
-            "last_event_date": last_day.isoformat() if last_day else "",
-            "last_reason_code": _clean_text_value(last_row.get("reason_code", "")),
-            "last_old_bid": last_row.get("old_bid_rub", ""),
-            "last_new_bid": last_row.get("new_bid_rub", ""),
-        }
-    return states
-
-
-def aggregate_after_event(
-    ads_df: pd.DataFrame,
-    key: Tuple[str, str, str],
-    start_date: date,
-    end_date: date,
-) -> Dict[str, float]:
-    if ads_df.empty:
-        return {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
-    if not has_valid_dates(ads_df):
-        return {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
-    campaign_id, nm_id, placement = key
-    mask = (
-        (ads_df["campaign_id"] == campaign_id)
-        & (ads_df["nm_id"] == nm_id)
-        & (ads_df["placement"] == placement)
-        & (ads_df["date"] >= start_date)
-        & (ads_df["date"] <= end_date)
-    )
-    part = ads_df.loc[mask]
-    if part.empty:
-        return {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
-    gp = part["gp_after_ads"].sum() if part["gp_after_ads"].notna().any() else float("nan")
-    return {
-        "spend": float(part["spend"].sum()),
-        "revenue": float(part["revenue"].sum()),
-        "orders": float(part["orders"].sum()),
-        "impressions": float(part["impressions"].sum()),
-        "clicks": float(part["clicks"].sum()),
-        "gp_after_ads": gp,
+def translate_col_name(col: Any) -> str:
+    c = str(col)
+    if c in COLUMN_RU:
+        return COLUMN_RU[c]
+    if "__" in c:
+        left, right = c.split("__", 1)
+        left_ru = COLUMN_RU.get(left, left)
+        return f"{left_ru}: {right}"
+    # Остаточные служебные имена переводим по частям.
+    out = c
+    replacements = {
+        "pct": "%", "avg": "среднее", "target": "цель", "last_full_week": "последняя полная неделя",
+        "order_sum": "сумма заказов", "gross_profit": "валовая прибыль", "localization": "локализация",
     }
+    for a, b in replacements.items():
+        out = out.replace(a, b)
+    return out
 
 
-def grew_enough(after: float, before: float, factor: float) -> bool:
-    before = float(before or 0)
-    after = float(after or 0)
-    if before == 0:
-        return after > 0
-    return after >= before * factor
+def translate_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    x = df.copy()
+    x = x.rename(columns={c: translate_col_name(c) for c in x.columns})
+    return x
+
+# ------------------------- export -------------------------
+def autofit(ws) -> None:
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        max_len = 8
+        for cell in ws[letter]:
+            max_len = max(max_len, min(len(str(cell.value)) if cell.value is not None else 0, 60))
+        ws.column_dimensions[letter].width = min(max_len + 2, 42)
 
 
-def retained_enough(after: float, before: float, factor: float) -> bool:
-    before = float(before or 0)
-    after = float(after or 0)
-    if before == 0:
-        return after >= 0
-    return after >= before * factor
+def style_sheet(ws) -> None:
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border = BORDER
+            if isinstance(cell.value, (int, float, np.number)) and not isinstance(cell.value, bool):
+                header = str(ws.cell(1, cell.column).value or "")
+                if "%" in header or "pct" in header.lower() or "ДРР" in header or "CTR" in header:
+                    cell.number_format = '0.0'
+                elif "цена" in header.lower() or "сум" in header.lower() or "ВП" in header or "profit" in header.lower() or "spend" in header.lower() or "выруч" in header.lower() or "order_sum" in header.lower():
+                    cell.number_format = money_format()
+                else:
+                    cell.number_format = '# ##0.00'
+    ws.freeze_panes = "A2"
+    autofit(ws)
 
 
-def ge_metric(after: float, before: float) -> bool:
-    if pd.isna(after) and pd.isna(before):
-        return True
-    if pd.isna(after) or pd.isna(before):
-        return False
-    return float(after) >= float(before)
+def write_df_sheet(wb: Workbook, name: str, df: pd.DataFrame) -> None:
+    ws = wb.create_sheet(name[:31])
+    if df is None or df.empty:
+        ws.cell(1, 1, "Нет данных")
+        return
+    x = translate_df(df.copy())
+    for c in x.columns:
+        if pd.api.types.is_datetime64_any_dtype(x[c]):
+            x[c] = x[c].dt.strftime("%Y-%m-%d")
+    ws.append(list(x.columns))
+    for row in x.itertuples(index=False, name=None):
+        ws.append(list(row))
+    style_sheet(ws)
 
 
-def ge_metric_factor(after: float, before: float, factor: float) -> bool:
-    if pd.isna(after) and pd.isna(before):
-        return True
-    if pd.isna(after) or pd.isna(before):
-        return False
-    return float(after) >= float(before) * factor
+def write_product_blocks(path: Path, title: str, outputs: Dict[str, pd.DataFrame], sections: List[Tuple[str, str, Optional[List[str]]]]) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+    # Determine products from metrics/conclusions/daily.
+    base = None
+    for key in ["metrics_summary_90d", "conclusions", "article_day_fact", "channel_summary"]:
+        if key in outputs and outputs[key] is not None and not outputs[key].empty:
+            base = outputs[key]
+            break
+    if base is None or base.empty:
+        ws = wb.create_sheet("Нет данных")
+        ws.cell(1, 1, "Нет данных")
+        wb.save(path)
+        return
+    used = set()
+    products = base[["subject", "product"]].drop_duplicates().sort_values(["subject", "product"]).itertuples(index=False, name=None)
+    for subject, product in products:
+        ws = wb.create_sheet(safe_sheet_name(str(product), used))
+        row = 1
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
+        c = ws.cell(row, 1, f"{title}: товар {product} / {subject}")
+        c.fill = TITLE_FILL
+        c.font = Font(color="FFFFFF", bold=True, size=14)
+        c.alignment = Alignment(horizontal="center")
+        row += 2
+        articles = base[(base["subject"] == subject) & (base["product"].astype(str) == str(product))]["supplier_article"].dropna().drop_duplicates().astype(str).sort_values().tolist()
+        for art in articles:
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=12)
+            ac = ws.cell(row, 1, f"Артикул {art}")
+            ac.fill = SECTION_FILL
+            ac.font = Font(bold=True, size=12)
+            row += 1
+            for section_title, key, cols in sections:
+                df = outputs.get(key, pd.DataFrame())
+                if df is None or df.empty or "supplier_article" not in df.columns:
+                    continue
+                part = df[(df["subject"] == subject) & (df["product"].astype(str) == str(product)) & (df["supplier_article"].astype(str) == art)].copy()
+                if part.empty:
+                    continue
+                if cols:
+                    keep = [c for c in cols if c in part.columns]
+                    part = part[keep]
+                if len(part) > 60:
+                    part = part.head(60)
+                part = translate_df(part)
+                ws.cell(row, 1, section_title).fill = SUBSECTION_FILL
+                ws.cell(row, 1).font = Font(bold=True)
+                row += 1
+                for col_idx, col in enumerate(part.columns, start=1):
+                    cell = ws.cell(row, col_idx, col)
+                    cell.fill = HEADER_FILL
+                    cell.font = HEADER_FONT
+                    cell.alignment = Alignment(horizontal="center")
+                    cell.border = BORDER
+                row += 1
+                for rec in part.to_dict("records"):
+                    for col_idx, col in enumerate(part.columns, start=1):
+                        val = rec.get(col)
+                        if isinstance(val, pd.Timestamp):
+                            val = val.strftime("%Y-%m-%d")
+                        cell = ws.cell(row, col_idx, val)
+                        cell.border = BORDER
+                        if isinstance(val, (int, float, np.number)) and not isinstance(val, bool):
+                            if "%" in col or "pct" in col.lower() or "ДРР" in col or "CTR" in col:
+                                cell.number_format = '0.0'
+                            elif "цена" in col.lower() or "сум" in col.lower() or "profit" in col.lower() or "spend" in col.lower() or "ВП" in col:
+                                cell.number_format = money_format()
+                            else:
+                                cell.number_format = '# ##0.00'
+                    row += 1
+                row += 2
+            row += 1
+        ws.freeze_panes = "A3"
+        autofit(ws)
+    wb.save(path)
 
 
-def lt_metric_factor(after: float, before: float, factor: float) -> bool:
-    if pd.isna(after) or pd.isna(before):
-        return False
-    return float(after) < float(before) * factor
+def export_outputs(outputs: Dict[str, pd.DataFrame], local_dir: Path) -> List[Path]:
+    local_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    # Main concise report
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Сводка"
+    ws.cell(1, 1, "Сводка по причинам и целям")
+    ws.cell(1, 1).fill = TITLE_FILL
+    ws.cell(1, 1).font = Font(color="FFFFFF", bold=True, size=14)
+    cons = outputs.get("conclusions", pd.DataFrame())
+    if not cons.empty:
+        small_cols = [c for c in ["subject", "product", "supplier_article", "status", "main_reason", "recommendation", "localization_with_replacements_pct"] if c in cons.columns]
+        x = translate_df(cons[small_cols].copy())
+        ws.append(list(x.columns))
+        for row in x.itertuples(index=False, name=None):
+            ws.append(list(row))
+        style_sheet(ws)
+    p = local_dir / MAIN_REPORT_NAME
+    wb.save(p)
+    paths.append(p)
+    # Technical report
+    wb = Workbook()
+    wb.remove(wb.active)
+    for name in ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_ads_daily_source", "manager_abc_source", "metrics_summary_90d", "best_days", "best_day_factors", "price_ranges", "channel_summary", "ads_category_source", "ads_raw_source", "ads_daily_source", "core_queries_80", "search_query_gp_position", "search_unique_demand", "entry_points_summary", "localization_summary", "localization_detail", "gp_potential_90d", "buyout_validation", "dictionary", "diagnostics"]:
+        write_df_sheet(wb, name[:31], outputs.get(name, pd.DataFrame()))
+    p = local_dir / TECH_REPORT_NAME
+    wb.save(p)
+    paths.append(p)
+    # Example 901
+    wb = Workbook()
+    wb.remove(wb.active)
+    for name in ["article_day_fact", "metrics_summary_90d", "best_days", "price_ranges", "core_queries_80"]:
+        df = outputs.get(name, pd.DataFrame())
+        if df is not None and not df.empty and "supplier_article" in df.columns:
+            df = df[df["supplier_article"].isin(EXAMPLE_ARTICLES)].copy()
+        write_df_sheet(wb, name[:31], df)
+    p = local_dir / EXAMPLE_REPORT_NAME
+    wb.save(p)
+    paths.append(p)
+    # Product block reports
+    potential_sections = [
+        ("Средние и целевые значения", "metrics_summary_90d", ["metric", "avg_90d_all_days", "avg_90d_nonzero_days", "target_above_mean_90d", "best_days_avg", "last_full_week_avg", "gap_to_target_pct"]),
+        ("Лучшие дни по сумме заказов", "best_days", None),
+        ("Факторы лучших дней", "best_day_factors", ["factor", "normal_days_avg", "best_days_avg", "difference_pct", "best_days_count", "conclusion"]),
+        ("Рекомендуемый ценовой диапазон", "price_ranges", ["price_range", "days", "order_sum", "orders", "avg_price_with_disc", "avg_finished_price", "avg_gross_profit", "avg_drr_manual", "avg_drr_unified", "avg_cart_conv_pct", "avg_order_conv_pct", "is_recommended"]),
+        ("Потенциал валовой прибыли по ABC", "gp_potential_90d", ["gross_profit_90d", "avg_gp_per_day", "target_gp_per_day", "best_week_gp_per_day", "prev_month_gross_profit", "plan_month", "current_month_gross_profit", "plan_to_date_completion_pct"]),
+    ]
+    p = local_dir / POTENTIAL_REPORT_NAME
+    write_product_blocks(p, "Средние и целевые значения", outputs, potential_sections)
+    paths.append(p)
+    channel_sections = [
+        ("Каналы продаж и реклама", "channel_summary", None),
+        ("Точки входа", "entry_points_summary", None),
+    ]
+    p = local_dir / CHANNEL_REPORT_NAME
+    write_product_blocks(p, "Каналы продаж и реклама", outputs, channel_sections)
+    paths.append(p)
+    search_sections = [
+        ("Ключи, которые дают 80%+ заказов", "core_queries_80", None),
+        ("Поиск по дням", "search_daily_summary", None),
+    ]
+    p = local_dir / SEARCH_REPORT_NAME
+    write_product_blocks(p, "Поисковые запросы и позиции", outputs, search_sections)
+    paths.append(p)
+    loc_sections = [
+        ("Сводка локализации", "localization_summary", None),
+        ("Детализация складов", "localization_detail", None),
+    ]
+    p = local_dir / LOCALIZATION_REPORT_NAME
+    write_product_blocks(p, "Локализация", outputs, loc_sections)
+    paths.append(p)
+    cons_sections = [
+        ("Выводы", "conclusions", None),
+        ("Факторы лучших дней", "best_day_factors", ["factor", "normal_days_avg", "best_days_avg", "difference_pct", "conclusion"]),
+        ("Средние и целевые значения", "metrics_summary_90d", ["metric", "last_full_week_avg", "target_above_mean_90d", "gap_to_target_pct"]),
+    ]
+    p = local_dir / CONCLUSIONS_REPORT_NAME
+    write_product_blocks(p, "Выводы по причинам", outputs, cons_sections)
+    paths.append(p)
+    return paths
+
+
+def upload_to_storage(storage: Storage, local_paths: List[Path], root: str) -> None:
+    for path in local_paths:
+        rel = str(path.relative_to(Path(root))).replace("\\", "/") if Path(root) in path.parents or Path(root) == path.parent else f"{OUT_DIR}/{path.name}"
+        try:
+            storage.write_bytes(rel, path.read_bytes())
+            log(f"Saved: {rel}")
+        except Exception as exc:
+            log(f"WARN: failed to save {rel}: {exc}")
 
 
 
-def bid_effect_empty_frame() -> pd.DataFrame:
-    return pd.DataFrame(columns=[
-        "event_id", "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "direction",
-        "event_date", "old_bid_rub", "new_bid_rub", "reason_code",
-        "before_window_days", "after_d1_days", "after_d3_days", "after_d7_days",
-        "before_spend", "after_d1_spend", "after_d3_spend", "after_d7_spend",
-        "before_spend_per_day", "after_d1_spend_per_day", "after_d3_spend_per_day", "after_d7_spend_per_day",
-        "before_revenue", "after_d1_revenue", "after_d3_revenue", "after_d7_revenue",
-        "before_revenue_per_day", "after_d1_revenue_per_day", "after_d3_revenue_per_day", "after_d7_revenue_per_day",
-        "before_orders", "after_d1_orders", "after_d3_orders", "after_d7_orders",
-        "before_orders_per_day", "after_d1_orders_per_day", "after_d3_orders_per_day", "after_d7_orders_per_day",
-        "before_impressions", "after_d1_impressions", "after_d3_impressions", "after_d7_impressions",
-        "before_impressions_per_day", "after_d1_impressions_per_day", "after_d3_impressions_per_day", "after_d7_impressions_per_day",
-        "before_clicks", "after_d1_clicks", "after_d3_clicks", "after_d7_clicks",
-        "before_clicks_per_day", "after_d1_clicks_per_day", "after_d3_clicks_per_day", "after_d7_clicks_per_day",
-        "before_ctr_pct", "after_d1_ctr_pct", "after_d3_ctr_pct", "after_d7_ctr_pct",
-        "before_drr_pct", "after_d1_drr_pct", "after_d3_drr_pct", "after_d7_drr_pct",
-        "before_gp", "after_d1_gp", "after_d3_gp", "after_d7_gp",
-        "before_gp_per_day", "after_d1_gp_per_day", "after_d3_gp_per_day", "after_d7_gp_per_day",
-        "d1_verdict", "d3_verdict", "d7_verdict", "final_verdict", "postcheck_status",
-        "target_bid_action", "target_bid_action_text", "recommended_next_bid_rub",
-        "traffic_delta_d1_pct", "traffic_delta_d3_pct", "orders_delta_d3_pct", "revenue_delta_d3_pct", "gp_delta_d3_pct",
-        # обратная совместимость со старым листом
-        "drr_before", "drr_after_d3", "impressions_after_d1", "clicks_after_d1", "orders_after_d3",
-        "revenue_after_d3", "spend_after_d3", "gp_after_d3",
-    ])
+# ------------------------- factor money bridge + PDF + Telegram -------------------------
+FACTOR_REPORT_NAME = "Факторный_мост_ВП_TOPFACE.xlsx"
+PDF_REPORT_NAME = "Управленческий_отчет_TOPFACE.pdf"
+
+REPORT_MONTH_GENITIVE_RU = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
+    7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
+def _max_report_day_from_outputs(outputs: Dict[str, Any]) -> pd.Timestamp:
+    """Return the latest real date represented in report outputs for PDF naming/caption."""
+    max_day = pd.NaT
+    for name in ["article_day_fact", "ads_daily_source", "search_unique_demand", "ads_raw_source"]:
+        df = outputs.get(name) if isinstance(outputs, dict) else None
+        if not isinstance(df, pd.DataFrame) or df.empty or "day" not in df.columns:
+            continue
+        days = pd.to_datetime(df["day"], errors="coerce").dropna()
+        if days.empty:
+            continue
+        d = days.max().normalize()
+        if pd.isna(max_day) or d > max_day:
+            max_day = d
+    if pd.isna(max_day):
+        max_day = pd.Timestamp.today().normalize()
+    return pd.Timestamp(max_day).normalize()
+
+def report_date_label_ru(outputs: Dict[str, Any]) -> str:
+    d = _max_report_day_from_outputs(outputs)
+    return f"{int(d.day)} {REPORT_MONTH_GENITIVE_RU.get(int(d.month), d.strftime('%m'))}"
+
+def sales_pdf_report_name(outputs: Dict[str, Any]) -> str:
+    return f"Отчет по продажам Влад {report_date_label_ru(outputs)}.pdf"
 
 
-def _event_num(row: pd.Series | Dict[str, Any], col: str, default: float = 0.0) -> float:
-    value = pd.to_numeric(pd.Series([row.get(col, default)]), errors="coerce").iloc[0]
-    if pd.isna(value):
+
+# ------------------------- report date / freshness guards -------------------------
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "")
+    if raw is None or str(raw).strip() == "":
         return default
-    return float(value)
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on", "да"}
 
 
-def _per_day(metrics: Dict[str, float], days: float) -> Dict[str, float]:
-    d = max(float(days or 1.0), 1.0)
-    return {
-        "spend": float(metrics.get("spend", 0.0) or 0.0) / d,
-        "revenue": float(metrics.get("revenue", 0.0) or 0.0) / d,
-        "orders": float(metrics.get("orders", 0.0) or 0.0) / d,
-        "impressions": float(metrics.get("impressions", 0.0) or 0.0) / d,
-        "clicks": float(metrics.get("clicks", 0.0) or 0.0) / d,
-        "gp_after_ads": (float(metrics.get("gp_after_ads", 0.0)) / d) if not pd.isna(metrics.get("gp_after_ads", float("nan"))) else float("nan"),
-    }
-
-
-def _pct_delta(after: float, before: float) -> Optional[float]:
-    before = float(before or 0.0)
-    after = float(after or 0.0)
-    if before == 0:
+def _env_date(name: str) -> Optional[pd.Timestamp]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
         return None
-    return (after / before - 1.0) * 100.0
+    ts = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"{name} должен быть датой YYYY-MM-DD, получено: {raw}")
+    return pd.Timestamp(ts).normalize()
 
 
-def _metric_ratio(after: float, before: float) -> float:
-    before = float(before or 0.0)
-    after = float(after or 0.0)
-    if before == 0:
-        return 1.0 if after >= 0 else 0.0
-    return after / before
+def _active_days_from_daily(daily: pd.DataFrame) -> pd.Series:
+    if daily is None or daily.empty or "day" not in daily.columns:
+        return pd.Series(dtype="datetime64[ns]")
+    x = daily.copy()
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    activity_cols = [
+        c for c in [
+            "order_sum", "orders", "ad_spend_total", "manual_spend", "unified_spend",
+            "unknown_spend", "open_cards", "search_frequency",
+        ]
+        if c in x.columns
+    ]
+    if activity_cols:
+        activity = pd.Series(0.0, index=x.index)
+        for col in activity_cols:
+            activity = activity + pd.to_numeric(x[col], errors="coerce").fillna(0).abs()
+        days = x.loc[activity > 0, "day"]
+    else:
+        days = x["day"]
+    return pd.to_datetime(days, errors="coerce").dropna()
 
 
-def _postcheck_target_action(
-    verdict: str,
-    direction: str,
-    is_ramp_event: bool,
-    current_new_bid: float,
-    step: float,
-) -> Tuple[str, str, Any]:
-    verdict = _clean_text_value(verdict)
-    direction = _clean_text_value(direction).lower()
-    if not verdict:
-        return "WAIT_POSTCHECK", "ждём созревания данных для оценки изменения ставки", ""
-    if verdict.startswith("WAIT") or verdict in {"RAMP_D3_MONITOR_WEEK"}:
-        return "WAIT_POSTCHECK", "ждём финальную оценку изменения ставки", ""
-    if verdict in {"RAISE_BAD"}:
-        next_bid = max(next_bid_by_step(current_new_bid, step, "lower"), TECHNICAL_BID_FLOOR_RUB)
-        return "REVERT_TO_PREVIOUS_BID", "эффект плохой: откатить ставку на предыдущий уровень", next_bid
-    if verdict == "LOWER_BAD":
-        next_bid = next_bid_by_step(current_new_bid, step, "raise")
-        return "REVERT_TO_PREVIOUS_BID", "снижение ухудшило трафик/экономику: откатить ставку вверх", next_bid
-    if verdict in {"RAISE_GOOD"}:
-        return "HOLD_BID_LEVEL", "повышение сработало: оставить новый уровень, следующий шаг только по обычной логике ДРР/разгона", ""
-    if verdict in {"RAISE_D3_MIXED", "RAISE_NO_TRAFFIC_GROWTH"}:
-        return "HOLD_BID_LEVEL", "эффект неоднозначный: оставить ставку, не делать автоматический откат без ухудшения экономики", ""
-    if verdict in {"LOWER_GOOD"}:
-        return "HOLD_BID_LEVEL", "снижение сработало: оставить новый уровень; дальше снижать только если ДРР всё ещё выше лимита", ""
-    if verdict in {"LOWER_D3_MIXED"}:
-        return "HOLD_BID_LEVEL", "эффект снижения смешанный: оставить ставку до следующего окна", ""
-    if verdict in {"RAMP_GOOD_D7", "RAMP_FINISHED_D7_TARGET_REACHED", "RAMP_FINISHED_D7_NORMAL_MODE", "RAMP_FINISHED_D7_OVERSPEND"}:
-        return "STOP_RAMP_HOLD", "период разгона завершён: дальше обычный режим управления ставкой", ""
-    if verdict == "RAMP_NEEDS_MORE_BID_D7":
-        return "STOP_RAMP_HOLD", "старая оценка RAMP_NEEDS_MORE_BID_D7 больше не продолжает разгон: после периода разгона обычный режим", ""
-    return "HOLD_BID_LEVEL", f"вердикт {verdict}: оставить ставку до следующего окна", ""
+def _active_days_from_source(df: pd.DataFrame, activity_columns: Optional[Sequence[str]] = None) -> pd.Series:
+    if df is None or df.empty or "day" not in df.columns:
+        return pd.Series(dtype="datetime64[ns]")
+    x = df.copy()
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    cols = [c for c in (activity_columns or []) if c in x.columns]
+    if cols:
+        activity = pd.Series(0.0, index=x.index)
+        for col in cols:
+            activity = activity + pd.to_numeric(x[col], errors="coerce").fillna(0).abs()
+        days = x.loc[activity > 0, "day"]
+    else:
+        days = x["day"]
+    return pd.to_datetime(days, errors="coerce").dropna()
 
 
-def evaluate_postchecks(ads_df: pd.DataFrame, bid_history: pd.DataFrame, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Оценивает эффект изменения ставки нормальным сравнением ДО/ПОСЛЕ.
+def _report_anchor_day_from_daily(daily: pd.DataFrame) -> pd.Timestamp:
+    forced = _env_date("REPORT_AS_OF_DATE")
+    if forced is not None:
+        return forced
+    days = _active_days_from_daily(daily)
+    if not days.empty:
+        return pd.Timestamp(days.max()).normalize()
+    if daily is not None and not daily.empty and "day" in daily.columns:
+        mx = pd.to_datetime(daily["day"], errors="coerce").max()
+        if pd.notna(mx):
+            return pd.Timestamp(mx).normalize()
+    return pd.Timestamp.today().normalize()
 
-    Важно: значения ДО в истории — это 5-дневная база на момент изменения ставки.
-    Старый код сравнивал D+1 за один день с этой 5-дневной суммой и мог ошибочно ставить
-    RAISE_NO_TRAFFIC_GROWTH. Здесь все сравнения делаются в формате среднее/день:
-    - ДО: сумма за 5 дней / 5;
-    - D+1: один зрелый день;
-    - D+3: сумма за 3 дня / 3;
-    - D+7 для разгона: сумма за 7 дней / 7.
-    """
-    if bid_history.empty:
-        return bid_history.copy(), bid_effect_empty_frame()
 
-    updated = coerce_history_columns_object(bid_history.copy(), BID_HISTORY_COLUMNS)
-    for col in BID_HISTORY_COLUMNS:
-        if col not in updated.columns:
-            updated[col] = pd.Series([""] * len(updated), index=updated.index, dtype="object")
+def _require_report_data_available(outputs: Dict[str, Any], context: str = "") -> None:
+    required = _env_date("REPORT_REQUIRE_DATA_DATE")
+    if required is None:
+        return
+
+    daily = outputs.get("article_day_fact", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    days = _active_days_from_daily(daily)
+    if days.empty:
+        raise RuntimeError(
+            f"Нет активных строк article_day_fact для проверки даты {required:%d.%m.%Y}. "
+            f"Отчёт не отправляю. context={context}"
+        )
+    latest = pd.Timestamp(days.max()).normalize()
+    if latest < required or not (days.dt.normalize() == required).any():
+        raise RuntimeError(
+            f"Нет данных за нужную дату {required:%d.%m.%Y}. "
+            f"Последняя активная дата в article_day_fact: {latest:%d.%m.%Y}. "
+            f"Отчёт не отправляю, чтобы не уйти старым днём. context={context}"
+        )
+    log(f"report_date_check: OK required={required:%Y-%m-%d}, latest_active={latest:%Y-%m-%d}, context={context}")
+
+    required_ads = _env_date("REPORT_REQUIRE_ADS_DATE")
+    if required_ads is not None:
+        # FIX40: category ad sheet is preferred, but some weekly WB ad exports have no
+        # category sheet at all. In that case allow only store-scoped ads_daily_source
+        # (already filtered to TOPFACE in Loader); never use ads_raw_source by default.
+        category_src = outputs.get("ads_category_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        manager_daily_src = outputs.get("manager_ads_daily_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        daily_src = outputs.get("ads_daily_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        category_days = _active_days_from_source(category_src, ["spend", "clicks", "impressions"])
+        manager_daily_days = _active_days_from_source(manager_daily_src, ["spend", "clicks", "impressions"])
+        daily_days = _active_days_from_source(daily_src, ["spend", "clicks", "impressions", "manual_spend", "unified_spend", "unknown_spend"])
+        raw_details = []
+        for source_name in ["ads_category_source", "manager_ads_daily_source", "ads_daily_source", "ads_raw_source"]:
+            src = outputs.get(source_name, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+            days_ads = _active_days_from_source(src, ["spend", "clicks", "impressions", "ad_spend_total", "manual_spend", "unified_spend", "unknown_spend"])
+            if not days_ads.empty:
+                raw_details.append(f"{source_name}: {pd.Timestamp(days_ads.max()).strftime('%d.%m.%Y')}")
+
+        candidates: List[Tuple[str, pd.Series]] = []
+        if not category_days.empty:
+            candidates.append(("ads_category_source", category_days))
+        if not manager_daily_days.empty:
+            candidates.append(("manager_ads_daily_source", manager_daily_days))
+        if not daily_days.empty:
+            candidates.append(("ads_daily_source", daily_days))
+
+        ok_source = ""
+        ok_latest = pd.NaT
+        for source_name, days_src in candidates:
+            latest_src = pd.Timestamp(days_src.max()).normalize()
+            if latest_src >= required_ads and (days_src.dt.normalize() == required_ads).any():
+                ok_source = source_name
+                ok_latest = latest_src
+                break
+
+        if not ok_source:
+            latest_text = ", ".join(raw_details) if raw_details else "рекламных источников нет"
+            raise RuntimeError(
+                f"Нет безопасного рекламного источника за нужную дату {required_ads:%d.%m.%Y}. "
+                f"Проверены ads_category_source, all-category manager_ads_daily_source и store-scoped ads_daily_source. Последние даты: {latest_text}. "
+                f"ads_raw_source напрямую не принимаю как источник Расхода РК/ДРР, чтобы не задвоить расход. "
+                f"Отчёт не отправляю, чтобы не показать неверный ДРР. context={context}"
+            )
+        log(f"ads_date_check: OK required={required_ads:%Y-%m-%d}, source={ok_source}, latest_ads={ok_latest:%Y-%m-%d}, context={context}")
+
+    if _env_flag("REPORT_REQUIRE_ABC_PERIOD", False):
+        period_end = required
+        period_start = period_end - pd.Timedelta(days=int(period_end.weekday()))
+        found = False
+        for name in ["abc_weekly", "abc_monthly"]:
+            src = outputs.get(name, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+            if src is None or src.empty or "period_start" not in src.columns or "period_end" not in src.columns:
+                continue
+            x = src.copy()
+            x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+            x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+            if ((x["period_start"] == period_start) & (x["period_end"] == period_end)).any():
+                found = True
+                break
+        if not found:
+            raise RuntimeError(
+                f"Нет точного ABC/АБС файла за закрытую неделю {period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}. "
+                f"Ожидаемый путь: Отчёты/ABC/wb_abc_report_goods__{period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}__at_*.xlsx. "
+                f"Отчёт не отправляю. context={context}"
+            )
+        log(f"abc_period_check: OK exact ABC period={period_start:%Y-%m-%d}..{period_end:%Y-%m-%d}, context={context}")
+
+
+def _collect_preflight_active_days(frames: Sequence[Tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for source_name, df in frames:
+        if source_name.startswith("ads"):
+            days = _active_days_from_source(df, ["spend", "clicks", "impressions"])
         else:
-            updated[col] = updated[col].astype("object")
-
-    effects: List[Dict[str, Any]] = []
-    before_days = float(ANALYSIS_WINDOW_DAYS)
-
-    for idx, row in updated.iterrows():
-        event_date = pd.to_datetime(row.get("event_date"), errors="coerce")
-        if pd.isna(event_date):
+            days = _active_days_from_source(df, ["order_sum", "orders", "open_cards", "search_frequency"])
+        if days.empty:
             continue
-        event_day = event_date.date()
-        key = make_key(row)
-        direction = _clean_text_value(row.get("direction", "")).lower()
-        event_reason_code = _clean_text_value(row.get("reason_code", ""))
-        is_ramp_event = is_ramp_event_reason(event_reason_code)
-        step, _ = bid_step_rub(row.get("placement", ""))
-        drr_limit = drr_limit_for_subject(row.get("subject_norm", ""))
+        x = pd.DataFrame({"day": pd.to_datetime(days, errors="coerce").dt.normalize()}).dropna()
+        by_day = x.groupby("day", as_index=False).size().rename(columns={"size": "rows"})
+        by_day["source"] = source_name
+        rows.extend(by_day[["source", "day", "rows"]].to_dict("records"))
+    return pd.DataFrame(rows, columns=["source", "day", "rows"])
 
-        status = _clean_text_value(row.get("postcheck_status", "")) or "pending"
-        final_verdict = _clean_text_value(row.get("final_verdict", ""))
-        d1_verdict = _clean_text_value(row.get("d1_verdict", ""))
-        d3_verdict = _clean_text_value(row.get("d3_verdict", ""))
-        d7_verdict = _clean_text_value(row.get("d7_verdict", ""))
 
-        before = {
-            "spend": _event_num(row, "spend_before", 0.0),
-            "revenue": _event_num(row, "revenue_before", 0.0),
-            "orders": _event_num(row, "orders_before", 0.0),
-            "impressions": _event_num(row, "impressions_before", 0.0),
-            "clicks": _event_num(row, "clicks_before", 0.0),
-            "gp_after_ads": _event_num(row, "gp_before", float("nan")),
-        }
-        before_drr = _event_num(row, "drr_before", safe_drr_pct(before["spend"], before["revenue"]))
-        before_daily = _per_day(before, before_days)
-        before_ctr = safe_ctr_pct(before["clicks"], before["impressions"])
 
-        d1_after = {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
-        d3_after = {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
-        d7_after = {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
-        d1_daily = _per_day(d1_after, 1.0)
-        d3_daily = _per_day(d3_after, 3.0)
-        d7_daily = _per_day(d7_after, float(RAMP_CHECK_DAYS))
-        drr_after_d1 = 0.0
-        drr_after_d3 = 0.0
-        drr_after_d7 = 0.0
+def _latest_complete_operational_day(outputs: Dict[str, Any]) -> Optional[pd.Timestamp]:
+    """Return latest day that has both operational sales/funnel/search activity and ads activity.
 
-        # D+1: только ранний сигнал по трафику, без финального отката обычного повышения.
-        d1_day = event_day + timedelta(days=1)
-        if ctx.mature_end >= d1_day and status not in {"resolved"}:
-            d1_after = aggregate_after_event(ads_df, key, d1_day, d1_day)
-            d1_daily = _per_day(d1_after, 1.0)
-            drr_after_d1 = safe_drr_pct(d1_after["spend"], d1_after["revenue"])
-            d1_traffic_grew = (
-                grew_enough(d1_daily["impressions"], before_daily["impressions"], 1.05)
-                or grew_enough(d1_daily["clicks"], before_daily["clicks"], 1.05)
-            )
-            if direction == "raise":
-                if is_ramp_event:
-                    d1_verdict = "RAMP_D1_TRAFFIC_GROWTH" if d1_traffic_grew else "RAMP_D1_WAIT_WEEK"
-                    status = "d1_done"
-                else:
-                    d1_verdict = "RAISE_D1_OK" if d1_traffic_grew else "RAISE_D1_NO_TRAFFIC_YET"
-                    status = "d1_done"
-            elif direction == "lower":
-                traffic_retained = (
-                    retained_enough(d1_daily["impressions"], before_daily["impressions"], 0.80)
-                    and retained_enough(d1_daily["clicks"], before_daily["clicks"], 0.80)
-                )
-                d1_verdict = "LOWER_D1_OK" if traffic_retained else "LOWER_TRAFFIC_DROP_RISK"
-                status = "d1_done"
-            updated.at[idx, "d1_verdict"] = d1_verdict
-            updated.at[idx, "d1_check_date"] = str(ctx.mature_end)
+    Daily lightweight runs must not force yesterday. WB ad files often lag orders by a day.
+    If orders/funnel already have 01.06 but ads end at 31.05, the report must anchor on
+    31.05 and skip 01.06 instead of showing zero ad spend / wrong DRR.
+    """
+    if not isinstance(outputs, dict):
+        return None
 
-        # D+3: финальная оценка обычного повышения/снижения. Сравнение только среднее/день.
-        d3_end = event_day + timedelta(days=3)
-        if ctx.mature_end >= d3_end and status not in {"resolved"}:
-            d3_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d3_end)
-            d3_daily = _per_day(d3_after, 3.0)
-            drr_after_d3 = safe_drr_pct(d3_after["spend"], d3_after["revenue"])
-            d3_traffic_grew = (
-                grew_enough(d3_daily["impressions"], before_daily["impressions"], 1.05)
-                or grew_enough(d3_daily["clicks"], before_daily["clicks"], 1.05)
-            )
-            traffic_retained = (
-                retained_enough(d3_daily["impressions"], before_daily["impressions"], 0.80)
-                and retained_enough(d3_daily["clicks"], before_daily["clicks"], 0.80)
-            )
-            orders_retained = retained_enough(d3_daily["orders"], before_daily["orders"], 0.90)
-            revenue_retained = retained_enough(d3_daily["revenue"], before_daily["revenue"], 0.90)
-            gp_retained = ge_metric_factor(d3_daily["gp_after_ads"], before_daily["gp_after_ads"], 0.90)
-            gp_bad = lt_metric_factor(d3_daily["gp_after_ads"], before_daily["gp_after_ads"], 0.80)
-            drr_ok = drr_after_d3 <= drr_limit
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    op_days = _active_days_from_source(
+        daily,
+        ["order_sum", "orders", "open_cards", "search_frequency", "gross_profit_model", "gross_profit_abc"],
+    )
+    if op_days.empty:
+        return None
 
-            if direction == "raise":
-                if is_ramp_event:
-                    d3_verdict = "RAMP_D3_MONITOR_WEEK"
-                    final_verdict = ""
-                    status = "d3_done"
-                elif (not drr_ok) and (not orders_retained or not revenue_retained or gp_bad):
-                    d3_verdict = "RAISE_BAD"
-                    final_verdict = "RAISE_BAD"
-                    status = "resolved"
-                elif d3_traffic_grew and drr_ok and orders_retained and revenue_retained and gp_retained:
-                    d3_verdict = "RAISE_GOOD"
-                    final_verdict = "RAISE_GOOD"
-                    status = "resolved"
-                elif (not d3_traffic_grew) and drr_ok and orders_retained and revenue_retained:
-                    d3_verdict = "RAISE_NO_TRAFFIC_GROWTH"
-                    final_verdict = "RAISE_NO_TRAFFIC_GROWTH"
-                    status = "resolved"
-                else:
-                    d3_verdict = "RAISE_D3_MIXED"
-                    final_verdict = "RAISE_D3_MIXED"
-                    status = "resolved"
-            elif direction == "lower":
-                if drr_after_d3 < before_drr and orders_retained and gp_retained and traffic_retained:
-                    d3_verdict = "LOWER_GOOD"
-                    final_verdict = "LOWER_GOOD"
-                elif (not traffic_retained or not orders_retained or gp_bad) and drr_after_d3 >= before_drr:
-                    d3_verdict = "LOWER_BAD"
-                    final_verdict = "LOWER_BAD"
-                else:
-                    d3_verdict = "LOWER_D3_MIXED"
-                    final_verdict = "LOWER_D3_MIXED"
-                status = "resolved"
-            updated.at[idx, "d3_verdict"] = d3_verdict
-            updated.at[idx, "d3_check_date"] = str(ctx.mature_end)
+    ads_day_parts: List[pd.Series] = []
+    for source_name in ["ads_daily_source", "ads_raw_source", "ads_category_source"]:
+        src = outputs.get(source_name, pd.DataFrame())
+        days_ads = _active_days_from_source(
+            src,
+            ["spend", "clicks", "impressions", "ad_spend_total", "manual_spend", "unified_spend", "unknown_spend"],
+        )
+        if not days_ads.empty:
+            ads_day_parts.append(days_ads)
 
-        # D+7: финальная оценка разгона.
-        if is_ramp_event:
-            d7_end = event_day + timedelta(days=RAMP_CHECK_DAYS)
-            if ctx.mature_end >= d7_end and status not in {"resolved"}:
-                d7_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d7_end)
-                d7_daily = _per_day(d7_after, float(RAMP_CHECK_DAYS))
-                drr_after_d7 = safe_drr_pct(d7_after["spend"], d7_after["revenue"])
-                avg_imp_d7 = d7_daily["impressions"]
-                avg_spend_d7 = d7_daily["spend"]
-                gp_d7_daily = d7_daily["gp_after_ads"]
-                # Финал разгона через 7 дней: экономику и ДРР не оцениваем.
-                # Цель разгона — дать товару тестовый трафик; дальше РК переходит в обычный режим.
-                if avg_spend_d7 >= RAMP_OVERSPEND_PER_DAY:
-                    d7_verdict = "RAMP_FINISHED_D7_OVERSPEND"
-                    final_verdict = "RAMP_FINISHED_D7_OVERSPEND"
-                elif avg_imp_d7 >= RAMP_TARGET_IMPRESSIONS_PER_DAY and avg_spend_d7 >= RAMP_TARGET_SPEND_PER_DAY:
-                    d7_verdict = "RAMP_FINISHED_D7_TARGET_REACHED"
-                    final_verdict = "RAMP_FINISHED_D7_TARGET_REACHED"
-                else:
-                    d7_verdict = "RAMP_FINISHED_D7_NORMAL_MODE"
-                    final_verdict = "RAMP_FINISHED_D7_NORMAL_MODE"
-                updated.at[idx, "d7_verdict"] = d7_verdict
-                updated.at[idx, "d7_check_date"] = str(ctx.mature_end)
-                status = "resolved"
+    if not ads_day_parts:
+        return None
 
-        # Для отчёта считаем доступные after-окна независимо от текущего status, если данные уже зрелые.
-        if ctx.mature_end >= d1_day:
-            d1_after = aggregate_after_event(ads_df, key, d1_day, d1_day)
-            d1_daily = _per_day(d1_after, 1.0)
-            drr_after_d1 = safe_drr_pct(d1_after["spend"], d1_after["revenue"])
-        if ctx.mature_end >= d3_end:
-            d3_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d3_end)
-            d3_daily = _per_day(d3_after, 3.0)
-            drr_after_d3 = safe_drr_pct(d3_after["spend"], d3_after["revenue"])
-        if is_ramp_event:
-            d7_end = event_day + timedelta(days=RAMP_CHECK_DAYS)
-            if ctx.mature_end >= d7_end:
-                d7_after = aggregate_after_event(ads_df, key, event_day + timedelta(days=1), d7_end)
-                d7_daily = _per_day(d7_after, float(RAMP_CHECK_DAYS))
-                drr_after_d7 = safe_drr_pct(d7_after["spend"], d7_after["revenue"])
+    op_set = {pd.Timestamp(x).normalize() for x in pd.to_datetime(op_days, errors="coerce").dropna()}
+    ads_all = pd.concat([pd.Series(x) for x in ads_day_parts], ignore_index=True)
+    ads_set = {pd.Timestamp(x).normalize() for x in pd.to_datetime(ads_all, errors="coerce").dropna()}
+    common = sorted(op_set & ads_set)
+    if not common:
+        return None
 
-        updated.at[idx, "postcheck_status"] = status
-        updated.at[idx, "final_verdict"] = final_verdict
+    chosen = pd.Timestamp(common[-1]).normalize()
+    log(
+        "auto_complete_date: latest operational=%s, latest ads=%s, chosen=%s" % (
+            max(op_set).date() if op_set else "-",
+            max(ads_set).date() if ads_set else "-",
+            chosen.date(),
+        )
+    )
+    return chosen
 
-        target_action, target_text, recommended_next_bid = _postcheck_target_action(
-            final_verdict, direction, is_ramp_event, _event_num(row, "new_bid_rub", 0.0), step
+
+def _apply_auto_complete_report_date(outputs: Dict[str, Any], context: str = "") -> None:
+    """For lightweight daily mode, anchor report on the latest fully available day.
+
+    This deliberately clears strict date checks: missing newer days are skipped, not treated
+    as fatal. Weekly full_refresh still uses exact REPORT_REQUIRE_* checks.
+    """
+    if not _env_flag("REPORT_AUTO_COMPLETE_DATE", False):
+        return
+    chosen = _latest_complete_operational_day(outputs)
+    if chosen is None:
+        log(f"auto_complete_date: WARN no common orders/funnel/ads day found; context={context}; keep existing REPORT_AS_OF_DATE")
+        return
+    prev = os.environ.get("REPORT_AS_OF_DATE", "")
+    os.environ["REPORT_AS_OF_DATE"] = f"{chosen:%Y-%m-%d}"
+    os.environ["WB_DAILY_TARGET_DATE"] = f"{chosen:%Y-%m-%d}"
+    os.environ.pop("REPORT_REQUIRE_DATA_DATE", None)
+    os.environ.pop("REPORT_REQUIRE_ADS_DATE", None)
+    log(
+        f"auto_complete_date: REPORT_AS_OF_DATE={chosen:%Y-%m-%d}; "
+        f"previous={prev or 'empty'}; incomplete newer days are skipped; context={context}"
+    )
+
+def _preflight_abc_period_exists(storage: Storage, reports_root: str, required: pd.Timestamp) -> None:
+    if not _env_flag("REPORT_REQUIRE_ABC_PERIOD", False):
+        return
+    period_end = pd.Timestamp(required).normalize()
+    period_start = period_end - pd.Timedelta(days=int(period_end.weekday()))
+    expected_prefix = f"wb_abc_report_goods__{period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}__at_"
+    prefixes = [
+        f"{reports_root.strip('/')}/ABC",
+        f"{reports_root.strip('/')}/ABC/TOPFACE",
+        f"{reports_root.strip('/')}/АБС анализ/TOPFACE",
+    ]
+    found_keys: List[str] = []
+    for prefix in prefixes:
+        try:
+            keys = storage.list_files(prefix)
+        except Exception as exc:
+            log(f"preflight ABC: WARN cannot list {prefix}: {exc}")
+            continue
+        for key in keys:
+            name = Path(key).name
+            if name.startswith(expected_prefix) and name.lower().endswith((".xlsx", ".xlsm", ".zip")):
+                found_keys.append(key)
+    if not found_keys:
+        raise RuntimeError(
+            f"preflight: нет точного ABC/АБС файла за закрытую неделю "
+            f"{period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}. "
+            f"Ожидал файл {expected_prefix}*.xlsx в Отчёты/ABC. "
+            f"Full refresh не запускаю, чтобы не ждать долгий пересчёт."
+        )
+    log(f"preflight ABC: OK exact period {period_start:%Y-%m-%d}..{period_end:%Y-%m-%d}; key={found_keys[0]}")
+
+
+def run_preflight_date_check(root: str, reports_root: str, store: str) -> None:
+    required = _env_date("REPORT_REQUIRE_DATA_DATE")
+    if required is None:
+        log("preflight: REPORT_REQUIRE_DATA_DATE is empty; skip")
+        return
+
+    diagnostics = Diagnostics()
+    storage = make_storage(root)
+
+    os.environ["WB_CURRENT_WEEK_ONLY"] = "1"
+    os.environ["WB_DAILY_TARGET_DATE"] = f"{required:%Y-%m-%d}"
+
+    loader = Loader(storage, reports_root, store, diagnostics)
+    log(f"preflight: required_date={required:%Y-%m-%d}, store={store}; reading only current-week primary files")
+    orders = loader.load_orders()
+    funnel = loader.load_funnel()
+    ads_raw, ads_daily, campaigns = loader.load_ads()
+
+    day_stats = _collect_preflight_active_days([
+        ("orders", orders),
+        ("funnel", funnel),
+        ("ads_daily", ads_daily),
+    ])
+    if day_stats.empty:
+        raise RuntimeError(
+            f"preflight: нет активных дат в orders/funnel/ads для проверки {required:%d.%m.%Y}. "
+            f"Основной отчёт не запускаю."
         )
 
-        after_d1_ctr = safe_ctr_pct(d1_after["clicks"], d1_after["impressions"])
-        after_d3_ctr = safe_ctr_pct(d3_after["clicks"], d3_after["impressions"])
-        after_d7_ctr = safe_ctr_pct(d7_after["clicks"], d7_after["impressions"])
+    summary = day_stats.groupby("source", as_index=False).agg(min_day=("day", "min"), max_day=("day", "max"), total_rows=("rows", "sum"))
+    for _, r in summary.iterrows():
+        log(f"preflight source {r['source']}: dates={pd.Timestamp(r['min_day']).date()}..{pd.Timestamp(r['max_day']).date()}, rows={int(r['total_rows']):,}")
 
-        effects.append({
-            "event_id": row.get("event_id", ""),
-            "campaign_id": row.get("campaign_id", ""),
-            "nm_id": row.get("nm_id", ""),
-            "supplier_article": row.get("supplier_article", ""),
-            "subject_norm": row.get("subject_norm", ""),
-            "placement": row.get("placement", ""),
-            "direction": direction,
-            "event_date": row.get("event_date", ""),
-            "old_bid_rub": row.get("old_bid_rub", ""),
-            "new_bid_rub": row.get("new_bid_rub", ""),
-            "reason_code": event_reason_code,
-            "before_window_days": before_days,
-            "after_d1_days": 1 if ctx.mature_end >= d1_day else 0,
-            "after_d3_days": 3 if ctx.mature_end >= d3_end else 0,
-            "after_d7_days": RAMP_CHECK_DAYS if is_ramp_event and ctx.mature_end >= event_day + timedelta(days=RAMP_CHECK_DAYS) else 0,
-            "before_spend": before["spend"], "after_d1_spend": d1_after["spend"], "after_d3_spend": d3_after["spend"], "after_d7_spend": d7_after["spend"],
-            "before_spend_per_day": before_daily["spend"], "after_d1_spend_per_day": d1_daily["spend"], "after_d3_spend_per_day": d3_daily["spend"], "after_d7_spend_per_day": d7_daily["spend"],
-            "before_revenue": before["revenue"], "after_d1_revenue": d1_after["revenue"], "after_d3_revenue": d3_after["revenue"], "after_d7_revenue": d7_after["revenue"],
-            "before_revenue_per_day": before_daily["revenue"], "after_d1_revenue_per_day": d1_daily["revenue"], "after_d3_revenue_per_day": d3_daily["revenue"], "after_d7_revenue_per_day": d7_daily["revenue"],
-            "before_orders": before["orders"], "after_d1_orders": d1_after["orders"], "after_d3_orders": d3_after["orders"], "after_d7_orders": d7_after["orders"],
-            "before_orders_per_day": before_daily["orders"], "after_d1_orders_per_day": d1_daily["orders"], "after_d3_orders_per_day": d3_daily["orders"], "after_d7_orders_per_day": d7_daily["orders"],
-            "before_impressions": before["impressions"], "after_d1_impressions": d1_after["impressions"], "after_d3_impressions": d3_after["impressions"], "after_d7_impressions": d7_after["impressions"],
-            "before_impressions_per_day": before_daily["impressions"], "after_d1_impressions_per_day": d1_daily["impressions"], "after_d3_impressions_per_day": d3_daily["impressions"], "after_d7_impressions_per_day": d7_daily["impressions"],
-            "before_clicks": before["clicks"], "after_d1_clicks": d1_after["clicks"], "after_d3_clicks": d3_after["clicks"], "after_d7_clicks": d7_after["clicks"],
-            "before_clicks_per_day": before_daily["clicks"], "after_d1_clicks_per_day": d1_daily["clicks"], "after_d3_clicks_per_day": d3_daily["clicks"], "after_d7_clicks_per_day": d7_daily["clicks"],
-            "before_ctr_pct": before_ctr, "after_d1_ctr_pct": after_d1_ctr, "after_d3_ctr_pct": after_d3_ctr, "after_d7_ctr_pct": after_d7_ctr,
-            "before_drr_pct": before_drr, "after_d1_drr_pct": drr_after_d1, "after_d3_drr_pct": drr_after_d3, "after_d7_drr_pct": drr_after_d7,
-            "before_gp": before["gp_after_ads"], "after_d1_gp": d1_after["gp_after_ads"], "after_d3_gp": d3_after["gp_after_ads"], "after_d7_gp": d7_after["gp_after_ads"],
-            "before_gp_per_day": before_daily["gp_after_ads"], "after_d1_gp_per_day": d1_daily["gp_after_ads"], "after_d3_gp_per_day": d3_daily["gp_after_ads"], "after_d7_gp_per_day": d7_daily["gp_after_ads"],
-            "d1_verdict": d1_verdict,
-            "d3_verdict": d3_verdict,
-            "d7_verdict": _clean_text_value(updated.at[idx, "d7_verdict"]) if "d7_verdict" in updated.columns else d7_verdict,
-            "final_verdict": final_verdict,
-            "postcheck_status": status,
-            "target_bid_action": target_action,
-            "target_bid_action_text": target_text,
-            "recommended_next_bid_rub": recommended_next_bid,
-            "traffic_delta_d1_pct": _pct_delta(d1_daily["impressions"], before_daily["impressions"]),
-            "traffic_delta_d3_pct": _pct_delta(d3_daily["impressions"], before_daily["impressions"]),
-            "orders_delta_d3_pct": _pct_delta(d3_daily["orders"], before_daily["orders"]),
-            "revenue_delta_d3_pct": _pct_delta(d3_daily["revenue"], before_daily["revenue"]),
-            "gp_delta_d3_pct": _pct_delta(d3_daily["gp_after_ads"], before_daily["gp_after_ads"]),
-            # обратная совместимость
-            "drr_before": before_drr,
-            "drr_after_d3": drr_after_d3,
-            "impressions_after_d1": d1_after.get("impressions", 0.0),
-            "clicks_after_d1": d1_after.get("clicks", 0.0),
-            "orders_after_d3": d3_after.get("orders", 0.0),
-            "revenue_after_d3": d3_after.get("revenue", 0.0),
-            "spend_after_d3": d3_after.get("spend", 0.0),
-            "gp_after_d3": d3_after.get("gp_after_ads", float("nan")),
+    missing = []
+    latest_by_source = {}
+    for source_name in ["orders", "funnel", "ads_daily"]:
+        part = day_stats[day_stats["source"] == source_name]
+        if part.empty:
+            missing.append(f"{source_name}: нет данных")
+            continue
+        latest_by_source[source_name] = pd.Timestamp(pd.to_datetime(part["day"], errors="coerce").max()).normalize()
+        if not (pd.to_datetime(part["day"], errors="coerce").dt.normalize() == required).any():
+            missing.append(f"{source_name}: последняя дата {latest_by_source[source_name]:%d.%m.%Y}")
+    if missing:
+        raise RuntimeError(
+            f"preflight: нет полных orders/funnel/ads данных за нужную дату {required:%d.%m.%Y}. "
+            f"Проблемные источники: {'; '.join(missing)}. "
+            f"Отчёт не запускаю, чтобы не показать неверную сумму/ДРР."
+        )
+
+    _preflight_abc_period_exists(storage, reports_root, required)
+    log(f"preflight: OK required_date={required:%Y-%m-%d}; можно запускать основной отчёт")
+
+
+PDF_ONLY_SHEETS = {
+    TECH_REPORT_NAME: ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_ads_daily_source", "manager_abc_source", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source", "gp_potential_90d"],
+    FACTOR_REPORT_NAME: ["optimal_benchmarks", "factor_bridge", "entry_points_bridge", "factor_summary_for_pdf"],
+}
+
+# Exact reverse mapping for PDF-only mode. Excel files are exported with Russian headers,
+# while generate_management_pdf expects the internal English column names.
+PDF_ONLY_RU_TO_EN = {v: k for k, v in COLUMN_RU.items()}
+PDF_ONLY_RU_TO_EN.update({
+    "Уровень": "level",
+    "Категория": "subject",
+    "Товар": "product",
+    "Артикул продавца": "supplier_article",
+    "Артикул WB": "nm_id",
+    "Дата": "day",
+    "Фактор": "factor",
+    "Комментарий": "comment",
+    "Раздел": "entry_section",
+    "Точка входа": "entry_point",
+    "Переходы": "transitions",
+    "Добавления в корзину": "add_to_cart",
+    "Заказы": "orders",
+    "Показы": "impressions",
+    "CTR, %": "ctr_pct",
+    "Конверсия в корзину, %": "cart_conv_pct",
+    "Конверсия в заказ, %": "order_conv_pct",
+    "Доля заказов, %": "orders_share_pct",
+    "Заказы всего": "orders_total",
+    "Валовая прибыль модель": "gross_profit_model",
+    "Сумма заказов": "order_sum",
+    "Открытия карточки / клики": "open_cards",
+    "Расход manual": "manual_spend",
+    "Расход unified": "unified_spend",
+    "Расход без типа": "unknown_spend",
+    "Клики manual": "manual_clicks",
+    "Клики unified": "unified_clicks",
+    "Клики без типа": "unknown_clicks",
+    "Показы manual": "manual_impressions",
+    "Показы unified": "unified_impressions",
+    "Показы без типа": "unknown_impressions",
+    "Заказы manual": "manual_orders",
+    "Заказы unified": "unified_orders",
+    "Заказы без типа": "unknown_orders",
+    "Сумма заказов manual": "manual_order_sum",
+    "Сумма заказов unified": "unified_order_sum",
+    "Сумма заказов без типа": "unknown_order_sum",
+    "Спрос / частотность": "search_frequency",
+    "Переходы из поиска": "search_transitions",
+    "Добавления из поиска": "search_add_to_cart",
+    "Заказы из поиска": "search_orders",
+    "% поискового трафика": "search_traffic_capture_pct",
+    "% общего захвата спроса": "total_traffic_capture_pct",
+    "Уникальный спрос WB": "unique_search_frequency",
+    "Уникальные запросы": "unique_search_queries",
+    "Дублей снято": "duplicate_query_rows_removed",
+    "Локализация с заменами, %": "localization_with_replacements_pct",
+    "Прямая локализация, %": "direct_localization_pct",
+    "Статус локализации": "localization_status",
+    "Остаток всего": "stock_qty_total",
+    "Непокрытые склады": "uncovered_warehouses",
+    "effect_type": "effect_type",
+    "zone": "zone",
+    "effect_gp_rub": "effect_gp_rub",
+    "abs_effect_gp_rub": "abs_effect_gp_rub",
+    "total_abs_effect": "total_abs_effect",
+    "effect_weight_%": "effect_weight_pct",
+})
+
+
+def _normalize_pdf_only_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out = out.rename(columns={c: PDF_ONLY_RU_TO_EN.get(str(c), str(c)) for c in out.columns})
+    for c in ["day", "period_start", "period_end", "stock_day"]:
+        if c in out.columns:
+            out[c] = pd.to_datetime(out[c], errors="coerce")
+    for c in ["subject", "product", "supplier_article"]:
+        if c in out.columns:
+            out[c] = out[c].astype(str).replace({"nan": "", "None": ""})
+    return out
+
+
+def _read_existing_report_bytes(storage: Storage, local_dir: Path, file_name: str) -> bytes:
+    local_path = local_dir / file_name
+    if local_path.exists():
+        log(f"pdf_only: using local {local_path}")
+        return local_path.read_bytes()
+    local_root_fallback = Path(file_name)
+    if local_root_fallback.exists():
+        log(f"pdf_only: using local {local_root_fallback}")
+        return local_root_fallback.read_bytes()
+    if storage.is_s3:
+        key = f"{OUT_DIR}/{file_name}"
+        log(f"pdf_only: reading s3://*/{key}")
+        return storage.read_bytes(key)
+    raise FileNotFoundError(f"Не найден файл для PDF-only режима: {local_path}")
+
+
+def load_existing_outputs_for_pdf(storage: Storage, local_dir: Path) -> Dict[str, pd.DataFrame]:
+    """Load previously generated Excel outputs and rebuild the minimal outputs dict for PDF.
+
+    This mode avoids the expensive S3 ingestion/recalculation stage. It expects that the full
+    report has already generated these files in OUT_DIR either locally or in Yandex Object Storage:
+    - Технические_расчеты_TOPFACE.xlsx / article_day_fact
+    - Факторный_мост_ВП_TOPFACE.xlsx / factor_* sheets
+    """
+    outputs: Dict[str, pd.DataFrame] = {}
+    for file_name, sheets in PDF_ONLY_SHEETS.items():
+        data = _read_existing_report_bytes(storage, local_dir, file_name)
+        xls = pd.ExcelFile(io.BytesIO(data))
+        for sheet_name in sheets:
+            if sheet_name not in xls.sheet_names:
+                log(f"WARN pdf_only: sheet {sheet_name} missing in {file_name}")
+                outputs[sheet_name] = pd.DataFrame()
+                continue
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+            outputs[sheet_name] = _normalize_pdf_only_df(df)
+            log(f"pdf_only: loaded {file_name}/{sheet_name}: rows={len(outputs[sheet_name]):,}, cols={len(outputs[sheet_name].columns):,}")
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily.empty:
+        raise RuntimeError("PDF-only режим невозможен: пустой article_day_fact в техническом файле")
+    required = ["day", "subject", "product", "supplier_article", "nm_id", "order_sum", "gross_profit_model"]
+    missing = [c for c in required if c not in daily.columns]
+    if missing:
+        raise RuntimeError(f"PDF-only режим невозможен: в article_day_fact нет колонок {missing}")
+    return outputs
+
+
+def _period_bounds_from_daily(daily: pd.DataFrame) -> Tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    if daily is None or daily.empty or "day" not in daily.columns:
+        today = pd.Timestamp(datetime.today().date())
+        last_monday = today - pd.Timedelta(days=int(today.weekday()))
+        if today.weekday() == 6:
+            week_start, week_end = last_monday, today
+        else:
+            week_start, week_end = last_monday - pd.Timedelta(days=7), last_monday - pd.Timedelta(days=1)
+        return week_start, week_end, week_start - pd.Timedelta(days=7), week_start - pd.Timedelta(days=1)
+    mx = pd.to_datetime(daily["day"], errors="coerce").max()
+    if pd.isna(mx):
+        mx = pd.Timestamp(datetime.today().date())
+    mx = pd.Timestamp(mx).normalize()
+    last_monday = mx - pd.Timedelta(days=int(mx.weekday()))
+    if mx.weekday() == 6:
+        week_start, week_end = last_monday, mx
+    else:
+        week_start, week_end = last_monday - pd.Timedelta(days=7), last_monday - pd.Timedelta(days=1)
+    return week_start, week_end, week_start - pd.Timedelta(days=7), week_start - pd.Timedelta(days=1)
+
+
+def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
+    base_sum_cols = [
+        "orders", "order_sum", "open_cards", "add_to_cart", "buyouts_count", "cancels_count",
+        "manual_impressions", "manual_clicks", "manual_spend", "manual_orders", "manual_order_sum",
+        "unified_impressions", "unified_clicks", "unified_spend", "unified_orders", "unified_order_sum",
+        "unknown_impressions", "unknown_clicks", "unknown_spend", "unknown_orders", "unknown_order_sum",
+        "search_frequency", "search_transitions", "search_add_to_cart", "search_orders",
+        "ad_spend_model", "gross_profit_model", "buyout_qty_model", "revenue_model",
+        "commission_model", "acquiring_model", "logistics_direct_model", "logistics_return_model",
+        "storage_model", "other_costs_model", "cost_model"
+    ]
+    base_mean_cols = ["finished_price", "price_with_disc", "spp", "finished_price_funnel", "spp_funnel", "rating_reviews", "direct_localization_pct", "localization_with_replacements_pct"]
+    derived_cols = ["ad_spend_total", "ad_clicks_total", "ad_impressions_total", "drr_pct", "cpc", "ctr_pct", "cart_conv_pct", "order_conv_pct", "card_to_order_pct", "search_traffic_capture_pct", "avg_order_price"]
+
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=group_cols + base_sum_cols + base_mean_cols + derived_cols)
+    x = daily.copy()
+    for c in group_cols:
+        if c not in x.columns:
+            x[c] = ""
+    sum_cols = [c for c in base_sum_cols if c in x.columns]
+    mean_cols = [c for c in base_mean_cols if c in x.columns]
+    empty_cols = group_cols + sum_cols + mean_cols + derived_cols
+
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    x = x[(x["day"] >= start) & (x["day"] <= end)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    agg = {c: (c, "sum") for c in sum_cols}
+    for c in mean_cols:
+        agg[c] = (c, "mean")
+    g = x.groupby(group_cols, dropna=False, as_index=False).agg(**agg)
+    g["ad_spend_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"])
+    # Avoid double-count if ad_spend_model already includes manual+unified and channels exist.
+    channel_spend = sum((g[c] if c in g.columns else 0) for c in ["manual_spend", "unified_spend", "unknown_spend"])
+    if "ad_spend_model" in g.columns and float(pd.to_numeric(channel_spend, errors="coerce").fillna(0).sum()) > 0:
+        g["ad_spend_total"] = channel_spend
+    g["ad_clicks_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_clicks", "unified_clicks", "unknown_clicks"])
+    g["ad_impressions_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_impressions", "unified_impressions", "unknown_impressions"])
+
+    zero = pd.Series(0.0, index=g.index)
+    def _num_col(col: str) -> pd.Series:
+        return pd.to_numeric(g[col], errors="coerce").fillna(0) if col in g.columns else zero
+
+    order_sum = _num_col("order_sum")
+    orders = _num_col("orders")
+    open_cards = _num_col("open_cards")
+    add_to_cart = _num_col("add_to_cart")
+    search_frequency = _num_col("search_frequency")
+    search_transitions = _num_col("search_transitions")
+
+    g["drr_pct"] = np.where(order_sum > 0, g["ad_spend_total"] / order_sum * 100, np.nan)
+    g["cpc"] = np.where(g["ad_clicks_total"] > 0, g["ad_spend_total"] / g["ad_clicks_total"], np.nan)
+    g["ctr_pct"] = np.where(g["ad_impressions_total"] > 0, g["ad_clicks_total"] / g["ad_impressions_total"] * 100, np.nan)
+    g["cart_conv_pct"] = np.where(open_cards > 0, add_to_cart / open_cards * 100, np.nan)
+    g["order_conv_pct"] = np.where(add_to_cart > 0, orders / add_to_cart * 100, np.nan)
+    g["card_to_order_pct"] = np.where(open_cards > 0, orders / open_cards * 100, np.nan)
+    g["search_traffic_capture_pct"] = np.where(search_frequency > 0, search_transitions / search_frequency * 100, np.nan)
+    g["avg_order_price"] = np.where(orders > 0, order_sum / orders, np.nan)
+    return g
+
+
+def _abc_gp_for_period(builder: AnalyticsBuilder, start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
+    """Strict ABC gross-profit lookup for PDF/reporting.
+
+    Important: do NOT use overlapping weekly ABC files for arbitrary periods.
+    The previous implementation silently summed every ABC week overlapping the requested
+    period; for monthly / partial periods this double-counted days outside the period and
+    made PDF gross profit disagree with ABC. Now ABC fact is used only for exact weekly
+    periods, or exact closed monthly periods. Other periods must use the model and be
+    labelled as calculated GP.
+    """
+    if builder is None:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact"])
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+    # There is no daily ABC fact in the source files; never try to merge weekly ABC into day rows.
+    if "day" in group_cols:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+
+    frames = []
+    # Exact weekly fact.
+    abc_w = builder.enrich(builder.pack.abc_weekly, "abc_weekly")
+    if abc_w is not None and not abc_w.empty:
+        w = abc_w.copy()
+        w["period_start"] = pd.to_datetime(w["period_start"], errors="coerce").dt.normalize()
+        w["period_end"] = pd.to_datetime(w["period_end"], errors="coerce").dt.normalize()
+        w = w[(w["period_start"] == start) & (w["period_end"] == end)].copy()
+        if not w.empty:
+            w["gp_source"] = "ABC_weekly_exact"
+            frames.append(w)
+    # Exact monthly fact for closed full months.
+    abc_m = builder.enrich(builder.pack.abc_monthly, "abc_monthly")
+    if abc_m is not None and not abc_m.empty:
+        m = abc_m.copy()
+        m["period_start"] = pd.to_datetime(m["period_start"], errors="coerce").dt.normalize()
+        m["period_end"] = pd.to_datetime(m["period_end"], errors="coerce").dt.normalize()
+        m = m[(m["period_start"] == start) & (m["period_end"] == end)].copy()
+        if not m.empty:
+            m["gp_source"] = "ABC_monthly_exact"
+            frames.append(m)
+    if not frames:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+    exact = pd.concat(frames, ignore_index=True)
+    for c in group_cols:
+        if c not in exact.columns:
+            exact[c] = ""
+    g = exact.groupby(group_cols, dropna=False, as_index=False).agg(
+        gp_fact=("gross_profit", "sum"),
+        gross_revenue_fact=("gross_revenue", "sum"),
+        sales_qty_fact=("orders", "sum"),
+        gp_source=("gp_source", "first"),
+    )
+    return g
+
+
+def _merge_cur_prev(cur: pd.DataFrame, prev: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+    cur = cur.copy() if cur is not None else pd.DataFrame(columns=keys)
+    prev = prev.copy() if prev is not None else pd.DataFrame(columns=keys)
+    for k in keys:
+        if k not in cur.columns:
+            cur[k] = ""
+        if k not in prev.columns:
+            prev[k] = ""
+    value_cols = sorted(set([c for c in cur.columns if c not in keys]) | set([c for c in prev.columns if c not in keys]))
+    for c in value_cols:
+        if c not in cur.columns:
+            cur[c] = np.nan
+        if c not in prev.columns:
+            prev[c] = np.nan
+    out = cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev"))
+    for c in value_cols:
+        if c not in out.columns:
+            out[c] = np.nan
+        pc = f"{c}_prev"
+        if pc not in out.columns:
+            out[pc] = np.nan
+    return out.fillna(0)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _factor_row(level: str, keys: Dict[str, Any], factor: str, was: Any, now: Any, change: Any, effect: float, zone: str, comment: str) -> Dict[str, Any]:
+    rec = {"level": level, **keys}
+    rec.update({
+        "factor": factor, "was": was, "now": now, "change": change,
+        "effect_gp_rub": float(effect) if pd.notna(effect) else 0.0,
+        "effect_type": "плюс" if effect > 0 else ("минус" if effect < 0 else "нейтрально"),
+        "zone": zone, "comment": comment,
+    })
+    return rec
+
+
+def _entity_factor_rows(level: str, g: pd.DataFrame, keys: List[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for _, r in g.iterrows():
+        keyvals = {k: r.get(k, "") for k in keys}
+        cur_sum = _safe_float(r.get("order_sum"))
+        prev_sum = _safe_float(r.get("order_sum_prev"))
+        cur_gp = _safe_float(r.get("gp_fact"), _safe_float(r.get("gross_profit_model")))
+        prev_gp = _safe_float(r.get("gp_fact_prev"), _safe_float(r.get("gross_profit_model_prev")))
+        cur_margin = cur_gp / cur_sum if cur_sum else 0.0
+        prev_margin = prev_gp / prev_sum if prev_sum else cur_margin
+        cur_orders = _safe_float(r.get("orders"))
+        avg_price = cur_sum / cur_orders if cur_orders else _safe_float(r.get("avg_order_price"), 0)
+        # 1) Volume/order sum effect.
+        volume_effect = (cur_sum - prev_sum) * prev_margin
+        rows.append(_factor_row(level, keyvals, "Объём / сумма заказов", prev_sum, cur_sum, cur_sum - prev_sum, volume_effect, "рынок + управление", "Сколько ВП изменилось из-за изменения суммы заказов при прежней рентабельностинальности."))
+        # 2) Margin total effect.
+        margin_effect = cur_sum * (cur_margin - prev_margin)
+        rows.append(_factor_row(level, keyvals, "Рентабельность", prev_margin * 100, cur_margin * 100, (cur_margin - prev_margin) * 100, margin_effect, "экономика", "Изменение ВП из-за изменения рентабельностинальности после расходов и ABC-факта."))
+        # 3) Advertising/Drr effect.
+        cur_drr = _safe_float(r.get("drr_pct"), np.nan)
+        prev_drr = _safe_float(r.get("drr_pct_prev"), np.nan)
+        if pd.notna(cur_drr) and pd.notna(prev_drr):
+            drr_effect = -cur_sum * ((cur_drr - prev_drr) / 100.0)
+            rows.append(_factor_row(level, keyvals, "ДРР / рекламная нагрузка", prev_drr, cur_drr, cur_drr - prev_drr, drr_effect, "управляемый", "Сколько ВП забрал или добавил сдвиг ДРР относительно прошлой недели."))
+        # 4) Price effect.
+        cur_price = _safe_float(r.get("avg_order_price"), _safe_float(r.get("finished_price")))
+        prev_price = _safe_float(r.get("avg_order_price_prev"), _safe_float(r.get("finished_price_prev")))
+        if cur_orders and prev_price:
+            price_effect = cur_orders * (cur_price - prev_price) * prev_margin
+            rows.append(_factor_row(level, keyvals, "Цена продажи", prev_price, cur_price, cur_price - prev_price, price_effect, "управляемый", "Эффект изменения продажной цены при текущем объёме заказов."))
+        # 5) WB buyer price / SPP.
+        cur_spp = _safe_float(r.get("spp"), _safe_float(r.get("spp_funnel")))
+        prev_spp = _safe_float(r.get("spp_prev"), _safe_float(r.get("spp_funnel_prev")))
+        if cur_spp or prev_spp:
+            # Higher SPP usually makes buyer price better; this is an explanatory external/partly external factor.
+            spp_effect = cur_sum * ((cur_spp - prev_spp) / 100.0) * 0.30 * prev_margin
+            rows.append(_factor_row(level, keyvals, "СПП / цена покупателя", prev_spp, cur_spp, cur_spp - prev_spp, spp_effect, "WB / внешний", "Оценка влияния изменения СПП на привлекательность цены и ВП."))
+        # 6) Unit expenses.
+        qty = _safe_float(r.get("buyout_qty_model"), _safe_float(r.get("sales_qty_fact"), cur_orders))
+        for title, col, zone in [
+            ("Комиссия WB/шт", "commission_model", "WB / экономика"),
+            ("Эквайринг/шт", "acquiring_model", "WB / экономика"),
+            ("Логистика/шт", "logistics_direct_model", "WB / логистика"),
+            ("Обратная логистика/шт", "logistics_return_model", "WB / логистика"),
+            ("Хранение/шт", "storage_model", "WB / логистика"),
+            ("Себестоимость/шт", "cost_model", "управляемый"),
+            ("Прочие расходы/шт", "other_costs_model", "экономика"),
+        ]:
+            cur_total = _safe_float(r.get(col))
+            prev_total = _safe_float(r.get(f"{col}_prev"))
+            cur_unit = cur_total / qty if qty else 0.0
+            prev_qty = _safe_float(r.get("buyout_qty_model_prev"), _safe_float(r.get("sales_qty_fact_prev"), _safe_float(r.get("orders_prev"))))
+            prev_unit = prev_total / prev_qty if prev_qty else 0.0
+            if cur_unit or prev_unit:
+                effect = -qty * (cur_unit - prev_unit)
+                rows.append(_factor_row(level, keyvals, title, prev_unit, cur_unit, cur_unit - prev_unit, effect, zone, "Эффект изменения расхода на единицу."))
+        # 7) Demand, traffic share and conversions.
+        demand_cur = _safe_float(r.get("search_frequency"))
+        demand_prev = _safe_float(r.get("search_frequency_prev"))
+        capture_cur = _safe_float(r.get("search_traffic_capture_pct")) / 100.0
+        capture_prev = _safe_float(r.get("search_traffic_capture_pct_prev")) / 100.0
+        cart_cur = _safe_float(r.get("cart_conv_pct")) / 100.0
+        cart_prev = _safe_float(r.get("cart_conv_pct_prev")) / 100.0
+        order_cur = _safe_float(r.get("order_conv_pct")) / 100.0
+        order_prev = _safe_float(r.get("order_conv_pct_prev")) / 100.0
+        if demand_cur or demand_prev:
+            demand_effect = (demand_cur - demand_prev) * capture_prev * cart_prev * order_prev * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "Спрос WB", demand_prev, demand_cur, demand_cur - demand_prev, demand_effect, "внешний", "Эффект изменения общего поискового спроса WB."))
+        if demand_cur and (capture_cur or capture_prev):
+            traffic_effect = demand_cur * (capture_cur - capture_prev) * cart_prev * order_prev * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "% поискового трафика", capture_prev * 100, capture_cur * 100, (capture_cur - capture_prev) * 100, traffic_effect, "управляемый", "Эффект изменения доли спроса, которую забрала карточка."))
+        opens = _safe_float(r.get("open_cards"))
+        if opens and (cart_cur or cart_prev):
+            cart_effect = opens * (cart_cur - cart_prev) * order_prev * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "Конверсия в корзину", cart_prev * 100, cart_cur * 100, (cart_cur - cart_prev) * 100, cart_effect, "карточка", "Сколько ВП изменилось из-за входной конверсии карточки."))
+        if opens and (order_cur or order_prev):
+            order_effect = opens * cart_cur * (order_cur - order_prev) * avg_price * prev_margin
+            rows.append(_factor_row(level, keyvals, "Корзина -> заказ", order_prev * 100, order_cur * 100, (order_cur - order_prev) * 100, order_effect, "карточка / цена / доставка", "Сколько ВП изменилось из-за дожима из корзины в заказ."))
+    return rows
+
+
+def compute_optimal_benchmarks(outputs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    x = daily.copy()
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    rows = []
+    group_cols = ["subject", "product", "supplier_article", "nm_id"]
+    for keys, part in x.groupby(group_cols, dropna=False):
+        p = part.sort_values("day").copy()
+        if p.empty:
+            continue
+        positive = p[p["order_sum"].fillna(0) > 0].copy()
+        if positive.empty:
+            positive = p.copy()
+        threshold = positive["order_sum"].quantile(0.80) if len(positive) >= 5 else positive["order_sum"].mean()
+        best = positive[positive["order_sum"] >= threshold].copy()
+        if best.empty:
+            best = positive.nlargest(min(3, len(positive)), "order_sum")
+        def ratio(num, den, mul=1.0):
+            den_sum = pd.to_numeric(best.get(den, 0), errors="coerce").sum()
+            if not den_sum:
+                return np.nan
+            return pd.to_numeric(best.get(num, 0), errors="coerce").sum() / den_sum * mul
+        ad_spend = best[[c for c in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"] if c in best.columns]].sum(axis=1)
+        clicks = best[[c for c in ["manual_clicks", "unified_clicks", "unknown_clicks"] if c in best.columns]].sum(axis=1)
+        impressions = best[[c for c in ["manual_impressions", "unified_impressions", "unknown_impressions"] if c in best.columns]].sum(axis=1)
+        order_sum = pd.to_numeric(best.get("order_sum", 0), errors="coerce").sum()
+        rec = dict(zip(group_cols, keys))
+        rec.update({
+            "best_days_count": len(best),
+            "optimal_order_sum_day": pd.to_numeric(best.get("order_sum", 0), errors="coerce").mean(),
+            "optimal_orders_day": pd.to_numeric(best.get("orders", 0), errors="coerce").mean(),
+            "optimal_drr_pct": ad_spend.sum() / order_sum * 100 if order_sum else np.nan,
+            "optimal_cpc": ad_spend.sum() / clicks.sum() if clicks.sum() else np.nan,
+            "optimal_ctr_pct": clicks.sum() / impressions.sum() * 100 if impressions.sum() else np.nan,
+            "optimal_cart_conv_pct": ratio("add_to_cart", "open_cards", 100),
+            "optimal_order_conv_pct": ratio("orders", "add_to_cart", 100),
+            "optimal_search_capture_pct": ratio("search_transitions", "search_frequency", 100),
+            "optimal_price_sale": ratio("order_sum", "orders", 1),
+            "optimal_spp": pd.to_numeric(best.get("spp", best.get("spp_funnel", np.nan)), errors="coerce").mean(),
         })
-
-    effect_df = pd.DataFrame(effects)
-    if effect_df.empty:
-        effect_df = bid_effect_empty_frame()
-    return updated[BID_HISTORY_COLUMNS], effect_df
+        rows.append(rec)
+    return pd.DataFrame(rows)
 
 
-# =============================
-# Решения по ставкам
-# =============================
+def compute_entry_points_bridge(builder: AnalyticsBuilder, week_start: pd.Timestamp, week_end: pd.Timestamp, prev_start: pd.Timestamp, prev_end: pd.Timestamp) -> pd.DataFrame:
+    e = builder.enrich(builder.pack.entry_points, "entry_points")
+    if e is None or e.empty:
+        return pd.DataFrame()
+    e = e.copy()
+    e["day"] = pd.to_datetime(e["day"], errors="coerce").dt.normalize()
+    group_cols = ["subject", "product", "supplier_article", "nm_id", "entry_section", "entry_point"]
+    metric_cols = ["impressions", "transitions", "add_to_cart", "orders", "ctr_pct", "cart_conv_pct", "order_conv_pct"]
+    def agg(start, end):
+        x = e[(e["day"] >= start) & (e["day"] <= end)].copy()
+        if x.empty:
+            return pd.DataFrame(columns=group_cols + metric_cols)
+        g = x.groupby(group_cols, dropna=False, as_index=False).agg(
+            impressions=("impressions", "sum"), transitions=("transitions", "sum"),
+            add_to_cart=("add_to_cart", "sum"), orders=("orders", "sum"),
+        )
+        g["ctr_pct"] = np.where(g["impressions"] > 0, g["transitions"] / g["impressions"] * 100, np.nan)
+        g["cart_conv_pct"] = np.where(g["transitions"] > 0, g["add_to_cart"] / g["transitions"] * 100, np.nan)
+        g["order_conv_pct"] = np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan)
+        return g
+    cur = agg(week_start, week_end)
+    prev = agg(prev_start, prev_end)
+    out = _merge_cur_prev(cur, prev, group_cols)
+    for c in metric_cols:
+        if c not in out.columns:
+            out[c] = 0.0
+        if f"{c}_prev" not in out.columns:
+            out[f"{c}_prev"] = 0.0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+        out[f"{c}_prev"] = pd.to_numeric(out[f"{c}_prev"], errors="coerce").fillna(0)
+    # Join article margin and avg price from daily data for ₽ effect.
+    daily = outputs_global_for_bridge.get("article_day_fact", pd.DataFrame()) if "outputs_global_for_bridge" in globals() else pd.DataFrame()
+    if daily is not None and not daily.empty:
+        ag = _agg_daily_for_bridge(daily, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        gp_cur = _abc_gp_for_period(builder, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        ag = ag.merge(gp_cur, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        ag["gp_use"] = ag["gp_fact"].fillna(ag.get("gross_profit_model", 0))
+        ag["margin_use"] = safe_div_series(ag["gp_use"], ag["order_sum"], 0.0)
+        ag["avg_price_use"] = safe_div_series(ag["order_sum"], ag["orders"], 0.0)
+        out = out.merge(ag[["subject", "product", "supplier_article", "nm_id", "margin_use", "avg_price_use"]], on=["subject", "product", "supplier_article", "nm_id"], how="left")
+    else:
+        out["margin_use"] = 0.0
+        out["avg_price_use"] = 0.0
+    out["delta_transitions"] = out["transitions"] - out["transitions_prev"]
+    out["delta_orders"] = out["orders"] - out["orders_prev"]
+    out["delta_cart_conv_pp"] = out["cart_conv_pct"] - out["cart_conv_pct_prev"]
+    out["delta_order_conv_pp"] = out["order_conv_pct"] - out["order_conv_pct_prev"]
+    out["effect_gp_rub"] = out["delta_orders"] * out["avg_price_use"].fillna(0) * out["margin_use"].fillna(0)
+    totals = out.groupby(["subject", "product", "supplier_article", "nm_id"], as_index=False)["orders"].sum().rename(columns={"orders": "orders_total"})
+    out = out.merge(totals, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+    out["orders_share_pct"] = safe_div_series(out["orders"], out["orders_total"], np.nan) * 100
+    return out.sort_values(["subject", "product", "supplier_article", "effect_gp_rub"], ascending=[True, True, True, False])
 
-def is_active_campaign(status_value: Any) -> bool:
-    text = _clean_text_value(status_value).replace("ё", "е").lower()
-    if not text:
-        return False
-    if text in {"9", "9.0"}:
-        return True
-    if "active" in text:
-        return True
-    if "актив" in text and "неактив" not in text and "не актив" not in text:
-        return True
-    return False
+
+def build_factor_outputs(builder: AnalyticsBuilder, outputs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    global outputs_global_for_bridge
+    outputs_global_for_bridge = outputs
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    week_start, week_end, prev_start, prev_end = _period_bounds_from_daily(daily)
+    optimal = compute_optimal_benchmarks(outputs)
+    factor_rows: List[Dict[str, Any]] = []
+    for level, keys in [
+        ("category", ["subject"]),
+        ("product", ["subject", "product"]),
+        ("article", ["subject", "product", "supplier_article", "nm_id"]),
+    ]:
+        cur = _agg_daily_for_bridge(daily, week_start, week_end, keys)
+        prev = _agg_daily_for_bridge(daily, prev_start, prev_end, keys)
+        cur_gp = _abc_gp_for_period(builder, week_start, week_end, keys)
+        prev_gp = _abc_gp_for_period(builder, prev_start, prev_end, keys).rename(columns={"gp_fact": "gp_fact_prev", "gross_revenue_fact": "gross_revenue_fact_prev", "sales_qty_fact": "sales_qty_fact_prev"})
+        g = _merge_cur_prev(cur, prev, keys)
+        if not cur_gp.empty:
+            g = g.merge(cur_gp, on=keys, how="left")
+        if not prev_gp.empty:
+            g = g.merge(prev_gp, on=keys, how="left")
+        for c in ["gp_fact", "gp_fact_prev", "gross_revenue_fact", "gross_revenue_fact_prev", "sales_qty_fact", "sales_qty_fact_prev"]:
+            if c not in g.columns:
+                g[c] = np.nan
+        factor_rows.extend(_entity_factor_rows(level, g, keys))
+    factor_bridge = pd.DataFrame(factor_rows)
+    if not factor_bridge.empty:
+        factor_bridge["abs_effect_gp_rub"] = factor_bridge["effect_gp_rub"].abs()
+        totals = factor_bridge.groupby(["level", "subject", "product", "supplier_article", "nm_id"], dropna=False)["abs_effect_gp_rub"].sum().rename("total_abs_effect").reset_index()
+        factor_bridge = factor_bridge.merge(totals, on=["level", "subject", "product", "supplier_article", "nm_id"], how="left")
+        factor_bridge["effect_weight_pct"] = np.where(factor_bridge["total_abs_effect"] > 0, factor_bridge["abs_effect_gp_rub"] / factor_bridge["total_abs_effect"] * 100, 0)
+        factor_bridge = factor_bridge.sort_values(["level", "subject", "product", "supplier_article", "abs_effect_gp_rub"], ascending=[True, True, True, True, False])
+    entry_bridge = compute_entry_points_bridge(builder, week_start, week_end, prev_start, prev_end)
+    # Human-readable summary for PDF: top-4 money factors per entity.
+    summary_rows = []
+    if not factor_bridge.empty:
+        for keys, part in factor_bridge.groupby(["level", "subject", "product", "supplier_article", "nm_id"], dropna=False):
+            lvl, subject, product, art, nm_id = keys
+            p = part[part["abs_effect_gp_rub"] > 50].sort_values("abs_effect_gp_rub", ascending=False).head(4)
+            if p.empty:
+                text = "Критичных денежных факторов не выделено: изменение ВП находится в рабочем диапазоне."
+            else:
+                phrases = []
+                for _, r in p.iterrows():
+                    val = float(r["effect_gp_rub"])
+                    sign = "добавил" if val > 0 else "забрал"
+                    phrases.append(f"{r['factor']}: {sign} около {abs(val):,.0f} ₽ ВП".replace(",", " "))
+                text = "; ".join(phrases) + "."
+            summary_rows.append({
+                "level": lvl, "subject": subject, "product": product, "supplier_article": art, "nm_id": nm_id,
+                "period": f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')}",
+                "compare_period": f"{prev_start.strftime('%d.%m')}-{prev_end.strftime('%d.%m.%Y')}",
+                "summary_text": text,
+            })
+    factor_summary = pd.DataFrame(summary_rows)
+    return {
+        "optimal_benchmarks": optimal,
+        "factor_bridge": factor_bridge,
+        "entry_points_bridge": entry_bridge,
+        "factor_summary_for_pdf": factor_summary,
+    }
 
 
-def is_managed_subject(subject_value: Any) -> bool:
-    text = normalize_subject_value(subject_value).lower()
-    return text in MANAGED_SUBJECTS
+def write_factor_report(path: Path, factor_outputs: Dict[str, pd.DataFrame]) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+    for sheet_name, df in factor_outputs.items():
+        write_df_sheet(wb, sheet_name[:31], df if df is not None else pd.DataFrame())
+    wb.save(path)
 
 
-def drr_limit_for_subject(subject_value: Any) -> float:
-    """Возвращает допустимый ДРР для предмета в процентах."""
-    subject = normalize_subject_value(subject_value).lower()
-    return float(SUBJECT_DRR_LIMITS.get(subject, DRR_LIMIT_PCT))
+def _fmt_rub(x: Any, short: bool = False) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    if short and abs(val) >= 1000:
+        return f"{val/1000:.0f}к ₽".replace(".", ",")
+    return f"{val:,.0f} ₽".replace(",", " ")
 
 
-def is_pause_allowed_subject(subject_value: Any) -> bool:
-    """Кисти не паузим никогда; пауза только для помад/блесков/карандашей."""
-    subject = normalize_subject_value(subject_value).lower()
-    return subject in PAUSE_ALLOWED_SUBJECTS
+def _fmt_num_pdf(x: Any) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    return f"{val:,.0f}".replace(",", " ")
 
 
-def is_one_campaign_experiment_subject(subject_value: Any) -> bool:
-    subject = normalize_subject_value(subject_value).lower()
-    return subject in ONE_CAMPAIGN_EXPERIMENT_SUBJECTS
+def _fmt_pct_pdf(x: Any, digits: int = 1) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    return f"{val:.{digits}f}%".replace(".", ",")
 
 
-def product_group_from_article(value: Any) -> str:
-    """617/1, PT617.001, 617_1 -> 617. Если артикул пустой — пустая группа."""
-    text = _clean_text_value(value).upper().replace(" ", "")
-    if not text:
+def _fmt_cpc_pdf(x: Any) -> str:
+    try:
+        val = float(x)
+    except Exception:
+        return "-"
+    if pd.isna(val):
+        return "-"
+    return f"{val:.1f} ₽".replace(".", ",")
+
+
+def _delta_pct(cur: Any, prev: Any) -> Optional[float]:
+    try:
+        cur = float(cur); prev = float(prev)
+        if pd.isna(cur) or pd.isna(prev) or abs(prev) < 1e-9:
+            return None
+        return (cur / prev - 1) * 100
+    except Exception:
+        return None
+
+
+def _register_topface_fonts():
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    candidates = [
+        (os.getenv("TOPFACE_FONT_REGULAR"), os.getenv("TOPFACE_FONT_BOLD"), os.getenv("TOPFACE_FONT_BLACK")),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Black.ttf"),
+    ]
+    for reg, bold, black in candidates:
+        if reg and bold and black and Path(reg).exists() and Path(bold).exists() and Path(black).exists():
+            pdfmetrics.registerFont(TTFont("TFReg", reg))
+            pdfmetrics.registerFont(TTFont("TFBold", bold))
+            pdfmetrics.registerFont(TTFont("TFBlack", black))
+            return "TFReg", "TFBold", "TFBlack"
+    return "Helvetica", "Helvetica-Bold", "Helvetica-Bold"
+
+
+
+
+PRODUCT_GROUP_AUDIT_NAME = "Проверить_товарные_группы_TOPFACE.xlsx"
+PDF_CALC_TRACE_NAME = "Лог_расчетов_PDF_TOPFACE.xlsx"
+
+# Строгий справочник для PDF. Он важнее автоматического product_code():
+# если товар/артикул не подтвержден здесь, в управленческий PDF он не попадает.
+# Так подводки 405/406 не будут попадать в "Карандаши", а случайные товары вроде 552 уйдут в техлист.
+PDF_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = VALID_PRODUCT_CATEGORY_REFERENCE.copy()
+
+PDF_EXCLUDED_PRODUCT_REASONS: Dict[str, str] = {
+    "405": "Подводки/лайнеры: не включать в категорию 'Косметические карандаши' для PDF",
+    "406": "Подводки/лайнеры: не включать в категорию 'Косметические карандаши' для PDF",
+}
+
+# Products can remain in top category totals, but must not receive detailed PDF pages.
+# Defaults reflect the current management rule: low-tail products 206/207/209/210/211
+# are not detailed objects in the PDF. Override with PDF_FORCE_EXCLUDE_PRODUCTS if needed.
+PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS = set(
+    p.strip() for p in os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "206,207,209,210,211").split(",") if p.strip()
+)
+
+# Products that must appear in the detailed PDF when they have current-week sales/GP.
+# This prevents useful pencil groups 605/611/613 from disappearing due to global 90% trimming.
+PDF_FORCE_INCLUDE_DETAIL_PRODUCTS = set(
+    p.strip() for p in os.getenv("PDF_FORCE_INCLUDE_PRODUCTS", "901,605,611,613,614,617,618,154,155,156,157").split(",") if p.strip()
+)
+
+
+def _pdf_product_code_from_value(value: Any) -> str:
+    """Return a strict product code candidate for PDF category validation."""
+    text = normalize_text(value).upper().replace(" ", "")
+    if not text or text in {"NAN", "NONE", "NULL", "-"}:
         return ""
-    m = re.search(r"(\d{3,4})", text)
+    text = text.replace("_", "/")
+    # PT901.F25 -> 901; PT156.001 -> 156; 901/22 -> 901; 405/черный -> 405.
+    m = re.match(r"^PT(\d+)", text)
     if m:
-        return m.group(1).lstrip("0") or m.group(1)
-    return text.split("/")[0].split(".")[0].split("_")[0][:32]
+        return m.group(1)
+    m = re.match(r"^(\d+)", text)
+    if m:
+        return m.group(1)
+    return ""
 
 
-def safe_window_days(ctx: Optional[RunContext] = None) -> float:
-    if ctx is None:
-        return float(ANALYSIS_WINDOW_DAYS)
-    days = (ctx.current_end - ctx.current_start).days + 1
-    return float(days if days > 0 else ANALYSIS_WINDOW_DAYS)
+def _pdf_resolve_product_category(article: Any = "", product: Any = "") -> Tuple[str, str, bool, str]:
+    """Resolve PDF product/category only through the approved reference.
+
+    Returns: (canonical_subject, canonical_product, keep, reason).
+    """
+    code = _pdf_product_code_from_value(article) or _pdf_product_code_from_value(product)
+    if not code:
+        return "", "", False, "Не удалось распознать товар по артикулу/товару"
+    if code in PDF_PRODUCT_CATEGORY_REFERENCE:
+        return PDF_PRODUCT_CATEGORY_REFERENCE[code], code, True, ""
+    if code in PDF_EXCLUDED_PRODUCT_REASONS:
+        return "", code, False, PDF_EXCLUDED_PRODUCT_REASONS[code]
+    return "", code, False, "Товар отсутствует в утвержденном справочнике PDF"
 
 
-def money_or_zero(value: Any) -> float:
-    return float(pd.to_numeric(pd.Series([value]), errors="coerce").fillna(0).iloc[0])
+def _filter_df_by_pdf_product_reference(df: pd.DataFrame, source_name: str, rejects: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Keep only rows whose product/category is approved for the PDF report.
 
-
-def filter_managed_subject_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Оставляет только 4 управляемых предмета.
-
-    Жёсткое правило проекта: скрипт не должен принимать решения, строить паузы,
-    post-check или API-вызовы по любым другим предметам.
+    Rows without article/product are treated as category-level rows and are kept only for target subjects.
+    Rows with product/article are validated by PDF_PRODUCT_CATEGORY_REFERENCE; canonical subject/product override source values.
     """
     if df is None or df.empty:
-        return pd.DataFrame() if df is None else df.copy()
-    if "subject_norm" not in df.columns:
-        return df.iloc[0:0].copy()
-    result = df.copy()
-    result["subject_norm"] = result["subject_norm"].map(normalize_subject_value)
-    mask = result["subject_norm"].map(is_managed_subject)
-    return result.loc[mask].copy()
-
-
-def make_key_set_from_ads(ads_df: pd.DataFrame) -> set[Tuple[str, str, str]]:
-    if ads_df is None or ads_df.empty:
-        return set()
-    required = {"campaign_id", "nm_id", "placement"}
-    if not required.issubset(set(ads_df.columns)):
-        return set()
-    keys: set[Tuple[str, str, str]] = set()
-    for _, row in ads_df.iterrows():
-        key = make_key(row)
-        if all(key):
-            keys.add(key)
-    return keys
-
-
-def filter_bid_history_managed_only(bid_history: pd.DataFrame, ads_df: pd.DataFrame) -> pd.DataFrame:
-    if bid_history is None or bid_history.empty:
-        return pd.DataFrame(columns=BID_HISTORY_COLUMNS)
-    result = bid_history.copy()
-    for col in BID_HISTORY_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    if "subject_norm" in result.columns and result["subject_norm"].map(_clean_text_value).ne("").any():
-        result = result.loc[result["subject_norm"].map(is_managed_subject)].copy()
-    else:
-        managed_keys = make_key_set_from_ads(ads_df)
-        result = result.loc[result.apply(lambda r: make_key(r) in managed_keys, axis=1)].copy() if managed_keys else result.iloc[0:0].copy()
-    return result[BID_HISTORY_COLUMNS]
-
-
-def filter_pause_history_managed_only(pause_history: pd.DataFrame, ads_df: pd.DataFrame) -> pd.DataFrame:
-    if pause_history is None or pause_history.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    result = pause_history.copy()
-    for col in PAUSE_HISTORY_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    managed_keys = make_key_set_from_ads(ads_df)
-    if not managed_keys:
-        return result.iloc[0:0][PAUSE_HISTORY_COLUMNS].copy()
-    result = result.loc[result.apply(lambda r: make_key(r) in managed_keys, axis=1)].copy()
-    return result[PAUSE_HISTORY_COLUMNS]
-
-
-def bid_step_rub(placement: Any) -> Tuple[float, str]:
-    placement_norm = normalize_placement_value(placement)
-    if placement_norm in {"search", "recommendations"}:
-        return 1.0, ""
-    if placement_norm == "combined":
-        return 5.0, ""
-    return 1.0, "UNKNOWN_PLACEMENT_DEFAULT_STEP"
-
-
-def _round_half_up(value: float) -> int:
-    return int(math.floor(float(value) + 0.5))
-
-
-def normalize_bid_to_step(value: Any, placement: Any = "", step: Optional[float] = None) -> float:
-    """Приводит ставку к допустимой сетке: CPC = целые рубли, combined/полки = кратно 5 ₽."""
-    value_num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(value_num):
-        return float("nan")
-    bid = max(float(value_num), 0.0)
-    step_f = float(step if step is not None else bid_step_rub(placement)[0] or 1.0)
-    if step_f >= 5.0:
-        return float(_round_half_up(bid / step_f) * int(step_f))
-    return float(_round_half_up(bid))
-
-
-def normalize_bid_to_api_grid(value: Any, placement: Any = "", action: Any = "") -> float:
-    """Финальная сетка перед API: CPC — целые ₽; combined/полки — целые и кратно 5 ₽.
-
-    Для повышения округляем вверх, для снижения — вниз, чтобы API не получил дробную CPM-ставку
-    и чтобы решение не меняло направление из-за округления.
-    """
-    value_num = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(value_num):
-        return float("nan")
-    bid = max(float(value_num), 0.0)
-    step, _ = bid_step_rub(placement)
-    step_f = float(step or 1.0)
-    action_norm = _clean_text_value(action).lower()
-    if step_f >= 5.0:
-        if action_norm in {"повысить", "raise", "up"}:
-            return float(math.ceil((bid - 1e-9) / step_f) * int(step_f))
-        if action_norm in {"снизить", "lower", "down"}:
-            return float(max(math.floor((bid + 1e-9) / step_f) * int(step_f), 0))
-        return float(_round_half_up(bid / step_f) * int(step_f))
-    if action_norm in {"повысить", "raise", "up"}:
-        return float(math.ceil(bid - 1e-9))
-    if action_norm in {"снизить", "lower", "down"}:
-        return float(max(math.floor(bid + 1e-9), 0))
-    return float(_round_half_up(bid))
-
-
-def should_block_cpm_min_jump(row: pd.Series | Dict[str, Any], min_bid: float, proposed_bid: Any) -> Tuple[bool, str]:
-    """CPM/полки имеют реальный WB minimum bid.
-
-    Минимальная ставка combined сейчас 80 ₽. Блокировка прыжка к 80 ₽ отключена: вместо неё
-    работает селектор разгона — не больше одной выбранной РК на товар и placement.
-    """
-    return False, ""
-
-
-def next_bid_for_action(current_bid: Any, placement: Any, direction: str) -> float:
-    """Следующая ставка строго по сетке: search/recommendations ±1 ₽; combined ±5 ₽."""
-    step, _ = bid_step_rub(placement)
-    base = normalize_bid_to_step(current_bid, placement, step)
-    if pd.isna(base):
-        return float("nan")
-    if str(direction).lower() in {"raise", "повысить", "up"}:
-        return float(base + step)
-    if str(direction).lower() in {"lower", "снизить", "down"}:
-        return float(max(base - step, 0.0))
-    return float(base)
-
-
-def next_bid_by_step(current_bid: Any, step: Any, direction: str) -> float:
-    """То же, но когда в функции известен только шаг, без placement."""
-    step_f = float(step or 1.0)
-    base = normalize_bid_to_step(current_bid, step=step_f)
-    if pd.isna(base):
-        return float("nan")
-    if str(direction).lower() in {"raise", "повысить", "up"}:
-        return float(base + step_f)
-    if str(direction).lower() in {"lower", "снизить", "down"}:
-        return float(max(base - step_f, 0.0))
-    return float(base)
-
-
-def format_float(value: Any, digits: int = 2) -> str:
-    if value is None or pd.isna(value):
-        return "н/д"
-    return f"{float(value):.{digits}f}"
-
-
-def build_reason_text(row: pd.Series, action: str, new_bid: Optional[float], extra: str = "") -> str:
-    old_bid = row.get("current_bid_rub", float("nan"))
-    parts = [
-        f"ДРР={format_float(row.get('campaign_drr_pct'), 2)}%",
-        f"ставка={format_float(old_bid, 2)} ₽",
-        f"мин. WB={format_float(row.get('min_bid_rub'), 2)} ₽" if 'min_bid_rub' in row.index and not pd.isna(row.get('min_bid_rub')) else "мин. WB=н/д",
-        f"новая ставка={format_float(new_bid, 2)} ₽" if new_bid is not None else "новая ставка=н/д",
-        f"расход={format_float(row.get('spend'), 2)} ₽",
-        f"выручка={format_float(row.get('revenue'), 2)} ₽",
-        f"заказы={format_float(row.get('orders'), 0)}",
-    ]
-    if extra:
-        parts.append(extra)
-    return f"{action}: " + "; ".join(parts)
-
-
-def technical_hold(reason_code: str, row: pd.Series, reason: str) -> Dict[str, Any]:
-    return {
-        "action": "Без изменений",
-        "new_bid_rub": None,
-        "reason_code": reason_code,
-        "reason_text": build_reason_text(row, "Без изменений", None, reason),
-        "pause_decision": "",
-    }
-
-
-def decide_action(
-    row: pd.Series,
-    pending_event: Optional[Dict[str, Any]] = None,
-    postcheck_result: Optional[Dict[str, Any]] = None,
-    ramp_state: Optional[Dict[str, Any]] = None,
-    ctx: Optional[RunContext] = None,
-) -> Dict[str, Any]:
-    """
-    Возвращает dict:
-    {
-        "action": "Повысить" | "Снизить" | "Без изменений",
-        "new_bid_rub": float | None,
-        "reason_code": str,
-        "reason_text": str,
-        "pause_decision": str | ""
-    }
-    """
-    campaign_id = _clean_id_value(row.get("campaign_id", ""))
-    nm_id = _clean_id_value(row.get("nm_id", ""))
-    placement = normalize_placement_value(row.get("placement", ""))
-    current_bid = row.get("current_bid_rub", float("nan"))
-
-    if not campaign_id or not nm_id or not placement or pd.isna(current_bid) or float(current_bid) <= 0:
-        return technical_hold("MISSING_KEY", row, "нет campaign_id / nm_id / placement или текущей ставки")
-
-    if not is_active_campaign(row.get("campaign_status", "")):
-        return technical_hold("NOT_ACTIVE", row, "кампания не активна")
-
-    if not is_managed_subject(row.get("subject_norm", "")):
-        return technical_hold("NOT_MANAGED_SUBJECT", row, "предмет не входит в управляемые")
-
-    final_verdict = _clean_text_value((postcheck_result or {}).get("final_verdict", ""))
-    previous_event_id = _clean_text_value((postcheck_result or {}).get("event_id", ""))
-
-    step, step_reason = bid_step_rub(placement)
-    current_bid_float = float(current_bid)
-    effective_min_bid = pd.to_numeric(row.get("min_bid_rub", business_min_bid_rub(placement)), errors="coerce")
-    if pd.isna(effective_min_bid) or float(effective_min_bid) <= 0:
-        effective_min_bid = business_min_bid_rub(placement)
-    effective_min_bid = max(float(effective_min_bid), business_min_bid_rub(placement))
-
-    # Жёсткий технический пол WB: combined/полки не могут работать ниже 80 ₽.
-    # Если в истории/отчёте осталась старая ставка 3-10 ₽, это не бизнес-решение, а исправление технического минимума.
-    if placement == "combined" and current_bid_float < effective_min_bid - 0.001:
-        target_bid = normalize_bid_to_api_grid(effective_min_bid, placement, "Повысить")
-        return {
-            "action": "Повысить",
-            "new_bid_rub": target_bid,
-            "reason_code": "TECHNICAL_COMBINED_MIN_BID_80_FIX",
-            "reason_text": build_reason_text(row, "Повысить", target_bid, f"combined/полки: текущая ставка {current_bid_float:.2f} ₽ ниже минимальной WB/effective {effective_min_bid:.2f} ₽; приводим к минимальной валидной ставке 80 ₽"),
-            "pause_decision": "",
-        }
-
-    drr_limit = drr_limit_for_subject(row.get("subject_norm", ""))
-    impressions = money_or_zero(row.get("impressions", 0))
-    spend = money_or_zero(row.get("spend", 0))
-    revenue = money_or_zero(row.get("revenue", 0))
-    orders = money_or_zero(row.get("orders", 0))
-    avg_impressions_per_day = money_or_zero(row.get("avg_impressions_per_day", impressions / ANALYSIS_WINDOW_DAYS))
-    avg_spend_per_day = money_or_zero(row.get("avg_spend_per_day", spend / ANALYSIS_WINDOW_DAYS))
-    drr = float(row.get("campaign_drr_pct", 0) or 0)
-    abc_margin = abc_profitability_value(row)
-    abc_margin_text = "н/д" if pd.isna(abc_margin) else f"{abc_margin:.2f}%"
-    abc_margin_low = abc_profitability_is_low(row)
-    abc_margin_ok = abc_profitability_is_ok(row)
-    keyword_guard_status = _clean_text_value(row.get("keyword_guard_status", ""))
-    core_click_delta_raw = pd.to_numeric(pd.Series([row.get("core80_clicks_delta_pct")]), errors="coerce").iloc[0]
-    core_click_delta_pct = None if pd.isna(core_click_delta_raw) else float(core_click_delta_raw)
-    core_current_clicks_day = money_or_zero(row.get("current_core80_clicks_per_day", 0))
-    core_base_clicks_day = money_or_zero(row.get("base_core80_clicks_per_day", 0))
-    core_position_delta = money_or_zero(row.get("core80_position_delta", 0))  # положительное = позиция стала хуже
-    core_visibility_delta = money_or_zero(row.get("core80_visibility_delta_pp", 0))
-    keyword_core_bad = KEYWORD_CORE_CLICK_GUARD_ENABLED and keyword_guard_status in {"CORE_CLICK_BAD_LOSS", "CORE_POSITION_BAD_LOSS", "CORE_VISIBILITY_BAD_LOSS"}
-    keyword_core_risk = KEYWORD_CORE_CLICK_GUARD_ENABLED and (keyword_core_bad or keyword_guard_status in {"CORE_CLICK_RISK"})
-    keyword_scale_ok = (
-        (not KEYWORD_CORE_CLICK_GUARD_ENABLED)
-        or keyword_guard_status in {"CORE_CLICK_GROWING", "LOW_CORE_VOLUME"}
-        or (keyword_guard_status == "CORE_CLICK_STABLE" and core_click_delta_pct is not None and core_click_delta_pct >= 0)
-    )
-    hard_reduce_by_drr = drr >= (drr_limit + KEYWORD_HARD_REDUCE_EXTRA_DRR_PP)
-
-    ramp_state = ramp_state or {}
-    today = ctx.run_datetime.date() if ctx is not None else date.today()
-    ramp_active = bool(ramp_state.get("active", False))
-    ramp_completed = bool(ramp_state.get("completed", False))
-    ramp_day = int(pd.to_numeric(pd.Series([ramp_state.get("ramp_day", 0)]), errors="coerce").fillna(0).iloc[0])
-    ramp_days_left = int(pd.to_numeric(pd.Series([ramp_state.get("ramp_days_left", 0)]), errors="coerce").fillna(0).iloc[0])
-    ramp_start_date = _clean_text_value(ramp_state.get("ramp_start_date", ""))
-    last_ramp_event_date = _clean_text_value(ramp_state.get("last_event_date", ""))
-
-    # 14-дневный разгон:
-    # 1) до 500 ₽/день расхода — даём карточке трафик, экономику не используем как стоп-фактор;
-    # 2) после 500 ₽/день — масштабируем только при строгой экономике: ДРР < 15%, есть выручка/заказы и ВП после рекламы > 0;
-    # 3) верхний предел разгона — 1000 ₽/день, выше этого ставку не повышаем.
-    if ramp_active:
-        gp_after_ads = money_or_zero(row.get("gp_after_ads", 0))
-        # Разгон — отдельный временный алгоритм. ABC-рентабельность здесь НЕ применяется:
-        # качество разгона контролируем только ДРР, заказами, выручкой, ВП после рекламы и CORE.
-        economy_only_scale_ok = (drr < RAMP_SCALE_DRR_LIMIT_PCT and revenue > 0 and orders > 0 and gp_after_ads > 0)
-        economy_scale_ok = economy_only_scale_ok and keyword_scale_ok
-        economy_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and not economy_only_scale_ok)
-        keyword_bad_after_target = (avg_spend_per_day >= RAMP_TARGET_SPEND_PER_DAY and economy_only_scale_ok and not keyword_scale_ok)
-
-        if last_ramp_event_date == today.isoformat():
-            return technical_hold(
-                "RAMP_DAILY_ALREADY_CHANGED_TODAY",
-                row,
-                (
-                    f"разгон активен день {ramp_day}/{RAMP_CHECK_DAYS}, старт={ramp_start_date}; "
-                    f"сегодня уже была правка ставки по разгону; расход={avg_spend_per_day:.0f} ₽/день; "
-                    f"показы={avg_impressions_per_day:.0f}/день; ДРР={drr:.2f}%; ВП после рекламы={gp_after_ads:.0f} ₽; "
-                    f"CORE-клики={core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%); "
-                    f"статус CORE={keyword_guard_status or 'н/д'}; осталось дней={ramp_days_left}"
-                ),
-            )
-
-        if avg_spend_per_day > RAMP_SCALE_MAX_SPEND_PER_DAY:
-            new_bid = next_bid_for_action(current_bid_float, placement, "lower")
-            reason_code = "RAMP_DAILY_SPEND_OVER_1000_REDUCE"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            if new_bid < TECHNICAL_BID_FLOOR_RUB:
-                return technical_hold(
-                    "RAMP_DAILY_SPEND_OVER_1000_FLOOR_REACHED",
-                    row,
-                    f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день > верхнего лимита {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f}, но ниже технического пола снижать нельзя",
-                )
-            return {
-                "action": "Снизить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день > верхнего лимита {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f}; снижаем ставку, чтобы не разгоняться выше 1000 ₽/день"),
-                "pause_decision": "",
-            }
-
-        if avg_spend_per_day < RAMP_TARGET_SPEND_PER_DAY:
-            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-            reason_code = "RAMP_DAILY_SPEND_UNDER_500_RAISE"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            return {
-                "action": "Повысить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день < базовой цели {RAMP_TARGET_SPEND_PER_DAY:.0f} ₽/день; показы {avg_impressions_per_day:.0f}/день, цель минимум {RAMP_TARGET_IMPRESSIONS_PER_DAY:.0f}; повышаем ежедневно, чтобы дать карточке тестовый трафик"),
-                "pause_decision": "",
-            }
-
-        if avg_spend_per_day < RAMP_SCALE_MAX_SPEND_PER_DAY and economy_scale_ok:
-            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-            reason_code = "RAMP_DAILY_CORE_GROWING_ECONOMY_OK_SCALE_TO_1000"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            return {
-                "action": "Повысить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Повысить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день уже >= {RAMP_TARGET_SPEND_PER_DAY:.0f}; экономика разгона ОК: ДРР {drr:.2f}% < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП {gp_after_ads:.0f} ₽ > 0, выручка/заказы есть; ABC-рентабельность в разгоне не применяется. CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день ({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус {keyword_guard_status or 'н/д'}; разрешаем масштабироваться до {RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"),
-                "pause_decision": "",
-            }
-
-        if keyword_bad_after_target and avg_spend_per_day < RAMP_SCALE_MAX_SPEND_PER_DAY:
-            return technical_hold(
-                "RAMP_SPEND_GROWS_CORE_NOT_GROWING_HOLD",
-                row,
-                (
-                    f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: экономика позволяет масштабироваться до 1000 ₽/день, "
-                    f"но целевые CORE-клики не растут: {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день "
-                    f"({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), позиция Δ={core_position_delta:.1f}, "
-                    f"видимость Δ={core_visibility_delta:.1f} п.п.; ставку выше 500 ₽/день не увеличиваем"
-                ),
-            )
-
-        if economy_bad_after_target and avg_spend_per_day > RAMP_TARGET_SPEND_PER_DAY:
-            new_bid = next_bid_for_action(current_bid_float, placement, "lower")
-            reason_code = "RAMP_DAILY_ECONOMY_BAD_AFTER_500_REDUCE"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            if new_bid < TECHNICAL_BID_FLOOR_RUB:
-                return technical_hold(
-                    "RAMP_DAILY_ECONOMY_BAD_AFTER_500_FLOOR_REACHED",
-                    row,
-                    f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: после выхода за 500 ₽/день экономика не прошла контроль, но ниже технического пола снижать нельзя; ДРР={drr:.2f}%, ВП={gp_after_ads:.0f} ₽",
-                )
-            return {
-                "action": "Снизить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Снизить", new_bid, f"разгон день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день >= 500, но экономика разгона не проходит масштабирование: ДРР={drr:.2f}% / лимит {RAMP_SCALE_DRR_LIMIT_PCT:.1f}%, ВП после рекламы={gp_after_ads:.0f} ₽, выручка={revenue:.0f} ₽, заказы={orders:.0f}; ABC-рентабельность в разгоне не применяется; возвращаемся к уровню около 500 ₽/день"),
-                "pause_decision": "",
-            }
-
-        return technical_hold(
-            "RAMP_DAILY_SCALE_MAX_OR_ECONOMY_HOLD",
-            row,
-            (
-                f"разгон активен день {ramp_day}/{RAMP_CHECK_DAYS}: расход {avg_spend_per_day:.0f} ₽/день; "
-                f"цель 500 ₽/день достигнута. Дальше растим только при ДРР < {RAMP_SCALE_DRR_LIMIT_PCT:.1f}% "
-                f"и ВП после рекламы > 0 плюс CORE-клики должны расти/держаться; ABC-рентабельность в разгоне не применяется; текущие ДРР={drr:.2f}%, ВП={gp_after_ads:.0f} ₽, "
-                f"выручка={revenue:.0f} ₽, заказы={orders:.0f}; CORE={keyword_guard_status or 'н/д'}, "
-                f"клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день; верхний предел={RAMP_SCALE_MAX_SPEND_PER_DAY:.0f} ₽/день"
-            ),
-        )
-
-    if final_verdict in {"RAISE_BAD", "RAISE_NO_TRAFFIC_GROWTH"}:
-        new_bid = next_bid_for_action(current_bid_float, placement, "lower")
-        reason_code = "RAISE_FAILED_REVERT"
-        if step_reason:
-            reason_code += f"__{step_reason}"
-        if new_bid < TECHNICAL_BID_FLOOR_RUB:
-            return {
-                "action": "Без изменений",
-                "new_bid_rub": None,
-                "reason_code": "TECHNICAL_FLOOR_REACHED",
-                "reason_text": build_reason_text(row, "Без изменений", None, f"откат после {final_verdict}; новая ставка ниже 1 ₽; previous_event_id={previous_event_id}"),
-                "pause_decision": "PAUSE_CANDIDATE",
-            }
-        return {
-            "action": "Снизить",
-            "new_bid_rub": new_bid,
-            "reason_code": reason_code,
-            "reason_text": build_reason_text(row, "Снизить", new_bid, f"откат после {final_verdict}; previous_event_id={previous_event_id}"),
-            "pause_decision": "",
-        }
-
-    if final_verdict in {"LOWER_BAD", "LOWER_BAD_CORE_CLICK_LOSS"}:
-        new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-        reason_code = "LOWER_FAILED_REVERT" if final_verdict == "LOWER_BAD" else "LOWER_CORE_CLICK_LOSS_REVERT"
-        if step_reason:
-            reason_code += f"__{step_reason}"
-        return {
-            "action": "Повысить",
-            "new_bid_rub": new_bid,
-            "reason_code": reason_code,
-            "reason_text": build_reason_text(row, "Повысить", new_bid, f"откат после {final_verdict}; previous_event_id={previous_event_id}"),
-            "pause_decision": "",
-        }
-
-    if final_verdict == "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK":
-        return technical_hold(
-            "LOWER_ECONOMY_OK_BUT_CORE_CLICK_RISK",
-            row,
-            f"после снижения ставки ДРР мог улучшиться, но CORE-клики просели; не снижаем дальше без следующего периода: {row.get('core_click_guard_comment', '')}"
-        )
-
-    if pending_event is not None:
-        wait_rule = _clean_text_value(pending_event.get("wait_rule", "WAIT_POSTCHECK"))
-        wait_until = _clean_text_value(pending_event.get("wait_until_date", ""))
-        wait_days_left = _clean_text_value(pending_event.get("wait_days_left", ""))
-        event_date = _clean_text_value(pending_event.get("event_date", ""))
-        old_bid = _clean_text_value(pending_event.get("old_bid_rub", ""))
-        new_bid_prev = _clean_text_value(pending_event.get("new_bid_rub", ""))
-        prev_reason = _clean_text_value(pending_event.get("reason_code", ""))
-        return technical_hold(
-            wait_rule,
-            row,
-            f"ждём post-check: event_id={pending_event.get('event_id', '')}; "
-            f"последняя правка={event_date}; ставка {old_bid}→{new_bid_prev}; "
-            f"правило={prev_reason}; ждём до {wait_until}; осталось дней={wait_days_left}"
-        )
-
-    # Старт 14-дневного разгона. Если РК уже прошла ramp-сессию, повторно автоматически не стартуем:
-    # после 14 дней она работает в обычном режиме. Стартуем, если не хватает расхода или показов.
-    if (not ramp_completed) and (avg_spend_per_day < RAMP_TARGET_SPEND_PER_DAY or avg_impressions_per_day < RAMP_TARGET_IMPRESSIONS_PER_DAY) and avg_spend_per_day < RAMP_SCALE_MAX_SPEND_PER_DAY:
-        new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-        reason_code = "RAMP_START_DAILY_TO_500_SPEND"
-        if spend == 0 and orders == 0:
-            reason_code = "LOW_BID_NO_SPEND_NO_ORDERS_RAMP_START"
-        if step_reason:
-            reason_code += f"__{step_reason}"
-        return {
-            "action": "Повысить",
-            "new_bid_rub": new_bid,
-            "reason_code": reason_code,
-            "reason_text": build_reason_text(row, "Повысить", new_bid, f"старт разгона на {RAMP_CHECK_DAYS} дней: расход {avg_spend_per_day:.0f} ₽/день < цели {RAMP_TARGET_SPEND_PER_DAY:.0f} ₽/день; показы {avg_impressions_per_day:.0f}/день, целевой минимум {RAMP_TARGET_IMPRESSIONS_PER_DAY:.0f}; задача — дать карточке трафик и проверить заказы, экономику в разгоне не оцениваем"),
-            "pause_decision": "",
-        }
-
-    # Если ставка долго не менялась, используем отдельное правило регулярного теста:
-    # нет роста заказов/ВП — пробуем повысить; заказы/ВП держатся или растут — можно тестово снизить,
-    # чтобы проверить, не переплачиваем ли за тот же результат. Разгон сюда не попадает.
-    latest_event_dt = pd.to_datetime((postcheck_result or {}).get("event_date", ""), errors="coerce")
-    days_since_last_change = None
-    if not pd.isna(latest_event_dt) and ctx is not None:
-        days_since_last_change = (ctx.run_datetime.date() - latest_event_dt.date()).days
-    if days_since_last_change is not None and days_since_last_change >= STABLE_BID_DAYS and final_verdict not in {"RAISE_BAD", "RAISE_NO_TRAFFIC_GROWTH", "LOWER_BAD", "LOWER_BAD_CORE_CLICK_LOSS"}:
-        base_orders = money_or_zero(row.get("base_orders", 0))
-        base_gp = money_or_zero(row.get("base_gp_after_ads", 0))
-        gp_after_ads_now = money_or_zero(row.get("gp_after_ads", 0))
-        orders_delta_pct = _safe_delta_pct(orders, base_orders)
-        gp_delta_pct = _safe_delta_pct(gp_after_ads_now, base_gp)
-        orders_delta_num = None if orders_delta_pct == "" else float(orders_delta_pct)
-        gp_delta_num = None if gp_delta_pct == "" else float(gp_delta_pct)
-        no_growth = (
-            (orders_delta_num is not None and orders_delta_num < STABLE_ORDER_GP_DELTA_FLAT_PCT)
-            or (gp_delta_num is not None and gp_delta_num < STABLE_ORDER_GP_DELTA_FLAT_PCT)
-        )
-        stable_or_growth = (
-            (orders_delta_num is None or orders_delta_num >= -STABLE_ORDER_GP_DELTA_FLAT_PCT)
-            and (gp_delta_num is None or gp_delta_num >= -STABLE_ORDER_GP_DELTA_FLAT_PCT)
-            and orders > 0 and gp_after_ads_now > 0
-        )
-        if no_growth and drr <= drr_limit + ABC_DRR_UNCERTAINTY_PP and not keyword_core_bad:
-            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-            reason_code = "STABLE_BID_NO_ORDER_GP_GROWTH_TEST_RAISE"
-            if abc_margin_ok and drr >= drr_limit:
-                reason_code = "STABLE_BID_ABC_OK_DRR_SLIGHTLY_HIGH_TEST_RAISE"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            return {
-                "action": "Повысить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Повысить", new_bid, f"ставка не менялась {days_since_last_change} дней; заказы Δ={orders_delta_pct or 'н/д'}%, ВП после рекламы Δ={gp_delta_pct or 'н/д'}%; роста нет/он слабый — тестируем повышение, post-check должен подтвердить рост заказов и ВП"),
-                "pause_decision": "",
-            }
-        if stable_or_growth and drr <= drr_limit and current_bid_float > effective_min_bid + 0.001:
-            new_bid = next_bid_for_action(current_bid_float, placement, "lower")
-            reason_code = "STABLE_BID_ORDERS_GP_HOLD_TRY_LOWER"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            return {
-                "action": "Снизить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Снизить", new_bid, f"ставка не менялась {days_since_last_change} дней; заказы/ВП держатся или растут: заказы Δ={orders_delta_pct or 'н/д'}%, ВП Δ={gp_delta_pct or 'н/д'}%; тестово снижаем, чтобы проверить, можно ли сохранить результат дешевле"),
-                "pause_decision": "",
-            }
-
-    # ABC-рентабельность используется как запас для роста в обычном режиме после разгона.
-    # Если рентабельность >=15%, можно аккуратно выходить за лимит ДРР, но только при заказах и ВП.
-    drr_in_uncertain_zone = drr <= (drr_limit + ABC_DRR_UNCERTAINTY_PP)
-
-    if drr >= drr_limit:
-        if abc_margin_ok and drr_in_uncertain_zone and not keyword_core_risk and revenue > 0 and orders > 0 and money_or_zero(row.get("gp_after_ads", 0)) > 0:
-            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-            reason_code = "DRR_SLIGHTLY_HIGH_BUT_ABC_PROFITABILITY_OK_GROW"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            return {
-                "action": "Повысить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% немного выше лимита {drr_limit:.1f}%, но ABC-рентабельность {abc_margin_text} >= {ABC_PROFITABILITY_MIN_PCT:.1f}%, заказы/выручка/ВП есть, CORE-риск не обнаружен; можно аккуратно тестировать рост ставки"),
-                "pause_decision": "",
-            }
-        if keyword_core_risk and not hard_reduce_by_drr and not abc_margin_low:
-            return technical_hold(
-                "DRR_GE_LIMIT_HOLD_CORE_CLICK_RISK",
-                row,
-                (
-                    f"ДРР {drr:.2f}% >= лимита {drr_limit:.1f}%, но снижение запрещено: падают целевые CORE-клики. "
-                    f"ABC-рентабельность={abc_margin_text}; "
-                    f"CORE-клики {core_base_clicks_day:.1f}→{core_current_clicks_day:.1f}/день "
-                    f"({core_click_delta_pct if core_click_delta_pct is not None else 0:.1f}%), статус={keyword_guard_status}; "
-                    f"жёсткое снижение разрешено при ДРР >= {drr_limit + KEYWORD_HARD_REDUCE_EXTRA_DRR_PP:.1f}% или ABC-рентабельности < {ABC_PROFITABILITY_MIN_PCT:.1f}%"
-                ),
-            )
-        new_bid = next_bid_for_action(current_bid_float, placement, "lower")
-        reason_code = "DRR_GE_LIMIT_REDUCE"
-        if abc_margin_low:
-            reason_code = "DRR_GE_LIMIT_ABC_PROFITABILITY_LOW_REDUCE"
-        elif keyword_core_risk and hard_reduce_by_drr:
-            reason_code = "DRR_HARD_REDUCE_DESPITE_CORE_RISK"
-        if step_reason:
-            reason_code += f"__{step_reason}"
-        if new_bid < TECHNICAL_BID_FLOOR_RUB:
-            return {
-                "action": "Без изменений",
-                "new_bid_rub": None,
-                "reason_code": "TECHNICAL_FLOOR_REACHED",
-                "reason_text": build_reason_text(row, "Без изменений", None, "требуется снижение, но новая ставка ниже 1 ₽"),
-                "pause_decision": "",
-            }
-        return {
-            "action": "Снизить",
-            "new_bid_rub": new_bid,
-            "reason_code": reason_code,
-            "reason_text": build_reason_text(row, "Снизить", new_bid, f"ДРР {drr:.2f}% >= лимита {drr_limit:.1f}%; ABC-рентабельность={abc_margin_text}, минимум для роста {ABC_PROFITABILITY_MIN_PCT:.1f}%"),
-            "pause_decision": "",
-        }
-
-    if abc_margin_low:
-        gp_after_ads = money_or_zero(row.get("gp_after_ads", 0))
-        # Низкая ABC-рентабельность не является абсолютным запретом роста при ДРР ниже лимита:
-        # смотрим фактическую ВП после рекламы. Если рост ставки не даст прирост заказов/ВП — post-check откатит.
-        if revenue > 0 and orders > 0 and gp_after_ads > 0 and not keyword_core_bad:
-            new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-            reason_code = "DRR_LT_LIMIT_LOW_ABC_PROFITABILITY_GP_OK_TEST_GROW"
-            if step_reason:
-                reason_code += f"__{step_reason}"
-            return {
-                "action": "Повысить",
-                "new_bid_rub": new_bid,
-                "reason_code": reason_code,
-                "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%, ABC-рентабельность {abc_margin_text} < {ABC_PROFITABILITY_MIN_PCT:.1f}%, но ВП после рекламы={gp_after_ads:.0f} ₽ > 0 и заказы есть; тестируем аккуратный рост, post-check должен подтвердить рост заказов и ВП, иначе откат"),
-                "pause_decision": "",
-            }
-        return technical_hold(
-            "DRR_LT_LIMIT_LOW_ABC_PROFITABILITY_GP_NOT_OK_HOLD",
-            row,
-            f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%, ABC-рентабельность {abc_margin_text} < {ABC_PROFITABILITY_MIN_PCT:.1f}%, но ВП после рекламы={gp_after_ads:.0f} ₽ / заказы={orders:.0f}; роста ставки не делаем до подтверждения экономики"
-        )
-
-    new_bid = next_bid_for_action(current_bid_float, placement, "raise")
-    reason_code = "DRR_LT_LIMIT_GROW"
-    if abc_margin_ok:
-        reason_code = "DRR_LT_LIMIT_ABC_PROFITABILITY_OK_GROW"
-    if step_reason:
-        reason_code += f"__{step_reason}"
-    return {
-        "action": "Повысить",
-        "new_bid_rub": new_bid,
-        "reason_code": reason_code,
-        "reason_text": build_reason_text(row, "Повысить", new_bid, f"ДРР {drr:.2f}% < лимита {drr_limit:.1f}%; ABC-рентабельность={abc_margin_text}; если рентабельность >= {ABC_PROFITABILITY_MIN_PCT:.1f}%, товар имеет запас для роста ставки, post-check контролирует заказы и ВП"),
-        "pause_decision": "",
-    }
-
-def business_min_bid_rub(placement: Any) -> float:
-    """Бизнес-минимум для отчёта и решений: поиск/CPC не ниже 4 ₽, полки/combined не ниже 80 ₽."""
-    placement_norm = normalize_placement_value(placement)
-    if placement_norm == "combined":
-        return 80.0
-    if placement_norm in {"search", "recommendations"}:
-        return 4.0
-    return 1.0
-
-
-def moscow_now(ctx: Optional[RunContext] = None) -> datetime:
-    """Текущее время в Москве. Для GitHub Actions считаем явно через UTC+3."""
-    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=3)
-
-
-def night_experiment_slot(ctx: Optional[RunContext] = None) -> str:
-    """Слот ночного запуска из YAML.
-
-    Почему это нужно:
-    GitHub Actions schedule иногда стартует с задержкой. Раньше код проверял только
-    фактический час МСК, поэтому scheduled job для 01:00 мог стартовать позже и
-    не применить Эксперимент 1/2. Теперь YAML явно передаёт слот:
-    - start: применить ночные минимальные ставки и ночные паузы;
-    - end: вернуть кампании после ночной паузы;
-    - auto: старая логика по фактическому времени МСК.
-    """
-    slot = _clean_text_value(getattr(ctx, "night_experiment_slot", "") if ctx is not None else os.environ.get("WB_NIGHT_EXPERIMENT_SLOT", "")).lower()
-    return slot if slot in {"start", "end"} else "auto"
-
-
-def is_night_experiment_window_by_clock(ctx: Optional[RunContext] = None) -> bool:
-    if not NIGHT_EXPERIMENTS_ENABLED:
-        return False
-    hour = moscow_now(ctx).hour
-    start = int(NIGHT_EXPERIMENT_START_HOUR_MSK)
-    end = int(NIGHT_EXPERIMENT_END_HOUR_MSK)
-    if start < end:
-        return start <= hour < end
-    return hour >= start or hour < end
-
-
-def is_night_experiment_window(ctx: Optional[RunContext] = None) -> bool:
-    if not NIGHT_EXPERIMENTS_ENABLED:
-        return False
-    slot = night_experiment_slot(ctx)
-    if slot == "start":
-        return True
-    if slot == "end":
-        return False
-    return is_night_experiment_window_by_clock(ctx)
-
-
-def night_experiment_window_text() -> str:
-    return f"{NIGHT_EXPERIMENT_START_HOUR_MSK:02d}:00-{NIGHT_EXPERIMENT_END_HOUR_MSK:02d}:00 МСК"
-
-
-def normalize_experiment_article(value: Any) -> str:
-    text = _clean_text_value(value).upper().replace(" ", "")
-    if not text:
-        return ""
-    text = text.replace("_/", "/")
-    text = text.replace("_", "/")
-    text = re.sub(r"/+", "/", text)
-    return text
-
-
-def is_experiment_1_article(value: Any) -> bool:
-    return normalize_experiment_article(value) in {normalize_experiment_article(x) for x in EXPERIMENT_1_ARTICLES}
-
-
-def experiment_min_bid_for_row(row: pd.Series | Dict[str, Any]) -> float:
-    placement = row.get("placement", "")
-    business_min = business_min_bid_rub(placement)
-    min_bid = pd.to_numeric(pd.Series([row.get("min_bid_rub", business_min)]), errors="coerce").iloc[0]
-    if pd.isna(min_bid) or float(min_bid) <= 0:
-        min_bid = business_min
-    target = max(float(min_bid), float(business_min))
-    return normalize_bid_to_api_grid(target, placement, "Повысить")
-
-
-def apply_night_bid_experiment_rules(decisions: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    """Эксперимент 1: ночью по 901/6, 901/2, 901/8 держим минимальную валидную ставку.
-
-    01:00-05:00 МСК: search/recommendations = не ниже min WB и 4 ₽, combined = не ниже min WB и 80 ₽.
-    После 05:00 этот override не применяется, работает обычная логика/разгон.
-    """
-    if decisions is None or decisions.empty:
-        return decisions
-    result = decisions.copy()
-    if not is_night_experiment_window(ctx):
-        for col in ["experiment_label", "experiment_id", "experiment_window_msk"]:
-            if col not in result.columns:
-                result[col] = ""
-        return result
-
-    for idx, row in result.iterrows():
-        if not is_active_campaign(row.get("campaign_status", "")):
-            continue
-        if not is_experiment_1_article(row.get("supplier_article", "")):
-            continue
-        placement = normalize_placement_value(row.get("placement", ""))
-        if placement not in {"search", "recommendations", "combined"}:
-            continue
-        target_bid = experiment_min_bid_for_row(row)
-        current_bid = pd.to_numeric(pd.Series([row.get("current_bid_rub", None)]), errors="coerce").iloc[0]
-        if pd.isna(current_bid) or float(current_bid) <= 0:
-            continue
-        current_bid_f = float(current_bid)
-        if current_bid_f > target_bid + 0.001:
-            action = "Снизить"
-        elif current_bid_f < target_bid - 0.001:
-            action = "Повысить"
-        else:
-            action = "Без изменений"
-            target_bid = None
-        result.at[idx, "action"] = action
-        result.at[idx, "new_bid_rub"] = target_bid
-        result.at[idx, "reason_code"] = EXPERIMENT_1_REASON_CODE
-        result.at[idx, "reason_text"] = build_reason_text(
-            result.loc[idx],
-            action,
-            target_bid,
-            (
-                f"Эксперимент 1: ночная минимальная ставка {night_experiment_window_text()} для 901/6, 901/2, 901/8; "
-                f"гипотеза: ночью конкуренция ниже, нет смысла держать высокую ставку. "
-                f"CPC/search минимум 4 ₽ или min WB, combined/полки минимум 80 ₽ или min WB"
-            ),
-        )
-        result.at[idx, "experiment_label"] = "Эксперимент 1 — ночная минимальная ставка"
-        result.at[idx, "experiment_id"] = "EXP1_NIGHT_MIN_BID_901_6_2_8"
-        result.at[idx, "experiment_window_msk"] = night_experiment_window_text()
-    return normalize_decision_bids_final(result)
-
-
-def filter_decisions_for_night_experiment_only(decisions: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    """В ночных запусках YAML не даём обычному алгоритму двигать ставки.
-
-    01:00 МСК: в API уходят только строки Эксперимента 1.
-    05:00 МСК: по ставкам ничего не отправляем, запуск нужен только для возврата РК Эксперимента 2.
-    """
-    if not bool(getattr(ctx, "night_experiment_only", False)):
-        return decisions
-    if decisions is None or decisions.empty:
-        return decisions
-    result = decisions.copy()
-    exp1_mask = result.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_1_REASON_CODE)
-    if is_night_experiment_window(ctx):
-        result.loc[~exp1_mask, "action"] = "Без изменений"
-        result.loc[~exp1_mask, "new_bid_rub"] = pd.NA
-        result.loc[~exp1_mask, "reason_code"] = "NIGHT_EXPERIMENT_ONLY_SKIP_MAIN_LOGIC"
-        result.loc[~exp1_mask, "reason_text"] = "Ночной запуск YAML: обычные изменения ставок отключены, работают только Эксперимент 1/2."
-    else:
-        result["action"] = "Без изменений"
-        result["new_bid_rub"] = pd.NA
-        result["reason_code"] = "NIGHT_EXPERIMENT_ONLY_START_WINDOW_NO_BID_CHANGES"
-        result["reason_text"] = "Ночной запуск YAML 05:00 МСК: изменения ставок не отправляются, запуск нужен для возврата РК Эксперимента 2."
-    return normalize_decision_bids_final(result)
-
-
-def filter_pause_candidates_for_night_experiment_only(pause_candidates: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    if not bool(getattr(ctx, "night_experiment_only", False)):
-        return pause_candidates
-    if pause_candidates is None or pause_candidates.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    return pause_candidates[pause_candidates.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_2_REASON_CODE)].copy()
-
-
-def filter_start_candidates_for_night_experiment_only(start_candidates: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    if not bool(getattr(ctx, "night_experiment_only", False)):
-        return start_candidates
-    if start_candidates is None or start_candidates.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    return start_candidates[start_candidates.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_2_START_REASON_CODE)].copy()
-
-
-def build_experiment_2_pause_candidates(decisions: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    """Эксперимент 2: ночью 01:00-05:00 МСК паузим combined/полки с ДРР > 15%."""
-    if decisions is None or decisions.empty or not is_night_experiment_window(ctx):
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    work = decisions.copy()
-    work = work[work.get("placement", pd.Series(dtype=str)).map(normalize_placement_value) == "combined"].copy()
-    if work.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    work = work[work.get("campaign_status", pd.Series(dtype=str)).map(is_active_campaign)].copy()
-    if work.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    rows: List[Dict[str, Any]] = []
-    today_msk = moscow_now(ctx).date().isoformat()
-    for campaign_id, g in work.groupby(work["campaign_id"].map(_clean_id_value), dropna=False):
-        campaign_id_clean = _clean_id_value(campaign_id)
-        if not campaign_id_clean:
-            continue
-        spend = money_or_zero(pd.to_numeric(g.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        revenue = money_or_zero(pd.to_numeric(g.get("revenue", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        orders = money_or_zero(pd.to_numeric(g.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        impressions = money_or_zero(pd.to_numeric(g.get("impressions", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        clicks = money_or_zero(pd.to_numeric(g.get("clicks", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        drr = safe_drr_pct(spend, revenue)
-        if drr <= EXPERIMENT_2_DRR_LIMIT_PCT:
-            continue
-        main = g.sort_values([c for c in ["spend", "impressions", "clicks"] if c in g.columns], ascending=False).iloc[0]
-        gp_series = pd.to_numeric(g.get("gp_after_ads", pd.Series(dtype=float)), errors="coerce")
-        gp = float(gp_series.sum()) if gp_series.notna().any() else float("nan")
-        rows.append({
-            "pause_event_id": str(uuid.uuid4()),
-            "pause_date": today_msk,
-            "campaign_id": campaign_id_clean,
-            "nm_id": main.get("nm_id", ""),
-            "placement": "combined",
-            "supplier_article": main.get("supplier_article", ""),
-            "subject_norm": main.get("subject_norm", ""),
-            "reason_code": EXPERIMENT_2_REASON_CODE,
-            "impressions_before_pause": impressions,
-            "clicks_before_pause": clicks,
-            "spend_before_pause": spend,
-            "revenue_before_pause": revenue,
-            "orders_before_pause": orders,
-            "drr_before_pause": drr,
-            "gp_before_pause": gp,
-            "status": "candidate",
-            "next_check_date": today_msk,
-            "api_status": "",
-        })
-    return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
-
-
-def build_experiment_2_start_candidates(pause_history: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    """После 05:00 МСК возвращаем кампании, которые были выключены Экспериментом 2."""
-    if pause_history is None or pause_history.empty or is_night_experiment_window(ctx):
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    latest = latest_pause_records(pause_history)
-    if latest.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    rows: List[Dict[str, Any]] = []
-    today_msk = moscow_now(ctx).date().isoformat()
-    for _, row in latest.iterrows():
-        status = _clean_text_value(row.get("status", "")).lower()
-        if status not in {"paused", "keep_paused"}:
-            continue
-        if _clean_text_value(row.get("reason_code", "")) != EXPERIMENT_2_REASON_CODE:
-            continue
-        rows.append({
-            "pause_event_id": str(uuid.uuid4()),
-            "pause_date": today_msk,
-            "campaign_id": row.get("campaign_id", ""),
-            "nm_id": row.get("nm_id", ""),
-            "placement": row.get("placement", "combined"),
-            "supplier_article": row.get("supplier_article", ""),
-            "subject_norm": row.get("subject_norm", ""),
-            "reason_code": EXPERIMENT_2_START_REASON_CODE,
-            "impressions_before_pause": row.get("impressions_before_pause", 0),
-            "clicks_before_pause": row.get("clicks_before_pause", 0),
-            "spend_before_pause": row.get("spend_before_pause", 0),
-            "revenue_before_pause": row.get("revenue_before_pause", 0),
-            "orders_before_pause": row.get("orders_before_pause", 0),
-            "drr_before_pause": row.get("drr_before_pause", 0),
-            "gp_before_pause": row.get("gp_before_pause", float("nan")),
-            "status": "restart_candidate",
-            "next_check_date": today_msk,
-            "api_status": "",
-        })
-    return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
-
-
-def build_experiments_description(ctx: RunContext) -> pd.DataFrame:
-    now_msk = moscow_now(ctx)
-    return pd.DataFrame([
-        {
-            "experiment_id": "EXP1_NIGHT_MIN_BID_901_6_2_8",
-            "Название": "Эксперимент 1 — ночная минимальная ставка",
-            "Окно МСК": night_experiment_window_text(),
-            "Статус окна сейчас": "активно" if is_night_experiment_window(ctx) else "не активно",
-            "Товары/артикулы": "901/6, 901/2, 901/8",
-            "Правило": "В 01:00-05:00 МСК ставим минимально допустимую ставку: CPC/search 4 ₽ или min WB; combined/полки 80 ₽ или min WB.",
-            "Гипотеза": "В ночные часы часть конкурентов выключает рекламу, конкуренция ниже, поэтому нет смысла держать высокую ставку.",
-            "Как оценивать": "Сравнить ночные клики, CTR, заказы, ДРР, CORE-клики и расход до/после. Если клики не падают, а расход ниже — оставить.",
-            "now_msk": now_msk.strftime("%Y-%m-%d %H:%M:%S"),
-        },
-        {
-            "experiment_id": "EXP2_NIGHT_COMBINED_DRR_GT_15_PAUSE",
-            "Название": "Эксперимент 2 — ночная пауза дорогих полок",
-            "Окно МСК": night_experiment_window_text(),
-            "Статус окна сейчас": "активно" if is_night_experiment_window(ctx) else "не активно",
-            "Товары/артикулы": "все managed combined/полки",
-            "Правило": "Если combined/полка имеет ДРР > 15%, в 01:00-05:00 МСК ставим РК на паузу; после 05:00 МСК запускаем обратно.",
-            "Гипотеза": "Дорогие полки ночью могут докупать слабый трафик; экономим бюджет, но не трогаем дневную работу.",
-            "Как оценивать": "Сравнить ночной расход, клики, заказы, корзины и ДРР по combined. Если экономим без потери целевых кликов/заказов — оставить.",
-            "now_msk": now_msk.strftime("%Y-%m-%d %H:%M:%S"),
-        },
-    ])
-
-
-def is_ramp_related_reason(reason_code: Any, wait_rule: Any = "", last_reason_code: Any = "") -> bool:
-    text = " ".join([
-        _clean_text_value(reason_code).upper(),
-        _clean_text_value(wait_rule).upper(),
-        _clean_text_value(last_reason_code).upper(),
-    ])
-    return "RAMP" in text or "РАЗГОН" in text or "LOW_BID_NO_SPEND_NO_ORDERS" in text or "WAIT_D7" in text
-
-
-def is_ramp_candidate_by_metrics(row: pd.Series | Dict[str, Any]) -> bool:
-    """Кампания подходит под старт/контроль разгона: расход ниже 500 ₽/день или трафик ниже 1000 показов/день."""
-    if not is_active_campaign(row.get("campaign_status", "")):
-        return False
-    if not is_managed_subject(row.get("subject_norm", "")):
-        return False
-    avg_imp = money_or_zero(row.get("avg_impressions_per_day", 0))
-    avg_spend = money_or_zero(row.get("avg_spend_per_day", 0))
-    return avg_spend < RAMP_TARGET_SPEND_PER_DAY or avg_imp < RAMP_TARGET_IMPRESSIONS_PER_DAY
-
-
-def classify_ramp_status(row: pd.Series | Dict[str, Any]) -> Tuple[str, str, bool]:
-    """Возвращает статус режима Разгон для отчёта: статус, группа причины, применён ли режим."""
-    reason_code = _clean_text_value(row.get("reason_code", ""))
-    wait_rule = _clean_text_value(row.get("wait_rule", ""))
-    wait_status = _clean_text_value(row.get("wait_status", ""))
-    last_reason = _clean_text_value(row.get("last_bid_change_reason_code", ""))
-    action = _clean_text_value(row.get("action", ""))
-    api_status = _clean_text_value(row.get("api_status", row.get("ramp_api_status", "")))
-    candidate = is_ramp_candidate_by_metrics(row)
-    related = is_ramp_related_reason(reason_code, wait_rule, last_reason)
-    reason_upper = reason_code.upper()
-    wait_upper = wait_rule.upper()
-    api_ok = api_status.isdigit() and 200 <= int(api_status) < 300
-
-    if api_ok and action in {"Повысить", "Снизить"} and related:
-        return "РАЗГОН_ПРИМЕНЕН_СЕЙЧАС_API_200", "APPLIED_NOW", True
-    if wait_status == "RAMP_ACTIVE_DAILY_CONTROL" or _clean_text_value(row.get("ramp_lifecycle_status", "")) == "RAMP_ACTIVE_DAILY_CONTROL":
-        if reason_upper == "RAMP_DAILY_TARGET_SPEND_REACHED_HOLD":
-            return "РАЗГОН_АКТИВЕН_ЦЕЛЬ_ДНЕВНАЯ_ДОСТИГНУТА", "ACTIVE_DAILY_TARGET_REACHED", True
-        return "РАЗГОН_АКТИВЕН_ЕЖЕДНЕВНЫЙ_КОНТРОЛЬ", "ACTIVE_DAILY_CONTROL", True
-    if wait_status == "RAMP_FINISHED_NORMAL_MODE" or _clean_text_value(row.get("ramp_lifecycle_status", "")) == "RAMP_FINISHED_NORMAL_MODE":
-        return "РАЗГОН_ЗАВЕРШЕН_ОБЫЧНЫЙ_РЕЖИМ", "FINISHED_NORMAL_MODE", False
-    if ("WAIT_D7_RAMP" in reason_upper or "WAIT_D7_RAMP" in wait_upper or "RAMP" in last_reason.upper()) and wait_status == "WAIT_ACTIVE":
-        return "РАЗГОН_АКТИВЕН_ЖДЕМ_D7", "ACTIVE_WAIT_D7", True
-    if related and "WB_MIN_BID_NOT_ALLOWED" in reason_upper:
-        return "РАЗГОН_ПОДХОДИТ_НО_БЛОК_MIN_WB", "BLOCKED_BY_MIN_BID", False
-    if action == "Повысить" and related:
-        return "РАЗГОН_К_ОТПРАВКЕ", "TO_SEND", False
-    if candidate and wait_status == "WAIT_ACTIVE" and not related:
-        return "РАЗГОН_ПОДХОДИТ_НО_ЖДЕМ_ДРУГОЙ_POSTCHECK", "WAIT_OTHER_POSTCHECK", False
-    if candidate and reason_code in {"NOT_ACTIVE", "MISSING_KEY", "NOT_MANAGED_SUBJECT"}:
-        return "РАЗГОН_НЕ_МОЖЕТ_БЫТЬ_ПРИМЕНЕН", "TECHNICAL_BLOCK", False
-    if candidate:
-        return "РАЗГОН_ПОДХОДИТ_ПО_МЕТРИКАМ_НО_НЕ_ВКЛЮЧЕН", "CANDIDATE_BY_METRICS", False
-    if related:
-        return "РАЗГОН_КОНТРОЛЬ", "RELATED_CONTROL", False
-    return "", "", False
-
-def build_decisions(
-    metrics_df: pd.DataFrame,
-    pending_events: Dict[Tuple[str, str, str], Dict[str, Any]],
-    postcheck_results: Dict[Tuple[str, str, str], Dict[str, Any]],
-    ctx: Optional[RunContext] = None,
-    ramp_states: Optional[Dict[Tuple[str, str, str], Dict[str, Any]]] = None,
-) -> pd.DataFrame:
-    if metrics_df.empty:
-        return pd.DataFrame(columns=DECISION_COLUMNS)
-    rows: List[Dict[str, Any]] = []
-    for _, row in metrics_df.iterrows():
-        key = make_key(row)
-        pending = pending_events.get(key)
-        latest_result = postcheck_results.get(key)
-        ramp_state = (ramp_states or {}).get(key, {})
-        reference_event = pending or latest_result or {}
-        decision = decide_action(row, pending_event=pending, postcheck_result=latest_result, ramp_state=ramp_state, ctx=ctx)
-        previous_event_id = _clean_text_value((latest_result or {}).get("event_id", ""))
-        postcheck_status = _clean_text_value((latest_result or {}).get("postcheck_status", ""))
-        days_since_last_bid_change = ""
-        last_change_dt = pd.to_datetime((reference_event or {}).get("event_date", ""), errors="coerce") if reference_event else pd.NaT
-        if not pd.isna(last_change_dt) and ctx is not None:
-            days_since_last_bid_change = max((ctx.run_datetime.date() - last_change_dt.date()).days, 0)
-        wait_info = pending_wait_info(reference_event, ctx) if reference_event else {
-            "wait_rule": "", "wait_until_date": "", "wait_days_left": "", "wait_status": "NO_PREVIOUS_EVENT"
-        }
-        if pending is None and reference_event:
-            wait_info["wait_status"] = "WAIT_EXPIRED_OR_RESOLVED"
-        if ramp_state.get("active"):
-            wait_info = {
-                "wait_rule": "RAMP_DAILY_CONTROL_14D",
-                "wait_until_date": "",
-                "wait_days_left": ramp_state.get("ramp_days_left", ""),
-                "wait_status": "RAMP_ACTIVE_DAILY_CONTROL",
-            }
-        elif ramp_state.get("completed") and pending is None:
-            wait_info = {
-                "wait_rule": "RAMP_FINISHED_NORMAL_MODE",
-                "wait_until_date": "",
-                "wait_days_left": 0,
-                "wait_status": "RAMP_FINISHED_NORMAL_MODE",
-            }
-        out = {
-            "campaign_id": row.get("campaign_id", ""),
-            "nm_id": row.get("nm_id", ""),
-            "supplier_article": row.get("supplier_article", ""),
-            "subject_norm": row.get("subject_norm", ""),
-            "placement": row.get("placement", ""),
-            "campaign_status": row.get("campaign_status", ""),
-            "current_bid_rub": row.get("current_bid_rub", 0),
-            "min_bid_rub": row.get("min_bid_rub", float("nan")),
-            "drr_limit_pct": row.get("drr_limit_pct", drr_limit_for_subject(row.get("subject_norm", ""))),
-            "avg_impressions_per_day": row.get("avg_impressions_per_day", 0),
-            "avg_spend_per_day": row.get("avg_spend_per_day", 0),
-            "last21_impressions": row.get("last21_impressions", 0),
-            "last21_spend": row.get("last21_spend", 0),
-            "last21_revenue": row.get("last21_revenue", 0),
-            "last21_orders": row.get("last21_orders", 0),
-            "last21_drr_pct": row.get("last21_drr_pct", 0),
-            "last21_avg_impressions_per_day": row.get("last21_avg_impressions_per_day", 0),
-            "last21_avg_spend_per_day": row.get("last21_avg_spend_per_day", 0),
-            "new_bid_rub": decision.get("new_bid_rub"),
-            "action": decision.get("action", "Без изменений"),
-            "reason_code": decision.get("reason_code", ""),
-            "reason_text": decision.get("reason_text", ""),
-            "spend": row.get("spend", 0),
-            "revenue": row.get("revenue", 0),
-            "orders": row.get("orders", 0),
-            "impressions": row.get("impressions", 0),
-            "clicks": row.get("clicks", 0),
-            "campaign_drr_pct": row.get("campaign_drr_pct", 0),
-            "cpo": row.get("cpo", 0),
-            "ctr_pct": row.get("ctr_pct", 0),
-            "gp_after_ads": row.get("gp_after_ads", float("nan")),
-            "abc_profitability_pct": row.get("abc_profitability_pct", float("nan")),
-            "abc_profitability_status": row.get("abc_profitability_status", ""),
-            "abc_drr_pct": row.get("abc_drr_pct", float("nan")),
-            "abc_gross_profit": row.get("abc_gross_profit", float("nan")),
-            "abc_gross_revenue": row.get("abc_gross_revenue", float("nan")),
-            "abc_period_start": row.get("abc_period_start", ""),
-            "abc_period_end": row.get("abc_period_end", ""),
-            "abc_source_file": row.get("abc_source_file", ""),
-            "abc_match_method": row.get("abc_match_method", ""),
-            "previous_event_id": previous_event_id,
-            "postcheck_status": postcheck_status,
-            "last_bid_change_event_id": _clean_text_value(reference_event.get("event_id", "")) if reference_event else "",
-            "last_bid_change_date": _clean_text_value(reference_event.get("event_date", "")) if reference_event else "",
-            "days_since_last_bid_change": days_since_last_bid_change,
-            "last_bid_change_old_bid": reference_event.get("old_bid_rub", "") if reference_event else "",
-            "last_bid_change_new_bid": reference_event.get("new_bid_rub", "") if reference_event else "",
-            "last_bid_change_direction": _clean_text_value(reference_event.get("direction", "")) if reference_event else "",
-            "last_bid_change_reason_code": _clean_text_value(reference_event.get("reason_code", "")) if reference_event else "",
-            "wait_rule": wait_info.get("wait_rule", ""),
-            "wait_until_date": wait_info.get("wait_until_date", ""),
-            "wait_days_left": wait_info.get("wait_days_left", ""),
-            "wait_status": wait_info.get("wait_status", ""),
-            "pause_decision": decision.get("pause_decision", ""),
-            "ramp_lifecycle_status": ramp_state.get("ramp_lifecycle_status", ""),
-            "ramp_start_date": ramp_state.get("ramp_start_date", ""),
-            "ramp_day": ramp_state.get("ramp_day", ""),
-            "ramp_days_left": ramp_state.get("ramp_days_left", ""),
-        }
-        for keyword_col in KEYWORD_TRAFFIC_GUARD_COLUMNS:
-            if keyword_col in {"nm_id", "supplier_article", "subject_norm"}:
-                continue
-            out[keyword_col] = row.get(keyword_col, "")
-        ramp_status, ramp_reason_group, ramp_applied = classify_ramp_status(out)
-        out["ramp_candidate"] = bool(is_ramp_candidate_by_metrics(out) or bool(ramp_state.get("active")))
-        out["ramp_status"] = ramp_status
-        out["ramp_applied_in_current_run"] = bool(ramp_applied and _clean_text_value(out.get("ramp_api_status", "")))
-        out["ramp_api_status"] = ""
-        rows.append(out)
-    result = pd.DataFrame(rows)
-    for col in DECISION_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    return result[DECISION_COLUMNS]
-
-
-# =============================
-# API ставок и запись истории
-# =============================
-
-def wb_headers(config: Config) -> Dict[str, str]:
-    return {
-        "Authorization": config.wb_promo_key,
-        "Content-Type": "application/json",
-    }
-
-
-def to_int_id(value: Any) -> Optional[int]:
-    text = _clean_id_value(value)
-    if re.fullmatch(r"\d+", text):
-        return int(text)
-    return None
-
-
-def build_bid_payload(row: pd.Series) -> Optional[Dict[str, Any]]:
-    advert_id = to_int_id(row.get("campaign_id", ""))
-    nm_id = to_int_id(row.get("nm_id", ""))
-    placement = normalize_placement_value(row.get("placement", ""))
-    new_bid = row.get("new_bid_rub")
-    if advert_id is None or nm_id is None or not placement or pd.isna(new_bid):
-        return None
-    api_bid_rub = normalize_bid_to_api_grid(float(new_bid), placement, row.get("action", ""))
-    bid_kopecks = int(round(api_bid_rub * 100))
-    return {
-        "bids": [
-            {
-                "advert_id": advert_id,
-                "nm_bids": [
-                    {
-                        "nm_id": nm_id,
-                        "bid_kopecks": bid_kopecks,
-                        "placement": placement,
-                    }
-                ],
-            }
-        ]
-    }
-
-
-def api_log_row(run_datetime: datetime, method: str, endpoint: str, payload: Any, status: str, response_text: str, campaign_id: Any = "", nm_id: Any = "", placement: Any = "") -> Dict[str, Any]:
-    return {
-        "run_datetime": run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-        "method": method,
-        "endpoint": endpoint,
-        "campaign_id": campaign_id,
-        "nm_id": nm_id,
-        "placement": placement,
-        "payload": json.dumps(payload, ensure_ascii=False) if payload not in (None, "") else "",
-        "api_status": status,
-        "response_text": str(response_text)[:1000],
-    }
-
-
-
-def placement_for_min_endpoint(value: Any) -> str:
-    placement = normalize_placement_value(value)
-    if placement == "recommendations":
-        return "recommendation"
-    if placement in {"search", "combined", "recommendation"}:
-        return placement
-    return "search"
-
-
-def infer_payment_type_for_min(row: pd.Series) -> str:
-    placement = normalize_placement_value(row.get("placement", ""))
-    # В текущем отчёте нет надёжной отдельной колонки payment_type, поэтому для WB min endpoint:
-    # combined считаем CPM, search/recommendations считаем CPC.
-    return "cpm" if placement == "combined" else "cpc"
-
-
-def fetch_wb_min_bids_for_decisions(decisions: pd.DataFrame, config: Config, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Получает минимальные ставки WB для активных управляемых строк перед отправкой изменений."""
-    empty_min = pd.DataFrame(columns=MIN_BID_COLUMNS)
-    empty_log = pd.DataFrame(columns=["run_datetime", "method", "endpoint", "campaign_id", "nm_id", "placement", "payload", "api_status", "response_text"])
-    if decisions is None or decisions.empty:
-        return empty_min, empty_log
-
-    work = decisions.copy()
-    # Минимальные ставки нужны не только перед отправкой, но и для объяснения WAIT/TECHNICAL_FLOOR:
-    # если текущая ставка уже равна минимальной WB, код не должен писать "ждём" вместо "снижать нельзя".
-    work = work[
-        work["campaign_id"].map(_clean_id_value).ne("")
-        & work["nm_id"].map(_clean_id_value).ne("")
-        & work["placement"].map(normalize_placement_value).ne("")
-        & work["subject_norm"].map(is_managed_subject)
-        & work["campaign_status"].map(is_active_campaign)
-    ].copy()
-    if work.empty:
-        return empty_min, empty_log
-
-    work["payment_type_for_min"] = work.apply(infer_payment_type_for_min, axis=1)
-    work["placement_for_min"] = work["placement"].map(placement_for_min_endpoint)
-    work["campaign_id_int"] = work["campaign_id"].map(to_int_id)
-    work["nm_id_int"] = work["nm_id"].map(to_int_id)
-    work = work.dropna(subset=["campaign_id_int", "nm_id_int"]).copy()
-    if work.empty:
-        return empty_min, empty_log
-
-    url = config.wb_base_url.rstrip("/") + WB_BIDS_MIN_ENDPOINT
-    min_rows: List[Dict[str, Any]] = []
-    api_logs: List[Dict[str, Any]] = []
-
-    if not config.wb_promo_key:
-        api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_BIDS_MIN_ENDPOINT, {}, "skipped", "Нет WB_PROMO_KEY_TOPFACE"))
-        return pd.DataFrame(min_rows, columns=MIN_BID_COLUMNS), pd.DataFrame(api_logs)
-
-    for (campaign_id, payment_type), grp in work.groupby(["campaign_id_int", "payment_type_for_min"], dropna=True):
-        nm_ids_all = sorted({int(x) for x in grp["nm_id_int"].tolist() if pd.notna(x) and int(x) > 0})
-        placement_types = sorted({placement_for_min_endpoint(x) for x in grp["placement_for_min"].tolist() if _clean_text_value(x)})
-        if not nm_ids_all:
-            continue
-        for offset in range(0, len(nm_ids_all), 100):
-            nm_chunk = nm_ids_all[offset:offset + 100]
-            payload = {
-                "advert_id": int(campaign_id),
-                "nm_ids": nm_chunk,
-                "payment_type": str(payment_type),
-                "placement_types": placement_types or ["search"],
-            }
-            try:
-                resp = requests.post(url, headers=wb_headers(config), json=payload, timeout=60)
-                api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_BIDS_MIN_ENDPOINT, payload, str(resp.status_code), resp.text, campaign_id=campaign_id))
-                if 200 <= resp.status_code < 300:
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        data = {}
-                    for item in data.get("bids", []) or []:
-                        nm_id = to_int_id(item.get("nm_id", ""))
-                        if nm_id is None:
-                            continue
-                        for bid_item in item.get("bids", []) or []:
-                            placement_type = placement_for_min_endpoint(bid_item.get("type", ""))
-                            value_kopecks = pd.to_numeric(bid_item.get("value", None), errors="coerce")
-                            if pd.isna(value_kopecks) or float(value_kopecks) <= 0:
-                                continue
-                            min_rows.append({
-                                "run_datetime": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-                                "campaign_id": str(int(campaign_id)),
-                                "nm_id": str(int(nm_id)),
-                                "placement": "recommendations" if placement_type == "recommendation" else placement_type,
-                                "payment_type": str(payment_type),
-                                "min_bid_rub": round(float(value_kopecks) / 100.0, 2),
-                                "api_status": str(resp.status_code),
-                                "response_text": "",
-                            })
-                # endpoint имеет ограничение по частоте; выдерживаем паузу как в старом рабочем коде.
-                time.sleep(3.1)
-            except Exception as exc:
-                api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_BIDS_MIN_ENDPOINT, payload, "exception", repr(exc), campaign_id=campaign_id))
-
-    min_df = pd.DataFrame(min_rows, columns=MIN_BID_COLUMNS).drop_duplicates() if min_rows else empty_min
-    return min_df, pd.DataFrame(api_logs)
-
-
-def enrich_frame_with_effective_min_bids(frame: pd.DataFrame, min_bids_df: pd.DataFrame) -> pd.DataFrame:
-    """Добавляет effective min_bid_rub в любой датафрейм с campaign_id/nm_id/placement.
-
-    Это нужно до расчёта решений: код должен видеть реальные минимальные ставки WB заранее,
-    особенно для combined/полок, где минимум сейчас 80 ₽.
-    """
-    if frame is None or frame.empty:
-        return frame if frame is not None else pd.DataFrame()
-    result = frame.copy()
-    if "min_bid_rub" not in result.columns:
-        result["min_bid_rub"] = float("nan")
-    if min_bids_df is None or min_bids_df.empty:
-        # Даже если WB min API недоступен, бизнес-минимум для combined должен быть 80 ₽.
-        for idx, row in result.iterrows():
-            fallback = business_min_bid_rub(row.get("placement", ""))
-            cur = pd.to_numeric(row.get("min_bid_rub", None), errors="coerce")
-            if pd.isna(cur) or float(cur) <= 0:
-                result.at[idx, "min_bid_rub"] = fallback
-            else:
-                result.at[idx, "min_bid_rub"] = max(float(cur), fallback)
-        return result
-
-    lookup: Dict[Tuple[str, str, str], float] = {}
-    for _, r in min_bids_df.iterrows():
-        key = (
-            _clean_id_value(r.get("campaign_id", "")),
-            _clean_id_value(r.get("nm_id", "")),
-            normalize_placement_value(r.get("placement", "")),
-        )
-        val = pd.to_numeric(r.get("min_bid_rub", None), errors="coerce")
-        if all(key) and not pd.isna(val) and float(val) > 0:
-            lookup[key] = float(val)
-
-    for idx, row in result.iterrows():
-        key = make_key(row)
-        fallback = business_min_bid_rub(row.get("placement", ""))
-        min_bid = lookup.get(key)
-        if min_bid is None:
-            current = pd.to_numeric(row.get("min_bid_rub", None), errors="coerce")
-            min_bid = fallback if pd.isna(current) or float(current) <= 0 else float(current)
-        result.at[idx, "min_bid_rub"] = round(max(float(min_bid), fallback), 2)
-    return result
-
-
-def ramp_control_product_key(row: pd.Series | Dict[str, Any]) -> str:
-    subject = normalize_subject_value(row.get("subject_norm", ""))
-    article = _clean_text_value(row.get("supplier_article", ""))
-    if subject == "кисти косметические":
-        return article
-    return product_group_from_article(article)
-
-
-def ramp_sample_tier(clicks: float, orders: float) -> int:
-    clicks = float(clicks or 0)
-    orders = float(orders or 0)
-    if clicks >= 200:
-        tier = 3
-    elif clicks >= 100:
-        tier = 2
-    elif clicks >= 50:
-        tier = 1
-    else:
-        tier = 0
-    if orders <= 0:
-        tier = min(tier, 1)
-    return int(tier)
-
-
-def ramp_selection_score(row: pd.Series | Dict[str, Any]) -> float:
-    clicks = money_or_zero(row.get("clicks", 0))
-    orders = money_or_zero(row.get("orders", 0))
-    impressions = money_or_zero(row.get("impressions", 0))
-    ctr = money_or_zero(row.get("ctr_pct", safe_ctr_pct(clicks, impressions)))
-    conv = (orders / clicks * 100.0) if clicks > 0 else 0.0
-    tier = ramp_sample_tier(clicks, orders)
-    score = tier * 10000.0 + conv * 120.0 + ctr * 80.0 + math.log1p(clicks) * 100.0 + orders * 10.0
-    avg_spend = money_or_zero(row.get("avg_spend_per_day", 0))
-    drr = money_or_zero(row.get("campaign_drr_pct", 999))
-    gp = pd.to_numeric(pd.Series([row.get("gp_after_ads", float("nan"))]), errors="coerce").iloc[0]
-    if avg_spend >= RAMP_TARGET_SPEND_PER_DAY and (drr >= RAMP_SCALE_DRR_LIMIT_PCT or (not pd.isna(gp) and float(gp) <= 0)):
-        score -= 5000.0
-    return float(score)
-
-
-def is_ramp_raise_decision(row: pd.Series | Dict[str, Any]) -> bool:
-    return (
-        _clean_text_value(row.get("action", "")) == "Повысить"
-        and is_ramp_related_reason(row.get("reason_code", ""), row.get("wait_rule", ""), row.get("last_bid_change_reason_code", ""))
-    )
-
-
-def normalize_decision_bids_final(decisions: pd.DataFrame) -> pd.DataFrame:
-    """Последний предохранитель перед API: никаких дробных ставок и ставок ниже min WB."""
-    if decisions is None or decisions.empty:
-        return pd.DataFrame(columns=DECISION_COLUMNS)
-    result = decisions.copy()
-    for idx, row in result.iterrows():
-        action = _clean_text_value(row.get("action", ""))
-        if action not in {"Повысить", "Снизить"}:
-            continue
-        new_bid = pd.to_numeric(row.get("new_bid_rub", None), errors="coerce")
-        if pd.isna(new_bid):
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "reason_code"] = (_clean_text_value(row.get("reason_code", "")) + "__NO_NEW_BID").strip("_")
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, "нет рассчитанной новой ставки")
-            continue
-        placement = row.get("placement", "")
-        min_bid = pd.to_numeric(row.get("min_bid_rub", business_min_bid_rub(placement)), errors="coerce")
-        if pd.isna(min_bid) or float(min_bid) <= 0:
-            min_bid = business_min_bid_rub(placement)
-        min_bid = max(float(min_bid), business_min_bid_rub(placement))
-        normalized = normalize_bid_to_api_grid(new_bid, placement, action)
-        if action == "Повысить" and normalized < min_bid:
-            normalized = normalize_bid_to_api_grid(min_bid, placement, action)
-        if action == "Снизить" and normalized < min_bid:
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            result.at[idx, "reason_code"] = (_clean_text_value(row.get("reason_code", "")) + "__WB_MIN_BID_REACHED").strip("_")
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"снижение ниже effective min_bid {min_bid:.0f} ₽ запрещено")
-            continue
-        result.at[idx, "new_bid_rub"] = float(normalized)
-    for col in DECISION_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    return result[DECISION_COLUMNS]
-
-
-def select_ramp_campaigns_per_product_placement(decisions: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Оставляет в разгоне максимум одну РК на товар и placement.
-
-    Для кистей товар = конкретный артикул. Для помад/блесков/карандашей товар = product_root
-    (209, 155, 617 и т.д.). Отдельно допускается 1 search/CPC и 1 combined/полки.
-    Выбор: достаточность кликов -> конверсия в заказ -> CTR -> заказы -> клики.
-    """
-    if decisions is None or decisions.empty:
-        return pd.DataFrame(columns=DECISION_COLUMNS), pd.DataFrame(columns=RAMP_SELECTION_COLUMNS)
-    result = decisions.copy()
-    work = result.copy()
-    work["subject_norm_norm"] = work.get("subject_norm", "").map(normalize_subject_value)
-    work["placement_norm"] = work.get("placement", "").map(normalize_placement_value)
-    work["control_product"] = work.apply(ramp_control_product_key, axis=1)
-    work["is_active"] = work.get("campaign_status", "").map(is_active_campaign)
-    work["is_managed"] = work.get("subject_norm", "").map(is_managed_subject)
-    work["is_ramp_context"] = work.apply(lambda r: is_ramp_related_reason(r.get("reason_code", ""), r.get("wait_rule", ""), r.get("last_bid_change_reason_code", "")) or bool(r.get("ramp_candidate", False)), axis=1)
-    work["is_ramp_raise"] = work.apply(is_ramp_raise_decision, axis=1)
-    work["score"] = work.apply(ramp_selection_score, axis=1)
-    work["clicks_num"] = pd.to_numeric(work.get("clicks", 0), errors="coerce").fillna(0.0)
-    work["orders_num"] = pd.to_numeric(work.get("orders", 0), errors="coerce").fillna(0.0)
-    work["ctr_num"] = pd.to_numeric(work.get("ctr_pct", 0), errors="coerce").fillna(0.0)
-    work["conv_num"] = work.apply(lambda r: (money_or_zero(r.get("orders", 0)) / money_or_zero(r.get("clicks", 0)) * 100.0) if money_or_zero(r.get("clicks", 0)) > 0 else 0.0, axis=1)
-    work["sample_tier"] = work.apply(lambda r: ramp_sample_tier(r.get("clicks_num", 0), r.get("orders_num", 0)), axis=1)
-
-    pool = work[
-        work["is_active"] & work["is_managed"]
-        & work["placement_norm"].isin(["search", "combined"])
-        & work["control_product"].astype(str).str.strip().ne("")
-        & work["is_ramp_context"]
-    ].copy()
-    if pool.empty:
-        return normalize_decision_bids_final(result), pd.DataFrame(columns=RAMP_SELECTION_COLUMNS)
-
-    selected_index_by_group: Dict[Tuple[str, str, str], int] = {}
-    selection_rows: List[Dict[str, Any]] = []
-    for group_key, g in pool.groupby(["subject_norm_norm", "control_product", "placement_norm"], dropna=False):
-        ranked = g.sort_values(["sample_tier", "conv_num", "ctr_num", "orders_num", "clicks_num", "score"], ascending=False)
-        selected = ranked.iloc[0]
-        selected_idx = int(selected.name)
-        selected_index_by_group[group_key] = selected_idx
-        blocked = [str(x) for x in ranked.index.tolist() if int(x) != selected_idx and bool(work.at[x, "is_ramp_raise"])]
-        blocked_campaign_ids = sorted({_clean_id_value(work.at[int(i), "campaign_id"]) for i in blocked if _clean_id_value(work.at[int(i), "campaign_id"])})
-        selection_rows.append({
-            "subject_norm": group_key[0],
-            "control_product": group_key[1],
-            "placement": group_key[2],
-            "selected_campaign_id": selected.get("campaign_id", ""),
-            "selected_nm_id": selected.get("nm_id", ""),
-            "selected_supplier_article": selected.get("supplier_article", ""),
-            "selected_current_bid_rub": selected.get("current_bid_rub", ""),
-            "selected_min_bid_rub": selected.get("min_bid_rub", ""),
-            "selected_new_bid_rub": selected.get("new_bid_rub", ""),
-            "selected_avg_spend_per_day": selected.get("avg_spend_per_day", ""),
-            "selected_avg_impressions_per_day": selected.get("avg_impressions_per_day", ""),
-            "selected_clicks": selected.get("clicks", ""),
-            "selected_orders": selected.get("orders", ""),
-            "selected_ctr_pct": selected.get("ctr_pct", ""),
-            "selected_conversion_pct": selected.get("conv_num", ""),
-            "selected_drr_pct": selected.get("campaign_drr_pct", ""),
-            "selected_gp_after_ads": selected.get("gp_after_ads", ""),
-            "selected_score": selected.get("score", ""),
-            "selected_sample_tier": selected.get("sample_tier", ""),
-            "selection_status": "selected_one_per_product_placement",
-            "reason_text": f"выбрана 1 РК на товар+placement: клики={money_or_zero(selected.get('clicks',0)):.0f}, заказы={money_or_zero(selected.get('orders',0)):.0f}, CTR={money_or_zero(selected.get('ctr_pct',0)):.2f}%, CR={selected.get('conv_num',0):.2f}%",
-            "blocked_campaign_ids": ",".join(blocked_campaign_ids),
-        })
-
-    for idx, row in work[work["is_ramp_raise"]].iterrows():
-        group_key = (row.get("subject_norm_norm", ""), row.get("control_product", ""), row.get("placement_norm", ""))
-        selected_idx = selected_index_by_group.get(group_key)
-        if selected_idx is None:
-            continue
-        selected = work.loc[selected_idx]
-        if int(idx) != int(selected_idx):
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            result.at[idx, "reason_code"] = "RAMP_BLOCKED_NOT_BEST_PRODUCT_PLACEMENT"
-            result.at[idx, "reason_text"] = build_reason_text(
-                result.loc[idx],
-                "Без изменений",
-                None,
-                (
-                    f"разгон заблокирован: на товар {group_key[1]} / {group_key[2]} разрешена только одна РК. "
-                    f"Выбрана campaign_id={_clean_id_value(selected.get('campaign_id',''))}, "
-                    f"артикул={_clean_text_value(selected.get('supplier_article',''))}, "
-                    f"клики={money_or_zero(selected.get('clicks',0)):.0f}, заказы={money_or_zero(selected.get('orders',0)):.0f}, "
-                    f"CTR={money_or_zero(selected.get('ctr_pct',0)):.2f}%, CR={selected.get('conv_num',0):.2f}%"
-                ),
-            )
-            continue
-
-        # Даже выбранную РК не усиливаем, если выбор статистически уже показал плохой тест.
-        clicks = money_or_zero(row.get("clicks", 0))
-        orders = money_or_zero(row.get("orders", 0))
-        avg_spend = money_or_zero(row.get("avg_spend_per_day", 0))
-        drr = money_or_zero(row.get("campaign_drr_pct", 999))
-        gp = pd.to_numeric(pd.Series([row.get("gp_after_ads", float("nan"))]), errors="coerce").iloc[0]
-        revenue = money_or_zero(row.get("revenue", 0))
-        if clicks >= 50 and orders <= 0:
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            result.at[idx, "reason_code"] = "RAMP_BLOCKED_NO_ORDERS_AFTER_50_CLICKS"
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"разгон заблокирован: уже было {clicks:.0f} кликов без заказов; сначала не повышаем ставку")
-            continue
-        if avg_spend >= RAMP_TARGET_SPEND_PER_DAY and (drr >= RAMP_SCALE_DRR_LIMIT_PCT or revenue <= 0 or orders <= 0 or (not pd.isna(gp) and float(gp) <= 0)):
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            result.at[idx, "reason_code"] = "RAMP_BLOCKED_AFTER_500_ECONOMY_CONTROL"
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"после 500 ₽/день масштабирование запрещено: ДРР={drr:.2f}%, выручка={revenue:.0f}, заказы={orders:.0f}, ВП={0 if pd.isna(gp) else float(gp):.0f}")
-            continue
-
-    out = pd.DataFrame(selection_rows, columns=RAMP_SELECTION_COLUMNS)
-    return normalize_decision_bids_final(result), out
-
-
-def enrich_decisions_with_min_bids(decisions: pd.DataFrame, min_bids_df: pd.DataFrame) -> pd.DataFrame:
-    if decisions is None or decisions.empty:
-        return pd.DataFrame(columns=DECISION_COLUMNS)
-    result = enrich_frame_with_effective_min_bids(decisions, min_bids_df)
-
-    for idx, row in result.iterrows():
-        min_bid = pd.to_numeric(row.get("min_bid_rub", business_min_bid_rub(row.get("placement", ""))), errors="coerce")
-        if pd.isna(min_bid) or float(min_bid) <= 0:
-            min_bid = business_min_bid_rub(row.get("placement", ""))
-        min_bid = max(float(min_bid), business_min_bid_rub(row.get("placement", "")))
-        result.at[idx, "min_bid_rub"] = round(min_bid, 2)
-
-        current_bid = pd.to_numeric(row.get("current_bid_rub", None), errors="coerce")
-        new_bid = pd.to_numeric(row.get("new_bid_rub", None), errors="coerce")
-        if pd.isna(current_bid):
-            continue
-        current_bid_f = float(current_bid)
-
-        drr_current = pd.to_numeric(row.get("campaign_drr_pct", 0), errors="coerce")
-        if pd.isna(drr_current):
-            drr_current = 0.0
-        drr_limit = pd.to_numeric(row.get("drr_limit_pct", drr_limit_for_subject(row.get("subject_norm", ""))), errors="coerce")
-        if pd.isna(drr_limit) or float(drr_limit) <= 0:
-            drr_limit = drr_limit_for_subject(row.get("subject_norm", ""))
-        drr_limit_f = float(drr_limit)
-
-        last21_impressions = money_or_zero(row.get("last21_impressions", row.get("impressions", 0)))
-        last21_drr = pd.to_numeric(row.get("last21_drr_pct", drr_current), errors="coerce")
-        if pd.isna(last21_drr):
-            last21_drr = float(drr_current)
-        last21_drr_f = float(last21_drr)
-        avg_impressions_per_day = money_or_zero(row.get("avg_impressions_per_day", 0))
-        avg_spend_per_day = money_or_zero(row.get("avg_spend_per_day", 0))
-        at_wb_min_bid = current_bid_f <= float(min_bid) + 0.001
-        pause_subject = is_pause_allowed_subject(row.get("subject_norm", ""))
-
-        # Главное правило: если ставка уже минимальная WB, а экономика стабильно плохая
-        # по 21 дню и статистики достаточно — не ждём, а ставим РК на паузу.
-        if (
-            pause_subject
-            and at_wb_min_bid
-            and last21_impressions >= PAUSE_MIN_IMPRESSIONS
-            and last21_drr_f > drr_limit_f
-        ):
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            result.at[idx, "reason_code"] = "PAUSE_MIN_BID_HIGH_DRR_21D_10000"
-            result.at[idx, "reason_text"] = build_reason_text(
-                result.loc[idx],
-                "Без изменений",
-                None,
-                (
-                    f"пауза: ставка {current_bid_f:.2f} ₽ уже на минимуме WB {float(min_bid):.2f} ₽; "
-                    f"ДРР за {PAUSE_ANALYSIS_DAYS} дней {last21_drr_f:.2f}% > лимита {drr_limit_f:.1f}%; "
-                    f"показов за {PAUSE_ANALYSIS_DAYS} дней {last21_impressions:.0f} >= {PAUSE_MIN_IMPRESSIONS}; ждать нечего"
-                ),
-            )
-            result.at[idx, "wait_status"] = "NO_WAIT_PAUSE_MIN_BID_21D"
-            result.at[idx, "wait_rule"] = "PAUSE_MIN_BID_HIGH_DRR_21D_10000"
-            result.at[idx, "wait_until_date"] = ""
-            result.at[idx, "wait_days_left"] = 0
-            result.at[idx, "pause_decision"] = "PAUSE_CANDIDATE"
-            continue
-
-        # Если ставка минимальная, ДРР высокий, но показов за 21 день меньше 10 000 —
-        # это не пауза. Включаем общий разгон, если расход в лимите 500 ₽/день.
-        if (
-            pause_subject
-            and at_wb_min_bid
-            and last21_impressions < PAUSE_MIN_IMPRESSIONS
-            and last21_drr_f > drr_limit_f
-            and avg_spend_per_day < RAMP_TARGET_SPEND_PER_DAY
-            and _clean_text_value(row.get("ramp_lifecycle_status", "")) != "RAMP_FINISHED_NORMAL_MODE"
-        ):
-            step, step_reason = bid_step_rub(row.get("placement", ""))
-            raw_ramp_bid = next_bid_for_action(current_bid_f, row.get("placement", ""), "raise")
-            block_jump, block_reason = should_block_cpm_min_jump(row, float(min_bid), raw_ramp_bid)
-            if block_jump:
-                result.at[idx, "action"] = "Без изменений"
-                result.at[idx, "new_bid_rub"] = None
-                result.at[idx, "reason_code"] = "RAMP_CPM_MIN_JUMP_BLOCKED_ECONOMY_RISK"
-                result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, block_reason)
-                result.at[idx, "wait_status"] = "NO_WAIT_CPM_MIN_JUMP_BLOCKED"
-                result.at[idx, "pause_decision"] = ""
-                continue
-            ramp_bid = normalize_bid_to_api_grid(max(float(raw_ramp_bid), float(min_bid)), row.get("placement", ""), "Повысить")
-            rc = "RAMP_START_MIN_BID_HIGH_DRR_UNDER_10000_DAILY"
-            if step_reason:
-                rc += f"__{step_reason}"
-            if ramp_bid >= float(min_bid):
-                rc += "__TO_EFFECTIVE_MIN_BID"
-            result.at[idx, "action"] = "Повысить"
-            result.at[idx, "new_bid_rub"] = ramp_bid
-            result.at[idx, "reason_code"] = rc
-            result.at[idx, "reason_text"] = build_reason_text(
-                result.loc[idx],
-                "Повысить",
-                ramp_bid,
-                (
-                    f"разгон вместо паузы: ставка ниже/на минимуме WB {float(min_bid):.2f} ₽, "
-                    f"ДРР за {PAUSE_ANALYSIS_DAYS} дней {last21_drr_f:.2f}% > лимита {drr_limit_f:.1f}%, "
-                    f"но показов {last21_impressions:.0f} < {PAUSE_MIN_IMPRESSIONS}; "
-                    f"расход {avg_spend_per_day:.0f} ₽/день < цели {RAMP_TARGET_SPEND_PER_DAY:.0f} ₽/день; "
-                    f"ставка приведена к API-сетке и effective min_bid"
-                ),
-            )
-            result.at[idx, "wait_status"] = "NO_WAIT_RAMP_UNDER_10000_21D"
-            result.at[idx, "pause_decision"] = ""
-            continue
-
-        # Если ДРР плохой, но ставка уже на минималке WB, это не ожидание post-check.
-        # Если статистики для паузы не хватает и разгон не разрешён лимитом, показываем честную причину.
-        if _clean_text_value(row.get("reason_code", "")).startswith("WAIT_") and float(drr_current) >= drr_limit_f and at_wb_min_bid:
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            result.at[idx, "reason_code"] = "WB_MIN_BID_REACHED"
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"ДРР {float(drr_current):.2f}% >= лимита {drr_limit_f:.1f}%, но текущая ставка {current_bid_f:.2f} ₽ не выше минимальной WB {float(min_bid):.2f} ₽; показов за {PAUSE_ANALYSIS_DAYS} дней {last21_impressions:.0f}; правило паузы/разгона не выполнено")
-            result.at[idx, "wait_status"] = "NO_WAIT_MIN_BID_REACHED"
-            result.at[idx, "pause_decision"] = ""
-            continue
-
-        if row.get("action") != "Снизить":
-            # Для повышения/разгона нельзя отправлять ставку ниже минимума WB: WB отклонит запрос.
-            # Но если это именно Разгон, корректно поднимаем ставку сразу до effective min_bid,
-            # иначе combined/полки с текущей ставкой 3-5 ₽ никогда не выйдут в рабочую минимальную ставку 80 ₽.
-            if not pd.isna(new_bid) and float(new_bid) < float(min_bid) and row.get("action") == "Повысить":
-                rc = _clean_text_value(result.at[idx, "reason_code"])
-                if is_ramp_related_reason(rc) or is_ramp_candidate_by_metrics(row):
-                    block_jump, block_reason = should_block_cpm_min_jump(row, float(min_bid), float(new_bid))
-                    if block_jump:
-                        result.at[idx, "action"] = "Без изменений"
-                        result.at[idx, "new_bid_rub"] = None
-                        result.at[idx, "reason_code"] = (rc + "__CPM_MIN_JUMP_BLOCKED_ECONOMY_RISK").strip("_")
-                        result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, block_reason)
-                        result.at[idx, "pause_decision"] = ""
-                    else:
-                        adjusted_bid = normalize_bid_to_api_grid(float(min_bid), row.get("placement", ""), "Повысить")
-                        result.at[idx, "new_bid_rub"] = adjusted_bid
-                        result.at[idx, "reason_code"] = (rc + "__TO_EFFECTIVE_MIN_BID").strip("_")
-                        result.at[idx, "reason_text"] = build_reason_text(
-                            result.loc[idx],
-                            "Повысить",
-                            adjusted_bid,
-                            f"разгон: расчётная ставка {float(new_bid):.2f} ₽ ниже effective min_bid {float(min_bid):.2f} ₽; ставим сразу минимально допустимую ставку"
-                        )
-                        result.at[idx, "pause_decision"] = ""
-                else:
-                    result.at[idx, "action"] = "Без изменений"
-                    result.at[idx, "new_bid_rub"] = None
-                    result.at[idx, "reason_code"] = (rc + "__WB_MIN_BID_NOT_ALLOWED").strip("_")
-                    result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"расчётная ставка {float(new_bid):.2f} ₽ ниже минимально допустимой WB/effective min {float(min_bid):.2f} ₽; не отправляем заведомо невалидную ставку")
-                    result.at[idx, "pause_decision"] = ""
-            continue
-        if pd.isna(new_bid):
-            continue
-        new_bid_f = float(new_bid)
-
-        if at_wb_min_bid:
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            result.at[idx, "reason_code"] = "WB_MIN_BID_REACHED"
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"текущая ставка не выше минимально допустимой WB {float(min_bid):.2f} ₽; снижение не отправляем; показов за {PAUSE_ANALYSIS_DAYS} дней {last21_impressions:.0f}")
-            result.at[idx, "pause_decision"] = ""
-            continue
-
-        if new_bid_f < float(min_bid):
-            result.at[idx, "action"] = "Без изменений"
-            result.at[idx, "new_bid_rub"] = None
-            rc = _clean_text_value(result.at[idx, "reason_code"])
-            result.at[idx, "reason_code"] = (rc + "__WB_MIN_BID_NOT_ALLOWED").strip("_")
-            result.at[idx, "reason_text"] = build_reason_text(result.loc[idx], "Без изменений", None, f"расчётная ставка {new_bid_f:.2f} ₽ ниже минимально допустимой WB {float(min_bid):.2f} ₽; не отправляем заведомо невалидную ставку")
-            result.at[idx, "pause_decision"] = ""
-
-    for col in DECISION_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    return result[DECISION_COLUMNS]
-
-def apply_bid_changes(decisions: pd.DataFrame, config: Config, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    candidates = decisions[decisions["action"].isin(["Повысить", "Снизить"])].copy() if not decisions.empty else pd.DataFrame(columns=decisions.columns)
-    api_logs: List[Dict[str, Any]] = []
-    changed_rows: List[Dict[str, Any]] = []
-
-    if candidates.empty:
-        return pd.DataFrame(columns=decisions.columns.tolist() + ["api_status"]), pd.DataFrame(api_logs)
-
-    url = config.wb_base_url.rstrip("/") + WB_BIDS_ENDPOINT
-    for _, row in candidates.iterrows():
-        payload = build_bid_payload(row)
-        if payload is None:
-            api_logs.append(api_log_row(ctx.run_datetime, "PATCH", WB_BIDS_ENDPOINT, {}, "payload_error", "Не удалось собрать payload", row.get("campaign_id"), row.get("nm_id"), row.get("placement")))
-            continue
-
-        if ctx.mode == "preview":
-            api_logs.append(api_log_row(ctx.run_datetime, "PATCH", WB_BIDS_ENDPOINT, payload, "preview_no_call", "Предпросмотр без API-вызова", row.get("campaign_id"), row.get("nm_id"), row.get("placement")))
-            continue
-
-        if ctx.dry_run:
-            api_logs.append(api_log_row(ctx.run_datetime, "PATCH", WB_BIDS_ENDPOINT, payload, "dry_run_no_call", "run --dry-run без API-вызова", row.get("campaign_id"), row.get("nm_id"), row.get("placement")))
-            continue
-
-        try:
-            resp = requests.patch(url, headers=wb_headers(config), json=payload, timeout=60)
-            status = str(resp.status_code)
-            api_logs.append(api_log_row(ctx.run_datetime, "PATCH", WB_BIDS_ENDPOINT, payload, status, resp.text, row.get("campaign_id"), row.get("nm_id"), row.get("placement")))
-            if 200 <= resp.status_code < 300:
-                changed = row.to_dict()
-                changed["api_status"] = status
-                changed_rows.append(changed)
-        except Exception as exc:
-            api_logs.append(api_log_row(ctx.run_datetime, "PATCH", WB_BIDS_ENDPOINT, payload, "exception", repr(exc), row.get("campaign_id"), row.get("nm_id"), row.get("placement")))
-
-    changed_df = pd.DataFrame(changed_rows)
-    api_log_df = pd.DataFrame(api_logs)
-    return changed_df, api_log_df
-
-
-def record_bid_events(successful_changes: pd.DataFrame, bid_history: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    if successful_changes.empty:
-        return bid_history[BID_HISTORY_COLUMNS].copy() if not bid_history.empty else pd.DataFrame(columns=BID_HISTORY_COLUMNS)
-
-    rows: List[Dict[str, Any]] = []
-    for _, row in successful_changes.iterrows():
-        action = _clean_text_value(row.get("action", ""))
-        direction = "raise" if action == "Повысить" else "lower"
-        rows.append({
-            "event_id": str(uuid.uuid4()),
-            "run_datetime": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-            "event_date": ctx.run_datetime.date().isoformat(),
-            "campaign_id": row.get("campaign_id", ""),
-            "nm_id": row.get("nm_id", ""),
-            "supplier_article": row.get("supplier_article", ""),
-            "subject_norm": row.get("subject_norm", ""),
-            "placement": row.get("placement", ""),
-            "old_bid_rub": row.get("current_bid_rub", 0),
-            "new_bid_rub": row.get("new_bid_rub", 0),
-            "direction": direction,
-            "reason_code": row.get("reason_code", ""),
-            "spend_before": row.get("spend", 0),
-            "revenue_before": row.get("revenue", 0),
-            "orders_before": row.get("orders", 0),
-            "impressions_before": row.get("impressions", 0),
-            "clicks_before": row.get("clicks", 0),
-            "drr_before": row.get("campaign_drr_pct", 0),
-            "gp_before": row.get("gp_after_ads", float("nan")),
-            "postcheck_status": "pending",
-            "final_verdict": "",
-            "d1_verdict": "",
-            "d3_verdict": "",
-            "d1_check_date": "",
-            "d3_check_date": "",
-        })
-    additions = pd.DataFrame(rows)
-    base = bid_history.copy()
-    for col in BID_HISTORY_COLUMNS:
-        if col not in base.columns:
-            base[col] = ""
-        if col not in additions.columns:
-            additions[col] = ""
-    return pd.concat([base[BID_HISTORY_COLUMNS], additions[BID_HISTORY_COLUMNS]], ignore_index=True)
-
-
-
-# =============================
-# Переименование рекламных кампаний
-# =============================
-
-def normalize_article_for_campaign_name(value: Any) -> str:
-    """
-    Приводит артикул продавца к короткому имени кампании.
-    Примеры: PT155.009K -> 155/9; PT156.001 -> 156/1; 155/001 -> 155/1.
-    Если артикул уже в нормальном формате или содержит буквенную часть, возвращаем аккуратно очищенный текст.
-    """
-    text = _clean_text_value(value).replace(" ", "").strip()
-    if not text:
-        return ""
-    upper = text.upper()
-
-    # PT155.009K / PT155.009 -> 155/9
-    m = re.fullmatch(r"PT(\d{2,5})[\._\-/](\d{1,4})([A-ZА-Я]*)", upper)
-    if m:
-        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
-        shade_raw = m.group(2)
-        shade = str(int(shade_raw)) if shade_raw.isdigit() else shade_raw
-        suffix = m.group(3) or ""
-        return f"{code}/{shade}{suffix}"
-
-    # 155.009K / 155_009 / 155-009 -> 155/9K
-    m = re.fullmatch(r"(\d{2,5})[\._\-/](\d{1,4})([A-ZА-Я]*)", upper)
-    if m:
-        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
-        shade_raw = m.group(2)
-        shade = str(int(shade_raw)) if shade_raw.isdigit() else shade_raw
-        suffix = m.group(3) or ""
-        return f"{code}/{shade}{suffix}"
-
-    # PT901.F26 -> 901/F26; если уже F26 — оставляем F26.
-    m = re.fullmatch(r"PT(\d{2,5})[\._\-/]([A-ZА-Я]+\d+)", upper)
-    if m:
-        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
-        return f"{code}/{m.group(2)}"
-
-    # Если уже есть слэш, убираем лидирующие нули у числового оттенка.
-    m = re.fullmatch(r"(\d{2,5})/(\d{1,4})([A-ZА-Я]*)", upper)
-    if m:
-        code = str(int(m.group(1))) if m.group(1).isdigit() else m.group(1)
-        shade = str(int(m.group(2))) if m.group(2).isdigit() else m.group(2)
-        return f"{code}/{shade}{m.group(3) or ''}"
-
-    return text[:100]
-
-
-def _best_article_by_nm(metrics_df: pd.DataFrame, keyword_core_df: Optional[pd.DataFrame], goods_prices: Optional[pd.DataFrame]) -> Dict[str, str]:
-    """Собирает nm_id -> артикул из отчёта рекламы, поисковых запросов и WB price API."""
-    article_by_nm: Dict[str, str] = {}
-
-    def add_mapping(df: Optional[pd.DataFrame], nm_col: str, art_col: str) -> None:
-        if df is None or df.empty or nm_col not in df.columns or art_col not in df.columns:
-            return
-        local = df[[nm_col, art_col]].copy()
-        local[nm_col] = local[nm_col].map(_clean_id_value)
-        local[art_col] = local[art_col].map(_clean_text_value)
-        local = local[(local[nm_col] != "") & (local[art_col] != "")]
-        # Берём самое частое непустое значение по nm_id.
-        for nm_id, grp in local.groupby(nm_col, dropna=False):
-            if nm_id in article_by_nm and article_by_nm[nm_id]:
-                continue
-            vals = grp[art_col].astype(str).str.strip()
-            if vals.empty:
-                continue
-            article_by_nm[nm_id] = normalize_article_for_campaign_name(vals.value_counts().index[0])
-
-    add_mapping(metrics_df, "nm_id", "supplier_article")
-    add_mapping(keyword_core_df, "nm_id", "supplier_article")
-    add_mapping(goods_prices, "nm_id", "supplier_article_api")
-    return article_by_nm
-
-
-def build_campaign_rename_plan(
-    metrics_df: pd.DataFrame,
-    keyword_core_df: Optional[pd.DataFrame],
-    goods_prices: Optional[pd.DataFrame],
-    ctx: RunContext,
-) -> pd.DataFrame:
-    """
-    Строит план переименования РК обратно в короткий артикул продавца.
-    Безопасное правило: переименовываем только кампании, где однозначно найден один артикул.
-    Если в campaign_id несколько разных артикулов — не трогаем, чтобы не назвать сборную кампанию неверно.
-    """
-    if metrics_df is None or metrics_df.empty:
-        return pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
-    article_by_nm = _best_article_by_nm(metrics_df, keyword_core_df, goods_prices)
-    work = metrics_df.copy()
-    for col in ["campaign_id", "nm_id", "campaign_name", "supplier_article", "subject_norm"]:
-        if col not in work.columns:
-            work[col] = ""
-    work["campaign_id"] = work["campaign_id"].map(_clean_id_value)
-    work["nm_id"] = work["nm_id"].map(_clean_id_value)
-    work["current_name_clean"] = work["campaign_name"].map(_clean_text_value)
-    work["article_for_name"] = work.apply(
-        lambda r: normalize_article_for_campaign_name(r.get("supplier_article", "")) or article_by_nm.get(_clean_id_value(r.get("nm_id", "")), ""),
-        axis=1,
-    )
-    work = work[(work["campaign_id"] != "") & (work["article_for_name"] != "")].copy()
-    if work.empty:
-        return pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
-
-    rows: List[Dict[str, Any]] = []
-    for campaign_id, grp in work.groupby("campaign_id", dropna=False):
-        current_names = [_clean_text_value(x) for x in grp.get("current_name_clean", pd.Series(dtype=str)).tolist() if _clean_text_value(x)]
-        current_name = current_names[0] if current_names else ""
-        articles = sorted({normalize_article_for_campaign_name(x) for x in grp.get("article_for_name", pd.Series(dtype=str)).tolist() if normalize_article_for_campaign_name(x)})
-        nm_ids = sorted({_clean_id_value(x) for x in grp.get("nm_id", pd.Series(dtype=str)).tolist() if _clean_id_value(x)})
-        subjects = sorted({normalize_subject_value(x) for x in grp.get("subject_norm", pd.Series(dtype=str)).tolist() if normalize_subject_value(x)})
-
-        if len(articles) != 1:
-            rows.append({
-                "run_datetime": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-                "campaign_id": campaign_id,
-                "current_name": current_name,
-                "target_name": "",
-                "supplier_article": "; ".join(articles[:10]),
-                "nm_ids": "; ".join(nm_ids[:20]),
-                "subjects": "; ".join(subjects[:10]),
-                "rename_action": "Без изменений",
-                "reason_code": "MULTIPLE_ARTICLES_IN_CAMPAIGN" if articles else "NO_SUPPLIER_ARTICLE",
-                "api_status": "not_sent",
-                "response_text": "Кампания содержит несколько артикулов или артикул не найден; автоматическое переименование небезопасно",
-            })
-            continue
-
-        target_name = articles[0]
-        if current_name == target_name:
-            action = "Без изменений"
-            reason_code = "ALREADY_NAMED_BY_ARTICLE"
-            api_status = "not_sent"
-            response_text = "Название уже равно артикулу продавца"
-        else:
-            action = "Переименовать"
-            reason_code = "RENAME_TO_SUPPLIER_ARTICLE"
-            api_status = ""
-            response_text = ""
-        rows.append({
-            "run_datetime": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-            "campaign_id": campaign_id,
-            "current_name": current_name,
-            "target_name": target_name,
-            "supplier_article": target_name,
-            "nm_ids": "; ".join(nm_ids[:20]),
-            "subjects": "; ".join(subjects[:10]),
-            "rename_action": action,
-            "reason_code": reason_code,
-            "api_status": api_status,
-            "response_text": response_text,
-        })
-    out = pd.DataFrame(rows)
-    for col in RENAME_CAMPAIGN_COLUMNS:
+        return pd.DataFrame()
+    out = df.copy()
+    for col in ["subject", "product", "supplier_article", "nm_id"]:
         if col not in out.columns:
-            out[col] = ""
-    return out[RENAME_CAMPAIGN_COLUMNS]
-
-
-def apply_campaign_renames(rename_plan: pd.DataFrame, config: Config, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """POST /adv/v0/rename. В run переименовывает РК в артикул продавца; в preview/dry-run только показывает план."""
-    if rename_plan is None or rename_plan.empty:
-        return pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS), pd.DataFrame()
-    result = rename_plan.copy()
-    api_logs: List[Dict[str, Any]] = []
-    candidates = result[result["rename_action"].astype(str) == "Переименовать"].copy()
-    if candidates.empty:
-        return result, pd.DataFrame(api_logs)
-
-    url = config.wb_base_url.rstrip("/") + WB_RENAME_ENDPOINT
-    for idx, row in candidates.iterrows():
-        advert_id = to_int_id(row.get("campaign_id", ""))
-        target_name = _clean_text_value(row.get("target_name", ""))
-        if advert_id is None or not target_name:
-            result.loc[idx, "api_status"] = "payload_error"
-            result.loc[idx, "response_text"] = "Не удалось собрать payload для rename"
-            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, {}, "payload_error", "Не удалось собрать payload для rename", campaign_id=row.get("campaign_id", "")))
+            out[col] = "" if col != "nm_id" else np.nan
+    keep_mask: List[bool] = []
+    canonical_subjects: List[Any] = []
+    canonical_products: List[Any] = []
+    rejected_count = 0
+    for _, row in out.iterrows():
+        subject_src = canonical_subject(row.get("subject", ""))
+        product_src = normalize_text(row.get("product", ""))
+        article_src = clean_article(row.get("supplier_article", ""))
+        has_product_level = bool(_pdf_product_code_from_value(article_src) or _pdf_product_code_from_value(product_src))
+        if not has_product_level:
+            keep = canonical_subject(subject_src) in TARGET_SUBJECTS
+            keep_mask.append(keep)
+            canonical_subjects.append(subject_src)
+            canonical_products.append(product_src)
+            if not keep:
+                rejected_count += 1
+                rejects.append({
+                    "source": source_name,
+                    "subject_src": subject_src,
+                    "product_src": product_src,
+                    "supplier_article": article_src,
+                    "nm_id": row.get("nm_id", ""),
+                    "resolved_product": "",
+                    "reason": "Строка без товара/артикула и вне целевых категорий PDF",
+                    "rows": 1,
+                })
             continue
-        payload = {"advertId": advert_id, "name": target_name}
-
-        if ctx.mode == "preview":
-            result.loc[idx, "api_status"] = "preview_no_call"
-            result.loc[idx, "response_text"] = "Предпросмотр без API-вызова"
-            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, "preview_no_call", "Предпросмотр без API-вызова", campaign_id=row.get("campaign_id", "")))
-            continue
-        if ctx.dry_run:
-            result.loc[idx, "api_status"] = "dry_run_no_call"
-            result.loc[idx, "response_text"] = "run --dry-run без API-вызова"
-            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, "dry_run_no_call", "run --dry-run без API-вызова", campaign_id=row.get("campaign_id", "")))
-            continue
-
-        try:
-            resp = requests.post(url, headers=wb_headers(config), json=payload, timeout=60)
-            status = str(resp.status_code)
-            result.loc[idx, "api_status"] = status
-            result.loc[idx, "response_text"] = str(resp.text)[:1000]
-            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, status, resp.text, campaign_id=row.get("campaign_id", "")))
-            if 200 <= resp.status_code < 300:
-                result.loc[idx, "reason_code"] = "RENAMED_TO_SUPPLIER_ARTICLE"
-            else:
-                result.loc[idx, "reason_code"] = "RENAME_API_ERROR"
-        except Exception as exc:
-            result.loc[idx, "api_status"] = "exception"
-            result.loc[idx, "response_text"] = repr(exc)[:1000]
-            result.loc[idx, "reason_code"] = "RENAME_API_EXCEPTION"
-            api_logs.append(api_log_row(ctx.run_datetime, "POST", WB_RENAME_ENDPOINT, payload, "exception", repr(exc), campaign_id=row.get("campaign_id", "")))
-        time.sleep(0.2)
-
-    for col in RENAME_CAMPAIGN_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    return result[RENAME_CAMPAIGN_COLUMNS], pd.DataFrame(api_logs)
-
-# =============================
-# Паузы и запуск обратно
-# =============================
-
-def consecutive_lowers_for_key(bid_history: pd.DataFrame, key: Tuple[str, str, str]) -> int:
-    if bid_history.empty:
-        return 0
-    local = bid_history.copy()
-    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce").dt.date
-    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
-    local = local[local.apply(lambda r: make_key(r) == key, axis=1)].sort_values(["event_date_parsed", "run_dt_parsed"], ascending=False)
-    count = 0
-    for _, row in local.iterrows():
-        if _clean_text_value(row.get("direction", "")).lower() == "lower":
-            count += 1
-        else:
-            break
-    return count
-
-
-def latest_lower_event_for_key(bid_history: pd.DataFrame, key: Tuple[str, str, str]) -> Optional[Dict[str, Any]]:
-    if bid_history.empty:
-        return None
-    local = bid_history.copy()
-    local = local[local.apply(lambda r: make_key(r) == key and _clean_text_value(r.get("direction", "")).lower() == "lower", axis=1)]
-    if local.empty:
-        return None
-    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce").dt.date
-    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
-    local = local.sort_values(["event_date_parsed", "run_dt_parsed"], ascending=False)
-    return local.iloc[0].to_dict()
-
-
-def build_pause_candidates(decisions: pd.DataFrame, bid_history: pd.DataFrame) -> pd.DataFrame:
-    """Строгая постановка на паузу по согласованному правилу v10.
-
-    Новая пауза разрешена только если одновременно выполнено:
-    - предмет: Помады / Блески / Косметические карандаши;
-    - кампания активна;
-    - текущая ставка уже на минимальной WB;
-    - ДРР за последние 21 зрелых дня выше лимита категории (15%);
-    - показов за последние 21 зрелых дня >= 10 000.
-
-    Если показов < 10 000, пауза не формируется: такая строка должна идти в разгон показов.
-    Кисти не паузятся никогда.
-    """
-    if decisions is None or decisions.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-
-    work = decisions.copy()
-    for col in DECISION_COLUMNS:
-        if col not in work.columns:
-            work[col] = ""
-    work["subject_norm"] = work["subject_norm"].map(normalize_subject_value)
-    work = work[work["subject_norm"].map(is_pause_allowed_subject)].copy()
-    work = work[work["campaign_status"].map(is_active_campaign)].copy()
-    if work.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-
-    candidates: List[Dict[str, Any]] = []
-    for campaign_id, g in work.groupby("campaign_id", dropna=False):
-        campaign_id_clean = _clean_id_value(campaign_id)
-        if not campaign_id_clean:
-            continue
-
-        direct = g[
-            (g["pause_decision"].map(_clean_text_value) == "PAUSE_CANDIDATE")
-            & (g["reason_code"].map(_clean_text_value) == "PAUSE_MIN_BID_HIGH_DRR_21D_10000")
-        ].copy()
-        if direct.empty:
-            continue
-
-        last21_impressions = money_or_zero(g.get("last21_impressions", pd.Series(dtype=float)).sum())
-        last21_clicks = money_or_zero(g.get("last21_clicks", pd.Series(dtype=float)).sum()) if "last21_clicks" in g.columns else money_or_zero(g.get("clicks", pd.Series(dtype=float)).sum())
-        last21_spend = money_or_zero(g.get("last21_spend", pd.Series(dtype=float)).sum())
-        last21_revenue = money_or_zero(g.get("last21_revenue", pd.Series(dtype=float)).sum())
-        last21_orders = money_or_zero(g.get("last21_orders", pd.Series(dtype=float)).sum())
-        campaign_drr_21d = safe_drr_pct(last21_spend, last21_revenue)
-        max_limit = max(drr_limit_for_subject(x) for x in g["subject_norm"].dropna().unique()) if not g.empty else 15.0
-
-        # Повторная защита на уровне campaign_id: без 10 000 показов паузы нет.
-        if last21_impressions < PAUSE_MIN_IMPRESSIONS:
-            continue
-        if campaign_drr_21d <= max_limit:
-            continue
-
-        # Основная строка для отображения — та, где сработало правило, с максимальными показами/расходом.
-        sort_cols = [c for c in ["last21_impressions", "last21_spend", "impressions", "spend"] if c in direct.columns]
-        main = direct.sort_values(sort_cols, ascending=False).iloc[0] if sort_cols else direct.iloc[0]
-        gp_series = pd.to_numeric(g.get("last21_gp_after_ads", g.get("gp_after_ads", pd.Series(dtype=float))), errors="coerce")
-        gp = float(gp_series.sum()) if gp_series.notna().any() else float("nan")
-
-        candidates.append({
-            "pause_event_id": str(uuid.uuid4()),
-            "pause_date": date.today().isoformat(),
-            "campaign_id": campaign_id_clean,
-            "nm_id": main.get("nm_id", ""),
-            "placement": main.get("placement", ""),
-            "supplier_article": main.get("supplier_article", ""),
-            "subject_norm": main.get("subject_norm", ""),
-            "reason_code": "PAUSE_MIN_BID_HIGH_DRR_21D_10000",
-            "impressions_before_pause": last21_impressions,
-            "clicks_before_pause": last21_clicks,
-            "spend_before_pause": last21_spend,
-            "revenue_before_pause": last21_revenue,
-            "orders_before_pause": last21_orders,
-            "drr_before_pause": campaign_drr_21d,
-            "gp_before_pause": gp,
-            "status": "candidate",
-            "next_check_date": (date.today() + timedelta(days=7)).isoformat(),
-            "api_status": "",
-        })
-    return pd.DataFrame(candidates, columns=PAUSE_HISTORY_COLUMNS)
-
-def apply_pause_actions(pause_candidates: pd.DataFrame, config: Config, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if pause_candidates.empty:
-        return pause_candidates.copy(), pd.DataFrame()
-
-    result = pause_candidates.copy()
-    api_logs: List[Dict[str, Any]] = []
-    if ctx.mode == "preview":
-        result["api_status"] = "preview_no_call"
-        return result, pd.DataFrame(api_logs)
-    if ctx.dry_run:
-        result["api_status"] = "dry_run_no_call"
-        return result, pd.DataFrame(api_logs)
-
-    # В обычном run без флага автоматически применяем только строгое согласованное правило v10.
-    # Остальные возможные кандидаты остаются кандидатами и не уходят в API без явного --apply-pause.
-    if ctx.apply_pause:
-        to_send = result.copy()
-        result["api_status"] = "not_sent"
-    else:
-        auto_mask = result["reason_code"].map(_clean_text_value).isin(AUTO_APPLY_PAUSE_REASON_CODES)
-        if ctx.mode == "run" and auto_mask.any():
-            result["api_status"] = "not_applied_without_flag"
-            result.loc[auto_mask, "api_status"] = "auto_apply_v10_pending"
-            to_send = result.loc[auto_mask].copy()
-        else:
-            result["api_status"] = "not_applied_without_flag"
-            return result, pd.DataFrame(api_logs)
-
-    url_base = config.wb_base_url.rstrip("/") + WB_PAUSE_ENDPOINT
-    status_by_campaign: Dict[str, Tuple[str, str]] = {}
-    for campaign_id in sorted(to_send["campaign_id"].map(_clean_id_value).unique()):
-        advert_id = to_int_id(campaign_id)
-        if advert_id is None:
-            status_by_campaign[campaign_id] = ("payload_error", "campaign_id не является числом")
-            continue
-        endpoint = f"{WB_PAUSE_ENDPOINT}?id={advert_id}"
-        try:
-            resp = requests.get(url_base, params={"id": advert_id}, headers=wb_headers(config), timeout=60)
-            status_by_campaign[campaign_id] = (str(resp.status_code), resp.text)
-            api_logs.append(api_log_row(ctx.run_datetime, "GET", endpoint, "", str(resp.status_code), resp.text, campaign_id=campaign_id))
-        except Exception as exc:
-            status_by_campaign[campaign_id] = ("exception", repr(exc))
-            api_logs.append(api_log_row(ctx.run_datetime, "GET", endpoint, "", "exception", repr(exc), campaign_id=campaign_id))
-
-    statuses: List[str] = []
-    final_statuses: List[str] = []
-    send_campaigns = set(to_send["campaign_id"].map(_clean_id_value).unique())
-    for _, row in result.iterrows():
-        campaign_id_clean = _clean_id_value(row.get("campaign_id", ""))
-        if campaign_id_clean not in send_campaigns:
-            statuses.append(_clean_text_value(row.get("api_status", "not_applied_without_flag")) or "not_applied_without_flag")
-            final_statuses.append(_clean_text_value(row.get("status", "candidate")) or "candidate")
-            continue
-        api_status, _ = status_by_campaign.get(campaign_id_clean, ("not_sent", ""))
-        statuses.append(api_status)
-        if api_status.isdigit() and 200 <= int(api_status) < 300:
-            final_statuses.append("paused")
-        else:
-            final_statuses.append("candidate")
-    result["api_status"] = statuses
-    result["status"] = final_statuses
-    return result, pd.DataFrame(api_logs)
-
-def latest_pause_records(pause_history: pd.DataFrame) -> pd.DataFrame:
-    if pause_history.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    local = pause_history.copy()
-    local["pause_date_parsed"] = pd.to_datetime(local["pause_date"], errors="coerce")
-    local = local.sort_values(["campaign_id", "nm_id", "placement", "pause_date_parsed"])
-    return local.groupby(["campaign_id", "nm_id", "placement"], dropna=False).tail(1)
-
-
-def build_start_candidates(pause_history: pd.DataFrame, ads_df: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    """Проверка paused РК только недельными окнами.
-
-    После паузы ждём 7 дней. Если за 7 дней дошли заказы/экономика восстановилась — возвращаем.
-    Если нет, ждём ещё неделю и смотрим 14 дней после паузы. Раньше 7 дней РК не возвращаем.
-    """
-    latest = latest_pause_records(pause_history)
-    if latest.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    rows: List[Dict[str, Any]] = []
-    for _, row in latest.iterrows():
-        status = _clean_text_value(row.get("status", "")).lower()
-        if status not in {"paused", "keep_paused"}:
-            continue
-        pause_date = pd.to_datetime(row.get("pause_date", ""), errors="coerce")
-        if pd.isna(pause_date):
-            continue
-        pause_day = pause_date.date()
-        days_after_pause = (ctx.mature_end - pause_day).days
-        if days_after_pause < 7:
-            continue
-        check_days = 7 if days_after_pause < 14 else 14
-        check_end = min(pause_day + timedelta(days=check_days), ctx.mature_end)
-        key = make_key(row)
-        after = aggregate_after_event(ads_df, key, pause_day + timedelta(days=1), check_end)
-        drr_after = safe_drr_pct(after["spend"], after["revenue"])
-        gp_after = after["gp_after_ads"]
-        subject_limit = drr_limit_for_subject(row.get("subject_norm", ""))
-        recovery_ok = (after["revenue"] > 0 and after["orders"] > 0 and drr_after < subject_limit) or (not pd.isna(gp_after) and gp_after > 0)
-        if recovery_ok:
-            rows.append({
-                "pause_event_id": str(uuid.uuid4()),
-                "pause_date": date.today().isoformat(),
-                "campaign_id": row.get("campaign_id", ""),
+        resolved_subject, canonical_product, keep, reason = _pdf_resolve_product_category(article_src, product_src)
+        keep_mask.append(keep)
+        canonical_subjects.append(resolved_subject if keep else subject_src)
+        canonical_products.append(canonical_product if keep else product_src)
+        if not keep:
+            rejected_count += 1
+            rejects.append({
+                "source": source_name,
+                "subject_src": subject_src,
+                "product_src": product_src,
+                "supplier_article": article_src,
                 "nm_id": row.get("nm_id", ""),
-                "placement": row.get("placement", ""),
-                "supplier_article": row.get("supplier_article", ""),
-                "subject_norm": row.get("subject_norm", ""),
-                "reason_code": f"START_AFTER_ECONOMY_RECOVERY_D{check_days}",
-                "spend_before_pause": after["spend"],
-                "revenue_before_pause": after["revenue"],
-                "orders_before_pause": after["orders"],
-                "drr_before_pause": drr_after,
-                "gp_before_pause": gp_after,
-                "status": "restart_candidate",
-                "next_check_date": (date.today() + timedelta(days=7)).isoformat(),
-                "api_status": "",
+                "resolved_product": canonical_product,
+                "reason": reason,
+                "rows": 1,
             })
-    return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
+    filtered = out.loc[pd.Series(keep_mask, index=out.index)].copy()
+    if not filtered.empty:
+        filtered.loc[:, "subject"] = pd.Series(canonical_subjects, index=out.index).loc[filtered.index].values
+        filtered.loc[:, "product"] = pd.Series(canonical_products, index=out.index).loc[filtered.index].values
+    if rejected_count:
+        log(f"PDF product category filter: {source_name}: kept={len(filtered):,}, rejected={rejected_count:,}")
+    return filtered
 
 
-
-def build_wrong_subject_pause_rollback_candidates(pause_history_raw: pd.DataFrame, managed_ads_df: pd.DataFrame, ctx: RunContext) -> pd.DataFrame:
-    """Возвращает кандидатов на запуск кампаний, ошибочно поставленных на паузу вне 4 управляемых предметов."""
-    if pause_history_raw is None or pause_history_raw.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    latest = latest_pause_records(pause_history_raw)
-    if latest.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-
-    managed_keys: set[Tuple[str, str, str]] = set()
-    if managed_ads_df is not None and not managed_ads_df.empty:
-        for _, r in managed_ads_df[["campaign_id", "nm_id", "placement"]].drop_duplicates().iterrows():
-            key = make_key(r)
-            if all(key):
-                managed_keys.add(key)
-
-    rows: List[Dict[str, Any]] = []
-    for _, row in latest.iterrows():
-        status = _clean_text_value(row.get("status", "")).lower()
-        if status not in {"paused", "keep_paused"}:
-            continue
-        key = make_key(row)
-        if not all(key):
-            continue
-        if key in managed_keys:
-            continue
-        rows.append({
-            "pause_event_id": str(uuid.uuid4()),
-            "pause_date": date.today().isoformat(),
-            "campaign_id": row.get("campaign_id", ""),
-            "nm_id": row.get("nm_id", ""),
-            "placement": row.get("placement", ""),
-            "supplier_article": row.get("supplier_article", ""),
-            "reason_code": "ROLLBACK_WRONG_SUBJECT_PAUSE",
-            "spend_before_pause": row.get("spend_before_pause", 0),
-            "revenue_before_pause": row.get("revenue_before_pause", 0),
-            "orders_before_pause": row.get("orders_before_pause", 0),
-            "drr_before_pause": row.get("drr_before_pause", 0),
-            "gp_before_pause": row.get("gp_before_pause", float("nan")),
-            "status": "restart_candidate",
-            "next_check_date": date.today().isoformat(),
-            "api_status": "",
-        })
-    return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
-
-
-def apply_start_actions(start_candidates: pd.DataFrame, config: Config, ctx: RunContext) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if start_candidates.empty:
-        return start_candidates.copy(), pd.DataFrame()
-    result = start_candidates.copy()
-    api_logs: List[Dict[str, Any]] = []
-    if ctx.mode == "preview":
-        result["api_status"] = "preview_no_call"
-        return result, pd.DataFrame(api_logs)
-    if ctx.dry_run:
-        result["api_status"] = "dry_run_no_call"
-        return result, pd.DataFrame(api_logs)
-    if not ctx.apply_start:
-        auto_mask = result.get("reason_code", pd.Series(dtype=str)).astype(str).isin(AUTO_APPLY_START_REASON_CODES)
-        if not auto_mask.any():
-            result["api_status"] = "not_applied_without_flag"
-            return result, pd.DataFrame(api_logs)
-        # Автовозврат разрешён только после недельного/двухнедельного контроля или rollback ошибочных пауз.
-        result.loc[~auto_mask, "api_status"] = "not_applied_without_flag"
-        result = result.loc[auto_mask].copy()
-
-    url_base = config.wb_base_url.rstrip("/") + WB_START_ENDPOINT
-    status_by_campaign: Dict[str, Tuple[str, str]] = {}
-    for campaign_id in sorted(result["campaign_id"].map(_clean_id_value).unique()):
-        advert_id = to_int_id(campaign_id)
-        if advert_id is None:
-            status_by_campaign[campaign_id] = ("payload_error", "campaign_id не является числом")
-            continue
-        endpoint = f"{WB_START_ENDPOINT}?id={advert_id}"
-        try:
-            resp = requests.get(url_base, params={"id": advert_id}, headers=wb_headers(config), timeout=60)
-            status_by_campaign[campaign_id] = (str(resp.status_code), resp.text)
-            api_logs.append(api_log_row(ctx.run_datetime, "GET", endpoint, "", str(resp.status_code), resp.text, campaign_id=campaign_id))
-        except Exception as exc:
-            status_by_campaign[campaign_id] = ("exception", repr(exc))
-            api_logs.append(api_log_row(ctx.run_datetime, "GET", endpoint, "", "exception", repr(exc), campaign_id=campaign_id))
-
-    statuses: List[str] = []
-    final_statuses: List[str] = []
-    for _, row in result.iterrows():
-        api_status, _ = status_by_campaign.get(_clean_id_value(row.get("campaign_id", "")), ("not_sent", ""))
-        statuses.append(api_status)
-        if api_status.isdigit() and 200 <= int(api_status) < 300:
-            final_statuses.append("started")
-        else:
-            final_statuses.append("restart_candidate")
-    result["api_status"] = statuses
-    result["status"] = final_statuses
-    return result, pd.DataFrame(api_logs)
-
-
-# =============================
-# Запись Excel / JSON
-# =============================
-
-def dataframe_to_excel_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        for sheet_name, df in sheets.items():
-            safe_name = sheet_name[:31]
-            local_df = df.copy() if df is not None else pd.DataFrame()
-            local_df.to_excel(writer, index=False, sheet_name=safe_name)
-            ws = writer.book[safe_name]
-            ws.freeze_panes = "A2"
-            for col_cells in ws.columns:
-                max_len = 0
-                col_letter = col_cells[0].column_letter
-                for cell in col_cells:
-                    value = cell.value
-                    if value is not None:
-                        max_len = max(max_len, len(str(value)))
-                ws.column_dimensions[col_letter].width = min(max(max_len + 2, 10), 60)
-    return output.getvalue()
-
-
-def save_table_to_s3_excel(s3_client, config: Config, key: str, df: pd.DataFrame) -> None:
-    payload = dataframe_to_excel_bytes({"Лист1": df})
-    upload_s3_bytes(s3_client, config.yc_bucket_name, key, payload, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-def append_api_log_to_s3(s3_client, config: Config, new_log: pd.DataFrame) -> pd.DataFrame:
-    existing = load_excel_table_from_s3(s3_client, config, API_LOG_KEY, [
-        "run_datetime", "method", "endpoint", "campaign_id", "nm_id", "placement", "payload", "api_status", "response_text"
-    ])
-    if new_log is None or new_log.empty:
-        combined = existing
+def _write_pdf_product_group_audit(rejects: List[Dict[str, Any]], audit_path: Path) -> Optional[Path]:
+    cols = ["source", "subject_src", "product_src", "supplier_article", "nm_id", "resolved_product", "reason", "rows"]
+    if rejects:
+        audit = pd.DataFrame(rejects, columns=cols)
+        group_cols = [c for c in cols if c != "rows"]
+        audit = audit.groupby(group_cols, dropna=False, as_index=False).agg(rows=("rows", "sum"))
+        audit = audit.sort_values(["reason", "resolved_product", "supplier_article"], na_position="last")
     else:
-        combined = pd.concat([existing, new_log], ignore_index=True, sort=False)
-    save_table_to_s3_excel(s3_client, config, API_LOG_KEY, combined)
-    return combined
+        audit = pd.DataFrame(columns=cols)
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(audit_path, engine="openpyxl") as writer:
+        audit.to_excel(writer, sheet_name="Проверить_группы", index=False)
+    log(f"Saved product group audit: {audit_path} rows={len(audit):,}")
+    return audit_path
 
 
-
-# =============================
-# Разгон показов и эксперимент 1 РК на товарную группу
-# =============================
-
-
-def enrich_supplier_articles_from_rename_plan(df: pd.DataFrame, rename_plan: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Подтягивает короткий артикул продавца из плана переименования в основные листы отчёта."""
-    if df is None or df.empty or rename_plan is None or rename_plan.empty:
-        return df if df is not None else pd.DataFrame()
-    if "campaign_id" not in df.columns:
-        return df
-    result = df.copy()
-    if "supplier_article" not in result.columns:
-        result["supplier_article"] = ""
-    rp = rename_plan.copy()
-    if "campaign_id" not in rp.columns or "supplier_article" not in rp.columns:
-        return result
-    rp["campaign_id_clean"] = rp["campaign_id"].map(_clean_id_value)
-    article_map = {
-        _clean_id_value(r.get("campaign_id", "")): _clean_text_value(r.get("supplier_article", ""))
-        for _, r in rp.iterrows()
-        if _clean_id_value(r.get("campaign_id", "")) and _clean_text_value(r.get("supplier_article", ""))
-    }
-    for idx, row in result.iterrows():
-        cur = _clean_text_value(row.get("supplier_article", ""))
-        if cur:
-            continue
-        art = article_map.get(_clean_id_value(row.get("campaign_id", "")), "")
-        if art:
-            result.at[idx, "supplier_article"] = art
-    return result
+def _filter_outputs_by_pdf_product_reference(outputs: Dict[str, pd.DataFrame], audit_dir: Path) -> Dict[str, pd.DataFrame]:
+    rejects: List[Dict[str, Any]] = []
+    filtered: Dict[str, pd.DataFrame] = dict(outputs)
+    for name in ["article_day_fact", "factor_bridge", "entry_points_bridge", "optimal_benchmarks", "factor_summary_for_pdf"]:
+        df = filtered.get(name, pd.DataFrame())
+        if df is not None and not df.empty:
+            filtered[name] = _filter_df_by_pdf_product_reference(df, name, rejects)
+    _write_pdf_product_group_audit(rejects, audit_dir / PRODUCT_GROUP_AUDIT_NAME)
+    return filtered
 
 
-def enrich_decisions_with_bid_api_status(decisions: pd.DataFrame, successful_changes: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Фиксирует в Решениях, какие ставки реально ушли в WB, и обновляет ramp_status."""
-    if decisions is None or decisions.empty:
-        return decisions if decisions is not None else pd.DataFrame(columns=DECISION_COLUMNS)
-    result = decisions.copy()
-    if "ramp_api_status" not in result.columns:
-        result["ramp_api_status"] = ""
-    if "ramp_applied_in_current_run" not in result.columns:
-        result["ramp_applied_in_current_run"] = False
-    success_map: Dict[Tuple[str, str, str], str] = {}
-    if successful_changes is not None and not successful_changes.empty:
-        for _, r in successful_changes.iterrows():
-            success_map[make_key(r)] = _clean_text_value(r.get("api_status", ""))
-    for idx, row in result.iterrows():
-        key = make_key(row)
-        if key in success_map:
-            result.at[idx, "ramp_api_status"] = success_map[key]
-        tmp = result.loc[idx].to_dict()
-        if key in success_map:
-            tmp["api_status"] = success_map[key]
-        status, reason_group, applied = classify_ramp_status(tmp)
-        result.at[idx, "ramp_candidate"] = bool(is_ramp_candidate_by_metrics(tmp) or _clean_text_value(tmp.get("ramp_lifecycle_status", "")) == "RAMP_ACTIVE_DAILY_CONTROL")
-        result.at[idx, "ramp_status"] = status
-        result.at[idx, "ramp_applied_in_current_run"] = bool(key in success_map and is_ramp_related_reason(tmp.get("reason_code", ""), tmp.get("wait_rule", ""), tmp.get("last_bid_change_reason_code", "")))
-    for col in DECISION_COLUMNS:
-        if col not in result.columns:
-            result[col] = ""
-    return result[DECISION_COLUMNS]
+def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Optional[Path]:
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib import colors
+        from reportlab.lib.colors import HexColor
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except Exception as exc:
+        log(f"WARN: reportlab недоступен, PDF не создан: {exc}")
+        return None
+    F_REG, F_BOLD, F_BLACK = _register_topface_fonts()
+    W, H = 1600, 900
+    RED = HexColor("#c90022")
+    RED_DARK = HexColor("#a50019")
+    WHITE = colors.white
+    SOFT = HexColor("#fff4f5")
+    BLACK = HexColor("#111111")
+    GRAY = HexColor("#555555")
+    GREEN = HexColor("#087a38")
+    BAD = HexColor("#b00020")
+    outputs = _filter_outputs_by_pdf_product_reference(outputs, path.parent)
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    week_start, week_end, prev_start, prev_end = _period_bounds_from_daily(daily)
+    # Current incomplete week: from Monday to latest available day in daily.
+    latest = pd.to_datetime(daily["day"], errors="coerce").max() if daily is not None and not daily.empty else week_end
+    cur_monday = latest - pd.Timedelta(days=int(latest.weekday()))
+    cur_week_end = cur_monday + pd.Timedelta(days=6)
+    c = canvas.Canvas(str(path), pagesize=(W, H))
+    bookmarks: Dict[str, str] = {}
+    page_num = 0
 
+    def bg(title: str, subtitle: str = "", section: str = ""):
+        nonlocal page_num
+        page_num += 1
+        c.setFillColor(RED); c.rect(0, 0, W, H, fill=1, stroke=0)
+        c.setFillColor(WHITE); c.setFont(F_REG, 34); c.drawString(70, 835, "topface")
+        c.setFont(F_BLACK, 46); c.drawString(70, 765, title)
+        if subtitle:
+            c.setFont(F_BOLD, 20); c.drawString(70, 725, subtitle)
+        if section:
+            c.setFont(F_BOLD, 14); c.drawRightString(W-75, 710, section)
+        c.setFont(F_BOLD, 13); c.drawRightString(W-75, 38, f"Страница {page_num}")
 
-def build_bid_ramp_monitor(decisions: pd.DataFrame) -> pd.DataFrame:
-    """Лист Разгон_показов: показывает не только отправленные изменения, но и весь статус режима Разгон.
+    def button(x, y, w, label, target=None):
+        c.setFillColor(WHITE); c.roundRect(x, y, w, 44, 14, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.setFont(F_BOLD, 13); c.drawCentredString(x+w/2, y+17, label)
+        if target:
+            c.linkRect("", str(target), (x, y, x+w, y+44), relative=0)
 
-    В лист попадают:
-    - кампании, которые подходят под разгон по метрикам: <1000 показов/день и расход <=500 ₽/день;
-    - кампании, где режим Разгон уже активен и ждёт D+7;
-    - кампании, где Разгон был заблокирован/скорректирован минимумом ставки WB.
-    """
-    if decisions is None or decisions.empty:
-        return pd.DataFrame(columns=BID_RAMP_MONITOR_COLUMNS)
-    rows: List[Dict[str, Any]] = []
-    for _, row in decisions.iterrows():
-        rc = _clean_text_value(row.get("reason_code", ""))
-        related = is_ramp_related_reason(rc, row.get("wait_rule", ""), row.get("last_bid_change_reason_code", ""))
-        candidate = is_ramp_candidate_by_metrics(row)
-        lifecycle = _clean_text_value(row.get("ramp_lifecycle_status", ""))
-        if not related and not candidate and not lifecycle:
-            continue
-        status, reason_group, applied = classify_ramp_status(row)
-        rows.append({
-            "campaign_id": row.get("campaign_id", ""),
-            "nm_id": row.get("nm_id", ""),
-            "supplier_article": row.get("supplier_article", ""),
-            "subject_norm": row.get("subject_norm", ""),
-            "placement": row.get("placement", ""),
-            "campaign_status": row.get("campaign_status", ""),
-            "ramp_candidate": bool(candidate),
-            "ramp_mode_status": status,
-            "ramp_applied_in_current_run": bool(row.get("ramp_applied_in_current_run", False)),
-            "ramp_reason_group": reason_group,
-            "current_bid_rub": row.get("current_bid_rub", 0),
-            "min_bid_rub": row.get("min_bid_rub", ""),
-            "new_bid_rub": row.get("new_bid_rub", ""),
-            "api_status": row.get("ramp_api_status", ""),
-            "reason_code": rc,
-            "reason_text": row.get("reason_text", ""),
-            "wait_status": row.get("wait_status", ""),
-            "wait_rule": row.get("wait_rule", ""),
-            "wait_until_date": row.get("wait_until_date", ""),
-            "wait_days_left": row.get("wait_days_left", ""),
-            "last_bid_change_date": row.get("last_bid_change_date", ""),
-            "days_since_last_bid_change": row.get("days_since_last_bid_change", ""),
-            "last_bid_change_old_bid": row.get("last_bid_change_old_bid", ""),
-            "last_bid_change_new_bid": row.get("last_bid_change_new_bid", ""),
-            "last_bid_change_reason_code": row.get("last_bid_change_reason_code", ""),
-            "impressions": row.get("impressions", 0),
-            "avg_impressions_per_day": row.get("avg_impressions_per_day", 0),
-            "spend": row.get("spend", 0),
-            "avg_spend_per_day": row.get("avg_spend_per_day", 0),
-            "orders": row.get("orders", 0),
-            "revenue": row.get("revenue", 0),
-            "campaign_drr_pct": row.get("campaign_drr_pct", 0),
-            "drr_limit_pct": row.get("drr_limit_pct", 0),
-            "last21_impressions": row.get("last21_impressions", 0),
-            "last21_drr_pct": row.get("last21_drr_pct", 0),
-            "keyword_profile_status": row.get("keyword_profile_status", ""),
-            "keyword_guard_status": row.get("keyword_guard_status", ""),
-            "current_core80_clicks_per_day": row.get("current_core80_clicks_per_day", ""),
-            "base_core80_clicks_per_day": row.get("base_core80_clicks_per_day", ""),
-            "core80_clicks_delta_pct": row.get("core80_clicks_delta_pct", ""),
-            "core80_position_delta": row.get("core80_position_delta", ""),
-            "core80_visibility_delta_pp": row.get("core80_visibility_delta_pp", ""),
-            "core_click_guard_comment": row.get("core_click_guard_comment", ""),
-            "target_impressions_per_day": RAMP_TARGET_IMPRESSIONS_PER_DAY,
-            "target_spend_per_day": RAMP_TARGET_SPEND_PER_DAY,
-            "overspend_per_day": RAMP_OVERSPEND_PER_DAY,
-            "scale_drr_limit_pct": RAMP_SCALE_DRR_LIMIT_PCT,
-            "max_spend_per_day": RAMP_MAX_SPEND_PER_DAY,
-            "check_days": RAMP_CHECK_DAYS,
-            "ramp_lifecycle_status": row.get("ramp_lifecycle_status", ""),
-            "ramp_start_date": row.get("ramp_start_date", ""),
-            "ramp_day": row.get("ramp_day", ""),
-            "ramp_days_left": row.get("ramp_days_left", ""),
-            "monitor_status": status or "not_ramp",
-        })
-    out = pd.DataFrame(rows)
-    for col in BID_RAMP_MONITOR_COLUMNS:
-        if col not in out.columns:
-            out[col] = ""
-    if not out.empty:
-        out = out.sort_values(["ramp_reason_group", "subject_norm", "avg_impressions_per_day"], ascending=[True, True, True])
-    return out[BID_RAMP_MONITOR_COLUMNS]
+    def top_nav(active=""):
+        labels = [("cur", "Текущая"), ("prev", "Прошлая"), ("month", "Месяц"), ("closed", "Закр. месяц"), ("summary", "Сводка")]
+        x = 880
+        for key, lab in labels:
+            button(x, 800, 128, lab, key)
+            x += 142
 
-def keyword_core_stats_for_group(keyword_core_df: pd.DataFrame, subject_norm: str, product_group: str, supplier_articles: Iterable[Any]) -> Dict[str, Any]:
-    if keyword_core_df is None or keyword_core_df.empty:
-        return {"core_queries_count": 0, "core_median_position": float("nan")}
-    work = keyword_core_df.copy()
-    if "keyword_group" in work.columns:
-        work = work[work["keyword_group"] == "CORE_80"].copy()
-    if work.empty:
-        return {"core_queries_count": 0, "core_median_position": float("nan")}
-    work["subject_norm"] = work.get("subject_norm", "").map(normalize_subject_value)
-    articles = set(_clean_text_value(x) for x in supplier_articles if _clean_text_value(x))
-    if "supplier_article" in work.columns and articles:
-        work = work[work["supplier_article"].astype(str).isin(articles)].copy()
-    else:
-        work["product_group"] = work.get("supplier_article", "").map(product_group_from_article)
-        work = work[(work["subject_norm"] == subject_norm) & (work["product_group"] == product_group)].copy()
-    if work.empty:
-        return {"core_queries_count": 0, "core_median_position": float("nan")}
-    return {
-        "core_queries_count": int(work.get("query_text", pd.Series(dtype=str)).nunique()),
-        "core_median_position": float(pd.to_numeric(work.get("median_position", pd.Series(dtype=float)), errors="coerce").median()),
-    }
+    def card(x, y, w, h, value, label, sub1="", sub2="", metric="good"):
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
+        c.setFillColor(BLACK); c.setFont(F_BLACK, 28); c.drawCentredString(x+w/2, y+h-42, str(value))
+        c.setFillColor(GRAY); c.setFont(F_REG, 14); c.drawCentredString(x+w/2, y+h-72, label)
+        if sub1:
+            color = GREEN if "↑" in sub1 else BAD if "↓" in sub1 else GRAY
+            c.setFillColor(color); c.setFont(F_BOLD, 11); c.drawCentredString(x+w/2, y+34, sub1)
+        if sub2:
+            color = GREEN if "↑" in sub2 else BAD if "↓" in sub2 else GRAY
+            c.setFillColor(color); c.setFont(F_BOLD, 11); c.drawCentredString(x+w/2, y+18, sub2)
 
+    def table_box(x, y, w, h, headers, rows, col_widths=None, font_size=13, row_h=48, first_col_red=True):
+        if col_widths is None:
+            col_widths = [w/len(headers)]*len(headers)
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 16, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.roundRect(x, y+h-54, w, 54, 12, fill=1, stroke=0)
+        xx=x
+        c.setFillColor(WHITE); c.setFont(F_BOLD, font_size)
+        for i, head in enumerate(headers):
+            c.drawCentredString(xx+col_widths[i]/2, y+h-34, str(head))
+            xx += col_widths[i]
+        yy=y+h-54-row_h
+        for ridx, row in enumerate(rows):
+            c.setFillColor(WHITE if ridx%2==0 else SOFT); c.rect(x, yy, w, row_h, fill=1, stroke=0)
+            xx=x
+            for i, val in enumerate(row):
+                if i == 0 and first_col_red:
+                    c.setFillColor(SOFT); c.roundRect(xx+8, yy+6, col_widths[i]-16, row_h-12, 8, fill=1, stroke=0)
+                    c.setFillColor(RED_DARK); c.setFont(F_BOLD, font_size)
+                else:
+                    c.setFillColor(BLACK); c.setFont(F_BOLD, font_size)
+                # Manual multi-line support.
+                text = str(val)
+                lines = text.split("\n")
+                line_y = yy + row_h/2 + (len(lines)-1)*8
+                for line in lines:
+                    c.drawCentredString(xx+col_widths[i]/2, line_y, line[:44])
+                    line_y -= 16
+                xx += col_widths[i]
+            yy -= row_h
 
-def build_one_campaign_experiment(metrics_df: pd.DataFrame, keyword_core_df: pd.DataFrame) -> pd.DataFrame:
-    """Формирует отдельный экспериментальный план: одна лучшая РК на товарную группу.
+    def delta_text(cur, prev, metric_lower_better=False):
+        d = _delta_pct(cur, prev)
+        if d is None:
+            return ""
+        arrow = "↑" if d > 0 else "↓" if d < 0 else "→"
+        # visual sign only; color is handled by arrow in card; compact.
+        return f"{arrow} {abs(d):.1f}%".replace(".", ",")
 
-    Для помад/блесков/косметических карандашей выбираем campaign_id с максимальными кликами,
-    затем CTR, затем заказами. Остальные campaign_id в этой товарной группе рекомендуются к паузе
-    только в рамках экспериментального блока. Главная цель — вывести выбранную РК в топ-10 по CORE_80.
-    """
-    if metrics_df is None or metrics_df.empty:
-        return pd.DataFrame(columns=ONE_CAMPAIGN_EXPERIMENT_COLUMNS)
-    work = metrics_df.copy()
-    work["subject_norm"] = work["subject_norm"].map(normalize_subject_value)
-    work = work[work["subject_norm"].map(is_one_campaign_experiment_subject)].copy()
-    work = work[work["campaign_status"].map(is_active_campaign)].copy()
-    if work.empty:
-        return pd.DataFrame(columns=ONE_CAMPAIGN_EXPERIMENT_COLUMNS)
-    work["product_group"] = work["supplier_article"].map(product_group_from_article)
-    work = work[work["product_group"].astype(str).str.strip() != ""].copy()
-    if work.empty:
-        return pd.DataFrame(columns=ONE_CAMPAIGN_EXPERIMENT_COLUMNS)
-
-    rows: List[Dict[str, Any]] = []
-    for (subject, product_group), g in work.groupby(["subject_norm", "product_group"], dropna=False):
-        campaign_count = int(g["campaign_id"].astype(str).nunique())
-        if campaign_count < 2:
-            continue
-        g = g.copy()
-        g["ctr_for_sort"] = pd.to_numeric(g.get("ctr_pct", 0), errors="coerce").fillna(0.0)
-        g["clicks_for_sort"] = pd.to_numeric(g.get("clicks", 0), errors="coerce").fillna(0.0)
-        g["orders_for_sort"] = pd.to_numeric(g.get("orders", 0), errors="coerce").fillna(0.0)
-        g["spend_for_sort"] = pd.to_numeric(g.get("spend", 0), errors="coerce").fillna(0.0)
-        selected = g.sort_values(["clicks_for_sort", "ctr_for_sort", "orders_for_sort", "spend_for_sort"], ascending=False).iloc[0]
-        selected_campaign_id = _clean_id_value(selected.get("campaign_id", ""))
-        to_pause = sorted(set(_clean_id_value(x) for x in g["campaign_id"].tolist()) - {selected_campaign_id})
-        if not to_pause:
-            continue
-
-        group_spend = money_or_zero(g["spend"].sum())
-        group_revenue = money_or_zero(g["revenue"].sum())
-        group_orders = money_or_zero(g["orders"].sum())
-        group_impressions = money_or_zero(g["impressions"].sum())
-        group_clicks = money_or_zero(g["clicks"].sum())
-        group_gp_series = pd.to_numeric(g.get("gp_after_ads", pd.Series(dtype=float)), errors="coerce")
-        group_gp = float(group_gp_series.sum()) if group_gp_series.notna().any() else float("nan")
-        group_ctr = safe_ctr_pct(group_clicks, group_impressions)
-        group_conversion = (group_orders / group_clicks * 100.0) if group_clicks > 0 else 0.0
-
-        selected_gp = money_or_zero(selected.get("gp_after_ads", 0))
-        selected_clicks = money_or_zero(selected.get("clicks", 0))
-        selected_orders = money_or_zero(selected.get("orders", 0))
-        selected_impressions = money_or_zero(selected.get("impressions", 0))
-        selected_conversion = (selected_orders / selected_clicks * 100.0) if selected_clicks > 0 else 0.0
-        step, _ = bid_step_rub(selected.get("placement", ""))
-        selected_bid = money_or_zero(selected.get("current_bid_rub", 0))
-        recommended_new_bid = next_bid_for_action(selected_bid, selected.get("placement", ""), "raise") if selected_bid > 0 else ""
-
-        kw_stats = keyword_core_stats_for_group(keyword_core_df, subject, product_group, g["supplier_article"].unique())
-        rows.append({
-            "experiment_id": str(uuid.uuid4()),
-            "run_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "subject_norm": subject,
-            "product_group": product_group,
-            "selected_campaign_id": selected_campaign_id,
-            "selected_nm_id": selected.get("nm_id", ""),
-            "selected_supplier_article": selected.get("supplier_article", ""),
-            "selected_placement": selected.get("placement", ""),
-            "selected_bid_rub": selected_bid,
-            "recommended_new_bid_rub": recommended_new_bid,
-            "selection_basis": "max_clicks_then_ctr_then_orders",
-            "group_campaigns_count": campaign_count,
-            "campaigns_to_pause": len(to_pause),
-            "pause_campaign_ids": ",".join(to_pause),
-            "group_gp_before": group_gp,
-            "group_orders_before": group_orders,
-            "group_revenue_before": group_revenue,
-            "group_spend_before": group_spend,
-            "group_impressions_before": group_impressions,
-            "group_clicks_before": group_clicks,
-            "group_ctr_before": group_ctr,
-            "group_conversion_before": group_conversion,
-            "selected_gp_before": selected_gp,
-            "selected_orders_before": selected_orders,
-            "selected_revenue_before": selected.get("revenue", 0),
-            "selected_spend_before": selected.get("spend", 0),
-            "selected_impressions_before": selected_impressions,
-            "selected_clicks_before": selected_clicks,
-            "selected_ctr_before": selected.get("ctr_pct", 0),
-            "selected_conversion_before": selected_conversion,
-            "core_queries_count": kw_stats["core_queries_count"],
-            "core_median_position": kw_stats["core_median_position"],
-            "core_target_position": ONE_CAMPAIGN_TARGET_POSITION,
-            "recommended_action": "leave_one_campaign_raise_selected_pause_others",
-            "reason_code": "ONE_CAMPAIGN_PER_PRODUCT_GROUP_EXPERIMENT",
-            "reason_text": (
-                f"выбрана РК {selected_campaign_id}: клики={selected_clicks:.0f}, CTR={money_or_zero(selected.get('ctr_pct',0)):.2f}%; "
-                f"остальные РК группы к паузе={len(to_pause)}; цель — топ-{ONE_CAMPAIGN_TARGET_POSITION} по CORE_80; "
-                f"сравнение через 7/10/14 дней: ВП группы, показы, клики, CTR, конверсия"
-            ),
-            "check_days": "/".join(str(x) for x in ONE_CAMPAIGN_CHECK_DAYS),
-        })
-    return pd.DataFrame(rows, columns=ONE_CAMPAIGN_EXPERIMENT_COLUMNS)
-
-
-def build_experiment_bid_decisions(one_campaign_experiment: pd.DataFrame, decisions: pd.DataFrame) -> pd.DataFrame:
-    if one_campaign_experiment is None or one_campaign_experiment.empty:
-        return pd.DataFrame(columns=DECISION_COLUMNS)
-    decision_lookup = decisions.copy() if decisions is not None else pd.DataFrame(columns=DECISION_COLUMNS)
-    rows: List[Dict[str, Any]] = []
-    for _, exp in one_campaign_experiment.iterrows():
-        new_bid = money_or_zero(exp.get("recommended_new_bid_rub", 0))
-        if new_bid <= 0:
-            continue
-        selected_campaign_id = _clean_id_value(exp.get("selected_campaign_id", ""))
-        selected_nm_id = _clean_id_value(exp.get("selected_nm_id", ""))
-        selected_placement = normalize_placement_value(exp.get("selected_placement", ""))
-        base = pd.Series(dtype=object)
-        if not decision_lookup.empty:
-            m = decision_lookup[
-                (decision_lookup["campaign_id"].astype(str).map(_clean_id_value) == selected_campaign_id)
-                & (decision_lookup["nm_id"].astype(str).map(_clean_id_value) == selected_nm_id)
-                & (decision_lookup["placement"].astype(str).map(normalize_placement_value) == selected_placement)
-            ]
-            if not m.empty:
-                base = m.iloc[0]
-        row = {col: base.get(col, "") if isinstance(base, pd.Series) else "" for col in DECISION_COLUMNS}
-        row.update({
-            "campaign_id": selected_campaign_id,
-            "nm_id": selected_nm_id,
-            "supplier_article": exp.get("selected_supplier_article", row.get("supplier_article", "")),
-            "subject_norm": exp.get("subject_norm", row.get("subject_norm", "")),
-            "placement": selected_placement,
-            "current_bid_rub": exp.get("selected_bid_rub", row.get("current_bid_rub", 0)),
-            "new_bid_rub": new_bid,
-            "action": "Повысить",
-            "reason_code": "EXPERIMENT_ONE_CAMPAIGN_RAISE_TO_TOP10_CORE80",
-            "reason_text": exp.get("reason_text", "эксперимент 1 РК на товарную группу: повышаем выбранную РК"),
-            "pause_decision": "",
-        })
-        rows.append(row)
-    return pd.DataFrame(rows, columns=DECISION_COLUMNS)
-
-
-def build_experiment_pause_candidates(one_campaign_experiment: pd.DataFrame, metrics_df: pd.DataFrame) -> pd.DataFrame:
-    if one_campaign_experiment is None or one_campaign_experiment.empty or metrics_df is None or metrics_df.empty:
-        return pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    metrics = metrics_df.copy()
-    metrics["campaign_id_clean"] = metrics["campaign_id"].astype(str).map(_clean_id_value)
-    rows: List[Dict[str, Any]] = []
-    for _, exp in one_campaign_experiment.iterrows():
-        pause_ids = [x.strip() for x in str(exp.get("pause_campaign_ids", "")).split(",") if x.strip()]
-        for campaign_id in pause_ids:
-            g = metrics[metrics["campaign_id_clean"] == _clean_id_value(campaign_id)].copy()
-            if g.empty:
-                continue
-            main = g.sort_values(["spend", "clicks", "impressions"], ascending=False).iloc[0]
-            rows.append({
-                "pause_event_id": str(uuid.uuid4()),
-                "pause_date": date.today().isoformat(),
-                "campaign_id": _clean_id_value(campaign_id),
-                "nm_id": main.get("nm_id", ""),
-                "placement": main.get("placement", ""),
-                "supplier_article": main.get("supplier_article", ""),
-                "subject_norm": main.get("subject_norm", exp.get("subject_norm", "")),
-                "reason_code": "EXPERIMENT_ONE_CAMPAIGN_PAUSE_DUPLICATE",
-                "impressions_before_pause": money_or_zero(g["impressions"].sum()),
-                "clicks_before_pause": money_or_zero(g["clicks"].sum()),
-                "spend_before_pause": money_or_zero(g["spend"].sum()),
-                "revenue_before_pause": money_or_zero(g["revenue"].sum()),
-                "orders_before_pause": money_or_zero(g["orders"].sum()),
-                "drr_before_pause": safe_drr_pct(money_or_zero(g["spend"].sum()), money_or_zero(g["revenue"].sum())),
-                "gp_before_pause": money_or_zero(pd.to_numeric(g.get("gp_after_ads", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
-                "status": "candidate",
-                "next_check_date": (date.today() + timedelta(days=7)).isoformat(),
-                "api_status": "",
-            })
-    return pd.DataFrame(rows, columns=PAUSE_HISTORY_COLUMNS)
-
-def build_summary(ctx: RunContext, decisions: pd.DataFrame, successful_changes: pd.DataFrame, pause_candidates: pd.DataFrame, applied_pauses: pd.DataFrame, start_candidates: pd.DataFrame, applied_starts: pd.DataFrame) -> Dict[str, Any]:
-    changed_count = int(len(successful_changes)) if successful_changes is not None else 0
-    pause_applied_count = 0
-    if applied_pauses is not None and not applied_pauses.empty:
-        pause_applied_count = int((applied_pauses["status"] == "paused").sum())
-    start_applied_count = 0
-    if applied_starts is not None and not applied_starts.empty:
-        start_applied_count = int((applied_starts["status"] == "started").sum())
-    recommendation_count = 0
-    if decisions is not None and not decisions.empty:
-        recommendation_count = int(decisions["action"].isin(["Повысить", "Снизить"]).sum())
-
-    return {
-        "Режим": ctx.mode if not ctx.dry_run else f"{ctx.mode} --dry-run",
-        "Дата формирования": ctx.run_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-        "Всего рекомендаций": recommendation_count,
-        "Изменённых ставок": changed_count,
-        "Блоков отправки ставок": recommendation_count if ctx.mode == "run" and not ctx.dry_run else 0,
-        "Кандидатов на паузу": int(len(pause_candidates)) if pause_candidates is not None else 0,
-        "Поставлено на паузу": pause_applied_count,
-        "Кандидатов на запуск": int(len(start_candidates)) if start_candidates is not None else 0,
-        "Запущено обратно": start_applied_count,
-        "Текущее окно с": ctx.current_start.isoformat(),
-        "Текущее окно по": ctx.current_end.isoformat(),
-        "База с": ctx.base_start.isoformat(),
-        "База по": ctx.base_end.isoformat(),
-        "ABC-рентабельность включена": "да" if decisions is not None and not decisions.empty and "abc_profitability_pct" in decisions.columns and pd.to_numeric(decisions["abc_profitability_pct"], errors="coerce").notna().any() else "нет",
-        "Порог ABC-рентабельности, %": ABC_PROFITABILITY_MIN_PCT,
-        "РК с ABC-рентабельностью < 15%": int((pd.to_numeric(decisions.get("abc_profitability_pct", pd.Series(dtype=float)), errors="coerce") < ABC_PROFITABILITY_MIN_PCT).sum()) if decisions is not None and not decisions.empty else 0,
-    }
-
-
-
-# =============================
-# Диагностика РК: нормальное сравнение 7 дней до/после изменения ставки
-# =============================
-
-def _date_window_label(start_date: Optional[date], end_date: Optional[date]) -> str:
-    if not start_date or not end_date or end_date < start_date:
-        return ""
-    return f"{start_date.isoformat()}..{end_date.isoformat()}"
-
-
-def _window_days_count(start_date: Optional[date], end_date: Optional[date]) -> int:
-    if not start_date or not end_date or end_date < start_date:
-        return 0
-    return int((end_date - start_date).days + 1)
-
-
-def _sum_window_campaign_metrics(ads_df: pd.DataFrame, key: Tuple[str, str, str], start_date: Optional[date], end_date: Optional[date]) -> Dict[str, float]:
-    if not start_date or not end_date or end_date < start_date:
-        return {"spend": 0.0, "revenue": 0.0, "orders": 0.0, "impressions": 0.0, "clicks": 0.0, "gp_after_ads": float("nan")}
-    return aggregate_after_event(ads_df, key, start_date, end_date)
-
-
-def _safe_per_day_value(value: Any, days: int) -> float:
-    if days <= 0:
-        return 0.0
-    val = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if pd.isna(val):
-        return float("nan")
-    return float(val) / float(days)
-
-
-def _safe_delta_pct(after: Any, before: Any) -> Any:
-    before_num = pd.to_numeric(pd.Series([before]), errors="coerce").iloc[0]
-    after_num = pd.to_numeric(pd.Series([after]), errors="coerce").iloc[0]
-    if pd.isna(before_num) or pd.isna(after_num) or float(before_num) == 0:
-        return ""
-    return (float(after_num) / float(before_num) - 1.0) * 100.0
-
-
-def _safe_delta_pp(after: Any, before: Any) -> Any:
-    before_num = pd.to_numeric(pd.Series([before]), errors="coerce").iloc[0]
-    after_num = pd.to_numeric(pd.Series([after]), errors="coerce").iloc[0]
-    if pd.isna(before_num) or pd.isna(after_num):
-        return ""
-    return float(after_num) - float(before_num)
-
-
-def _weighted_average(values: pd.Series, weights: pd.Series) -> float:
-    vals = pd.to_numeric(values, errors="coerce")
-    w = pd.to_numeric(weights, errors="coerce").fillna(0.0)
-    mask = vals.notna() & (w > 0)
-    if mask.any() and float(w.loc[mask].sum()) > 0:
-        return float((vals.loc[mask] * w.loc[mask]).sum() / w.loc[mask].sum())
-    vals = vals.dropna()
-    return float(vals.mean()) if not vals.empty else 0.0
-
-
-def _core80_queries_for_nm(keyword_core_df: pd.DataFrame, nm_id: str, supplier_article: str = "") -> set[str]:
-    if keyword_core_df is None or keyword_core_df.empty or "query_text_norm" not in keyword_core_df.columns:
-        return set()
-    core = keyword_core_df.copy()
-    if "keyword_group" in core.columns:
-        core = core[core["keyword_group"].astype(str).eq("CORE_80")].copy()
-    core = core[core["nm_id"].astype(str).map(_clean_id_value).eq(_clean_id_value(nm_id))].copy() if "nm_id" in core.columns else core.iloc[0:0].copy()
-    if supplier_article and "supplier_article" in core.columns:
-        art_core = core[core["supplier_article"].astype(str).map(_clean_text_value).eq(_clean_text_value(supplier_article))].copy()
-        if not art_core.empty:
-            core = art_core
-    return set(core["query_text_norm"].astype(str).str.strip().str.lower().tolist())
-
-
-def _aggregate_core80_keyword_window(keyword_df: pd.DataFrame, keyword_core_df: pd.DataFrame, nm_id: str, supplier_article: str, start_date: Optional[date], end_date: Optional[date]) -> Dict[str, float]:
-    empty = {"queries_count": 0.0, "avg_position": 0.0, "visibility_pct": 0.0, "query_freq": 0.0, "clicks_to_card": 0.0, "keyword_orders": 0.0}
-    if keyword_df is None or keyword_df.empty or not start_date or not end_date or end_date < start_date:
-        return empty
-    queries = _core80_queries_for_nm(keyword_core_df, nm_id, supplier_article)
-    if not queries:
-        return empty
-    part = keyword_df.copy()
-    if "nm_id" in part.columns:
-        part = part[part["nm_id"].astype(str).map(_clean_id_value).eq(_clean_id_value(nm_id))].copy()
-    if supplier_article and "supplier_article" in part.columns:
-        art_part = part[part["supplier_article"].astype(str).map(_clean_text_value).eq(_clean_text_value(supplier_article))].copy()
-        if not art_part.empty:
-            part = art_part
-    if "query_text_norm" in part.columns:
-        part = part[part["query_text_norm"].astype(str).str.strip().str.lower().isin(queries)].copy()
-    if has_valid_dates(part):
-        part = part[(part["date"] >= start_date) & (part["date"] <= end_date)].copy()
-    if part.empty:
-        return {**empty, "queries_count": float(len(queries))}
-    query_freq = pd.to_numeric(part.get("query_freq", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
-    return {
-        "queries_count": float(len(queries)),
-        "avg_position": _weighted_average(part.get("median_position", pd.Series(dtype=float)), query_freq),
-        "visibility_pct": _weighted_average(part.get("visibility_pct", pd.Series(dtype=float)), query_freq),
-        "query_freq": float(query_freq.sum()),
-        "clicks_to_card": float(pd.to_numeric(part.get("clicks_to_card", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
-        "keyword_orders": float(pd.to_numeric(part.get("keyword_orders", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()),
-    }
-
-
-def _aggregate_funnel_card_views_window(funnel_df: pd.DataFrame, nm_id: str, start_date: Optional[date], end_date: Optional[date]) -> float:
-    if funnel_df is None or funnel_df.empty or not start_date or not end_date or end_date < start_date:
-        return 0.0
-    part = funnel_df.copy()
-    if "nm_id" not in part.columns:
-        return 0.0
-    part = part[part["nm_id"].astype(str).map(_clean_id_value).eq(_clean_id_value(nm_id))].copy()
-    if has_valid_dates(part):
-        part = part[(part["date"] >= start_date) & (part["date"] <= end_date)].copy()
-    if part.empty:
-        return 0.0
-    return float(pd.to_numeric(part.get("card_views", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum())
-
-
-def _latest_bid_event_by_key(bid_history: pd.DataFrame) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    if bid_history is None or bid_history.empty:
-        return {}
-    local = bid_history.copy()
-    for col in BID_HISTORY_COLUMNS:
-        if col not in local.columns:
-            local[col] = ""
-    local["event_date_parsed"] = pd.to_datetime(local["event_date"], errors="coerce")
-    local["run_dt_parsed"] = pd.to_datetime(local["run_datetime"], errors="coerce")
-    local = local.sort_values(["event_date_parsed", "run_dt_parsed"], na_position="first")
-    out: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for _, row in local.iterrows():
-        key = make_key(row)
-        if all(key):
-            out[key] = row.to_dict()
-    return out
-
-
-def _effect_by_event_id(effect_df: Optional[pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
-    if effect_df is None or effect_df.empty or "event_id" not in effect_df.columns:
-        return {}
-    out: Dict[str, Dict[str, Any]] = {}
-    for _, row in effect_df.iterrows():
-        eid = _clean_text_value(row.get("event_id", ""))
-        if eid:
-            out[eid] = row.to_dict()
-    return out
-
-
-def _bid_compare_conclusion(
-    action: str,
-    reason_code: str,
-    final_verdict: str,
-    target_action: str,
-    before_gp_day: Any,
-    after_gp_day: Any,
-    before_drr: float,
-    after_drr: float,
-    before_pos: float,
-    after_pos: float,
-    before_visibility: float,
-    after_visibility: float,
-) -> str:
-    gp_delta = _safe_delta_pct(after_gp_day, before_gp_day)
-    drr_delta = _safe_delta_pp(after_drr, before_drr)
-    pos_delta = _safe_delta_pp(after_pos, before_pos)
-    vis_delta = _safe_delta_pp(after_visibility, before_visibility)
-    gp_text = "условная ВП после рекламы/день н/д"
-    if gp_delta != "":
-        gp_text = f"условная ВП после рекламы/день {'выросла' if float(gp_delta) >= 0 else 'упала'} на {float(gp_delta):.1f}%"
-    drr_text = f"ДРР {before_drr:.2f}%→{after_drr:.2f}%" if before_drr or after_drr else "ДРР н/д"
-    pos_text = "позиция CORE80 н/д"
-    if pos_delta != "":
-        pos_text = f"позиция CORE80 {before_pos:.1f}→{after_pos:.1f} ({float(pos_delta):+.1f}; меньше лучше)"
-    vis_text = "видимость CORE80 н/д"
-    if vis_delta != "":
-        vis_text = f"видимость {before_visibility:.1f}%→{after_visibility:.1f}% ({float(vis_delta):+.1f} п.п.)"
-    decision_text = f"Решение кода: {action or 'Без изменений'} / {reason_code or 'без reason_code'}"
-    if final_verdict:
-        decision_text += f"; post-check={final_verdict}"
-    if target_action:
-        decision_text += f"; целевое действие={target_action}"
-    return "; ".join([gp_text, drr_text, pos_text, vis_text, decision_text])
-
-
-def build_campaign_7d_comparison(
-    decisions: pd.DataFrame,
-    bid_history: pd.DataFrame,
-    ads_df: pd.DataFrame,
-    keyword_df: pd.DataFrame,
-    keyword_core_df: pd.DataFrame,
-    funnel_df: pd.DataFrame,
-    effect_df: Optional[pd.DataFrame],
-    ctx: RunContext,
-) -> pd.DataFrame:
-    """Строит диагностический лист: РК × nm × placement, сравнение 7 дней до/после последней ставки.
-
-    Если по строке есть последняя успешная правка ставки, окно ДО = 7 дней до event_date,
-    окно ПОСЛЕ = до 7 зрелых дней после event_date. Если истории правки нет, сравниваем
-    последние 7 зрелых дней с предыдущими 7 днями. Метрики CORE_80 берутся по продающим
-    запросам, которые формируют 80% заказов по SKU; доля трафика = переходы в карточку
-    из воронки / частотность CORE_80.
-    """
-    if decisions is None or decisions.empty:
-        return pd.DataFrame(columns=BID_CAMPAIGN_COMPARE_COLUMNS)
-    latest_events = _latest_bid_event_by_key(bid_history)
-    effects = _effect_by_event_id(effect_df)
-    rows: List[Dict[str, Any]] = []
-    current_after_end = ctx.mature_end
-    current_after_start = current_after_end - timedelta(days=6)
-    current_before_end = current_after_start - timedelta(days=1)
-    current_before_start = current_before_end - timedelta(days=6)
-
-    for _, decision in decisions.iterrows():
-        key = make_key(decision)
-        if not all(key):
-            continue
-        event = latest_events.get(key)
-        comparison_status = "NO_BID_CHANGE_HISTORY_COMPARE_LAST_7D"
-        old_bid = ""
-        new_bid = ""
-        change_reason = ""
-        event_date_text = ""
-        if event:
-            event_dt = pd.to_datetime(event.get("event_date", ""), errors="coerce")
-            if not pd.isna(event_dt):
-                event_day = event_dt.date()
-                before_start = event_day - timedelta(days=7)
-                before_end = event_day - timedelta(days=1)
-                after_start = event_day + timedelta(days=1)
-                after_end = min(ctx.mature_end, event_day + timedelta(days=7))
-                comparison_status = "BID_CHANGE_7D_BEFORE_AFTER"
-                event_date_text = event_day.isoformat()
+    # Page 1 current week by days.
+    bookmarks["cur"] = "cur"; c.bookmarkPage("cur")
+    bg("Текущая неделя", f"{cur_monday.strftime('%d.%m')}-{cur_week_end.strftime('%d.%m.%Y')} / оперативно: дни и план", "Текущая неделя")
+    top_nav("cur")
+    cur_period = _agg_daily_for_bridge(daily, cur_monday, latest, ["subject"])
+    prev_same = _agg_daily_for_bridge(daily, cur_monday-pd.Timedelta(days=7), latest-pd.Timedelta(days=7), ["subject"])
+    cur_total = cur_period.sum(numeric_only=True)
+    prev_total = prev_same.sum(numeric_only=True) if not prev_same.empty else pd.Series(dtype=float)
+    card(70, 610, 260, 120, _fmt_rub(cur_total.get("order_sum", 0)), "Сумма заказов", delta_text(cur_total.get("order_sum",0), prev_total.get("order_sum",0)))
+    card(360, 610, 260, 120, _fmt_rub(cur_total.get("gross_profit_model", 0)), "ВП расч.", delta_text(cur_total.get("gross_profit_model",0), prev_total.get("gross_profit_model",0)))
+    card(650, 610, 260, 120, _fmt_pct_pdf(cur_total.get("ad_spend_total",0)/cur_total.get("order_sum",1)*100 if cur_total.get("order_sum",0) else 0), "ДРР", delta_text(cur_total.get("ad_spend_total",0)/cur_total.get("order_sum",1), prev_total.get("ad_spend_total",0)/prev_total.get("order_sum",1) if prev_total.get("order_sum",0) else None))
+    card(940, 610, 260, 120, _fmt_rub(cur_total.get("ad_spend_total", 0)), "Расход РК", delta_text(cur_total.get("ad_spend_total",0), prev_total.get("ad_spend_total",0)))
+    plan_day = max(0, float(cur_total.get("order_sum",0)) / max(1, (latest-cur_monday).days+1) * 1.1)
+    card(1230, 610, 260, 120, _fmt_rub(plan_day), "План/день", "по сумме")
+    # Day table.
+    headers = ["Категория", "Пн\n"+cur_monday.strftime("%d.%m"), "Вт\n"+(cur_monday+pd.Timedelta(days=1)).strftime("%d.%m"), "Ср\n"+(cur_monday+pd.Timedelta(days=2)).strftime("%d.%m"), "Чт\n"+(cur_monday+pd.Timedelta(days=3)).strftime("%d.%m"), "Пт\n"+(cur_monday+pd.Timedelta(days=4)).strftime("%d.%m"), "Сб\n"+(cur_monday+pd.Timedelta(days=5)).strftime("%d.%m"), "Вс\n"+(cur_monday+pd.Timedelta(days=6)).strftime("%d.%m"), "План/день"]
+    rows=[]
+    cats = ["Кисти косметические", "Косметические карандаши", "Помады", "Блески"]
+    cat_short = {"Кисти косметические":"Кисти", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
+    day_agg = _agg_daily_for_bridge(daily, cur_monday, cur_week_end, ["day", "subject"])
+    for cat in cats:
+        left = f"{cat_short.get(cat,cat)}\nСумма\nВП\nРасх. РК\nДРР"
+        vals=[left]
+        for i in range(7):
+            day = cur_monday + pd.Timedelta(days=i)
+            p = day_agg[(day_agg["day"] == day) & (day_agg["subject"] == cat)] if not day_agg.empty and "day" in day_agg.columns else pd.DataFrame()
+            if p.empty or day > latest:
+                vals.append("-\n-\n-\n-")
             else:
-                before_start, before_end = current_before_start, current_before_end
-                after_start, after_end = current_after_start, current_after_end
-            old_bid = event.get("old_bid_rub", "")
-            new_bid = event.get("new_bid_rub", "")
-            change_reason = _clean_text_value(event.get("reason_code", ""))
+                rr=p.iloc[0]
+                vals.append(f"{_fmt_rub(rr.get('order_sum',0), True)}\n{_fmt_rub(rr.get('gross_profit_model',0), True)}\n{_fmt_rub(rr.get('ad_spend_total',0), True)}\n{_fmt_pct_pdf(rr.get('drr_pct',0))}")
+        vals.append(f"{_fmt_rub(plan_day/4, True)}\n-\n-\n-")
+        rows.append(vals)
+    table_box(70, 80, 1460, 470, headers, rows, col_widths=[190]+[145]*7+[255], font_size=12, row_h=92)
+    c.showPage()
+
+    # Page 2 current categories.
+    bookmarks["cur_cat"] = "cur_cat"; c.bookmarkPage("cur_cat")
+    bg("Текущая неделя: категории", f"{cur_monday.strftime('%d.%m')}-{latest.strftime('%d.%m.%Y')} / переход по категории", "Текущая неделя")
+    top_nav("cur")
+    cat_cur = _merge_cur_prev(cur_period, prev_same, ["subject"])
+    rows=[]
+    for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows():
+        rows.append([cat_short.get(r.get("subject"), r.get("subject")), _fmt_rub(r.get("order_sum")), delta_text(r.get("order_sum"), r.get("order_sum_prev")), _fmt_rub(r.get("gross_profit_model")), _fmt_pct_pdf(r.get("drr_pct")), _fmt_rub(r.get("ad_spend_total")), _fmt_cpc_pdf(r.get("cpc"))])
+    table_box(80, 300, 1360, 330, ["Категория", "Сумма", "Δ", "ВП расч.", "ДРР", "Расход РК", "CPC"], rows, col_widths=[230,210,120,210,160,220,160], font_size=14, row_h=66)
+    c.showPage()
+
+    # Page 3 previous week summary.
+    bookmarks["prev"] = "prev"; c.bookmarkPage("prev")
+    bg("Прошлая неделя", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / сравнение с {prev_start.strftime('%d.%m')}-{prev_end.strftime('%d.%m.%Y')}", "Прошлая неделя")
+    top_nav("prev")
+    cat = _agg_daily_for_bridge(daily, week_start, week_end, ["subject"])
+    cat_prev = _agg_daily_for_bridge(daily, prev_start, prev_end, ["subject"])
+    cat_gp = _abc_gp_for_period(builder_global_for_pdf, week_start, week_end, ["subject"]) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+    cat_gp_prev = _abc_gp_for_period(builder_global_for_pdf, prev_start, prev_end, ["subject"]).rename(columns={"gp_fact":"gp_fact_prev"}) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+    cat_sum = _merge_cur_prev(cat, cat_prev, ["subject"])
+    if not cat_gp.empty: cat_sum = cat_sum.merge(cat_gp, on="subject", how="left")
+    if not cat_gp_prev.empty: cat_sum = cat_sum.merge(cat_gp_prev[["subject","gp_fact_prev"]], on="subject", how="left")
+    total = cat_sum.sum(numeric_only=True)
+    card(70, 610, 260, 120, _fmt_rub(total.get("order_sum",0)), "Сумма заказов", delta_text(total.get("order_sum",0), total.get("order_sum_prev",0)))
+    card(360, 610, 260, 120, _fmt_rub(total.get("gp_fact", total.get("gross_profit_model",0))), "ВП факт ABC", delta_text(total.get("gp_fact",0), total.get("gp_fact_prev",0)))
+    card(650, 610, 260, 120, _fmt_pct_pdf(total.get("ad_spend_total",0)/total.get("order_sum",1)*100 if total.get("order_sum",0) else 0), "ДРР", delta_text(total.get("ad_spend_total",0)/total.get("order_sum",1), total.get("ad_spend_total_prev",0)/total.get("order_sum_prev",1) if total.get("order_sum_prev",0) else None))
+    card(940, 610, 260, 120, _fmt_rub(total.get("ad_spend_total",0)), "Расход РК", delta_text(total.get("ad_spend_total",0), total.get("ad_spend_total_prev",0)))
+    card(1230, 610, 260, 120, _fmt_cpc_pdf(total.get("ad_spend_total",0)/total.get("ad_clicks_total",1) if total.get("ad_clicks_total",0) else 0), "CPC")
+    rows=[]
+    for _, r in cat_sum.sort_values("order_sum", ascending=False).iterrows():
+        gp = r.get("gp_fact", r.get("gross_profit_model", 0))
+        mar = gp / r.get("order_sum",1)*100 if r.get("order_sum",0) else 0
+        rows.append([cat_short.get(r.get("subject"), r.get("subject")), _fmt_rub(r.get("order_sum")), delta_text(r.get("order_sum"), r.get("order_sum_prev")), _fmt_rub(gp), delta_text(gp, r.get("gp_fact_prev", r.get("gross_profit_model_prev",0))), _fmt_pct_pdf(mar), _fmt_pct_pdf(r.get("drr_pct")), _fmt_cpc_pdf(r.get("cpc"))])
+    table_box(70, 90, 1460, 420, ["Категория", "Сумма", "Δ", "ВП", "Δ", "Рент.", "ДРР", "CPC"], rows, col_widths=[220,200,100,200,100,150,150,150], font_size=13, row_h=66)
+    c.showPage()
+
+    # Month placeholders simplified.
+    for key, title, sub in [("month", "Текущий месяц", "месяц неполный / темп к плану"), ("closed", "Последний закрытый месяц", "факт по доступным данным"), ("summary", "Сводка по месяцам", "категории / без лишней детализации")]:
+        bookmarks[key] = key; c.bookmarkPage(key)
+        bg(title, sub, title)
+        top_nav(key)
+        c.setFillColor(WHITE); c.roundRect(100, 300, 1400, 180, 20, fill=1, stroke=0)
+        c.setFillColor(BLACK); c.setFont(F_BOLD, 24); c.drawCentredString(800, 390, "Данные раздела формируются в Excel-расчёте; PDF использует этот блок как навигационный уровень.")
+        c.showPage()
+
+    # Category pages for previous week.
+    factor_summary = outputs.get("factor_summary_for_pdf", pd.DataFrame())
+    factor_bridge = outputs.get("factor_bridge", pd.DataFrame())
+    opt = outputs.get("optimal_benchmarks", pd.DataFrame())
+    detail_articles = []
+    cat_rows = cat_sum.sort_values("order_sum", ascending=False)
+    for _, catr in cat_rows.iterrows():
+        subject = catr.get("subject")
+        cat_name = cat_short.get(subject, subject)
+        cat_book = f"cat_{cat_name}"
+        bookmarks[cat_book] = cat_book; c.bookmarkPage(cat_book)
+        # Article/product rows from bridge/daily.
+        a_cur = _agg_daily_for_bridge(daily, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        a_prev = _agg_daily_for_bridge(daily, prev_start, prev_end, ["subject", "product", "supplier_article", "nm_id"])
+        a = _merge_cur_prev(a_cur, a_prev, ["subject", "product", "supplier_article", "nm_id"])
+        agp = _abc_gp_for_period(builder_global_for_pdf, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"]) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+        if not agp.empty: a = a.merge(agp, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        a = a[a["subject"] == subject].copy()
+        if a.empty:
+            continue
+        a["gp_use"] = a["gp_fact"].fillna(a.get("gross_profit_model", 0)) if "gp_fact" in a.columns else a.get("gross_profit_model", 0)
+        # ABC-80: only details contributing 80% positive GP; category table still shows visible rows.
+        apos = a[a["gp_use"] > 0].sort_values("gp_use", ascending=False).copy()
+        total_gp = apos["gp_use"].sum()
+        if total_gp > 0:
+            apos["cum_share"] = apos["gp_use"].cumsum() / total_gp
+            detail_articles += apos[apos["cum_share"] <= 0.80][["subject","product","supplier_article","nm_id"]].to_dict("records")
+        pages = [a.sort_values("order_sum", ascending=False).iloc[i:i+7] for i in range(0, len(a), 7)]
+        for pi, part in enumerate(pages, start=1):
+            bg(f"Категория: {cat_name}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / динамика к прошлой неделе / лист {pi} из {len(pages)}", "Категория")
+            button(1280, 800, 180, "← прошлая", "prev")
+            rows=[]
+            for _, r in part.iterrows():
+                gp = r.get("gp_use", 0); mar = gp / r.get("order_sum",1)*100 if r.get("order_sum",0) else 0
+                rows.append([r.get("supplier_article"), _fmt_rub(r.get("order_sum")), delta_text(r.get("order_sum"), r.get("order_sum_prev")), _fmt_rub(gp), _fmt_pct_pdf(mar), _fmt_pct_pdf(r.get("drr_pct")), _fmt_cpc_pdf(r.get("cpc")), _fmt_pct_pdf(r.get("search_traffic_capture_pct")), _fmt_pct_pdf(r.get("localization_with_replacements_pct"))])
+            table_box(80, 170, 1400, 520, ["Артикул", "Сумма", "Δ", "ВП", "Рент.", "ДРР", "CPC", "% поиска", "Локал."], rows, col_widths=[190,180,90,180,140,130,120,140,140], font_size=13, row_h=62)
+            c.showPage()
+
+    # Article detail pages from ABC-80 only.
+    seen = set()
+    for rec in detail_articles:
+        key_tuple = (rec.get("subject"), str(rec.get("product")), str(rec.get("supplier_article")), rec.get("nm_id"))
+        if key_tuple in seen:
+            continue
+        seen.add(key_tuple)
+        subject, product, art, nm_id = key_tuple
+        a_cur = _agg_daily_for_bridge(daily, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"])
+        a_prev = _agg_daily_for_bridge(daily, prev_start, prev_end, ["subject", "product", "supplier_article", "nm_id"])
+        a = _merge_cur_prev(a_cur, a_prev, ["subject", "product", "supplier_article", "nm_id"])
+        agp = _abc_gp_for_period(builder_global_for_pdf, week_start, week_end, ["subject", "product", "supplier_article", "nm_id"]) if "builder_global_for_pdf" in globals() else pd.DataFrame()
+        if not agp.empty: a = a.merge(agp, on=["subject", "product", "supplier_article", "nm_id"], how="left")
+        rr = a[(a["subject"] == subject) & (a["supplier_article"].astype(str) == str(art))]
+        if rr.empty:
+            continue
+        r = rr.iloc[0]
+        page1 = f"article_{art}_1"; page2=f"article_{art}_2"
+        bookmarks[page1]=page1; c.bookmarkPage(page1)
+        bg(f"Артикул: {art}", f"{cat_short.get(subject,subject)} / товар {product} / {week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')}", "Артикул 1/2")
+        button(1240, 800, 170, "← категория", f"cat_{cat_short.get(subject,subject)}")
+        button(1430, 800, 100, "стр.2", page2)
+        c.setFillColor(RED_DARK); c.roundRect(80, 690, 1440, 44, 10, fill=1, stroke=0); c.setFillColor(WHITE); c.setFont(F_BLACK, 20); c.drawString(105, 705, "Блок 1. Продажи и экономика")
+        gp = _safe_float(r.get("gp_fact"), _safe_float(r.get("gross_profit_model")))
+        mar = gp / _safe_float(r.get("order_sum"),1)*100 if _safe_float(r.get("order_sum")) else 0
+        cards1 = [
+            (_fmt_rub(r.get("order_sum")), "Сумма заказов", delta_text(r.get("order_sum"), r.get("order_sum_prev"))),
+            (_fmt_rub(gp), "ВП факт ABC", ""),
+            (_fmt_pct_pdf(mar), "Рентабельность", ""),
+            (_fmt_rub(r.get("avg_order_price")), "Цена продажи", delta_text(r.get("avg_order_price"), r.get("avg_order_price_prev"))),
+            (_fmt_pct_pdf(r.get("spp", r.get("spp_funnel",0))), "СПП", delta_text(r.get("spp",0), r.get("spp_prev",0))),
+            (_fmt_rub(r.get("commission_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Комиссия/шт", ""),
+            (_fmt_rub((r.get("logistics_direct_model",0)+r.get("logistics_return_model",0))/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Логистика/шт", ""),
+            (_fmt_rub(r.get("storage_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Хранение/шт", ""),
+            (_fmt_rub(r.get("acquiring_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Эквайринг/шт", ""),
+            (_fmt_rub(r.get("cost_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Себест./шт", ""),
+            (_fmt_rub(r.get("other_costs_model",0)/max(_safe_float(r.get("buyout_qty_model"),1),1)), "Прочие/шт", ""),
+        ]
+        for idx, it in enumerate(cards1[:6]): card(80+idx*240, 570, 220, 96, *it)
+        for idx, it in enumerate(cards1[6:]): card(80+idx*240, 455, 220, 96, *it)
+        c.setFillColor(RED_DARK); c.roundRect(80, 385, 1440, 44, 10, fill=1, stroke=0); c.setFillColor(WHITE); c.setFont(F_BLACK, 20); c.drawString(105, 400, "Блок 2. Реклама, спрос и конверсии")
+        cards2 = [
+            (_fmt_rub(r.get("ad_spend_total")), "Расход РК", delta_text(r.get("ad_spend_total"), r.get("ad_spend_total_prev"))),
+            (_fmt_pct_pdf(r.get("drr_pct")), "ДРР", delta_text(r.get("drr_pct"), r.get("drr_pct_prev"))),
+            (_fmt_cpc_pdf(r.get("cpc")), "CPC", delta_text(r.get("cpc"), r.get("cpc_prev"))),
+            (_fmt_num_pdf(r.get("ad_impressions_total")), "Показы РК", delta_text(r.get("ad_impressions_total"), r.get("ad_impressions_total_prev"))),
+            (_fmt_num_pdf(r.get("ad_clicks_total")), "Клики РК", delta_text(r.get("ad_clicks_total"), r.get("ad_clicks_total_prev"))),
+            (_fmt_num_pdf(r.get("open_cards")), "Открытия", delta_text(r.get("open_cards"), r.get("open_cards_prev"))),
+            (_fmt_pct_pdf(r.get("cart_conv_pct")), "Конв. в корзину", delta_text(r.get("cart_conv_pct"), r.get("cart_conv_pct_prev"))),
+            (_fmt_pct_pdf(r.get("order_conv_pct")), "Корзина -> заказ", delta_text(r.get("order_conv_pct"), r.get("order_conv_pct_prev"))),
+            (_fmt_num_pdf(r.get("search_frequency")), "Спрос WB", delta_text(r.get("search_frequency"), r.get("search_frequency_prev"))),
+            (_fmt_pct_pdf(r.get("search_traffic_capture_pct")), "% поиска", delta_text(r.get("search_traffic_capture_pct"), r.get("search_traffic_capture_pct_prev"))),
+            (_fmt_pct_pdf(r.get("localization_with_replacements_pct")), "Локализация", ""),
+        ]
+        for idx, it in enumerate(cards2[:6]): card(80+idx*240, 260, 220, 96, *it)
+        for idx, it in enumerate(cards2[6:]): card(80+idx*240, 145, 220, 96, *it)
+        c.showPage()
+        bookmarks[page2]=page2; c.bookmarkPage(page2)
+        bg(f"Артикул: {art}", f"{cat_short.get(subject,subject)} / товар {product} / точки входа и выводы", "Артикул 2/2")
+        button(1240, 800, 170, "← категория", f"cat_{cat_short.get(subject,subject)}")
+        button(1430, 800, 100, "стр.1", page1)
+        eb = outputs.get("entry_points_bridge", pd.DataFrame())
+        ep_rows=[]
+        if eb is not None and not eb.empty:
+            part = eb[(eb["subject"]==subject) & (eb["supplier_article"].astype(str)==str(art))].sort_values("orders", ascending=False).head(7)
+            for _, ebr in part.iterrows():
+                ep_rows.append([f"{ebr.get('entry_section','')} / {ebr.get('entry_point','')}", _fmt_num_pdf(ebr.get("transitions")), delta_text(ebr.get("transitions"), ebr.get("transitions_prev")), _fmt_num_pdf(ebr.get("orders")), delta_text(ebr.get("orders"), ebr.get("orders_prev")), _fmt_rub(ebr.get("effect_gp_rub"))])
+        if not ep_rows:
+            ep_rows=[['-', '-', '-', '-', '-', '-']]
+        table_box(90, 380, 1420, 340, ["Точка входа", "Переходы", "Δ", "Заказы", "Δ", "Вклад ВП"], ep_rows, col_widths=[570,160,100,140,100,180], font_size=13, row_h=42, first_col_red=False)
+        # Factor summary money.
+        fs = factor_summary[(factor_summary["level"]=="article") & (factor_summary["supplier_article"].astype(str)==str(art))] if factor_summary is not None and not factor_summary.empty else pd.DataFrame()
+        txt = fs.iloc[0]["summary_text"] if not fs.empty else "Факторный мост не выделил значимых денежных причин."
+        c.setFillColor(WHITE); c.roundRect(90, 130, 1420, 190, 18, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.setFont(F_BLACK, 22); c.drawString(120, 280, "Факторный вывод в деньгах")
+        c.setFillColor(BLACK); c.setFont(F_BOLD, 18)
+        # simple wrap
+        words = str(txt).split()
+        lines=[]; line=""
+        for w0 in words:
+            cand = (line + " " + w0).strip()
+            if stringWidth(cand, F_BOLD, 18) > 1320:
+                lines.append(line); line=w0
+            else:
+                line=cand
+        if line: lines.append(line)
+        yy=245
+        for line in lines[:6]:
+            c.drawString(120, yy, line); yy -= 26
+        c.showPage()
+    c.save()
+    return path
+
+
+
+# ============================================================================
+# STRICT PDF REPORT OVERRIDES 2026-05-26
+# Пересборка управленческого PDF строго по чек-листу:
+# - PDF-only без полного пересчета;
+# - утвержденный справочник товаров;
+# - отбор товаров по 90% стабильной ВП на уровне товара;
+# - ДРР сравнивается только с оптимальным ДРР по лучшим дням;
+# - факторные выводы строятся по денежному эффекту факторов, а не по сухим %;
+# - точки входа выводятся с динамикой и денежным вкладом;
+# - страницы артикула показывают два блока: экономика/продажи и спрос/точки входа/конверсии.
+# ============================================================================
+
+# PDF-only должен читать новые листы, но старые файлы не ломаются: отсутствующие листы = WARN + пустой df.
+try:
+    PDF_ONLY_SHEETS[FACTOR_REPORT_NAME] = [
+        "optimal_benchmarks", "factor_bridge", "entry_points_bridge",
+        "factor_summary_for_pdf", "selected_pdf_products", "product_stability_for_pdf",
+    ]
+except Exception:
+    pass
+
+
+_FACTOR_ECONOMY_KEYWORDS = (
+    "рентабельностин", "дрр", "реклам", "цена", "спп", "комис", "логист", "хран", "эквайр", "себест", "прочие", "расход",
+)
+_FACTOR_DEMAND_KEYWORDS = (
+    "спрос", "поиск", "трафик", "конвер", "корзина", "заказ", "открыт", "ctr", "cpc",
+)
+_LOWER_BETTER_METRICS = {
+    "drr_pct", "cpc", "ad_spend_total", "manual_spend", "unified_spend", "unknown_spend",
+    "commission_unit", "logistics_unit", "storage_unit", "acquiring_unit", "cost_unit", "other_costs_unit",
+}
+_GOOD_GROWTH_METRICS = {
+    "order_sum", "gross_profit", "gp_fact", "gross_profit_model", "orders", "open_cards", "add_to_cart",
+    "ad_impressions_total", "ad_clicks_total", "search_frequency", "search_traffic_capture_pct",
+    "cart_conv_pct", "order_conv_pct", "localization_with_replacements_pct", "margin_pct",
+}
+
+
+def _pdf_text(value: Any) -> str:
+    return normalize_text(value)
+
+
+def _pdf_num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        v = float(value)
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _pdf_color_delta_value(cur: Any, prev: Any, lower_better: bool = False) -> Tuple[str, str]:
+    d = _delta_pct(cur, prev)
+    if d is None:
+        return "", "neutral"
+    arrow = "↑" if d > 0 else "↓" if d < 0 else "→"
+    # color semantic, not just direction
+    if abs(d) < 1e-9:
+        tone = "neutral"
+    elif lower_better:
+        tone = "bad" if d > 0 else "good"
+    else:
+        tone = "good" if d > 0 else "bad"
+    return f"{arrow} {abs(d):.1f}%".replace(".", ","), tone
+
+
+def _pdf_signed_rub(x: Any) -> str:
+    val = _pdf_num(x, 0.0)
+    sign = "+" if val > 0 else "-" if val < 0 else ""
+    return f"{sign}{abs(val):,.0f} ₽".replace(",", " ")
+
+
+def _pdf_short_factor_name(name: Any) -> str:
+    n = _pdf_text(name)
+    repl = {
+        "Объём / сумма заказов": "объём заказов",
+        "Рентабельность": "рентабельность",
+        "ДРР / рекламная нагрузка": "рекламная нагрузка",
+        "Цена продажи": "цена продажи",
+        "СПП / цена покупателя": "СПП / цена покупателя",
+        "% поискового трафика": "доля поискового трафика",
+        "Конверсия в корзину": "конверсия в корзину",
+        "Корзина -> заказ": "корзина → заказ",
+        "Спрос WB": "спрос WB",
+    }
+    return repl.get(n, n.lower())
+
+
+def _factor_block_name(factor: Any, zone: Any = "") -> str:
+    f = norm_key(factor)
+    z = norm_key(zone)
+    if any(k in f or k in z for k in ["спрос", "поиск", "трафик", "конверс", "корзин", "открыт", "ctr", "cpc"]):
+        return "Спрос и точки входа / конверсии"
+    return "Экономика и продажи"
+
+
+def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold: float = 0.90) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Select only product groups that form 90% stable GP by category.
+
+    Selection is done at product level, not article level. Products with non-positive or unstable GP are excluded.
+    """
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=["subject", "product", "selected_for_pdf"]), pd.DataFrame()
+    x = daily.copy()
+    for col in ["subject", "product", "supplier_article"]:
+        if col not in x.columns:
+            x[col] = ""
+    x["day"] = pd.to_datetime(x.get("day"), errors="coerce").dt.normalize()
+    latest = x["day"].max()
+    if pd.notna(latest):
+        x = x[x["day"] >= latest - pd.Timedelta(days=89)].copy()
+    x["week"] = x["day"].map(lambda v: week_code(v) if pd.notna(v) else "")
+    gp_col = "gp_fact" if "gp_fact" in x.columns else "gross_profit_model"
+    if gp_col not in x.columns:
+        x[gp_col] = 0.0
+    x[gp_col] = pd.to_numeric(x[gp_col], errors="coerce").fillna(0)
+    if "order_sum" in x.columns:
+        x["order_sum"] = pd.to_numeric(x["order_sum"], errors="coerce").fillna(0)
+    else:
+        x["order_sum"] = 0.0
+    if "orders" in x.columns:
+        x["orders"] = pd.to_numeric(x["orders"], errors="coerce").fillna(0)
+    else:
+        x["orders"] = 0.0
+    week_gp = x.groupby(["subject", "product", "week"], dropna=False, as_index=False).agg(week_gp=(gp_col, "sum"), week_orders=("orders", "sum"))
+    agg = x.groupby(["subject", "product"], dropna=False, as_index=False).agg(
+        gp_90=(gp_col, "sum"), order_sum_90=("order_sum", "sum"), orders_90=("orders", "sum"),
+        active_days=("day", "nunique"), articles=("supplier_article", "nunique"),
+    )
+    pos = week_gp.groupby(["subject", "product"], dropna=False, as_index=False).agg(
+        active_weeks=("week", "nunique"), positive_weeks=("week_gp", lambda s: int((pd.to_numeric(s, errors="coerce") > 0).sum())),
+        negative_weeks=("week_gp", lambda s: int((pd.to_numeric(s, errors="coerce") < 0).sum())),
+    )
+    agg = agg.merge(pos, on=["subject", "product"], how="left")
+    agg["selected_for_pdf"] = False
+    agg["selection_reason"] = ""
+    selected_rows = []
+    for subject, part in agg.groupby("subject", dropna=False):
+        p = part.copy()
+        p = p[p["subject"].isin(TARGET_SUBJECTS)].copy()
+        p = p[p["gp_90"] > 0].copy()
+        p = p[(p["positive_weeks"].fillna(0) >= 2) | (p["active_days"].fillna(0) >= 5)].copy()
+        if p.empty:
+            continue
+        p = p.sort_values("gp_90", ascending=False).copy()
+        total = p["gp_90"].sum()
+        p["gp_share_pct"] = np.where(total > 0, p["gp_90"] / total * 100, 0)
+        p["cum_gp_share_pct"] = p["gp_share_pct"].cumsum()
+        # Include products until cumulative reaches threshold; always keep at least top product.
+        keep = (p["cum_gp_share_pct"] <= threshold * 100) | (p.index == p.index[0])
+        # Also include the first product that crosses the threshold, because it is part of the 90% bucket.
+        if (~keep).any():
+            first_cross_pos = list(p.index).index(p[~keep].index[0]) if len(p[~keep].index) else None
+            if first_cross_pos is not None and first_cross_pos > 0:
+                keep.loc[p.index[first_cross_pos]] = True
+        p.loc[:, "selected_for_pdf"] = keep
+        p.loc[:, "selection_reason"] = np.where(keep, "Входит в 90% стабильной ВП категории", "Остаток вне 90% ВП категории")
+        selected_rows.append(p)
+    result = pd.concat(selected_rows, ignore_index=True) if selected_rows else pd.DataFrame(columns=list(agg.columns) + ["gp_share_pct", "cum_gp_share_pct"])
+    audit = agg.merge(result[["subject", "product", "selected_for_pdf", "selection_reason", "gp_share_pct", "cum_gp_share_pct"]], on=["subject", "product"], how="left", suffixes=("", "_sel")) if not result.empty else agg
+    if "selected_for_pdf_sel" in audit.columns:
+        audit["selected_for_pdf"] = audit["selected_for_pdf_sel"].fillna(False)
+        audit["selection_reason"] = audit["selection_reason_sel"].fillna("Не входит в 90% стабильной ВП категории / неприбыльный товар")
+        audit = audit.drop(columns=[c for c in ["selected_for_pdf_sel", "selection_reason_sel"] if c in audit.columns])
+    return result[result.get("selected_for_pdf", False) == True].copy() if not result.empty else result, audit
+
+
+def _filter_to_selected_products(outputs: Dict[str, pd.DataFrame], selected: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    if selected is None or selected.empty:
+        return outputs
+    keyset = set((str(r["subject"]), str(r["product"])) for _, r in selected.iterrows())
+    filtered = dict(outputs)
+    for name in ["article_day_fact", "factor_bridge", "entry_points_bridge", "optimal_benchmarks", "factor_summary_for_pdf"]:
+        df = filtered.get(name, pd.DataFrame())
+        if df is None or df.empty or not {"subject", "product"}.issubset(df.columns):
+            continue
+        # Keep pure category-level rows, and product/article rows only when product is selected.
+        if "product" in df.columns:
+            mask = []
+            for _, r in df.iterrows():
+                prod = _pdf_text(r.get("product", ""))
+                subj = _pdf_text(r.get("subject", ""))
+                if not prod:
+                    mask.append(subj in TARGET_SUBJECTS)
+                else:
+                    mask.append((subj, prod) in keyset)
+            filtered[name] = df.loc[pd.Series(mask, index=df.index)].copy()
+    return filtered
+
+
+def compute_optimal_benchmarks(outputs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Compute optimal benchmark values from best-order days, not hard limits.
+
+    The report must not use a DRR limit. It compares current DRR with the DRR observed on the best days
+    when the entity received the highest number of orders / order revenue.
+    """
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily is None or daily.empty:
+        return pd.DataFrame()
+    x = daily.copy()
+    x["day"] = pd.to_datetime(x.get("day"), errors="coerce").dt.normalize()
+    levels = [
+        ("category", ["subject"]),
+        ("product", ["subject", "product"]),
+        ("article", ["subject", "product", "supplier_article", "nm_id"]),
+    ]
+    rows: List[Dict[str, Any]] = []
+    for level, keys in levels:
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        for key_vals, part in x.groupby(keys, dropna=False):
+            if not isinstance(key_vals, tuple):
+                key_vals = (key_vals,)
+            d = part.copy()
+            if d.empty:
+                continue
+            day = _agg_daily_for_bridge(d, d["day"].min(), d["day"].max(), ["day"])
+            if day.empty:
+                continue
+            day["score"] = pd.to_numeric(day.get("orders", 0), errors="coerce").fillna(0) * 0.65 + (pd.to_numeric(day.get("order_sum", 0), errors="coerce").fillna(0) / 1000.0) * 0.35
+            day = day[day["score"] > 0].copy()
+            if day.empty:
+                continue
+            if len(day) >= 10:
+                threshold = day["score"].quantile(0.80)
+                best = day[day["score"] >= threshold].copy()
+            else:
+                best = day.nlargest(min(3, len(day)), "score").copy()
+            if best.empty:
+                continue
+            ad_spend = pd.to_numeric(best.get("ad_spend_total", 0), errors="coerce").fillna(0)
+            order_sum = pd.to_numeric(best.get("order_sum", 0), errors="coerce").fillna(0)
+            clicks = pd.to_numeric(best.get("ad_clicks_total", 0), errors="coerce").fillna(0)
+            imps = pd.to_numeric(best.get("ad_impressions_total", 0), errors="coerce").fillna(0)
+            orders = pd.to_numeric(best.get("orders", 0), errors="coerce").fillna(0)
+            open_cards = pd.to_numeric(best.get("open_cards", 0), errors="coerce").fillna(0)
+            add_to_cart = pd.to_numeric(best.get("add_to_cart", 0), errors="coerce").fillna(0)
+            search_freq = pd.to_numeric(best.get("search_frequency", 0), errors="coerce").fillna(0)
+            search_trans = pd.to_numeric(best.get("search_transitions", 0), errors="coerce").fillna(0)
+            rec = {"level": level}
+            rec.update(dict(zip(keys, key_vals)))
+            for k in ["subject", "product", "supplier_article", "nm_id"]:
+                rec.setdefault(k, "")
+            rec.update({
+                "best_days_count": int(len(best)),
+                "optimal_order_sum_day": float(order_sum.mean()) if len(order_sum) else np.nan,
+                "optimal_orders_day": float(orders.mean()) if len(orders) else np.nan,
+                "optimal_drr_pct": float(ad_spend.sum() / order_sum.sum() * 100) if order_sum.sum() else np.nan,
+                "optimal_cpc": float(ad_spend.sum() / clicks.sum()) if clicks.sum() else np.nan,
+                "optimal_ctr_pct": float(clicks.sum() / imps.sum() * 100) if imps.sum() else np.nan,
+                "optimal_cart_conv_pct": float(add_to_cart.sum() / open_cards.sum() * 100) if open_cards.sum() else np.nan,
+                "optimal_order_conv_pct": float(orders.sum() / add_to_cart.sum() * 100) if add_to_cart.sum() else np.nan,
+                "optimal_search_capture_pct": float(search_trans.sum() / search_freq.sum() * 100) if search_freq.sum() else np.nan,
+                "optimal_price_sale": float(order_sum.sum() / orders.sum()) if orders.sum() else np.nan,
+                "optimal_spp": float(pd.to_numeric(best.get("spp", best.get("spp_funnel", np.nan)), errors="coerce").mean()),
+            })
+            rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def _append_optimal_factor_rows(level: str, g: pd.DataFrame, keys: List[str], optimal: pd.DataFrame) -> List[Dict[str, Any]]:
+    if g is None or g.empty or optimal is None or optimal.empty:
+        return []
+    rows: List[Dict[str, Any]] = []
+    opt = optimal[optimal.get("level", "") == level].copy() if "level" in optimal.columns else optimal.copy()
+    if opt.empty:
+        return []
+    join_cols = [k for k in keys if k in opt.columns and k in g.columns]
+    if not join_cols:
+        return []
+    m = g.merge(opt, on=join_cols, how="left", suffixes=("", "_opt"))
+    for _, r in m.iterrows():
+        keyvals = {k: r.get(k, "") for k in keys}
+        cur_sum = _pdf_num(r.get("order_sum"), 0.0)
+        cur_orders = _pdf_num(r.get("orders"), 0.0)
+        cur_gp = _pdf_num(r.get("gp_fact"), _pdf_num(r.get("gross_profit_model"), 0.0))
+        margin = cur_gp / cur_sum if cur_sum else 0.0
+        avg_price = cur_sum / cur_orders if cur_orders else _pdf_num(r.get("avg_order_price"), 0.0)
+        # Against optimal DRR from best days.
+        cur_drr = _pdf_num(r.get("drr_pct"), np.nan)
+        opt_drr = _pdf_num(r.get("optimal_drr_pct"), np.nan)
+        if pd.notna(cur_drr) and pd.notna(opt_drr) and opt_drr > 0 and cur_sum:
+            effect = -cur_sum * ((cur_drr - opt_drr) / 100.0)
+            rows.append(_factor_row(level, keyvals, "ДРР против оптимума", opt_drr, cur_drr, cur_drr - opt_drr, effect, "оптимум", "Сколько ВП отличается от лучших дней из-за текущего ДРР."))
+        # Demand/traffic/conversions vs best-day benchmark.
+        opens = _pdf_num(r.get("open_cards"), 0.0)
+        cart_cur = _pdf_num(r.get("cart_conv_pct"), np.nan) / 100.0
+        cart_opt = _pdf_num(r.get("optimal_cart_conv_pct"), np.nan) / 100.0
+        order_cur = _pdf_num(r.get("order_conv_pct"), np.nan) / 100.0
+        order_opt = _pdf_num(r.get("optimal_order_conv_pct"), np.nan) / 100.0
+        if opens and pd.notna(cart_cur) and pd.notna(cart_opt) and pd.notna(order_cur):
+            effect = opens * (cart_cur - cart_opt) * order_cur * avg_price * margin
+            rows.append(_factor_row(level, keyvals, "Конверсия в корзину против оптимума", cart_opt * 100, cart_cur * 100, (cart_cur - cart_opt) * 100, effect, "оптимум", "Потеря/прирост ВП относительно конверсии в корзину на лучших днях."))
+        if opens and pd.notna(order_cur) and pd.notna(order_opt) and pd.notna(cart_cur):
+            effect = opens * cart_cur * (order_cur - order_opt) * avg_price * margin
+            rows.append(_factor_row(level, keyvals, "Корзина -> заказ против оптимума", order_opt * 100, order_cur * 100, (order_cur - order_opt) * 100, effect, "оптимум", "Потеря/прирост ВП относительно дожима корзина→заказ на лучших днях."))
+        capture_cur = _pdf_num(r.get("search_traffic_capture_pct"), np.nan) / 100.0
+        capture_opt = _pdf_num(r.get("optimal_search_capture_pct"), np.nan) / 100.0
+        demand = _pdf_num(r.get("search_frequency"), 0.0)
+        if demand and pd.notna(capture_cur) and pd.notna(capture_opt) and pd.notna(cart_cur) and pd.notna(order_cur):
+            effect = demand * (capture_cur - capture_opt) * cart_cur * order_cur * avg_price * margin
+            rows.append(_factor_row(level, keyvals, "% поиска против оптимума", capture_opt * 100, capture_cur * 100, (capture_cur - capture_opt) * 100, effect, "оптимум", "Потеря/прирост ВП относительно доли поискового трафика на лучших днях."))
+    for row in rows:
+        row["comparison"] = "optimal_best_days"
+    return rows
+
+
+def _build_factor_summary_df(factor_bridge: pd.DataFrame) -> pd.DataFrame:
+    if factor_bridge is None or factor_bridge.empty:
+        return pd.DataFrame(columns=["level", "subject", "product", "supplier_article", "nm_id", "summary_text"])
+    fb = factor_bridge.copy()
+    for col in ["level", "subject", "product", "supplier_article", "nm_id", "factor", "zone"]:
+        if col not in fb.columns:
+            fb[col] = ""
+    fb["effect_gp_rub"] = pd.to_numeric(fb.get("effect_gp_rub"), errors="coerce").fillna(0.0)
+    fb["abs_effect_gp_rub"] = fb["effect_gp_rub"].abs()
+    if "comparison" not in fb.columns:
+        fb["comparison"] = "prev_week"
+    rows: List[Dict[str, Any]] = []
+    for keys, part in fb.groupby(["level", "subject", "product", "supplier_article", "nm_id"], dropna=False):
+        lvl, subject, product, art, nm = keys
+        p = part[part["abs_effect_gp_rub"] > 100].sort_values("abs_effect_gp_rub", ascending=False).head(6)
+        if p.empty:
+            main = "Существенных денежных факторов не выделено: изменение ВП в рабочем диапазоне."
+            econ = "Экономика/продажи: значимых отклонений в деньгах нет."
+            demand = "Спрос/точки входа/конверсии: значимых отклонений в деньгах нет."
         else:
-            before_start, before_end = current_before_start, current_before_end
-            after_start, after_end = current_after_start, current_after_end
+            labels = ["Основная причина", "Вторичная причина", "Дополнительный фактор"]
+            lines = []
+            for i, (_, r) in enumerate(p.head(3).iterrows()):
+                val = float(r["effect_gp_rub"])
+                verb = "добавила" if val > 0 else "забрала"
+                compare = "к оптимуму" if str(r.get("comparison", "")) == "optimal_best_days" else "к прошлой неделе"
+                change = r.get("change", "")
+                try:
+                    ch = float(change)
+                    ch_txt = f", изменение {ch:+.1f} п.п." if "конверс" in norm_key(r.get("factor")) or "дрр" in norm_key(r.get("factor")) or "поиск" in norm_key(r.get("factor")) else ""
+                    ch_txt = ch_txt.replace(".", ",")
+                except Exception:
+                    ch_txt = ""
+                lines.append(f"{i+1}. {labels[i]}: {_pdf_short_factor_name(r.get('factor'))} {verb} {abs(val):,.0f} ₽ ВП {compare}{ch_txt}.".replace(",", " "))
+            main = " ".join(lines)
+            econ_part = p[p.apply(lambda r: _factor_block_name(r.get("factor"), r.get("zone")) == "Экономика и продажи", axis=1)].head(3)
+            dem_part = p[p.apply(lambda r: _factor_block_name(r.get("factor"), r.get("zone")) != "Экономика и продажи", axis=1)].head(3)
+            def block_text(title: str, df: pd.DataFrame) -> str:
+                if df.empty:
+                    return f"{title}: крупных денежных факторов нет."
+                pieces = []
+                for _, rr in df.iterrows():
+                    val = float(rr["effect_gp_rub"])
+                    pieces.append(f"{_pdf_short_factor_name(rr.get('factor'))}: {'+' if val > 0 else '-'}{abs(val):,.0f} ₽".replace(",", " "))
+                return f"{title}: " + "; ".join(pieces) + "."
+            econ = block_text("Экономика и продажи", econ_part)
+            demand = block_text("Спрос и точки входа / конверсии", dem_part)
+        rows.append({
+            "level": lvl, "subject": subject, "product": product, "supplier_article": art, "nm_id": nm,
+            "summary_text": main,
+            "economy_sales_text": econ,
+            "demand_entry_conversion_text": demand,
+            "top_negative_effect_rub": float(p[p["effect_gp_rub"] < 0]["effect_gp_rub"].min()) if not p[p["effect_gp_rub"] < 0].empty else 0.0,
+            "top_positive_effect_rub": float(p[p["effect_gp_rub"] > 0]["effect_gp_rub"].max()) if not p[p["effect_gp_rub"] > 0].empty else 0.0,
+        })
+    return pd.DataFrame(rows)
 
-        before_days = _window_days_count(before_start, before_end)
-        after_days = _window_days_count(after_start, after_end)
-        before_metrics = _sum_window_campaign_metrics(ads_df, key, before_start, before_end)
-        after_metrics = _sum_window_campaign_metrics(ads_df, key, after_start, after_end)
-        before_daily = _per_day(before_metrics, before_days or 1)
-        after_daily = _per_day(after_metrics, after_days or 1)
-        before_ctr = safe_ctr_pct(before_metrics.get("clicks", 0), before_metrics.get("impressions", 0))
-        after_ctr = safe_ctr_pct(after_metrics.get("clicks", 0), after_metrics.get("impressions", 0))
-        before_drr = safe_drr_pct(before_metrics.get("spend", 0), before_metrics.get("revenue", 0))
-        after_drr = safe_drr_pct(after_metrics.get("spend", 0), after_metrics.get("revenue", 0))
 
-        nm_id = _clean_id_value(decision.get("nm_id", ""))
-        supplier_article = _clean_text_value(decision.get("supplier_article", ""))
-        before_kw = _aggregate_core80_keyword_window(keyword_df, keyword_core_df, nm_id, supplier_article, before_start, before_end)
-        after_kw = _aggregate_core80_keyword_window(keyword_df, keyword_core_df, nm_id, supplier_article, after_start, after_end)
-        before_card_views = _aggregate_funnel_card_views_window(funnel_df, nm_id, before_start, before_end)
-        after_card_views = _aggregate_funnel_card_views_window(funnel_df, nm_id, after_start, after_end)
-        before_share = safe_ctr_pct(before_card_views, before_kw.get("query_freq", 0))
-        after_share = safe_ctr_pct(after_card_views, after_kw.get("query_freq", 0))
-        econ_info = _economics_info_for_key(ads_df, key)
+def build_factor_outputs(builder: AnalyticsBuilder, outputs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    global outputs_global_for_bridge
+    outputs_global_for_bridge = outputs
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    week_start, week_end, prev_start, prev_end = _period_bounds_from_daily(daily)
+    optimal = compute_optimal_benchmarks(outputs)
+    selected, product_stability = _selected_products_by_stable_gp(outputs, threshold=0.90)
+    factor_rows: List[Dict[str, Any]] = []
+    for level, keys in [
+        ("category", ["subject"]),
+        ("product", ["subject", "product"]),
+        ("article", ["subject", "product", "supplier_article", "nm_id"]),
+    ]:
+        cur = _agg_daily_for_bridge(daily, week_start, week_end, keys)
+        prev = _agg_daily_for_bridge(daily, prev_start, prev_end, keys)
+        cur_gp = _abc_gp_for_period(builder, week_start, week_end, keys)
+        prev_gp = _abc_gp_for_period(builder, prev_start, prev_end, keys).rename(columns={"gp_fact": "gp_fact_prev", "gross_revenue_fact": "gross_revenue_fact_prev", "sales_qty_fact": "sales_qty_fact_prev"})
+        g = _merge_cur_prev(cur, prev, keys)
+        if not cur_gp.empty:
+            g = g.merge(cur_gp, on=keys, how="left")
+        if not prev_gp.empty:
+            g = g.merge(prev_gp, on=keys, how="left")
+        for c0 in ["gp_fact", "gp_fact_prev", "gross_revenue_fact", "gross_revenue_fact_prev", "sales_qty_fact", "sales_qty_fact_prev"]:
+            if c0 not in g.columns:
+                g[c0] = np.nan
+        base_rows = _entity_factor_rows(level, g, keys)
+        for row in base_rows:
+            row["comparison"] = "prev_week"
+            row["factor_block"] = _factor_block_name(row.get("factor"), row.get("zone"))
+        factor_rows.extend(base_rows)
+        opt_rows = _append_optimal_factor_rows(level, g, keys, optimal)
+        for row in opt_rows:
+            row["factor_block"] = _factor_block_name(row.get("factor"), row.get("zone"))
+        factor_rows.extend(opt_rows)
+    factor_bridge = pd.DataFrame(factor_rows)
+    if not factor_bridge.empty:
+        for c0 in ["subject", "product", "supplier_article", "nm_id"]:
+            if c0 not in factor_bridge.columns:
+                factor_bridge[c0] = ""
+        factor_bridge["abs_effect_gp_rub"] = pd.to_numeric(factor_bridge["effect_gp_rub"], errors="coerce").fillna(0).abs()
+        totals = factor_bridge.groupby(["level", "subject", "product", "supplier_article", "nm_id"], dropna=False)["abs_effect_gp_rub"].sum().rename("total_abs_effect").reset_index()
+        factor_bridge = factor_bridge.merge(totals, on=["level", "subject", "product", "supplier_article", "nm_id"], how="left")
+        factor_bridge["effect_weight_pct"] = np.where(factor_bridge["total_abs_effect"] > 0, factor_bridge["abs_effect_gp_rub"] / factor_bridge["total_abs_effect"] * 100, 0)
+        factor_bridge = factor_bridge.sort_values(["level", "subject", "product", "supplier_article", "abs_effect_gp_rub"], ascending=[True, True, True, True, False])
+    entry_bridge = compute_entry_points_bridge(builder, week_start, week_end, prev_start, prev_end)
+    factor_summary = _build_factor_summary_df(factor_bridge)
+    return {
+        "optimal_benchmarks": optimal,
+        "factor_bridge": factor_bridge,
+        "entry_points_bridge": entry_bridge,
+        "factor_summary_for_pdf": factor_summary,
+        "selected_pdf_products": selected,
+        "product_stability_for_pdf": product_stability,
+    }
 
-        if after_days <= 0:
-            comparison_status = "WAIT_AFTER_DATA" if event else comparison_status
 
-        event_id = _clean_text_value(event.get("event_id", "")) if event else ""
-        eff = effects.get(event_id, {}) if event_id else {}
-        final_verdict = _clean_text_value(eff.get("final_verdict", event.get("final_verdict", "") if event else ""))
-        target_action = _clean_text_value(eff.get("target_bid_action", ""))
-        target_text = _clean_text_value(eff.get("target_bid_action_text", ""))
-        recommended_next = eff.get("recommended_next_bid_rub", "") if eff else ""
-        action = _clean_text_value(decision.get("action", ""))
-        reason_code = _clean_text_value(decision.get("reason_code", ""))
-        reason_text = _clean_text_value(decision.get("reason_text", ""))
-        conclusion = _bid_compare_conclusion(
-            action, reason_code, final_verdict, target_action,
-            before_daily.get("gp_after_ads", float("nan")), after_daily.get("gp_after_ads", float("nan")),
-            before_drr, after_drr,
-            before_kw.get("avg_position", 0.0), after_kw.get("avg_position", 0.0),
-            before_kw.get("visibility_pct", 0.0), after_kw.get("visibility_pct", 0.0),
+def _wrap_pdf_lines(text: Any, font_name: str, font_size: int, max_width: float, max_lines: int = 99) -> List[str]:
+    try:
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except Exception:
+        return str(text).split("\n")[:max_lines]
+    words = str(text).replace("\n", " ").split()
+    lines: List[str] = []
+    line = ""
+    for w0 in words:
+        cand = (line + " " + w0).strip()
+        if stringWidth(cand, font_name, font_size) > max_width and line:
+            lines.append(line)
+            line = w0
+            if len(lines) >= max_lines:
+                break
+        else:
+            line = cand
+    if line and len(lines) < max_lines:
+        lines.append(line)
+    return lines[:max_lines]
+
+
+def _find_optimal_row(opt: pd.DataFrame, level: str, subject: Any = "", product: Any = "", article: Any = "") -> pd.Series:
+    if opt is None or opt.empty:
+        return pd.Series(dtype=object)
+    x = opt.copy()
+    if "level" in x.columns:
+        x = x[x["level"].astype(str).eq(level)]
+    if subject and "subject" in x.columns:
+        x = x[x["subject"].astype(str).eq(str(subject))]
+    if product and "product" in x.columns:
+        x = x[x["product"].astype(str).eq(str(product))]
+    if article and "supplier_article" in x.columns:
+        x = x[x["supplier_article"].astype(str).eq(str(article))]
+    return x.iloc[0] if not x.empty else pd.Series(dtype=object)
+
+
+
+# ------------------------- FINAL PDF/GROSS PROFIT FIXES 2026-05-26 -------------------------
+def _load_abc_for_pdf_only(storage: Storage, reports_root: str, store: str, diagnostics: Optional[Diagnostics] = None, latest_year: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load only ABC reports for PDF-only mode.
+
+    This is much faster than the full report rebuild and prevents PDF-only from falling back to
+    model GP while the captions say "ВП факт ABC".
+    """
+    diag = diagnostics or Diagnostics()
+    try:
+        loader = Loader(storage, reports_root, store, diag)
+        year = int(latest_year or datetime.today().year)
+        weekly, monthly = loader.load_abc(year)
+        return weekly, monthly
+    except Exception as exc:
+        log(f"WARN pdf_only: ABC fact was not loaded, GP fact pages will use calculated model where needed: {exc}")
+        return pd.DataFrame(), pd.DataFrame()
+
+
+def load_existing_outputs_for_pdf(storage: Storage, local_dir: Path, reports_root: str = "Отчёты", store: str = "TOPFACE", diagnostics: Optional[Diagnostics] = None) -> Dict[str, pd.DataFrame]:
+    """Load generated Excel files for PDF-only plus ABC fact files for correct GP.
+
+    Old PDF-only mode used only article_day_fact and factor sheets; therefore gross profit in
+    the PDF was often a model value while the page title said ABC fact. This function also loads
+    weekly/monthly ABC from S3/local storage and stores it in outputs.
+    """
+    outputs: Dict[str, pd.DataFrame] = {}
+    for file_name, sheets in PDF_ONLY_SHEETS.items():
+        data = _read_existing_report_bytes(storage, local_dir, file_name)
+        xls = pd.ExcelFile(io.BytesIO(data))
+        for sheet_name in sheets:
+            if sheet_name not in xls.sheet_names:
+                log(f"WARN pdf_only: sheet {sheet_name} missing in {file_name}")
+                outputs[sheet_name] = pd.DataFrame()
+                continue
+            df = pd.read_excel(xls, sheet_name=sheet_name)
+            outputs[sheet_name] = _normalize_pdf_only_df(df)
+            log(f"pdf_only: loaded {file_name}/{sheet_name}: rows={len(outputs[sheet_name]):,}, cols={len(outputs[sheet_name].columns):,}")
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily.empty:
+        raise RuntimeError("PDF-only режим невозможен: пустой article_day_fact в техническом файле")
+    required = ["day", "subject", "product", "supplier_article", "nm_id", "order_sum", "gross_profit_model"]
+    missing = [c for c in required if c not in daily.columns]
+    if missing:
+        raise RuntimeError(f"PDF-only режим невозможен: в article_day_fact нет колонок {missing}")
+    latest = pd.to_datetime(daily.get("day"), errors="coerce").max()
+    latest_year = int(pd.Timestamp(latest).year) if pd.notna(latest) else datetime.today().year
+    abc_weekly, abc_monthly = _load_abc_for_pdf_only(storage, reports_root, store, diagnostics, latest_year)
+    outputs["abc_weekly"] = abc_weekly
+    outputs["abc_monthly"] = abc_monthly
+    return outputs
+
+
+def _gp_from_abc_frames(outputs: Dict[str, pd.DataFrame], start: pd.Timestamp, end: pd.Timestamp, group_cols: List[str]) -> pd.DataFrame:
+    """Return exact ABC GP for weekly/monthly periods from outputs, never overlap-prorated."""
+    start = pd.Timestamp(start).normalize()
+    end = pd.Timestamp(end).normalize()
+    if "day" in group_cols:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+    frames = []
+    for src_name, tag in [("abc_weekly", "ABC_weekly_exact"), ("abc_monthly", "ABC_monthly_exact")]:
+        src = outputs.get(src_name, pd.DataFrame())
+        if src is None or src.empty:
+            continue
+        x = src.copy()
+        if "period_start" not in x.columns or "period_end" not in x.columns:
+            continue
+        x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+        x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+        x = x[(x["period_start"] == start) & (x["period_end"] == end)].copy()
+        if x.empty:
+            continue
+        for c in group_cols:
+            if c not in x.columns:
+                x[c] = ""
+        x["gp_source"] = tag
+        frames.append(x)
+    if not frames and "builder_global_for_pdf" in globals():
+        try:
+            return _abc_gp_for_period(builder_global_for_pdf, start, end, group_cols)
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame(columns=group_cols + ["gp_fact", "gross_revenue_fact", "sales_qty_fact", "gp_source"])
+    exact = pd.concat(frames, ignore_index=True)
+    for c0 in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct", "abc_commission_amount", "abc_acquiring_amount"]:
+        if c0 not in exact.columns:
+            exact[c0] = np.nan if c0 == "abc_drr_pct" else 0.0
+        exact[c0] = pd.to_numeric(exact[c0], errors="coerce")
+    exact["_abc_ad_spend"] = np.where(exact["gross_revenue"].fillna(0) > 0, exact["gross_revenue"].fillna(0) * exact["abc_drr_pct"].fillna(0) / 100.0, 0.0)
+    exact["_abc_commission_abs"] = exact["abc_commission_amount"].abs().fillna(0)
+    exact["_abc_acquiring_abs"] = exact["abc_acquiring_amount"].abs().fillna(0)
+    def _join_unique(s):
+        vals = [normalize_text(v) for v in s.dropna().astype(str).tolist() if normalize_text(v)]
+        vals = list(dict.fromkeys(vals))
+        return " | ".join(vals[:20])
+    g = exact.groupby(group_cols, dropna=False, as_index=False).agg(
+        gp_fact=("gross_profit", "sum"),
+        gross_revenue_fact=("gross_revenue", "sum"),
+        sales_qty_fact=("orders", "sum"),
+        abc_ad_spend_fact=("_abc_ad_spend", "sum"),
+        abc_commission_amount_fact=("_abc_commission_abs", "sum"),
+        abc_acquiring_amount_fact=("_abc_acquiring_abs", "sum"),
+        gp_source=("gp_source", "first"),
+        gp_source_file=("source_file", _join_unique),
+        gp_source_sheet=("source_sheet", _join_unique),
+        gp_source_rows=("source_row_excel", _join_unique),
+        gp_source_cells=("cell_gross_profit", _join_unique),
+    )
+    rev = pd.to_numeric(g["gross_revenue_fact"], errors="coerce").fillna(0)
+    g["abc_margin_pct"] = np.where(rev > 0, pd.to_numeric(g["gp_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    g["abc_drr_pct"] = np.where(rev > 0, pd.to_numeric(g["abc_ad_spend_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    g["abc_commission_pct"] = np.where(rev > 0, pd.to_numeric(g["abc_commission_amount_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    g["abc_acquiring_pct"] = np.where(rev > 0, pd.to_numeric(g["abc_acquiring_amount_fact"], errors="coerce").fillna(0) / rev * 100, np.nan)
+    return g
+
+
+def _selected_products_by_stable_gp(outputs: Dict[str, pd.DataFrame], threshold: float = 0.90) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Select product groups for detailed PDF pages by stable GP at PRODUCT level.
+
+    Final rule:
+    - select products first, never articles directly;
+    - selection is global across approved products, not category-by-category, so weak tails
+      do not receive pages just because their category is small;
+    - exclude products with no current sales/profit and explicit low-value tails;
+    - keep products inside 90% of stable GP, subject to materiality guards.
+    """
+    daily = outputs.get("article_day_fact", pd.DataFrame())
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=["subject", "product", "selected_for_pdf"]), pd.DataFrame()
+    x = daily.copy()
+    for col in ["subject", "product", "supplier_article"]:
+        if col not in x.columns:
+            x[col] = ""
+    x["day"] = pd.to_datetime(x.get("day"), errors="coerce").dt.normalize()
+    latest = x["day"].max()
+    if pd.notna(latest):
+        x = x[x["day"] >= latest - pd.Timedelta(days=89)].copy()
+    gp_col = "gross_profit_model"
+    if gp_col not in x.columns:
+        x[gp_col] = 0.0
+    for c0 in [gp_col, "order_sum", "orders"]:
+        if c0 not in x.columns:
+            x[c0] = 0.0
+        x[c0] = pd.to_numeric(x[c0], errors="coerce").fillna(0)
+    x = x[x["subject"].astype(str).isin(TARGET_SUBJECTS)].copy()
+    allowed_pairs = {(subj, prod) for prod, subj in PDF_PRODUCT_CATEGORY_REFERENCE.items()}
+    x = x[x.apply(lambda r: (str(r.get("subject")), str(r.get("product"))) in allowed_pairs, axis=1)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["subject", "product", "selected_for_pdf"]), pd.DataFrame()
+    x["week"] = x["day"].map(lambda v: week_code(v) if pd.notna(v) else "")
+    cur_monday = latest - pd.Timedelta(days=int(latest.weekday())) if pd.notna(latest) else None
+    week_gp = x.groupby(["subject", "product", "week"], dropna=False, as_index=False).agg(
+        week_gp=(gp_col, "sum"), week_order_sum=("order_sum", "sum"), week_orders=("orders", "sum")
+    )
+    agg = x.groupby(["subject", "product"], dropna=False, as_index=False).agg(
+        gp_90=(gp_col, "sum"), order_sum_90=("order_sum", "sum"), orders_90=("orders", "sum"),
+        active_days=("day", "nunique"), articles=("supplier_article", "nunique"),
+    )
+    pos = week_gp.groupby(["subject", "product"], dropna=False, as_index=False).agg(
+        active_weeks=("week", "nunique"),
+        positive_weeks=("week_gp", lambda s: int((pd.to_numeric(s, errors="coerce") > 0).sum())),
+        negative_weeks=("week_gp", lambda s: int((pd.to_numeric(s, errors="coerce") < 0).sum())),
+    )
+    agg = agg.merge(pos, on=["subject", "product"], how="left")
+    if cur_monday is not None:
+        cur_week = x[x["day"] >= cur_monday].groupby(["subject", "product"], dropna=False, as_index=False).agg(
+            current_week_gp=(gp_col, "sum"), current_week_order_sum=("order_sum", "sum"), current_week_orders=("orders", "sum")
+        )
+        agg = agg.merge(cur_week, on=["subject", "product"], how="left")
+    else:
+        agg["current_week_gp"] = np.nan
+        agg["current_week_order_sum"] = np.nan
+        agg["current_week_orders"] = np.nan
+    agg["selected_for_pdf"] = False
+    agg["selection_reason"] = "Не входит в глобальные 90% стабильной ВП / хвостовой товар"
+    min_share_pct = float(os.getenv("PDF_MIN_PRODUCT_GP_SHARE_PCT", "1.0") or 1.0)
+    min_current_gp = float(os.getenv("PDF_MIN_PRODUCT_CURRENT_WEEK_GP", "1000") or 1000)
+    min_current_order_sum = float(os.getenv("PDF_MIN_PRODUCT_CURRENT_WEEK_ORDER_SUM", "10000") or 10000)
+    force_excl = set(PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS)
+    eligible = agg.copy()
+    eligible = eligible[~eligible["product"].astype(str).isin(force_excl)].copy()
+    eligible = eligible[pd.to_numeric(eligible["gp_90"], errors="coerce").fillna(0) > 0].copy()
+    eligible = eligible[pd.to_numeric(eligible["current_week_gp"], errors="coerce").fillna(0) >= min_current_gp].copy()
+    eligible = eligible[pd.to_numeric(eligible["current_week_order_sum"], errors="coerce").fillna(0) >= min_current_order_sum].copy()
+    eligible = eligible[pd.to_numeric(eligible["current_week_orders"], errors="coerce").fillna(0) > 0].copy()
+    eligible = eligible[(eligible["positive_weeks"].fillna(0) >= 3) & (eligible["negative_weeks"].fillna(0) <= 1)].copy()
+    if eligible.empty:
+        audit = agg.copy()
+        audit.loc[audit["product"].astype(str).isin(force_excl), "selection_reason"] = "Исключен как хвостовой товар по правилу PDF_FORCE_EXCLUDE_PRODUCTS"
+        return pd.DataFrame(columns=list(agg.columns) + ["gp_share_pct", "cum_gp_share_pct"]), audit
+    eligible = eligible.sort_values("gp_90", ascending=False).copy()
+    total = pd.to_numeric(eligible["gp_90"], errors="coerce").fillna(0).sum()
+    eligible["gp_share_pct"] = np.where(total > 0, eligible["gp_90"] / total * 100, 0)
+    eligible["cum_gp_share_pct"] = eligible["gp_share_pct"].cumsum()
+    eligible["cum_before_pct"] = eligible["cum_gp_share_pct"] - eligible["gp_share_pct"]
+    keep = (eligible["cum_before_pct"] < threshold * 100) & (eligible["gp_share_pct"] >= min_share_pct)
+    if not keep.any() and not eligible.empty:
+        keep.iloc[0] = True
+    selected = eligible[keep].copy()
+    # Force include user-confirmed product groups when they have current sales and positive current GP.
+    force_incl = set(PDF_FORCE_INCLUDE_DETAIL_PRODUCTS) - set(PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS)
+    forced = agg[agg["product"].astype(str).isin(force_incl)].copy()
+    forced = forced[(pd.to_numeric(forced.get("current_week_order_sum"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(forced.get("current_week_gp"), errors="coerce").fillna(0) > 0)].copy()
+    if not forced.empty:
+        if "gp_share_pct" not in forced.columns:
+            forced["gp_share_pct"] = np.where(total > 0, pd.to_numeric(forced["gp_90"], errors="coerce").fillna(0) / total * 100, 0)
+        if "cum_gp_share_pct" not in forced.columns:
+            forced["cum_gp_share_pct"] = np.nan
+        selected = pd.concat([selected, forced], ignore_index=True).drop_duplicates(["subject", "product"], keep="first")
+    selected["selected_for_pdf"] = True
+    selected["selection_reason"] = np.where(selected["product"].astype(str).isin(force_incl), "Включен принудительно как подтвержденная товарная группа PDF", "Входит в глобальные 90% стабильной ВП товаров")
+    audit = agg.merge(selected[["subject", "product", "selected_for_pdf", "selection_reason", "gp_share_pct", "cum_gp_share_pct"]], on=["subject", "product"], how="left", suffixes=("", "_sel"))
+    if "selected_for_pdf_sel" in audit.columns:
+        audit["selected_for_pdf"] = audit["selected_for_pdf_sel"].fillna(False)
+        audit["selection_reason"] = audit["selection_reason_sel"].fillna("Не входит в глобальные 90% стабильной ВП / хвостовой товар")
+        audit = audit.drop(columns=[c for c in ["selected_for_pdf_sel", "selection_reason_sel"] if c in audit.columns])
+    audit.loc[audit["product"].astype(str).isin(force_excl), "selection_reason"] = "Исключен как хвостовой товар по правилу PDF_FORCE_EXCLUDE_PRODUCTS"
+    return selected, audit
+
+
+def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Optional[Path]:
+    """Generate the strict management PDF report.
+
+    This implementation intentionally avoids Excel-like tables and uses one clear red/white layout.
+    It relies on monetary factor effects already calculated in factor_bridge. If old factor files are used
+    in --pdf-only mode, it rebuilds the PDF summary from factor_bridge on the fly.
+    """
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib import colors
+        from reportlab.lib.colors import HexColor
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except Exception as exc:
+        log(f"WARN: reportlab недоступен, PDF не создан: {exc}")
+        return None
+    F_REG, F_BOLD, F_BLACK = _register_topface_fonts()
+    W, H = 1600, 900
+    RED = HexColor("#c90022")
+    RED_DARK = HexColor("#9d0018")
+    WHITE = colors.white
+    SOFT = HexColor("#fff4f5")
+    BLACK = HexColor("#111111")
+    GRAY = HexColor("#555555")
+    GREEN = HexColor("#087a38")
+    BAD = HexColor("#b00020")
+    AMBER = HexColor("#b85c00")
+
+    outputs = _filter_outputs_by_pdf_product_reference(outputs, path.parent)
+    selected, product_stability = _selected_products_by_stable_gp(outputs, threshold=0.90)
+    # Do NOT filter article_day_fact globally: top pages must show category totals for all approved products.
+    # The selected product set is applied only when building detailed category/product/article pages.
+
+    daily = outputs.get("article_day_fact", pd.DataFrame()).copy()
+    if daily is None or daily.empty:
+        raise RuntimeError("PDF невозможен: пустой article_day_fact")
+    daily["day"] = pd.to_datetime(daily["day"], errors="coerce").dt.normalize()
+    for cnum in ["order_sum", "orders", "gross_profit_model", "ad_spend_total", "open_cards", "add_to_cart"]:
+        if cnum in daily.columns:
+            daily[cnum] = pd.to_numeric(daily[cnum], errors="coerce").fillna(0)
+    # Technical files written by older versions may not have derived ad totals. Rebuild them for PDF-only.
+    def _sum_existing(cols):
+        s = pd.Series(0.0, index=daily.index)
+        for col in cols:
+            if col in daily.columns:
+                s = s + pd.to_numeric(daily[col], errors="coerce").fillna(0)
+        return s
+    if "ad_spend_total" not in daily.columns:
+        daily["ad_spend_total"] = _sum_existing(["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"])
+    if "ad_clicks_total" not in daily.columns:
+        daily["ad_clicks_total"] = _sum_existing(["manual_clicks", "unified_clicks", "unknown_clicks"])
+    if "ad_impressions_total" not in daily.columns:
+        daily["ad_impressions_total"] = _sum_existing(["manual_impressions", "unified_impressions", "unknown_impressions"])
+    week_start, week_end, prev_start, prev_end = _period_bounds_from_daily(daily)
+    latest = pd.to_datetime(daily["day"], errors="coerce").max()
+    latest = pd.Timestamp(latest).normalize() if pd.notna(latest) else week_end
+    cur_monday = latest - pd.Timedelta(days=int(latest.weekday()))
+    cur_week_end = cur_monday + pd.Timedelta(days=6)
+
+    factor_bridge = outputs.get("factor_bridge", pd.DataFrame()).copy()
+    if factor_bridge is None:
+        factor_bridge = pd.DataFrame()
+    if not factor_bridge.empty:
+        # In the PDF we compare factors to previous week / plan, not to an abstract optimum.
+        if "comparison" in factor_bridge.columns:
+            factor_bridge = factor_bridge[~factor_bridge["comparison"].astype(str).eq("optimal_best_days")].copy()
+        if "factor" in factor_bridge.columns:
+            factor_bridge = factor_bridge[~factor_bridge["factor"].astype(str).str.contains("оптим", case=False, na=False)].copy()
+        factor_bridge["effect_gp_rub"] = pd.to_numeric(factor_bridge.get("effect_gp_rub"), errors="coerce").fillna(0)
+        if "abs_effect_gp_rub" not in factor_bridge.columns:
+            factor_bridge["abs_effect_gp_rub"] = factor_bridge["effect_gp_rub"].abs()
+        if "comparison" not in factor_bridge.columns:
+            factor_bridge["comparison"] = "prev_week"
+        if "factor_block" not in factor_bridge.columns:
+            factor_bridge["factor_block"] = factor_bridge.apply(lambda r: _factor_block_name(r.get("factor"), r.get("zone")), axis=1)
+    factor_summary = outputs.get("factor_summary_for_pdf", pd.DataFrame())
+    if factor_summary is None or factor_summary.empty or "economy_sales_text" not in factor_summary.columns:
+        factor_summary = _build_factor_summary_df(factor_bridge)
+    entry_bridge = outputs.get("entry_points_bridge", pd.DataFrame()).copy()
+    if entry_bridge is None:
+        entry_bridge = pd.DataFrame()
+    opt = outputs.get("optimal_benchmarks", pd.DataFrame()).copy()
+    if opt is None:
+        opt = pd.DataFrame()
+
+    search_unique_demand = outputs.get("search_unique_demand", pd.DataFrame()).copy()
+    if search_unique_demand is None:
+        search_unique_demand = pd.DataFrame()
+    if not search_unique_demand.empty:
+        if "day" in search_unique_demand.columns:
+            search_unique_demand["day"] = pd.to_datetime(search_unique_demand["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in search_unique_demand.columns:
+            if "subject" in search_unique_demand.columns:
+                search_unique_demand["subject_disp"] = search_unique_demand["subject"].map(_subject_disp)
+            else:
+                search_unique_demand["subject_disp"] = ""
+        if "product_code" not in search_unique_demand.columns:
+            if "product" in search_unique_demand.columns:
+                search_unique_demand["product_code"] = search_unique_demand["product"].map(_prod)
+            else:
+                search_unique_demand["product_code"] = ""
+        if "supplier_article" in search_unique_demand.columns:
+            search_unique_demand["supplier_article"] = search_unique_demand["supplier_article"].map(_clean_article_local)
+        search_unique_demand = _normalize_pdf_merge_keys(search_unique_demand, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        for _c in ["unique_search_frequency", "unique_search_queries", "duplicate_query_rows_removed", "raw_query_rows"]:
+            if _c not in search_unique_demand.columns:
+                search_unique_demand[_c] = 0
+            search_unique_demand[_c] = pd.to_numeric(search_unique_demand[_c], errors="coerce").fillna(0)
+
+    search_query_gp_position = outputs.get("search_query_gp_position", pd.DataFrame()).copy()
+    if search_query_gp_position is None:
+        search_query_gp_position = pd.DataFrame()
+    if not search_query_gp_position.empty:
+        if "day" in search_query_gp_position.columns:
+            search_query_gp_position["day"] = pd.to_datetime(search_query_gp_position["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in search_query_gp_position.columns:
+            search_query_gp_position["subject_disp"] = search_query_gp_position.get("subject", "").map(_subject_disp) if "subject" in search_query_gp_position.columns else ""
+        if "product_code" not in search_query_gp_position.columns:
+            search_query_gp_position["product_code"] = search_query_gp_position.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in search_query_gp_position.columns:
+            search_query_gp_position["supplier_article"] = search_query_gp_position["supplier_article"].map(_clean_article_local)
+        search_query_gp_position = _normalize_pdf_merge_keys(search_query_gp_position, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        for _c in ["frequency", "transitions", "orders", "query_gp_est", "avg_position", "median_position"]:
+            if _c not in search_query_gp_position.columns:
+                search_query_gp_position[_c] = np.nan
+            search_query_gp_position[_c] = pd.to_numeric(search_query_gp_position[_c], errors="coerce")
+
+    trace_rows: List[Dict[str, Any]] = []
+    log(f"PDF_DEBUG: article_day_fact rows={len(daily):,}, period={daily['day'].min().date() if not daily.empty else '-'}..{daily['day'].max().date() if not daily.empty else '-'}, cols={len(daily.columns):,}")
+    log(f"PDF_DEBUG: abc_weekly rows={len(outputs.get('abc_weekly', pd.DataFrame())):,}, abc_monthly rows={len(outputs.get('abc_monthly', pd.DataFrame())):,}")
+
+    def add_trace(block: str, level: str, period_start: Any, period_end: Any, metric: str, value: Any, source: str, source_columns: str, filters: str = "", formula: str = "", source_file: str = "", source_sheet: str = "", source_rows: str = "", source_cells: str = ""):
+        trace_rows.append({
+            "block": block,
+            "level": level,
+            "period_start": str(pd.Timestamp(period_start).date()) if pd.notna(period_start) else "",
+            "period_end": str(pd.Timestamp(period_end).date()) if pd.notna(period_end) else "",
+            "metric": metric,
+            "value": value,
+            "source": source,
+            "source_file": source_file,
+            "source_sheet": source_sheet,
+            "source_rows": source_rows,
+            "source_cells": source_cells,
+            "source_columns": source_columns,
+            "filters": filters,
+            "formula": formula,
+        })
+
+    c = canvas.Canvas(str(path), pagesize=(W, H))
+    bookmarks: Dict[str, str] = {}
+    page_num = 0
+    cat_short = {"Кисти косметические":"Кисти", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
+    cats = ["Кисти косметические", "Косметические карандаши", "Помады", "Блески"]
+    cat_code = {"Кисти косметические": "brushes", "Косметические карандаши": "pencils", "Помады": "lipsticks", "Блески": "glosses"}
+    def cat_bookmark(subject_value: Any) -> str:
+        return "cat_" + cat_code.get(str(subject_value), re.sub(r"[^A-Za-z0-9]+", "_", str(subject_value)))
+    def product_bookmark(subject_value: Any, product_value: Any) -> str:
+        return "prod_" + cat_code.get(str(subject_value), re.sub(r"[^A-Za-z0-9]+", "_", str(subject_value))) + "_" + re.sub(r"[^A-Za-z0-9]+", "_", str(product_value))
+
+    def page_bg(title: str, subtitle: str = "", section: str = ""):
+        nonlocal page_num
+        page_num += 1
+        c.setFillColor(RED); c.rect(0, 0, W, H, fill=1, stroke=0)
+        c.setFillColor(WHITE); c.setFont(F_REG, 32); c.drawString(70, 838, "topface")
+        c.setFont(F_BLACK, 46); c.drawString(70, 765, title)
+        if subtitle:
+            c.setFont(F_BOLD, 20); c.drawString(70, 724, subtitle)
+        if section:
+            c.setFont(F_BOLD, 14); c.drawRightString(W-75, 712, section)
+        c.setFont(F_BOLD, 13); c.drawRightString(W-75, 36, f"Страница {page_num}")
+
+    def button(x, y, w, label, target=None):
+        c.setFillColor(WHITE); c.roundRect(x, y, w, 42, 14, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.setFont(F_BOLD, 13); c.drawCentredString(x+w/2, y+16, label)
+        if target:
+            c.linkRect("", str(target), (x, y, x+w, y+42), relative=0)
+
+    def top_nav(active=""):
+        labels = [("cur", "Текущая"), ("prev", "Прошлая"), ("month", "Месяц"), ("closed", "Закр. месяц"), ("summary", "Сводка")]
+        x = 880
+        for key, lab in labels:
+            button(x, 800, 126, lab, key)
+            x += 140
+
+    def dyn_text(cur, prev, lower=False):
+        return _pdf_color_delta_value(cur, prev, lower)[0]
+
+    def tone_color(tone: str):
+        return GREEN if tone == "good" else BAD if tone == "bad" else GRAY
+
+    def draw_metric_card(x, y, w, h, value, label, dyn="", tone="neutral", sub2="", sub2_tone="neutral"):
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 16, fill=1, stroke=0)
+        val = str(value)
+        c.setFont(F_BLACK, 27)
+        val_w = stringWidth(val, F_BLACK, 27)
+        base_x = x + w/2 - (val_w/2 if dyn else val_w/2)
+        # When there is dynamic, reserve space to the right so the arrow is not drawn below.
+        if dyn:
+            dyn_w = stringWidth(str(dyn), F_BOLD, 12)
+            total_w = val_w + 12 + dyn_w
+            base_x = max(x + 14, x + w/2 - total_w/2)
+        c.setFillColor(BLACK); c.setFont(F_BLACK, 27); c.drawString(base_x, y+h-42, val)
+        if dyn:
+            c.setFillColor(tone_color(tone)); c.setFont(F_BOLD, 12); c.drawString(base_x + val_w + 12, y+h-39, str(dyn))
+        c.setFillColor(GRAY); c.setFont(F_REG, 14); c.drawCentredString(x+w/2, y+h-72, str(label))
+        if sub2:
+            c.setFillColor(tone_color(sub2_tone)); c.setFont(F_BOLD, 12); c.drawCentredString(x+w/2, y+18, sub2)
+
+    def draw_table(x, y, w, h, headers, rows, col_widths=None, font_size=13, row_h=44, first_col_red=True, align_left_cols=None, lower_better_cols=None):
+        align_left_cols = set(align_left_cols or [])
+        lower_better_cols = set(lower_better_cols or [])
+        if col_widths is None:
+            col_widths = [w/len(headers)]*len(headers)
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 18, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.roundRect(x, y+h-50, w, 50, 12, fill=1, stroke=0)
+        xx = x
+        c.setFillColor(WHITE); c.setFont(F_BLACK, font_size)
+        for i, head in enumerate(headers):
+            lines = str(head).split("\n")
+            yy = y+h-29 + (len(lines)-1)*8
+            for line in lines:
+                c.drawCentredString(xx+col_widths[i]/2, yy, line)
+                yy -= 15
+            xx += col_widths[i]
+        yy = y+h-50-row_h
+        for ridx, row in enumerate(rows):
+            c.setFillColor(WHITE if ridx % 2 == 0 else SOFT); c.rect(x, yy, w, row_h, fill=1, stroke=0)
+            xx = x
+            for i, val in enumerate(row):
+                text = str(val)
+                lines = text.split("\n")
+                if i == 0 and first_col_red:
+                    c.setFillColor(SOFT); c.roundRect(xx+6, yy+5, col_widths[i]-12, row_h-10, 8, fill=1, stroke=0)
+                    c.setFillColor(RED_DARK); c.setFont(F_BLACK, font_size)
+                else:
+                    c.setFillColor(BLACK); c.setFont(F_BOLD, font_size)
+                # If the value is written as two lines: value + arrow, render the arrow to the right.
+                if len(lines) >= 2 and lines[1].strip().startswith(("↑", "↓", "→")):
+                    lines = [lines[0] + " " + lines[1].strip()] + lines[2:]
+                line_y = yy + row_h/2 + (len(lines)-1)*8
+                for line in lines:
+                    raw = line[:70]
+                    arrow_pos = min([p for p in [raw.find("↑"), raw.find("↓"), raw.find("→")] if p >= 0], default=-1)
+                    if arrow_pos >= 0:
+                        main_part = raw[:arrow_pos].rstrip()
+                        delta_part = raw[arrow_pos:].strip()
+                        is_lower = i in lower_better_cols
+                        if delta_part.startswith("↑"):
+                            dcolor = BAD if is_lower else GREEN
+                        elif delta_part.startswith("↓"):
+                            dcolor = GREEN if is_lower else BAD
+                        else:
+                            dcolor = GRAY
+                        if i in align_left_cols:
+                            start_x = xx + 12
+                        else:
+                            total_w = stringWidth(main_part, F_BOLD, font_size) + 8 + stringWidth(delta_part, F_BOLD, max(font_size-1, 9))
+                            start_x = xx + col_widths[i]/2 - total_w/2
+                        c.setFillColor(BLACK); c.setFont(F_BOLD, font_size); c.drawString(start_x, line_y, main_part)
+                        c.setFillColor(dcolor); c.setFont(F_BOLD, max(font_size-1, 9)); c.drawString(start_x + stringWidth(main_part, F_BOLD, font_size) + 8, line_y, delta_part)
+                    else:
+                        if raw.strip().startswith(("↑", "↓", "→")):
+                            c.setFillColor(GREEN if raw.strip().startswith("↑") else BAD if raw.strip().startswith("↓") else GRAY)
+                        if i in align_left_cols:
+                            c.drawString(xx+12, line_y, raw)
+                        else:
+                            c.drawCentredString(xx+col_widths[i]/2, line_y, raw)
+                    line_y -= 16
+                    c.setFillColor(BLACK)
+                xx += col_widths[i]
+            yy -= row_h
+
+
+    def add_table_row_links(x, y, w, h, row_h, targets, header_h=50):
+        """Overlay clickable areas on table body rows. Targets may point to bookmarks created later."""
+        yy = y + h - header_h - row_h
+        for target in targets:
+            if target:
+                c.linkRect("", str(target), (x, yy, x + w, yy + row_h), relative=0)
+            yy -= row_h
+
+    def agg(start, end, keys):
+        return _agg_daily_for_bridge(daily, pd.Timestamp(start), pd.Timestamp(end), keys)
+
+    def gp_week(keys, start=week_start, end=week_end):
+        return _gp_from_abc_frames(outputs, start, end, keys)
+
+    def with_gp(a: pd.DataFrame, keys: List[str], start=week_start, end=week_end) -> pd.DataFrame:
+        a = a.copy() if a is not None else pd.DataFrame(columns=keys)
+        period_start = pd.Timestamp(start).normalize()
+        period_end = pd.Timestamp(end).normalize()
+        # Use exact ABC for any exact closed week/month that exists, including the current report week
+        # when WB ABC has already been exported. If exact ABC is absent, fallback is model GP.
+        gp = gp_week(keys, start, end)
+        if gp is not None and not gp.empty:
+            a = a.merge(gp, on=keys, how="left")
+        # Previous exact ABC for dynamics. For week pages this is the previous week.
+        prev_len = period_end - period_start + pd.Timedelta(days=1)
+        prev_period_start = period_start - prev_len
+        prev_period_end = period_start - pd.Timedelta(days=1)
+        gp_prev_exact = _gp_from_abc_frames(outputs, prev_period_start, prev_period_end, keys)
+        if gp_prev_exact is not None and not gp_prev_exact.empty:
+            rename_prev = {c: f"{c}_prev_abc" for c in gp_prev_exact.columns if c not in keys}
+            a = a.merge(gp_prev_exact.rename(columns=rename_prev), on=keys, how="left")
+        if "gp_fact" not in a.columns:
+            a["gp_fact"] = np.nan
+        if len(a.index):
+            model_gp = pd.to_numeric(a.get("gross_profit_model", 0), errors="coerce").fillna(0)
+            fact_gp = pd.to_numeric(a["gp_fact"], errors="coerce")
+            a["gp_use"] = fact_gp.where(fact_gp.notna(), model_gp)
+            a["gp_is_fact"] = fact_gp.notna()
+            model_gp_prev = pd.to_numeric(a["gross_profit_model_prev"] if "gross_profit_model_prev" in a.columns else pd.Series(0.0, index=a.index), errors="coerce").fillna(0)
+            fact_gp_prev = pd.to_numeric(a["gp_fact_prev_abc"] if "gp_fact_prev_abc" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            a["gp_use_prev"] = fact_gp_prev.where(fact_gp_prev.notna(), model_gp_prev)
+            # ABC is source of truth for weekly margin and DRR when exact ABC exists.
+            if "abc_drr_pct" in a.columns:
+                a["drr_pct"] = pd.to_numeric(a["abc_drr_pct"], errors="coerce").where(pd.to_numeric(a["abc_drr_pct"], errors="coerce").notna(), pd.to_numeric(a["drr_pct"] if "drr_pct" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce"))
+            if "abc_drr_pct_prev_abc" in a.columns:
+                a["drr_pct_prev"] = pd.to_numeric(a["abc_drr_pct_prev_abc"], errors="coerce").where(pd.to_numeric(a["abc_drr_pct_prev_abc"], errors="coerce").notna(), pd.to_numeric(a["drr_pct_prev"] if "drr_pct_prev" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce"))
+            if "abc_commission_pct" in a.columns:
+                a["commission_pct_abc"] = pd.to_numeric(a["abc_commission_pct"], errors="coerce")
+            if "abc_commission_pct_prev_abc" in a.columns:
+                a["commission_pct_abc_prev"] = pd.to_numeric(a["abc_commission_pct_prev_abc"], errors="coerce")
+            if "abc_acquiring_pct" in a.columns:
+                a["acquiring_pct_abc"] = pd.to_numeric(a["abc_acquiring_pct"], errors="coerce")
+            if "abc_acquiring_pct_prev_abc" in a.columns:
+                a["acquiring_pct_abc_prev"] = pd.to_numeric(a["abc_acquiring_pct_prev_abc"], errors="coerce")
+            order_sum_num = pd.to_numeric(a.get("order_sum", 0), errors="coerce").fillna(0)
+            abc_margin = pd.to_numeric(a["abc_margin_pct"] if "abc_margin_pct" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            fact_rev = pd.to_numeric(a["gross_revenue_fact"] if "gross_revenue_fact" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            margin_calc = np.where(fact_rev.fillna(0) > 0, pd.to_numeric(a["gp_use"], errors="coerce") / fact_rev * 100, np.where(order_sum_num > 0, pd.to_numeric(a["gp_use"], errors="coerce") / order_sum_num * 100, np.nan))
+            a["margin_pct"] = abc_margin.where(abc_margin.notna(), margin_calc)
+            abc_margin_prev = pd.to_numeric(a["abc_margin_pct_prev_abc"] if "abc_margin_pct_prev_abc" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            fact_rev_prev = pd.to_numeric(a["gross_revenue_fact_prev_abc"] if "gross_revenue_fact_prev_abc" in a.columns else pd.Series(np.nan, index=a.index), errors="coerce")
+            order_sum_prev_num = pd.to_numeric(a["order_sum_prev"] if "order_sum_prev" in a.columns else pd.Series(0.0, index=a.index), errors="coerce").fillna(0)
+            margin_prev_calc = np.where(fact_rev_prev.fillna(0) > 0, pd.to_numeric(a["gp_use_prev"], errors="coerce") / fact_rev_prev * 100, np.where(order_sum_prev_num > 0, pd.to_numeric(a["gp_use_prev"], errors="coerce") / order_sum_prev_num * 100, np.nan))
+            a["margin_pct_prev"] = abc_margin_prev.where(abc_margin_prev.notna(), margin_prev_calc)
+            try:
+                source_cnt = int(a["gp_is_fact"].fillna(False).sum())
+                source_txt = "ABC exact" if source_cnt else "model gross_profit_model"
+                log(f"PDF_GP: period={period_start.date()}..{period_end.date()} group={keys} rows={len(a):,} abc_rows={source_cnt:,} gp_sum={pd.to_numeric(a['gp_use'], errors='coerce').fillna(0).sum():,.0f} source={source_txt}")
+                for _, tr in a.iterrows():
+                    key_filter = "; ".join([f"{k}={tr.get(k, '')}" for k in keys])
+                    if bool(tr.get("gp_is_fact", False)):
+                        add_trace("gross_profit", "+".join(keys), period_start, period_end, "ВП", float(_pdf_num(tr.get("gp_use"), 0)), "ABC exact", "Валовая прибыль", key_filter, "SUM(ABC[Валовая прибыль]) по exact period_start/period_end и ключам", str(tr.get("gp_source_file", "")), str(tr.get("gp_source_sheet", "")), str(tr.get("gp_source_rows", "")), str(tr.get("gp_source_cells", "")))
+                    else:
+                        add_trace("gross_profit", "+".join(keys), period_start, period_end, "ВП", float(_pdf_num(tr.get("gp_use"), 0)), "article_day_fact model", "gross_profit_model", key_filter, "SUM(article_day_fact[gross_profit_model]) по периоду и ключам")
+            except Exception as exc:
+                log(f"WARN PDF_TRACE with_gp failed: {exc}")
+        else:
+            a["gp_use"] = pd.Series(dtype=float)
+            a["gp_is_fact"] = pd.Series(dtype=bool)
+            a["margin_pct"] = pd.Series(dtype=float)
+        return a
+
+    # ------------------------------------------------------------------
+    # 1. Current week by days. Strict checklist format.
+    # ------------------------------------------------------------------
+    bookmarks["cur"] = "cur"; c.bookmarkPage("cur")
+    page_bg("Текущая неделя", f"{cur_monday.strftime('%d.%m')}-{cur_week_end.strftime('%d.%m.%Y')} / оперативно: дни и план", "Текущая неделя")
+    top_nav("cur")
+    cur_period = agg(cur_monday, latest, ["subject"])
+    prev_same = agg(cur_monday-pd.Timedelta(days=7), latest-pd.Timedelta(days=7), ["subject"])
+    cur_period_gp = with_gp(cur_period, ["subject"], cur_monday, cur_week_end if latest >= cur_week_end else latest)
+    prev_same_gp = with_gp(prev_same, ["subject"], cur_monday-pd.Timedelta(days=7), cur_week_end-pd.Timedelta(days=7) if latest >= cur_week_end else latest-pd.Timedelta(days=7))
+    cur_total = cur_period.sum(numeric_only=True)
+    prev_total = prev_same.sum(numeric_only=True) if not prev_same.empty else pd.Series(dtype=float)
+    cur_gp_total = pd.to_numeric(cur_period_gp.get("gp_use", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if not cur_period_gp.empty else _pdf_num(cur_total.get("gross_profit_model"),0)
+    prev_gp_total = pd.to_numeric(prev_same_gp.get("gp_use", pd.Series(dtype=float)), errors="coerce").fillna(0).sum() if not prev_same_gp.empty else _pdf_num(prev_total.get("gross_profit_model"),0)
+    cur_gp_fact_flag = bool(cur_period_gp.get("gp_is_fact", pd.Series(dtype=bool)).fillna(False).any()) if not cur_period_gp.empty else False
+    drr_cur = _pdf_num(cur_total.get("ad_spend_total"), 0) / _pdf_num(cur_total.get("order_sum"), 1) * 100 if _pdf_num(cur_total.get("order_sum"), 0) else np.nan
+    drr_prev = _pdf_num(prev_total.get("ad_spend_total"), 0) / _pdf_num(prev_total.get("order_sum"), 1) * 100 if _pdf_num(prev_total.get("order_sum"), 0) else np.nan
+    dt, tone = _pdf_color_delta_value(cur_total.get("order_sum",0), prev_total.get("order_sum",0), False)
+    draw_metric_card(70, 610, 260, 120, _fmt_rub(cur_total.get("order_sum", 0)), "Сумма заказов", dt, tone)
+    dt, tone = _pdf_color_delta_value(cur_gp_total, prev_gp_total, False)
+    draw_metric_card(360, 610, 260, 120, _fmt_rub(cur_gp_total), "ВП факт ABC" if cur_gp_fact_flag else "ВП расч.", dt, tone)
+    dt, tone = _pdf_color_delta_value(drr_cur, drr_prev, True)
+    draw_metric_card(650, 610, 260, 120, _fmt_pct_pdf(drr_cur), "ДРР", dt, tone)
+    dt, tone = _pdf_color_delta_value(cur_total.get("ad_spend_total",0), prev_total.get("ad_spend_total",0), True)
+    draw_metric_card(940, 610, 260, 120, _fmt_rub(cur_total.get("ad_spend_total", 0)), "Расход РК", dt, tone)
+    plan_day = max(0, _pdf_num(cur_total.get("order_sum"), 0) / max(1, (latest-cur_monday).days+1) * 1.1)
+    draw_metric_card(1230, 610, 260, 120, _fmt_rub(plan_day), "План/день", "по сумме", "neutral")
+    headers = ["Категория", "Пн\n"+cur_monday.strftime("%d.%m"), "Вт\n"+(cur_monday+pd.Timedelta(days=1)).strftime("%d.%m"), "Ср\n"+(cur_monday+pd.Timedelta(days=2)).strftime("%d.%m"), "Чт\n"+(cur_monday+pd.Timedelta(days=3)).strftime("%d.%m"), "Пт\n"+(cur_monday+pd.Timedelta(days=4)).strftime("%d.%m"), "Сб\n"+(cur_monday+pd.Timedelta(days=5)).strftime("%d.%m"), "Вс\n"+(cur_monday+pd.Timedelta(days=6)).strftime("%d.%m"), "План/день"]
+    rows=[]
+    day_agg = with_gp(agg(cur_monday, cur_week_end, ["day", "subject"]), ["day", "subject"], cur_monday, cur_week_end)
+    day_prev = with_gp(agg(cur_monday-pd.Timedelta(days=7), cur_week_end-pd.Timedelta(days=7), ["day", "subject"]), ["day", "subject"], cur_monday-pd.Timedelta(days=7), cur_week_end-pd.Timedelta(days=7))
+    for cat in cats:
+        vals=[f"{cat_short.get(cat,cat)}\nСумма\nВП расч.\nРасх. РК\nДРР"]
+        for i in range(7):
+            day = cur_monday + pd.Timedelta(days=i)
+            p = day_agg[(day_agg["day"] == day) & (day_agg["subject"] == cat)] if not day_agg.empty else pd.DataFrame()
+            pp = day_prev[(day_prev["day"] == day-pd.Timedelta(days=7)) & (day_prev["subject"] == cat)] if not day_prev.empty else pd.DataFrame()
+            if p.empty or day > latest:
+                vals.append("—\n—\n—\n—")
+            else:
+                r = p.iloc[0]
+                rp = pp.iloc[0] if not pp.empty else pd.Series(dtype=object)
+                dt_sum = dyn_text(r.get("order_sum"), rp.get("order_sum"), False)
+                vals.append(f"{_fmt_rub(r.get('order_sum'), True)} {dt_sum}\n{_fmt_rub(r.get('gp_use'), True)}\n{_fmt_rub(r.get('ad_spend_total'), True)}\n{_fmt_pct_pdf(r.get('drr_pct'))}")
+        vals.append(f"{_fmt_rub(plan_day/4, True)}\n—\n—\n—")
+        rows.append(vals)
+    draw_table(70, 80, 1460, 470, headers, rows, col_widths=[190]+[145]*7+[255], font_size=12, row_h=92)
+    c.showPage()
+
+    # Current category summary.
+    bookmarks["cur_cat"] = "cur_cat"; c.bookmarkPage("cur_cat")
+    page_bg("Текущая неделя: категории", f"{cur_monday.strftime('%d.%m')}-{latest.strftime('%d.%m.%Y')} / переход по категории", "Текущая неделя")
+    top_nav("cur")
+    cat_cur = with_gp(_merge_cur_prev(cur_period, prev_same, ["subject"]), ["subject"], cur_monday, latest)
+    rows=[]
+    for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows():
+        rows.append([
+            cat_short.get(r.get("subject"), r.get("subject")),
+            f"{_fmt_rub(r.get('order_sum'))}\n{dyn_text(r.get('order_sum'), r.get('order_sum_prev'))}",
+            f"{_fmt_rub(r.get('gp_use'))}",
+            _fmt_pct_pdf(r.get("margin_pct")),
+            f"{_fmt_pct_pdf(r.get('drr_pct'))}\n{dyn_text(r.get('drr_pct'), r.get('drr_pct_prev'), True)}",
+            f"{_fmt_rub(r.get('ad_spend_total'))}",
+            f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
+            _fmt_pct_pdf(r.get("search_traffic_capture_pct")),
+        ])
+    cur_gp_label = "ВП факт ABC" if bool(cat_cur.get("gp_is_fact", pd.Series(dtype=bool)).fillna(False).any()) else "ВП расч."
+    draw_table(80, 260, 1440, 400, ["Категория", "Сумма", cur_gp_label, "Рент.", "ДРР", "Расход РК", "CPC", "% поиска"], rows, col_widths=[210,210,190,150,190,190,160,150], font_size=14, row_h=74, lower_better_cols={4,5,6})
+    # Category rows are clickable: category -> products; brushes -> article list on the category page.
+    cat_targets = [cat_bookmark(str(r.get("subject"))) for _, r in cat_cur.sort_values("order_sum", ascending=False).iterrows()]
+    add_table_row_links(80, 260, 1440, 400, 74, cat_targets)
+    c.showPage()
+
+    # Previous week, current month, closed month, monthly summary.
+    def draw_period_category_page(bookmark, title, subtitle, section, start, end, prev_s, prev_e, gp_fact_label="ВП факт ABC"):
+        bookmarks[bookmark] = bookmark; c.bookmarkPage(bookmark)
+        page_bg(title, subtitle, section); top_nav(bookmark)
+        cur = with_gp(agg(start, end, ["subject"]), ["subject"], start, end)
+        prev = with_gp(agg(prev_s, prev_e, ["subject"]), ["subject"], prev_s, prev_e)
+        merged = _merge_cur_prev(cur, prev, ["subject"])
+        rows = []
+        for _, r in merged.sort_values("order_sum", ascending=False).iterrows():
+            gp = r.get("gp_use", r.get("gross_profit_model", 0))
+            gp_prev = r.get("gp_use_prev", r.get("gross_profit_model_prev", 0))
+            rows.append([
+                cat_short.get(r.get("subject"), r.get("subject")),
+                f"{_fmt_rub(r.get('order_sum'))}\n{dyn_text(r.get('order_sum'), r.get('order_sum_prev'))}",
+                f"{_fmt_rub(gp)}\n{dyn_text(gp, gp_prev)}",
+                _fmt_pct_pdf(r.get("margin_pct")),
+                f"{_fmt_pct_pdf(r.get('drr_pct'))}\n{dyn_text(r.get('drr_pct'), r.get('drr_pct_prev'), True)}",
+                f"{_fmt_rub(r.get('ad_spend_total'))}\n{dyn_text(r.get('ad_spend_total'), r.get('ad_spend_total_prev'), True)}",
+                f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
+            ])
+        draw_table(80, 235, 1440, 460, ["Категория", "Сумма", gp_fact_label, "Рент.", "ДРР", "Расход РК", "CPC"], rows, col_widths=[230,230,230,150,180,230,150], font_size=14, row_h=80, lower_better_cols={4,5,6})
+        c.showPage()
+
+    prev_report_start = cur_monday - pd.Timedelta(days=7)
+    prev_report_end = cur_monday - pd.Timedelta(days=1)
+    prev_report_cmp_start = cur_monday - pd.Timedelta(days=14)
+    prev_report_cmp_end = cur_monday - pd.Timedelta(days=8)
+    draw_period_category_page("prev", "Прошлая неделя", f"{prev_report_start.strftime('%d.%m')}-{prev_report_end.strftime('%d.%m.%Y')} / сравнение с {prev_report_cmp_start.strftime('%d.%m')}-{prev_report_cmp_end.strftime('%d.%m.%Y')}", "Прошлая неделя", prev_report_start, prev_report_end, prev_report_cmp_start, prev_report_cmp_end)
+
+    month_start = pd.Timestamp(latest.replace(day=1))
+    prev_month_end = month_start - pd.Timedelta(days=1)
+    prev_month_start = pd.Timestamp(prev_month_end.replace(day=1))
+    draw_period_category_page("month", "Текущий месяц", f"{month_start.strftime('%d.%m')}-{latest.strftime('%d.%m.%Y')} / месяц неполный / темп к плану", "Текущий месяц", month_start, latest, prev_month_start, prev_month_start + (latest - month_start), "ВП расч.")
+    closed_start = prev_month_start
+    closed_end = prev_month_end
+    preclosed_end = closed_start - pd.Timedelta(days=1)
+    preclosed_start = pd.Timestamp(preclosed_end.replace(day=1))
+    draw_period_category_page("closed", "Последний закрытый месяц", f"{closed_start.strftime('%d.%m')}-{closed_end.strftime('%d.%m.%Y')} / сравнение с {preclosed_start.strftime('%d.%m')}-{preclosed_end.strftime('%d.%m.%Y')}", "Закрытый месяц", closed_start, closed_end, preclosed_start, preclosed_end)
+
+    bookmarks["summary"] = "summary"; c.bookmarkPage("summary")
+    page_bg("Сводка по месяцам", "Категории / без лишней детализации", "Сводка"); top_nav("summary")
+    monthly_rows=[]
+    mm = daily.copy()
+    mm["month"] = mm["day"].dt.strftime("%m.%Y")
+    m_agg = mm.groupby(["month", "subject"], as_index=False).agg(order_sum=("order_sum", "sum"), gp_model=("gross_profit_model", "sum"), ad=("ad_spend_total", "sum"))
+    # Closed months must use exact ABC fact, otherwise this page disagrees with the closed-month page.
+    abc_m = outputs.get("abc_monthly", pd.DataFrame())
+    if abc_m is not None and not abc_m.empty:
+        am = abc_m.copy()
+        am["period_start"] = pd.to_datetime(am.get("period_start"), errors="coerce").dt.normalize()
+        am["period_end"] = pd.to_datetime(am.get("period_end"), errors="coerce").dt.normalize()
+        am = am[am["period_end"] < month_start].copy()
+        if not am.empty:
+            am["month"] = am["period_start"].dt.strftime("%m.%Y")
+            am_gp = am.groupby(["month", "subject"], as_index=False).agg(gp_fact=("gross_profit", "sum"))
+            m_agg = m_agg.merge(am_gp, on=["month", "subject"], how="left")
+    if "gp_fact" not in m_agg.columns:
+        m_agg["gp_fact"] = np.nan
+    m_agg["gp"] = pd.to_numeric(m_agg["gp_fact"], errors="coerce").where(pd.to_numeric(m_agg["gp_fact"], errors="coerce").notna(), pd.to_numeric(m_agg["gp_model"], errors="coerce").fillna(0))
+    for _, r in m_agg.sort_values(["month", "subject"]).iterrows():
+        drr = _pdf_num(r.get("ad"), 0) / _pdf_num(r.get("order_sum"), 1) * 100 if _pdf_num(r.get("order_sum"), 0) else np.nan
+        monthly_rows.append([r.get("month"), cat_short.get(r.get("subject"), r.get("subject")), _fmt_rub(r.get("order_sum")), _fmt_rub(r.get("gp")), _fmt_pct_pdf(drr)])
+    draw_table(180, 160, 1240, 560, ["Месяц", "Категория", "Сумма", "ВП", "ДРР"], monthly_rows[-16:], col_widths=[180,280,280,280,180], font_size=15, row_h=42)
+    c.showPage()
+
+    # ------------------------------------------------------------------
+    # Category and product pages.
+    # ------------------------------------------------------------------
+    selected_products = selected.copy() if selected is not None and not selected.empty else pd.DataFrame(columns=["subject", "product"])
+    selected_set = set((str(r.get("subject")), str(r.get("product"))) for _, r in selected_products.iterrows())
+    product_pages: Dict[Tuple[str, str], str] = {}
+    article_pages: Dict[str, Tuple[str, str]] = {}
+
+    product_week = with_gp(_merge_cur_prev(agg(week_start, week_end, ["subject", "product"]), agg(prev_start, prev_end, ["subject", "product"]), ["subject", "product"]), ["subject", "product"], week_start, week_end)
+    article_week = with_gp(_merge_cur_prev(agg(week_start, week_end, ["subject", "product", "supplier_article", "nm_id"]), agg(prev_start, prev_end, ["subject", "product", "supplier_article", "nm_id"]), ["subject", "product", "supplier_article", "nm_id"]), ["subject", "product", "supplier_article", "nm_id"], week_start, week_end)
+
+    for subject in cats:
+        cp = product_week[product_week["subject"].astype(str).eq(subject)].copy()
+        cp = cp[cp["product"].astype(str).map(lambda p: (subject, p) in selected_set)].copy() if selected_set else cp
+        cat_key = cat_bookmark(subject)
+        if cp.empty:
+            bookmarks[cat_key] = cat_key; c.bookmarkPage(cat_key)
+            page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / нет товаров для детализации по правилу отбора", "Категория")
+            button(1220, 800, 240, "← текущая неделя", "cur_cat")
+            draw_table(180, 330, 1240, 220, ["Статус", "Комментарий"], [["Не детализируем", "Товары категории не прошли отбор стабильной ВП / исключены как хвостовые"]], col_widths=[260, 980], font_size=16, row_h=80, first_col_red=True, align_left_cols={1})
+            c.showPage()
+            continue
+        products = list(cp["product"].astype(str).unique())
+        skip_product_level = (len(products) == 1 and products[0] == "901")
+        bookmarks[cat_key] = cat_key; c.bookmarkPage(cat_key)
+
+        def article_keep_for_product(product_value: str) -> pd.DataFrame:
+            aw0 = article_week[(article_week["subject"].astype(str).eq(subject)) & (article_week["product"].astype(str).eq(product_value))].copy()
+            if aw0.empty:
+                return aw0
+            aw0 = aw0[(pd.to_numeric(aw0.get("order_sum"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw0.get("orders"), errors="coerce").fillna(0) > 0) & (pd.to_numeric(aw0["gp_use"], errors="coerce").fillna(0) > 0)].copy()
+            if aw0.empty:
+                return aw0
+            total_gp0 = pd.to_numeric(aw0["gp_use"], errors="coerce").fillna(0).sum()
+            aw0 = aw0.sort_values("gp_use", ascending=False).copy()
+            aw0["share"] = np.where(total_gp0 > 0, aw0["gp_use"] / total_gp0 * 100, 0)
+            aw0["cum"] = aw0["share"].cumsum()
+            keep0 = aw0[(aw0["cum"] <= 90) | (aw0.index == aw0.index[0])].copy()
+            if len(keep0) < len(aw0):
+                first_out0 = aw0[~aw0.index.isin(keep0.index)].head(1)
+                if not first_out0.empty and _pdf_num(first_out0.iloc[0].get("gp_use"), 0) > 1000:
+                    keep0 = pd.concat([keep0, first_out0])
+            return keep0.head(14)
+
+        if skip_product_level:
+            # Brushes have only one meaningful product (901), so category page is immediately an article list.
+            product = products[0]
+            aw_cat = article_keep_for_product(product)
+            page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / артикулы товара {product} / 90% ВП", "Категория")
+            button(1220, 800, 240, "← текущая неделя", "cur_cat")
+            rows=[]; row_targets=[]
+            for _, ar in aw_cat.iterrows():
+                art = str(ar.get("supplier_article"))
+                page1 = f"article_{art}_1".replace("/", "_").replace(" ", "_")
+                row_targets.append(page1)
+                rows.append([
+                    art,
+                    f"{_fmt_rub(ar.get('order_sum'))}\n{dyn_text(ar.get('order_sum'), ar.get('order_sum_prev'))}",
+                    f"{_fmt_rub(ar.get('gp_use'))}\n{dyn_text(ar.get('gp_use'), ar.get('gp_use_prev'))}",
+                    _fmt_pct_pdf(ar.get("margin_pct")),
+                    f"{_fmt_pct_pdf(ar.get('drr_pct'))}\n{dyn_text(ar.get('drr_pct'), ar.get('drr_pct_prev'), True)}",
+                    f"{_fmt_cpc_pdf(ar.get('cpc'))}\n{dyn_text(ar.get('cpc'), ar.get('cpc_prev'), True)}",
+                    f"{_fmt_pct_pdf(ar.get('search_traffic_capture_pct'))}\n{dyn_text(ar.get('search_traffic_capture_pct'), ar.get('search_traffic_capture_pct_prev'))}",
+                    _fmt_pct_pdf(ar.get("localization_with_replacements_pct")),
+                ])
+            draw_table(90, 150, 1420, 500, ["Артикул", "Сумма", "ВП", "Рент.", "ДРР", "CPC", "% поиска", "Локал."], rows, col_widths=[220,200,200,130,130,130,170,150], font_size=13, row_h=58, lower_better_cols={4,5})
+            add_table_row_links(90, 150, 1420, 500, 58, row_targets)
+            c.showPage()
+        else:
+            page_bg(f"Категория: {cat_short.get(subject, subject)}", f"{week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')} / товары 90% стабильной ВП", "Категория")
+            button(1220, 800, 240, "← текущая неделя", "cur_cat")
+            rows=[]; row_targets=[]
+            for _, r in cp.sort_values("gp_use", ascending=False).iterrows():
+                product_value = str(r.get("product"))
+                prod_key_tmp = product_bookmark(subject, product_value)
+                row_targets.append(prod_key_tmp)
+                rows.append([
+                    product_value,
+                    f"{_fmt_rub(r.get('order_sum'))}\n{dyn_text(r.get('order_sum'), r.get('order_sum_prev'))}",
+                    f"{_fmt_rub(r.get('gp_use'))}\n{dyn_text(r.get('gp_use'), r.get('gp_use_prev'))}",
+                    _fmt_pct_pdf(r.get("margin_pct")),
+                    f"{_fmt_pct_pdf(r.get('drr_pct'))}\n{dyn_text(r.get('drr_pct'), r.get('drr_pct_prev'), True)}",
+                    f"{_fmt_cpc_pdf(r.get('cpc'))}\n{dyn_text(r.get('cpc'), r.get('cpc_prev'), True)}",
+                    f"{_fmt_pct_pdf(r.get('search_traffic_capture_pct'))}\n{dyn_text(r.get('search_traffic_capture_pct'), r.get('search_traffic_capture_pct_prev'))}",
+                    _fmt_pct_pdf(r.get("localization_with_replacements_pct")),
+                ])
+            draw_table(90, 150, 1420, 500, ["Товар", "Сумма", "ВП", "Рент.", "ДРР", "CPC", "% поиска", "Локал."], rows, col_widths=[190,210,210,140,180,150,180,150], font_size=14, row_h=74, lower_better_cols={4,5})
+            add_table_row_links(90, 150, 1420, 500, 74, row_targets)
+            c.showPage()
+
+        for product in products:
+            aw = article_keep_for_product(product)
+            if aw.empty:
+                continue
+            aw_keep = aw.copy()
+
+            prod_key = product_bookmark(subject, product)
+            if not skip_product_level:
+                product_pages[(subject, product)] = prod_key
+                bookmarks[prod_key] = prod_key; c.bookmarkPage(prod_key)
+                page_bg(f"Товар: {product}", f"{cat_short.get(subject,subject)} / {week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')}", "Товар")
+                button(1240, 800, 190, "← категория", cat_key)
+                pr = cp[cp["product"].astype(str).eq(product)].iloc[0]
+                dt, tone = _pdf_color_delta_value(pr.get("order_sum"), pr.get("order_sum_prev"), False)
+                draw_metric_card(90, 620, 230, 100, _fmt_rub(pr.get("order_sum")), "Сумма", dt, tone)
+                dt, tone = _pdf_color_delta_value(pr.get("gp_use"), pr.get("gp_use_prev"), False)
+                draw_metric_card(340, 620, 230, 100, _fmt_rub(pr.get("gp_use")), "ВП", dt, tone)
+                dt, tone = _pdf_color_delta_value(pr.get("drr_pct"), pr.get("drr_pct_prev"), True)
+                draw_metric_card(590, 620, 230, 100, _fmt_pct_pdf(pr.get("drr_pct")), "ДРР", dt, tone)
+                dt, tone = _pdf_color_delta_value(pr.get("cpc"), pr.get("cpc_prev"), True)
+                draw_metric_card(840, 620, 230, 100, _fmt_cpc_pdf(pr.get("cpc")), "CPC", dt, tone)
+                rows2=[]; art_targets=[]
+                for _, ar in aw_keep.iterrows():
+                    art = str(ar.get("supplier_article"))
+                    art_targets.append(f"article_{art}_1".replace("/", "_").replace(" ", "_"))
+                    rows2.append([
+                        art,
+                        f"{_fmt_rub(ar.get('order_sum'))}\n{dyn_text(ar.get('order_sum'), ar.get('order_sum_prev'))}",
+                        f"{_fmt_rub(ar.get('gp_use'))}\n{dyn_text(ar.get('gp_use'), ar.get('gp_use_prev'))}",
+                        _fmt_pct_pdf(ar.get("margin_pct")),
+                        f"{_fmt_pct_pdf(ar.get('drr_pct'))}\n{dyn_text(ar.get('drr_pct'), ar.get('drr_pct_prev'), True)}",
+                        f"{_fmt_cpc_pdf(ar.get('cpc'))}\n{dyn_text(ar.get('cpc'), ar.get('cpc_prev'), True)}",
+                        f"{_fmt_pct_pdf(ar.get('search_traffic_capture_pct'))}\n{dyn_text(ar.get('search_traffic_capture_pct'), ar.get('search_traffic_capture_pct_prev'))}",
+                        _fmt_pct_pdf(ar.get("localization_with_replacements_pct")),
+                    ])
+                draw_table(90, 150, 1420, 410, ["Артикул", "Сумма", "ВП", "Рент.", "ДРР", "CPC", "% поиска", "Локал."], rows2, col_widths=[220,200,200,130,130,130,170,150], font_size=13, row_h=58, lower_better_cols={4,5})
+                add_table_row_links(90, 150, 1420, 410, 58, art_targets)
+                c.showPage()
+
+            # Article pages for top 90% GP inside selected product.
+            for _, ar in aw_keep.iterrows():
+                art = str(ar.get("supplier_article"))
+                page1 = f"article_{art}_1".replace("/", "_").replace(" ", "_")
+                page2 = f"article_{art}_2".replace("/", "_").replace(" ", "_")
+                article_pages[art] = (page1, page2)
+                bookmarks[page1] = page1; c.bookmarkPage(page1)
+                page_bg(f"Артикул: {art}", f"{cat_short.get(subject,subject)} / товар {product} / {week_start.strftime('%d.%m')}-{week_end.strftime('%d.%m.%Y')}", "Артикул 1/2")
+                if not skip_product_level:
+                    button(1120, 800, 150, "← товар", prod_key)
+                    button(1290, 800, 150, "← категория", cat_key)
+                else:
+                    button(1240, 800, 180, "← категория", cat_key)
+                button(1440, 800, 90, "стр.2", page2)
+
+                def unit(col):
+                    qty = max(_pdf_num(ar.get("buyout_qty_model"), _pdf_num(ar.get("orders"), 1)), 1)
+                    return _pdf_num(ar.get(col), 0) / qty
+                def pct_of_sales(col, suffix=""):
+                    denom = _pdf_num(ar.get("order_sum" + suffix), 0)
+                    return (_pdf_num(ar.get(col + suffix), 0) / denom * 100) if denom else np.nan
+                gp = _pdf_num(ar.get("gp_use"), 0)
+                gp_label = "ВП факт ABC" if bool(ar.get("gp_is_fact", False)) else "ВП расч."
+                cards1 = [
+                    (_fmt_rub(ar.get("order_sum")), "Сумма заказов", ar.get("order_sum"), ar.get("order_sum_prev"), False, ""),
+                    (_fmt_rub(gp), gp_label, gp, ar.get("gp_use_prev"), False, ""),
+                    (_fmt_pct_pdf(ar.get("margin_pct")), "Рентабельность", ar.get("margin_pct"), ar.get("margin_pct_prev"), False, ""),
+                    (_fmt_rub(ar.get("avg_order_price")), "Цена продажи", ar.get("avg_order_price"), ar.get("avg_order_price_prev"), False, ""),
+                    (_fmt_rub(ar.get("price_with_disc")), "Цена покупателя", ar.get("price_with_disc"), ar.get("price_with_disc_prev"), False, ""),
+                    (_fmt_pct_pdf(ar.get("spp", ar.get("spp_funnel",0))), "СПП", ar.get("spp", ar.get("spp_funnel",0)), ar.get("spp_prev", ar.get("spp_funnel_prev",0)), False, ""),
+                    (_fmt_pct_pdf(ar.get("commission_pct_abc", pct_of_sales("commission_model"))), "Комиссия, %", ar.get("commission_pct_abc", pct_of_sales("commission_model")), ar.get("commission_pct_abc_prev", pct_of_sales("commission_model", "_prev")), True, ""),
+                    (_fmt_rub(unit("logistics_direct_model")+unit("logistics_return_model")), "Логистика/шт", "", "", True, ""),
+                    (_fmt_rub(unit("storage_model")), "Хранение/шт", "", "", True, ""),
+                    (_fmt_pct_pdf(ar.get("acquiring_pct_abc", pct_of_sales("acquiring_model"))), "Эквайринг, %", ar.get("acquiring_pct_abc", pct_of_sales("acquiring_model")), ar.get("acquiring_pct_abc_prev", pct_of_sales("acquiring_model", "_prev")), True, ""),
+                    (_fmt_rub(unit("cost_model")), "Себест./шт", "", "", True, ""),
+                    (_fmt_rub(unit("other_costs_model")), "Прочие/шт", "", "", True, ""),
+                ]
+                c.setFillColor(RED_DARK); c.roundRect(80, 650, 1440, 42, 10, fill=1, stroke=0); c.setFillColor(WHITE); c.setFont(F_BLACK, 20); c.drawString(105, 664, "Блок 1. Экономика и продажи")
+                for idx, (val, lab, curv, prevv, lower, sub2) in enumerate(cards1[:6]):
+                    dt, tone = _pdf_color_delta_value(curv, prevv, lower) if curv != "" else ("", "neutral")
+                    draw_metric_card(80+idx*240, 535, 220, 96, val, lab, dt, tone, sub2)
+                for idx, (val, lab, curv, prevv, lower, sub2) in enumerate(cards1[6:]):
+                    dt, tone = _pdf_color_delta_value(curv, prevv, lower) if curv != "" else ("", "neutral")
+                    draw_metric_card(80+idx*240, 420, 220, 96, val, lab, dt, tone)
+                c.setFillColor(RED_DARK); c.roundRect(80, 350, 1440, 42, 10, fill=1, stroke=0); c.setFillColor(WHITE); c.setFont(F_BLACK, 20); c.drawString(105, 364, "Блок 2. Спрос, точки входа и конверсии")
+                cards2 = [
+                    (_fmt_rub(ar.get("ad_spend_total")), "Расход РК", ar.get("ad_spend_total"), ar.get("ad_spend_total_prev"), True, ""),
+                    (_fmt_pct_pdf(ar.get("drr_pct")), "ДРР", ar.get("drr_pct"), ar.get("drr_pct_prev"), True, ""),
+                    (_fmt_cpc_pdf(ar.get("cpc")), "CPC", ar.get("cpc"), ar.get("cpc_prev"), True, ""),
+                    (_fmt_num_pdf(ar.get("ad_impressions_total")), "Показы РК", ar.get("ad_impressions_total"), ar.get("ad_impressions_total_prev"), False, ""),
+                    (_fmt_num_pdf(ar.get("ad_clicks_total")), "Клики РК", ar.get("ad_clicks_total"), ar.get("ad_clicks_total_prev"), False, ""),
+                    (_fmt_num_pdf(ar.get("open_cards")), "Открытия", ar.get("open_cards"), ar.get("open_cards_prev"), False, ""),
+                    (_fmt_pct_pdf(ar.get("cart_conv_pct")), "Конв. в корзину", ar.get("cart_conv_pct"), ar.get("cart_conv_pct_prev"), False, ""),
+                    (_fmt_pct_pdf(ar.get("order_conv_pct")), "Корзина → заказ", ar.get("order_conv_pct"), ar.get("order_conv_pct_prev"), False, ""),
+                    (_fmt_num_pdf(ar.get("search_frequency")), "Спрос WB", ar.get("search_frequency"), ar.get("search_frequency_prev"), False, ""),
+                    (_fmt_pct_pdf(ar.get("search_traffic_capture_pct")), "% поиска", ar.get("search_traffic_capture_pct"), ar.get("search_traffic_capture_pct_prev"), False, ""),
+                    (_fmt_pct_pdf(ar.get("localization_with_replacements_pct")), "Локализация", ar.get("localization_with_replacements_pct"), ar.get("localization_with_replacements_pct_prev"), False, ""),
+                    (_fmt_num_pdf(ar.get("rating_reviews")), "Рейтинг отзывов", ar.get("rating_reviews"), ar.get("rating_reviews_prev"), False, ""),
+                ]
+                for idx, (val, lab, curv, prevv, lower, sub2) in enumerate(cards2[:6]):
+                    dt, tone = _pdf_color_delta_value(curv, prevv, lower)
+                    draw_metric_card(80+idx*240, 205, 220, 96, val, lab, dt, tone, sub2)
+                for idx, (val, lab, curv, prevv, lower, sub2) in enumerate(cards2[6:]):
+                    dt, tone = _pdf_color_delta_value(curv, prevv, lower)
+                    draw_metric_card(80+idx*240, 90, 220, 96, val, lab, dt, tone, sub2)
+                c.showPage()
+
+                bookmarks[page2] = page2; c.bookmarkPage(page2)
+                page_bg(f"Артикул: {art}", f"{cat_short.get(subject,subject)} / товар {product} / точки входа и выводы", "Артикул 2/2")
+                if not skip_product_level:
+                    button(1120, 800, 150, "← товар", prod_key)
+                    button(1290, 800, 150, "← категория", cat_key)
+                else:
+                    button(1240, 800, 180, "← категория", cat_key)
+                button(1440, 800, 90, "стр.1", page1)
+                ep_rows=[]
+                if entry_bridge is not None and not entry_bridge.empty:
+                    ep = entry_bridge[(entry_bridge["subject"].astype(str).eq(subject)) & (entry_bridge["product"].astype(str).eq(product)) & (entry_bridge["supplier_article"].astype(str).eq(art))].copy()
+                    if not ep.empty:
+                        ep = ep.sort_values("orders", ascending=False).head(8)
+                        for _, er in ep.iterrows():
+                            dord, _tone = _pdf_color_delta_value(er.get("orders"), er.get("orders_prev"), False)
+                            ep_rows.append([
+                                f"{er.get('entry_section','')} / {er.get('entry_point','')}",
+                                f"{_fmt_num_pdf(er.get('transitions'))}\n{dyn_text(er.get('transitions'), er.get('transitions_prev'))}",
+                                f"{_fmt_num_pdf(er.get('orders'))}\n{dord}",
+                                _fmt_pct_pdf(er.get("cart_conv_pct")),
+                                _fmt_pct_pdf(er.get("order_conv_pct")),
+                                _fmt_pct_pdf(er.get("orders_share_pct")),
+                                _pdf_signed_rub(er.get("effect_gp_rub")),
+                            ])
+                if not ep_rows:
+                    ep_rows = [["—", "—", "—", "—", "—", "—", "—"]]
+                draw_table(90, 425, 1420, 300, ["Канал / точка входа", "Переходы", "Заказы", "Конв.\nкорз.", "Корзина\n→ заказ", "Доля\nзаказов", "Вклад\nВП"], ep_rows, col_widths=[470,170,150,140,160,140,170], font_size=12, row_h=31, first_col_red=False, align_left_cols={0})
+                fs = factor_summary[(factor_summary["level"].astype(str).eq("article")) & (factor_summary["supplier_article"].astype(str).eq(art))] if factor_summary is not None and not factor_summary.empty else pd.DataFrame()
+                txt_main = fs.iloc[0].get("summary_text", "Факторный мост не выделил значимых денежных причин.") if not fs.empty else "Факторный мост не выделил значимых денежных причин."
+                txt_econ = fs.iloc[0].get("economy_sales_text", "") if not fs.empty else ""
+                txt_dem = fs.iloc[0].get("demand_entry_conversion_text", "") if not fs.empty else ""
+                c.setFillColor(WHITE); c.roundRect(90, 105, 1420, 270, 18, fill=1, stroke=0)
+                c.setFillColor(RED_DARK); c.setFont(F_BLACK, 22); c.drawString(120, 340, "Факторный вывод в деньгах")
+                c.setFillColor(BLACK); c.setFont(F_BOLD, 16)
+                yy = 305
+                for line in _wrap_pdf_lines(txt_main, F_BOLD, 16, 1340, 4):
+                    c.drawString(120, yy, line); yy -= 23
+                c.setFillColor(GRAY); c.setFont(F_BOLD, 14)
+                for line in _wrap_pdf_lines(txt_econ, F_BOLD, 14, 1340, 2):
+                    c.drawString(120, yy, line); yy -= 20
+                for line in _wrap_pdf_lines(txt_dem, F_BOLD, 14, 1340, 2):
+                    c.drawString(120, yy, line); yy -= 20
+                c.showPage()
+
+    c.save()
+    try:
+        trace_path = path.parent / PDF_CALC_TRACE_NAME
+        with pd.ExcelWriter(trace_path, engine="openpyxl") as writer:
+            trace_df = pd.DataFrame(trace_rows) if trace_rows else pd.DataFrame(columns=["block", "level", "period_start", "period_end", "metric", "value", "source", "source_file", "source_sheet", "source_rows", "source_cells", "source_columns", "filters", "formula"])
+            trace_df.to_excel(writer, sheet_name="Расчет_ВП", index=False)
+            if selected is not None and not selected.empty:
+                selected.to_excel(writer, sheet_name="Выбранные_товары", index=False)
+            if product_stability is not None and not product_stability.empty:
+                product_stability.to_excel(writer, sheet_name="Отбор_товаров", index=False)
+        log(f"Saved PDF calc trace: {trace_path} rows={len(trace_rows):,}")
+    except Exception as exc:
+        log(f"WARN PDF calc trace was not saved: {exc}")
+    return path
+
+
+
+# The PDF/report logic must not introduce artificial "optimum" comparison rows.
+def _append_optimal_factor_rows(level: str, g: pd.DataFrame, keys: List[str], optimal: pd.DataFrame) -> List[Dict[str, Any]]:
+    return []
+
+
+# ================================================================
+# PDF v11: three-contour management report
+# Контуры:
+# 1) текущая неделя — только обзор, без провала в детализацию;
+# 2) прошлая полная неделя — категория → товар → артикул;
+# 3) последний закрытый месяц — категория → товар → артикул.
+# ================================================================
+
+def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Optional[Path]:
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib import colors
+        from reportlab.lib.colors import HexColor
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+    except Exception as exc:
+        log(f"WARN: reportlab недоступен, PDF не создан: {exc}")
+        return None
+
+    F_REG, F_BOLD, F_BLACK = _register_topface_fonts()
+    W, H = 1600, 900
+    RED = HexColor("#c90022")
+    RED_DARK = HexColor("#9d0018")
+    WHITE = colors.white
+    BLACK = HexColor("#111111")
+    GRAY = HexColor("#595959")
+    GREEN = HexColor("#087a38")
+    BAD = HexColor("#b00020")
+    SOFT = HexColor("#fff4f5")
+    LINE = HexColor("#e6d8d8")
+
+    # 1) строгий справочник товарных групп + аудит.
+    outputs = _filter_outputs_by_pdf_product_reference(outputs, path.parent)
+
+    daily = outputs.get("article_day_fact", pd.DataFrame()).copy()
+    if daily is None or daily.empty:
+        raise RuntimeError("PDF невозможен: пустой article_day_fact")
+
+    # ---------- basic normalization ----------
+    SUBJECT_DISPLAY = {
+        "Кисти косметические": "Кисти",
+        "Кисти": "Кисти",
+        "Косметические карандаши": "Карандаши",
+        "Карандаши": "Карандаши",
+        "Помады": "Помады",
+        "Блески": "Блески",
+    }
+    DISPLAY_TO_CANON = {
+        "Кисти": "Кисти косметические",
+        "Карандаши": "Косметические карандаши",
+        "Помады": "Помады",
+        "Блески": "Блески",
+    }
+    CATEGORY_ORDER = ["Кисти", "Карандаши", "Помады", "Блески"]
+    PRODUCT_ORDER = {
+        "Кисти": ["901"],
+        "Карандаши": ["605", "611", "613", "614", "617", "618"],
+        "Помады": ["154", "155", "156", "157", "206"],
+        "Блески": ["207", "209", "210", "211"],
+    }
+    DETAIL_EXCLUDE = set(os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "206,207,209,210,211").split(","))
+    DETAIL_EXCLUDE = {x.strip() for x in DETAIL_EXCLUDE if x.strip()}
+
+    def _num(x, default=0.0):
+        try:
+            if pd.isna(x):
+                return default
+            return float(x)
+        except Exception:
+            return default
+
+    def _clean_article_local(x):
+        try:
+            return clean_article(x)
+        except Exception:
+            return "" if pd.isna(x) else str(x).strip()
+
+    def _prod(x):
+        return _pdf_product_code_from_value(x)
+
+    def _normalize_pdf_merge_keys(df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+        """Normalize PDF grouping/merge keys so int/string nm_id cannot break late PDF generation.
+
+        The source tables come from different Excel sheets: article_day_fact often keeps nm_id
+        as numeric, while ads/search/ABC can return it as text after Excel round-trips. Pandas
+        refuses to merge int64 and object keys, so every PDF-side key is normalized before
+        groupby/merge.
+        """
+        if df is None:
+            return pd.DataFrame(columns=keys)
+        out = df.copy()
+        for k in keys:
+            if k not in out.columns:
+                out[k] = ""
+            if k == "nm_id":
+                vals = pd.to_numeric(out[k], errors="coerce")
+                # WB nm_id is an integer identifier; keep empty for missing values.
+                out[k] = vals.round().astype("Int64").astype(str).replace("<NA>", "")
+                out[k] = out[k].replace({"nan": "", "None": ""})
+            elif k == "supplier_article":
+                out[k] = out[k].map(_clean_article_local)
+            else:
+                out[k] = out[k].map(normalize_text)
+        return out
+
+    def _fmt_money(x):
+        x = _num(x, 0)
+        sign = "-" if x < 0 else ""
+        return f"{sign}{int(round(abs(x))):,} ₽".replace(",", " ")
+
+    def _fmt_money_short(x):
+        x = _num(x, 0)
+        sign = "-" if x < 0 else ""
+        ax = abs(x)
+        if ax >= 1_000_000:
+            return f"{sign}{ax/1_000_000:.1f} млн ₽".replace(".", ",")
+        if ax >= 1000:
+            return f"{sign}{ax/1000:.0f}к ₽".replace(".", ",")
+        return f"{sign}{ax:.0f} ₽".replace(".", ",")
+
+    def _fmt_signed_money(x):
+        x = _num(x, 0)
+        if abs(x) < 0.5:
+            return "0 ₽"
+        return ("+" if x > 0 else "-") + f"{int(round(abs(x))):,} ₽".replace(",", " ")
+
+    def _fmt_pct(x, digits=1):
+        if x is None or pd.isna(x):
+            return "—"
+        return f"{_num(x):.{digits}f}%".replace(".", ",")
+
+    def _fmt_num(x):
+        if x is None or pd.isna(x):
+            return "—"
+        return f"{int(round(_num(x))):,}".replace(",", " ")
+
+    def _fmt_rub1(x):
+        if x is None or pd.isna(x):
+            return "—"
+        return f"{_num(x):.1f} ₽".replace(".", ",")
+
+    def _fmt_loc_pair(direct, repl):
+        # Compact localization display requested by user: direct coverage -> coverage with replacements.
+        # Header stays simply "Локализация"; no explanatory text in PDF.
+        d = _num(direct, np.nan)
+        r = _num(repl, np.nan)
+        if pd.isna(d) and pd.isna(r):
+            return "—"
+        if pd.isna(d):
+            return f"— → {int(round(r))}%"
+        if pd.isna(r):
+            return f"{int(round(d))}% → —"
+        return f"{int(round(d))}% → {int(round(r))}%"
+
+    def _delta_abs(cur, prev):
+        cur, prev = _num(cur), _num(prev)
+        if abs(prev) < 1e-9 and abs(cur) < 1e-9:
+            return 0.0
+        return cur - prev
+
+    def _arrow_money(delta, lower_bad=False):
+        if delta is None or abs(_num(delta)) < 0.5:
+            return "→ 0 ₽"
+        d = _num(delta)
+        return ("↑ +" if d > 0 else "↓ -") + f"{int(round(abs(d))):,} ₽".replace(",", " ")
+
+    def _delta(cur, prev):
+        cur, prev = _num(cur), _num(prev)
+        # Управленческий отчет: не показываем мусорные +10000% / -3000%
+        # при нулевой или отрицательной базе. В таких случаях в PDF выводится «—».
+        if abs(prev) < 1e-9:
+            if abs(cur) < 1e-9:
+                return 0.0
+            return None
+        if prev < 0:
+            return None
+        d = (cur / prev - 1.0) * 100.0
+        if abs(d) > 999.0:
+            return None
+        return d
+
+    LOWER_BAD = {"ДРР", "CPC", "Расход РК", "Комиссия", "Эквайринг", "Логистика", "Хранение", "Себест", "Прочие", "СПП", "Позиция"}
+    def _lower_bad(metric: str) -> bool:
+        s = str(metric).lower()
+        return any(k.lower() in s for k in LOWER_BAD)
+
+    def _arrow(delta, lower_bad=False):
+        if delta is None:
+            return "→ 0,0%"
+        if abs(delta) < 0.05:
+            return "→ 0,0%"
+        return ("↑ " if delta > 0 else "↓ ") + f"{abs(delta):.1f}%".replace(".", ",")
+
+    def _tone(delta, lower_bad=False):
+        if delta is None or abs(delta) < 0.05:
+            return GRAY
+        good = (delta < 0) if lower_bad else (delta > 0)
+        return GREEN if good else BAD
+
+    def _subject_disp(x):
+        return SUBJECT_DISPLAY.get(normalize_text(x), normalize_text(x))
+
+    def _safe_mean(s):
+        s = pd.to_numeric(s, errors="coerce")
+        return float(s.dropna().mean()) if len(s.dropna()) else 0.0
+
+    for col in ["day", "subject", "product", "supplier_article", "nm_id"]:
+        if col not in daily.columns:
+            daily[col] = ""
+    daily["day"] = pd.to_datetime(daily["day"], errors="coerce").dt.normalize()
+    daily["subject_disp"] = daily["subject"].map(_subject_disp)
+    daily["product_code"] = daily.apply(lambda r: _prod(r.get("product")) or _prod(r.get("supplier_article")), axis=1)
+    # Keep approved products. 405/406 are removed by _filter_outputs_by_pdf_product_reference.
+    daily = daily[daily["subject_disp"].isin(CATEGORY_ORDER)].copy()
+    daily = _normalize_pdf_merge_keys(daily, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+
+    # Уникальный спрос WB для PDF: считаем по уникальным поисковым запросам,
+    # а не суммой спроса по артикулам. Если листа нет в старом техфайле,
+    # используем старый fallback, но в новом полном запуске лист будет создан.
+    search_unique_demand = outputs.get("search_unique_demand", pd.DataFrame()).copy()
+    if search_unique_demand is None:
+        search_unique_demand = pd.DataFrame()
+    if not search_unique_demand.empty:
+        if "day" in search_unique_demand.columns:
+            search_unique_demand["day"] = pd.to_datetime(search_unique_demand["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in search_unique_demand.columns:
+            if "subject" in search_unique_demand.columns:
+                search_unique_demand["subject_disp"] = search_unique_demand["subject"].map(_subject_disp)
+            else:
+                search_unique_demand["subject_disp"] = ""
+        if "product_code" not in search_unique_demand.columns:
+            if "product" in search_unique_demand.columns:
+                search_unique_demand["product_code"] = search_unique_demand["product"].map(_prod)
+            else:
+                search_unique_demand["product_code"] = ""
+        if "supplier_article" in search_unique_demand.columns:
+            search_unique_demand["supplier_article"] = search_unique_demand["supplier_article"].map(_clean_article_local)
+        for _c in ["unique_search_frequency", "unique_search_queries", "duplicate_query_rows_removed", "raw_query_rows"]:
+            if _c not in search_unique_demand.columns:
+                search_unique_demand[_c] = 0
+            search_unique_demand[_c] = pd.to_numeric(search_unique_demand[_c], errors="coerce").fillna(0)
+
+    search_query_gp_position = outputs.get("search_query_gp_position", pd.DataFrame()).copy()
+    if search_query_gp_position is None:
+        search_query_gp_position = pd.DataFrame()
+    if not search_query_gp_position.empty:
+        if "day" in search_query_gp_position.columns:
+            search_query_gp_position["day"] = pd.to_datetime(search_query_gp_position["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in search_query_gp_position.columns:
+            search_query_gp_position["subject_disp"] = search_query_gp_position.get("subject", "").map(_subject_disp) if "subject" in search_query_gp_position.columns else ""
+        if "product_code" not in search_query_gp_position.columns:
+            search_query_gp_position["product_code"] = search_query_gp_position.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in search_query_gp_position.columns:
+            search_query_gp_position["supplier_article"] = search_query_gp_position["supplier_article"].map(_clean_article_local)
+        search_query_gp_position = _normalize_pdf_merge_keys(search_query_gp_position, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        for _c in ["frequency", "transitions", "orders", "query_gp_est", "avg_position", "median_position"]:
+            if _c not in search_query_gp_position.columns:
+                search_query_gp_position[_c] = np.nan
+            search_query_gp_position[_c] = pd.to_numeric(search_query_gp_position[_c], errors="coerce")
+
+    # Strict mode: the user explicitly rejected duplicated demand from article_day_fact.
+    # Therefore a PDF with fallback demand is not a valid управленческий отчет.
+    PDF_ALLOW_DEMAND_FALLBACK = os.getenv("PDF_ALLOW_DEMAND_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "y"}
+    # Default is no duplicated fallback, but also no late 30-minute crash: missing unique demand
+    # is rendered as blank/diagnostic unless PDF_FAIL_ON_MISSING_DEMAND=1 is explicitly set.
+    PDF_FAIL_ON_MISSING_DEMAND = os.getenv("PDF_FAIL_ON_MISSING_DEMAND", "0").strip().lower() in {"1", "true", "yes", "y"}
+    if (search_unique_demand is None or search_unique_demand.empty) and not PDF_ALLOW_DEMAND_FALLBACK:
+        raise RuntimeError(
+            "PDF остановлен: нет листа/данных search_unique_demand. "
+            "Спрос WB нельзя считать суммой по артикулам. "
+            "Запусти полный пересчет источников или временно поставь PDF_ALLOW_DEMAND_FALLBACK=1 только для диагностики."
         )
 
-        rows.append({
-            "campaign_id": decision.get("campaign_id", ""),
-            "nm_id": nm_id,
-            "supplier_article": supplier_article,
-            "subject_norm": decision.get("subject_norm", ""),
-            "placement": decision.get("placement", ""),
-            "campaign_status": decision.get("campaign_status", ""),
-            "economics_match_method": econ_info.get("economics_match_method", ""),
-            "economics_product_group": econ_info.get("economics_product_group", ""),
-            "economics_avg_price": econ_info.get("economics_avg_price", ""),
-            "economics_commission_pct": econ_info.get("economics_commission_pct", ""),
-            "economics_acquiring_pct": econ_info.get("economics_acquiring_pct", ""),
-            "economics_vat_per_unit": econ_info.get("economics_vat_per_unit", ""),
-            "economics_logistics_per_unit": econ_info.get("economics_logistics_per_unit", ""),
-            "economics_cogs_per_unit": econ_info.get("economics_cogs_per_unit", ""),
-            "comparison_status": comparison_status,
-            "last_bid_change_date": event_date_text,
-            "old_bid_rub": old_bid,
-            "new_bid_rub": new_bid,
-            "bid_change_reason_code": change_reason,
-            "before_period": _date_window_label(before_start, before_end),
-            "after_period": _date_window_label(after_start, after_end),
-            "before_days": before_days,
-            "after_days": after_days,
-            "current_action": action,
-            "current_reason_code": reason_code,
-            "current_reason_text": reason_text,
-            "postcheck_status": decision.get("postcheck_status", ""),
-            "final_verdict": final_verdict,
-            "target_bid_action": target_action,
-            "target_bid_action_text": target_text,
-            "recommended_next_bid_rub": recommended_next,
-            "before_impressions": before_metrics.get("impressions", 0),
-            "after_impressions": after_metrics.get("impressions", 0),
-            "before_impressions_per_day": before_daily.get("impressions", 0),
-            "after_impressions_per_day": after_daily.get("impressions", 0),
-            "impressions_delta_pct": _safe_delta_pct(after_daily.get("impressions", 0), before_daily.get("impressions", 0)),
-            "before_clicks": before_metrics.get("clicks", 0),
-            "after_clicks": after_metrics.get("clicks", 0),
-            "before_clicks_per_day": before_daily.get("clicks", 0),
-            "after_clicks_per_day": after_daily.get("clicks", 0),
-            "clicks_delta_pct": _safe_delta_pct(after_daily.get("clicks", 0), before_daily.get("clicks", 0)),
-            "before_ctr_pct": before_ctr,
-            "after_ctr_pct": after_ctr,
-            "ctr_delta_pp": _safe_delta_pp(after_ctr, before_ctr),
-            "before_orders_qty": before_metrics.get("orders", 0),
-            "after_orders_qty": after_metrics.get("orders", 0),
-            "before_orders_qty_per_day": before_daily.get("orders", 0),
-            "after_orders_qty_per_day": after_daily.get("orders", 0),
-            "orders_qty_delta_pct": _safe_delta_pct(after_daily.get("orders", 0), before_daily.get("orders", 0)),
-            "before_orders_sum_rub": before_metrics.get("revenue", 0),
-            "after_orders_sum_rub": after_metrics.get("revenue", 0),
-            "before_orders_sum_rub_per_day": before_daily.get("revenue", 0),
-            "after_orders_sum_rub_per_day": after_daily.get("revenue", 0),
-            "orders_sum_delta_pct": _safe_delta_pct(after_daily.get("revenue", 0), before_daily.get("revenue", 0)),
-            "before_gp_after_ads_rub": before_metrics.get("gp_after_ads", float("nan")),
-            "after_gp_after_ads_rub": after_metrics.get("gp_after_ads", float("nan")),
-            "before_gp_after_ads_rub_per_day": before_daily.get("gp_after_ads", float("nan")),
-            "after_gp_after_ads_rub_per_day": after_daily.get("gp_after_ads", float("nan")),
-            "gp_after_ads_delta_pct": _safe_delta_pct(after_daily.get("gp_after_ads", float("nan")), before_daily.get("gp_after_ads", float("nan"))),
-            "before_ad_spend_rub": before_metrics.get("spend", 0),
-            "after_ad_spend_rub": after_metrics.get("spend", 0),
-            "before_ad_spend_rub_per_day": before_daily.get("spend", 0),
-            "after_ad_spend_rub_per_day": after_daily.get("spend", 0),
-            "ad_spend_delta_pct": _safe_delta_pct(after_daily.get("spend", 0), before_daily.get("spend", 0)),
-            "before_drr_pct": before_drr,
-            "after_drr_pct": after_drr,
-            "drr_delta_pp": _safe_delta_pp(after_drr, before_drr),
-            "core80_queries_count": max(before_kw.get("queries_count", 0), after_kw.get("queries_count", 0)),
-            "before_core80_avg_position": before_kw.get("avg_position", 0),
-            "after_core80_avg_position": after_kw.get("avg_position", 0),
-            "core80_position_delta": _safe_delta_pp(after_kw.get("avg_position", 0), before_kw.get("avg_position", 0)),
-            "before_core80_visibility_pct": before_kw.get("visibility_pct", 0),
-            "after_core80_visibility_pct": after_kw.get("visibility_pct", 0),
-            "core80_visibility_delta_pp": _safe_delta_pp(after_kw.get("visibility_pct", 0), before_kw.get("visibility_pct", 0)),
-            "before_core80_query_freq": before_kw.get("query_freq", 0),
-            "after_core80_query_freq": after_kw.get("query_freq", 0),
-            "before_card_views": before_card_views,
-            "after_card_views": after_card_views,
-            "before_card_views_per_day": _safe_per_day_value(before_card_views, before_days),
-            "after_card_views_per_day": _safe_per_day_value(after_card_views, after_days),
-            "before_traffic_share_pct": before_share,
-            "after_traffic_share_pct": after_share,
-            "traffic_share_delta_pp": _safe_delta_pp(after_share, before_share),
-            "diagnostic_conclusion": conclusion,
-        })
-    out = pd.DataFrame(rows)
-    for col in BID_CAMPAIGN_COMPARE_COLUMNS:
+    for col in ["order_sum", "orders", "gross_profit_model", "open_cards", "add_to_cart", "search_frequency", "search_traffic_capture_pct", "direct_localization_pct", "localization_with_replacements_pct", "rating_reviews", "finished_price", "price_with_disc", "spp", "commission_%", "acquiring_%", "logistics_direct", "storage", "other_costs", "cost", "cart_conv_pct", "order_conv_pct"]:
+        if col not in daily.columns:
+            daily[col] = 0.0
+        daily[col] = pd.to_numeric(daily[col], errors="coerce").fillna(0)
+    if "ad_spend_total" not in daily.columns:
+        daily["ad_spend_total"] = 0.0
+        for col in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"]:
+            if col in daily.columns:
+                daily["ad_spend_total"] += pd.to_numeric(daily[col], errors="coerce").fillna(0)
+    if "ad_clicks_total" not in daily.columns:
+        daily["ad_clicks_total"] = 0.0
+        for col in ["manual_clicks", "unified_clicks", "unknown_clicks"]:
+            if col in daily.columns:
+                daily["ad_clicks_total"] += pd.to_numeric(daily[col], errors="coerce").fillna(0)
+    if "ad_impressions_total" not in daily.columns:
+        daily["ad_impressions_total"] = 0.0
+        for col in ["manual_impressions", "unified_impressions", "unknown_impressions"]:
+            if col in daily.columns:
+                daily["ad_impressions_total"] += pd.to_numeric(daily[col], errors="coerce").fillna(0)
+
+    # Advertising truth source. Use the same freshest-source selector as Telegram.
+    # This prevents stale ads_category_source through 26.05 from hiding a fresh raw WB ad file through 28.05.
+    try:
+        ads_truth, ads_truth_source_name = _tg_prepare_ads_truth(outputs)
+    except Exception as exc:
+        log(f"PDF WARN: fresh ads truth selector failed, fallback to direct outputs: {exc}")
+        ads_truth = outputs.get("ads_category_source", pd.DataFrame()).copy()
+        ads_truth_source_name = "ads_category_source" if ads_truth is not None and not ads_truth.empty else ""
+        if ads_truth is None or ads_truth.empty:
+            ads_truth = outputs.get("ads_raw_source", pd.DataFrame()).copy()
+            ads_truth_source_name = "ads_raw_source" if ads_truth is not None and not ads_truth.empty else ""
+        if ads_truth is None or ads_truth.empty:
+            ads_truth = outputs.get("ads_daily_source", pd.DataFrame()).copy()
+            ads_truth_source_name = "ads_daily_source" if ads_truth is not None and not ads_truth.empty else ""
+        if ads_truth is None:
+            ads_truth = pd.DataFrame()
+    if not ads_truth.empty:
+        if "day" in ads_truth.columns:
+            ads_truth["day"] = pd.to_datetime(ads_truth["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in ads_truth.columns:
+            ads_truth["subject_disp"] = ads_truth.get("subject", "").map(_subject_disp) if "subject" in ads_truth.columns else ""
+        if "product_code" not in ads_truth.columns:
+            ads_truth["product_code"] = ads_truth.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in ads_truth.columns:
+            ads_truth["supplier_article"] = ads_truth["supplier_article"].map(_clean_article_local)
+        ads_truth = _normalize_pdf_merge_keys(ads_truth, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        for _c in ["spend", "clicks", "impressions"]:
+            if _c not in ads_truth.columns:
+                ads_truth[_c] = 0.0
+            ads_truth[_c] = pd.to_numeric(ads_truth[_c], errors="coerce").fillna(0.0)
+
+    # В техфайле могут быть заготовленные строки будущих дней с нулями.
+    # Их нельзя считать фактическими днями, иначе в текущей неделе появляются 0 ₽ ↓100%.
+    _activity_cols = [c for c in ["order_sum", "ad_spend_total", "open_cards", "search_frequency"] if c in daily.columns]
+    if _activity_cols:
+        _activity = pd.Series(0.0, index=daily.index)
+        for _c in _activity_cols:
+            _activity = _activity + pd.to_numeric(daily[_c], errors="coerce").fillna(0).abs()
+        latest = pd.to_datetime(daily.loc[_activity > 0, "day"], errors="coerce").max()
+    else:
+        latest = pd.to_datetime(daily["day"], errors="coerce").max()
+    if pd.isna(latest):
+        latest = pd.Timestamp.today().normalize()
+    # Environment override for scheduled closed-week runs.
+    # REPORT_AS_OF_DATE controls the report anchor date; REPORT_CLOSED_WEEK_AS_PREVIOUS=1
+    # makes the just-closed Mon-Sun week appear in the "Прошлая полная неделя" block.
+    latest_before_override = pd.Timestamp(latest).normalize()
+    latest = _report_anchor_day_from_daily(daily)
+    if latest != latest_before_override:
+        log(f"REPORT_AS_OF_DATE override: latest_day {latest_before_override.date()} -> {latest.date()}")
+    latest = pd.Timestamp(latest).normalize()
+    # In daily/current-week mode do not jump to a new day until the full contour exists.
+    # Example: orders/funnel for 01.06 are present, but advertising is only up to 31.05.
+    # Then the operational report must stay on 31.05 instead of showing "нет данных РК".
+    if _env_date("REPORT_AS_OF_DATE") is None:
+        _complete_limits = []
+        try:
+            _ads_days = _active_days_from_source(ads_truth, ["spend", "clicks", "impressions"]) if isinstance(ads_truth, pd.DataFrame) else pd.Series(dtype="datetime64[ns]")
+            if not _ads_days.empty:
+                _complete_limits.append(pd.Timestamp(_ads_days.max()).normalize())
+        except Exception:
+            pass
+        try:
+            _demand_src = outputs.get("search_unique_demand", pd.DataFrame())
+            _demand_days = _active_days_from_source(_demand_src, ["unique_search_frequency", "frequency", "search_frequency"]) if isinstance(_demand_src, pd.DataFrame) else pd.Series(dtype="datetime64[ns]")
+            if not _demand_days.empty:
+                _complete_limits.append(pd.Timestamp(_demand_days.max()).normalize())
+        except Exception:
+            pass
+        if _complete_limits:
+            _complete_latest = min([latest] + _complete_limits)
+            if _complete_latest < latest:
+                log(f"complete-day guard: latest_day {latest.date()} -> {_complete_latest.date()} because ads/demand are not complete")
+                latest = _complete_latest
+    cur_start = latest - pd.Timedelta(days=int(latest.weekday()))
+    cur_end = cur_start + pd.Timedelta(days=6)
+    cur_actual_end = latest
+    if _env_flag("REPORT_CLOSED_WEEK_AS_PREVIOUS", False):
+        if int(latest.weekday()) != 6:
+            raise RuntimeError(
+                f"REPORT_CLOSED_WEEK_AS_PREVIOUS=1 требует дату-воскресенье, получено {latest:%d.%m.%Y}"
+            )
+        prev_start = cur_start
+        prev_end = cur_end
+        prev2_start = cur_start - pd.Timedelta(days=7)
+        prev2_end = cur_start - pd.Timedelta(days=1)
+        log(
+            f"Closed-week mode: previous full week={prev_start:%d.%m.%Y}-{prev_end:%d.%m.%Y}; "
+            f"comparison={prev2_start:%d.%m.%Y}-{prev2_end:%d.%m.%Y}"
+        )
+    else:
+        prev_start = cur_start - pd.Timedelta(days=7)
+        prev_end = cur_start - pd.Timedelta(days=1)
+        prev2_start = cur_start - pd.Timedelta(days=14)
+        prev2_end = cur_start - pd.Timedelta(days=8)
+    # Last closed month. In a Monday full-refresh for a week that ended on the last day
+    # of the month (example: report anchor 2026-05-31, run date 2026-06-02),
+    # the closed month is that just-finished month, not April.
+    latest_month_last_day = calendar.monthrange(int(latest.year), int(latest.month))[1]
+    if int(latest.day) == latest_month_last_day:
+        closed_end = pd.Timestamp(latest).normalize()
+    else:
+        closed_end = cur_start.replace(day=1) - pd.Timedelta(days=1)
+    closed_start = closed_end.replace(day=1)
+    closed_prev_end = closed_start - pd.Timedelta(days=1)
+    closed_prev_start = closed_prev_end.replace(day=1)
+
+    def _orders_vat_amount(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
+        """VAT included in buyer amount for a period.
+
+        priceWithDisc / order_sum is seller sale amount before SPP.
+        finishedPrice is buyer amount after SPP.
+        VAT base = buyer amount; VAT rate is 7/107 because VAT is included.
+        """
+        x = daily[(daily["day"] >= pd.Timestamp(start_dt).normalize()) & (daily["day"] <= pd.Timestamp(end_dt).normalize())].copy()
+        if x.empty:
+            return 0.0
+        sale_total = pd.to_numeric(x.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+        orders_total = pd.to_numeric(x.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0)
+        buyer_price = pd.to_numeric(x.get("finished_price", pd.Series(dtype=float)), errors="coerce")
+        buyer_total = (buyer_price.fillna(0) * orders_total.fillna(0)).sum()
+        if sale_total > 0 and buyer_total <= 0 and "spp" in x.columns:
+            spp_pct = pd.to_numeric(x.get("spp"), errors="coerce")
+            weights = pd.to_numeric(x.get("order_sum"), errors="coerce").fillna(0)
+            valid = spp_pct.notna() & (weights > 0)
+            if valid.any():
+                buyer_total = sale_total * (1.0 - float(np.average(spp_pct[valid], weights=weights[valid])) / 100.0)
+        if buyer_total <= 0:
+            return 0.0
+        return max(0.0, float(buyer_total) * 7.0 / 107.0)
+
+    # ---------- ABC helpers ----------
+    def _prepare_abc(src: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+        if src is None or src.empty:
+            return pd.DataFrame()
+        x = src.copy()
+        if "period_start" not in x.columns or "period_end" not in x.columns:
+            return pd.DataFrame()
+        x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+        x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+        x = x[(x["period_start"] == pd.Timestamp(start).normalize()) & (x["period_end"] == pd.Timestamp(end).normalize())].copy()
+        if x.empty:
+            return x
+        if "subject_disp" not in x.columns:
+            x["subject_disp"] = x.get("subject", "").map(_subject_disp) if "subject" in x.columns else ""
+        if "product_code" not in x.columns:
+            x["product_code"] = x.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in x.columns:
+            x["supplier_article"] = x["supplier_article"].map(_clean_article_local)
+        x = _normalize_pdf_merge_keys(x, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        for col in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct", "abc_margin_pct", "abc_commission_amount", "abc_acquiring_amount"]:
+            if col not in x.columns:
+                x[col] = 0.0
+            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0)
+        return x[x["subject_disp"].isin(CATEGORY_ORDER)].copy()
+
+    def _abc_exact(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        frames = []
+        for nm in ["abc_weekly", "abc_monthly"]:
+            src = _prepare_abc(outputs.get(nm, pd.DataFrame()), start, end)
+            if not src.empty:
+                frames.append(src)
+        if not frames:
+            return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "orders_abc", "abc_drr_pct", "abc_commission_pct", "abc_acquiring_pct", "abc_rows"])
+        x = pd.concat(frames, ignore_index=True)
+        if "day" in keys:
+            x = x[x["period_start"].eq(x["period_end"])].copy()
+            x["day"] = x["period_start"]
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        x["_abc_ad"] = np.where(x["gross_revenue"] > 0, x["gross_revenue"] * x["abc_drr_pct"] / 100.0, 0.0)
+        # Рентабельность берем из ABC-отчета, если колонка есть. Для агрегата считаем
+        # weighted-average по ABC-выручке, а не пересчитываем как ВП/сумма, потому что
+        # в ABC rentability может быть отдельной бизнес-метрикой.
+        x["_margin_weight"] = np.where(
+            x["gross_revenue"] > 0,
+            x["gross_revenue"] * pd.to_numeric(x.get("abc_margin_pct", np.nan), errors="coerce") / 100.0,
+            np.nan,
+        )
+        x["_margin_weight"] = pd.to_numeric(x["_margin_weight"], errors="coerce")
+        x["_margin_rev"] = np.where(x["_margin_weight"].notna(), x["gross_revenue"], 0.0)
+        x["_margin_weight"] = x["_margin_weight"].fillna(0.0)
+        x["_comm_abs"] = x["abc_commission_amount"].abs()
+        x["_acq_abs"] = x["abc_acquiring_amount"].abs()
+        g = x.groupby(keys, dropna=False, as_index=False).agg(
+            gp_abc=("gross_profit", "sum"),
+            revenue_abc=("gross_revenue", "sum"),
+            orders_abc=("orders", "sum"),
+            abc_ad_spend=("_abc_ad", "sum"),
+            abc_margin_weight=("_margin_weight", "sum"),
+            abc_margin_revenue=("_margin_rev", "sum"),
+            abc_commission_amount=("_comm_abs", "sum"),
+            abc_acquiring_amount=("_acq_abs", "sum"),
+            abc_rows=("gross_profit", "size"),
+        )
+        rev = pd.to_numeric(g["revenue_abc"], errors="coerce").fillna(0)
+        g["abc_margin_pct_calc"] = np.where(rev > 0, g["gp_abc"] / rev * 100, np.nan)
+        g["abc_margin_pct"] = np.where(
+            pd.to_numeric(g.get("abc_margin_revenue", 0), errors="coerce").fillna(0) > 0,
+            g["abc_margin_weight"] / g["abc_margin_revenue"] * 100,
+            g["abc_margin_pct_calc"],
+        )
+        g["abc_drr_pct"] = np.where(rev > 0, g["abc_ad_spend"] / rev * 100, np.nan)
+        g["abc_commission_pct"] = np.where(rev > 0, g["abc_commission_amount"] / rev * 100, np.nan)
+        g["abc_acquiring_pct"] = np.where(rev > 0, g["abc_acquiring_amount"] / rev * 100, np.nan)
+        return g
+
+    def _level_for_keys(keys: List[str]) -> str:
+        k = list(keys)
+        if k == ["subject_disp"]:
+            return "category"
+        if k == ["subject_disp", "product_code"]:
+            return "product"
+        if k == ["subject_disp", "product_code", "supplier_article", "nm_id"]:
+            return "article"
+        return ""
+
+    def _unique_demand_period(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        if search_unique_demand is None or search_unique_demand.empty:
+            return pd.DataFrame()
+        level = _level_for_keys(keys)
+        if not level:
+            return pd.DataFrame()
+        x = search_unique_demand[(search_unique_demand["day"] >= pd.Timestamp(start).normalize()) & (search_unique_demand["day"] <= pd.Timestamp(end).normalize())].copy()
+        x = x[x.get("level", "").astype(str).eq(level)].copy() if "level" in x.columns else x
+        if x.empty:
+            return pd.DataFrame()
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        g = x.groupby(keys, dropna=False, as_index=False).agg(
+            demand_unique=("unique_search_frequency", "sum"),
+            unique_queries=("unique_search_queries", "sum"),
+            duplicate_query_rows_removed=("duplicate_query_rows_removed", "sum"),
+            raw_query_rows=("raw_query_rows", "sum"),
+        )
+        return g
+
+    def _search_gp80_position_period(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        if search_query_gp_position is None or search_query_gp_position.empty:
+            return pd.DataFrame()
+        level = _level_for_keys(keys)
+        if not level:
+            return pd.DataFrame()
+        x = search_query_gp_position[(search_query_gp_position["day"] >= pd.Timestamp(start).normalize()) & (search_query_gp_position["day"] <= pd.Timestamp(end).normalize())].copy()
+        if x.empty:
+            return pd.DataFrame()
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        rows = []
+        for keyvals, part in x.groupby(keys, dropna=False):
+            if not isinstance(keyvals, tuple):
+                keyvals = (keyvals,)
+            q = part.groupby("search_query", dropna=False, as_index=False).agg(
+                query_gp_est=("query_gp_est", "sum"),
+                orders=("orders", "sum"),
+                frequency=("frequency", "sum"),
+                transitions=("transitions", "sum"),
+                avg_position=("avg_position", lambda s: weighted_mean(s, part.loc[s.index, "query_gp_est"].clip(lower=0).fillna(0) + part.loc[s.index, "orders"].fillna(0) + part.loc[s.index, "frequency"].fillna(0) / 1000)),
+            )
+            q["query_gp_est"] = pd.to_numeric(q["query_gp_est"], errors="coerce").fillna(0.0)
+            q["_rank_gp"] = q["query_gp_est"].clip(lower=0)
+            q = q.sort_values(["_rank_gp", "orders", "frequency"], ascending=[False, False, False]).copy()
+            total_gp = float(q["_rank_gp"].sum())
+            if total_gp > 0:
+                q["cum_gp_share"] = q["_rank_gp"].cumsum() / total_gp
+                top = q[(q["cum_gp_share"] <= 0.80) | (q["_rank_gp"] == q["_rank_gp"].max())].copy()
+                crossing = q[q["cum_gp_share"] > 0.80].head(1)
+                top = pd.concat([top, crossing], ignore_index=True).drop_duplicates("search_query")
+                weight = top["_rank_gp"].replace(0, np.nan)
+                gp_share = float(top["_rank_gp"].sum() / total_gp * 100.0) if total_gp else np.nan
+            else:
+                top = q.head(10).copy()
+                weight = (top["orders"].fillna(0) + top["frequency"].fillna(0) / 1000).replace(0, np.nan)
+                gp_share = np.nan
+            rec = dict(zip(keys, keyvals))
+            rec["search_gp80_avg_position"] = weighted_mean(top["avg_position"], weight) if not top.empty else np.nan
+            rec["search_gp80_queries"] = int(top["search_query"].astype(str).replace("", np.nan).dropna().nunique()) if not top.empty else 0
+            rec["search_gp80_gp_share"] = gp_share
+            rec["search_gp80_gp_est"] = float(top["_rank_gp"].sum()) if "_rank_gp" in top.columns else 0.0
+            rows.append(rec)
+        return pd.DataFrame(rows)
+
+    def _ads_truth_period(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        if ads_truth is None or ads_truth.empty:
+            return pd.DataFrame()
+        x = ads_truth[(ads_truth["day"] >= pd.Timestamp(start).normalize()) & (ads_truth["day"] <= pd.Timestamp(end).normalize())].copy()
+        if x.empty:
+            return pd.DataFrame()
+        # Raw ad report usually has nm_id and subject. For product/article levels we can use enriched fields when present.
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        g = x.groupby(keys, dropna=False, as_index=False).agg(
+            ad_spend_truth=("spend", "sum"),
+            clicks_truth=("clicks", "sum"),
+            impressions_truth=("impressions", "sum"),
+            ad_truth_rows=("spend", "size"),
+        )
+        return g
+
+    def _agg_daily(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        x = daily[(daily["day"] >= pd.Timestamp(start).normalize()) & (daily["day"] <= pd.Timestamp(end).normalize())].copy()
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        if x.empty:
+            return pd.DataFrame(columns=keys)
+        # Weighted values from WB Orders report.
+        # Do not average article/day averages equally: category/product cards must be weighted by real orders/money.
+        _orders_w = pd.to_numeric(x.get("orders", 0), errors="coerce").fillna(0.0)
+        _orders_w = _orders_w.where(_orders_w > 0, 0.0)
+        _money_w = pd.to_numeric(x.get("order_sum", 0), errors="coerce").fillna(0.0)
+        _money_w = _money_w.where(_money_w > 0, _orders_w)
+        for _c in ["price_with_disc", "finished_price", "spp"]:
+            if _c not in x.columns:
+                x[_c] = np.nan
+            x[_c] = pd.to_numeric(x[_c], errors="coerce")
+        x["_price_with_disc_num"] = x["price_with_disc"] * _orders_w
+        x["_price_with_disc_den"] = np.where(x["price_with_disc"].notna(), _orders_w, 0.0)
+        x["_finished_price_num"] = x["finished_price"] * _orders_w
+        x["_finished_price_den"] = np.where(x["finished_price"].notna(), _orders_w, 0.0)
+        x["_spp_num"] = x["spp"] * _money_w
+        x["_spp_den"] = np.where(x["spp"].notna(), _money_w, 0.0)
+        g = x.groupby(keys, dropna=False, as_index=False).agg(
+            daily_rows=("order_sum", "size"),
+            active_days=("day", "nunique"),
+            order_sum=("order_sum", "sum"),
+            orders=("orders", "sum"),
+            gp_model=("gross_profit_model", "sum"),
+            ad_spend=("ad_spend_total", "sum"),
+            clicks=("ad_clicks_total", "sum"),
+            impressions=("ad_impressions_total", "sum"),
+            opens=("open_cards", "sum"),
+            carts=("add_to_cart", "sum"),
+            demand=("search_frequency", "sum"),
+            search_share=("search_traffic_capture_pct", _safe_mean),
+            localization_direct=("direct_localization_pct", _safe_mean),
+            localization=("localization_with_replacements_pct", _safe_mean),
+            rating=("rating_reviews", _safe_mean),
+            _price_with_disc_num=("_price_with_disc_num", "sum"),
+            _price_with_disc_den=("_price_with_disc_den", "sum"),
+            _finished_price_num=("_finished_price_num", "sum"),
+            _finished_price_den=("_finished_price_den", "sum"),
+            _spp_num=("_spp_num", "sum"),
+            _spp_den=("_spp_den", "sum"),
+            commission_pct_model=("commission_%", _safe_mean),
+            acquiring_pct_model=("acquiring_%", _safe_mean),
+            logistics_per_unit=("logistics_direct", _safe_mean),
+            storage_per_unit=("storage", _safe_mean),
+            other_per_unit=("other_costs", _safe_mean),
+            cost_per_unit=("cost", _safe_mean),
+        )
+        g["buyer_price"] = np.where(g["_finished_price_den"] > 0, g["_finished_price_num"] / g["_finished_price_den"], np.nan)
+        g["price_with_disc_avg"] = np.where(g["_price_with_disc_den"] > 0, g["_price_with_disc_num"] / g["_price_with_disc_den"], np.nan)
+        g["spp"] = np.where(g["_spp_den"] > 0, g["_spp_num"] / g["_spp_den"], np.nan)
+        g = g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
+        at = _ads_truth_period(start, end, keys)
+        if at is not None and not at.empty:
+            g = _normalize_pdf_merge_keys(g, keys)
+            at = _normalize_pdf_merge_keys(at, keys)
+            g = g.merge(at, on=keys, how="left")
+            mask = pd.to_numeric(g.get("ad_truth_rows"), errors="coerce").fillna(0) > 0
+            g["ad_spend_source"] = np.where(mask, ads_truth_source_name or "ads_truth", "article_day_fact")
+            g["ad_spend"] = np.where(mask, pd.to_numeric(g.get("ad_spend_truth"), errors="coerce").fillna(0), g["ad_spend"])
+            g["clicks"] = np.where(mask, pd.to_numeric(g.get("clicks_truth"), errors="coerce").fillna(0), g["clicks"])
+            g["impressions"] = np.where(mask, pd.to_numeric(g.get("impressions_truth"), errors="coerce").fillna(0), g["impressions"])
+        else:
+            g["ad_spend_source"] = "article_day_fact"
+            g["ad_truth_rows"] = 0
+        # Store the old duplicated demand for diagnostics before replacing it with unique-query demand.
+        g["demand_daily_sum"] = g["demand"]
+        # Demand for category/product/article levels must be unique by search query.
+        # Fallback: old article_day_fact sum only when the new search_unique_demand sheet is absent.
+        du = _unique_demand_period(start, end, keys)
+        if du is not None and not du.empty:
+            g = _normalize_pdf_merge_keys(g, keys)
+            du = _normalize_pdf_merge_keys(du, keys)
+            g = g.merge(du, on=keys, how="left")
+            g["demand_source"] = np.where(pd.to_numeric(g.get("demand_unique"), errors="coerce").fillna(0) > 0, "unique_queries", "daily_fallback")
+            g["demand"] = np.where(pd.to_numeric(g.get("demand_unique"), errors="coerce").fillna(0) > 0, pd.to_numeric(g.get("demand_unique"), errors="coerce").fillna(0), g["demand"])
+        else:
+            g["demand_source"] = "daily_sum_fallback"
+            g["unique_queries"] = 0
+            g["duplicate_query_rows_removed"] = 0
+            g["raw_query_rows"] = 0
+            if not PDF_ALLOW_DEMAND_FALLBACK:
+                msg = (
+                    f"PDF WARN: для периода {pd.Timestamp(start):%d.%m.%Y}-{pd.Timestamp(end):%d.%m.%Y} "
+                    f"и уровня {keys} нет уникального спроса search_unique_demand. "
+                    "Fallback SUM(search_frequency) НЕ используется; спрос/% поиска будут пустыми."
+                )
+                if PDF_FAIL_ON_MISSING_DEMAND:
+                    raise RuntimeError(msg)
+                log(msg)
+                g["demand"] = np.nan
+        # % поиска = все открытия карточки / Спрос WB.
+        g["search_share"] = np.where(g["demand"] > 0, g["opens"] / g["demand"] * 100, np.nan)
+        g["drr_model"] = np.where(g["order_sum"] > 0, g["ad_spend"] / g["order_sum"] * 100, 0.0)
+        g["cpc"] = np.where(g["clicks"] > 0, g["ad_spend"] / g["clicks"], np.nan)
+        # CTR РК = все клики рекламных кампаний / все показы рекламных кампаний.
+        g["ad_ctr"] = np.where(g["impressions"] > 0, g["clicks"] / g["impressions"] * 100, np.nan)
+        # CPC is kept as calculated from the available ad spend/click source.
+        # Do not hide low CPC values: shelf-type ads can legitimately produce CPC below bid floor.
+        g["cart_conv"] = np.where(g["opens"] > 0, g["carts"] / g["opens"] * 100, 0.0)
+        g["order_conv"] = np.where(g["carts"] > 0, g["orders"] / g["carts"] * 100, 0.0)
+        # Управленческая конверсия в заказ: заказы / все открытия карточки.
+        g["order_from_open_conv"] = np.where(g["opens"] > 0, g["orders"] / g["opens"] * 100, 0.0)
+        return g
+
+    def _metrics_period(start: pd.Timestamp, end: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        cur = _normalize_pdf_merge_keys(_agg_daily(start, end, keys), keys)
+        prev = _normalize_pdf_merge_keys(_agg_daily(prev_s, prev_e, keys), keys)
+        out = cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev"))
+        pos80 = _normalize_pdf_merge_keys(_search_gp80_position_period(start, end, keys), keys)
+        pos80_prev = _normalize_pdf_merge_keys(_search_gp80_position_period(prev_s, prev_e, keys), keys)
+        if pos80 is not None and not pos80.empty:
+            out = _normalize_pdf_merge_keys(out, keys).merge(pos80, on=keys, how="left")
+        if pos80_prev is not None and not pos80_prev.empty:
+            pos80_prev = pos80_prev.rename(columns={c: c + "_prev" for c in pos80_prev.columns if c not in keys})
+            out = _normalize_pdf_merge_keys(out, keys).merge(_normalize_pdf_merge_keys(pos80_prev, keys), on=keys, how="left")
+        abc = _normalize_pdf_merge_keys(_abc_exact(start, end, keys), keys)
+        abc_prev = _normalize_pdf_merge_keys(_abc_exact(prev_s, prev_e, keys), keys)
+        out = _normalize_pdf_merge_keys(out, keys).merge(abc, on=keys, how="left")
+        abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
+        out = _normalize_pdf_merge_keys(out, keys).merge(_normalize_pdf_merge_keys(abc_prev, keys), on=keys, how="left")
+        # fill numeric values
+        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "ad_ctr", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "price_with_disc_avg", "spp", "search_gp80_avg_position", "search_gp80_queries", "search_gp80_gp_share", "search_gp80_gp_est", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
+            if col not in out.columns: out[col] = 0.0
+            if col + "_prev" not in out.columns: out[col + "_prev"] = 0.0
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+            out[col + "_prev"] = pd.to_numeric(out[col + "_prev"], errors="coerce").fillna(0.0)
+        # ABC is source of truth for closed periods when exact ABC exists.
+        out["sum_use"] = np.where(pd.to_numeric(out.get("revenue_abc", 0), errors="coerce").fillna(0) > 0, pd.to_numeric(out.get("revenue_abc", 0), errors="coerce").fillna(0), out["order_sum"])
+        out["sum_prev_use"] = np.where(pd.to_numeric(out.get("revenue_abc_prev_abc", 0), errors="coerce").fillna(0) > 0, pd.to_numeric(out.get("revenue_abc_prev_abc", 0), errors="coerce").fillna(0), out["order_sum_prev"])
+        out["gp_use"] = np.where(pd.to_numeric(out.get("gp_abc", 0), errors="coerce").fillna(0).abs() > 1e-9, pd.to_numeric(out.get("gp_abc", 0), errors="coerce").fillna(0), out["gp_model"])
+        out["gp_prev_use"] = np.where(pd.to_numeric(out.get("gp_abc_prev_abc", 0), errors="coerce").fillna(0).abs() > 1e-9, pd.to_numeric(out.get("gp_abc_prev_abc", 0), errors="coerce").fillna(0), out["gp_model_prev"])
+        out["margin"] = np.where(out["sum_use"].abs() > 1e-9, out["gp_use"] / out["sum_use"] * 100, 0.0)
+        out["margin_prev"] = np.where(out["sum_prev_use"].abs() > 1e-9, out["gp_prev_use"] / out["sum_prev_use"] * 100, 0.0)
+        out["drr"] = np.where(pd.to_numeric(out.get("abc_drr_pct", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_drr_pct", 0), errors="coerce"), out["drr_model"])
+        out["drr_prev"] = np.where(pd.to_numeric(out.get("abc_drr_pct_prev_abc", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_drr_pct_prev_abc", 0), errors="coerce"), out["drr_model_prev"])
+        out["commission_pct"] = np.where(pd.to_numeric(out.get("abc_commission_pct", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_commission_pct", 0), errors="coerce"), out["commission_pct_model"])
+        out["commission_pct_prev"] = np.where(pd.to_numeric(out.get("abc_commission_pct_prev_abc", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_commission_pct_prev_abc", 0), errors="coerce"), out["commission_pct_model_prev"])
+        out["acquiring_pct"] = np.where(pd.to_numeric(out.get("abc_acquiring_pct", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_acquiring_pct", 0), errors="coerce"), out["acquiring_pct_model"])
+        out["acquiring_pct_prev"] = np.where(pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", 0), errors="coerce"), out["acquiring_pct_model_prev"])
+        out["has_abc"] = pd.to_numeric(out.get("abc_rows", 0), errors="coerce").fillna(0) > 0
+        out["has_abc_prev"] = pd.to_numeric(out.get("abc_rows_prev_abc", 0), errors="coerce").fillna(0) > 0
+
+        # ВАЖНО: если есть exact ABC за закрытый период, весь финансовый контур
+        # берём из ABC, а не смешиваем ABC-ВП/ДРР с оперативными заказами/рекламой.
+        # Иначе получается ложная картина: ДРР из ABC, а расход РК из дневной рекламы.
+        def _ncol(name: str, default: float = 0.0) -> pd.Series:
+            if name in out.columns:
+                return pd.to_numeric(out[name], errors="coerce").fillna(default)
+            return pd.Series(default, index=out.index, dtype="float64")
+        abc_rev = _ncol("revenue_abc")
+        abc_rev_prev = _ncol("revenue_abc_prev_abc")
+        abc_gp = _ncol("gp_abc")
+        abc_gp_prev = _ncol("gp_abc_prev_abc")
+        abc_ad = _ncol("abc_ad_spend")
+        abc_ad_prev = _ncol("abc_ad_spend_prev_abc")
+        abc_orders = _ncol("orders_abc")
+        abc_orders_prev = _ncol("orders_abc_prev_abc")
+
+        out["sum_use"] = np.where(out["has_abc"] & (abc_rev.abs() > 1e-9), abc_rev, out["order_sum"])
+        out["sum_prev_use"] = np.where(out["has_abc_prev"] & (abc_rev_prev.abs() > 1e-9), abc_rev_prev, out["order_sum_prev"])
+        out["gp_use"] = np.where(out["has_abc"], abc_gp, out["gp_model"])
+        out["gp_prev_use"] = np.where(out["has_abc_prev"], abc_gp_prev, out["gp_model_prev"])
+        # Заказы в PDF всегда берём из отчёта WB Заказы после исключения отмен,
+        # даже когда ВП/выручка для закрытого периода пришли из ABC.
+        out["orders"] = pd.to_numeric(out["orders"], errors="coerce").fillna(0.0)
+        out["orders_prev"] = pd.to_numeric(out["orders_prev"], errors="coerce").fillna(0.0)
+        # Prices in detail cards must come from WB Orders report:
+        # priceWithDisc = seller sale price, finishedPrice = buyer price after SPP.
+        # Do not recalculate sale price from ABC revenue, otherwise price changes when ABC is used.
+        _orders_price_sale = np.where(out["orders"].abs() > 1e-9, out["order_sum"] / out["orders"].replace(0, np.nan), np.nan)
+        _orders_price_sale_prev = np.where(out["orders_prev"].abs() > 1e-9, out["order_sum_prev"] / out["orders_prev"].replace(0, np.nan), np.nan)
+        out["price_sale"] = pd.to_numeric(out.get("price_with_disc_avg", np.nan), errors="coerce")
+        out["price_sale"] = out["price_sale"].where(out["price_sale"].abs() > 1e-9, _orders_price_sale)
+        out["price_sale_prev"] = pd.to_numeric(out.get("price_with_disc_avg_prev", np.nan), errors="coerce")
+        out["price_sale_prev"] = out["price_sale_prev"].where(out["price_sale_prev"].abs() > 1e-9, _orders_price_sale_prev)
+
+        # Расход РК для ABC-периода считаем только из ABC: Валовая выручка × ДРР ABC.
+        out["ad_spend"] = np.where(out["has_abc"], abc_ad, out["ad_spend"])
+        out["ad_spend_prev"] = np.where(out["has_abc_prev"], abc_ad_prev, out["ad_spend_prev"])
+        out["drr"] = np.where(out["sum_use"].abs() > 1e-9, out["ad_spend"] / out["sum_use"] * 100, 0.0)
+        out["drr_prev"] = np.where(out["sum_prev_use"].abs() > 1e-9, out["ad_spend_prev"] / out["sum_prev_use"] * 100, 0.0)
+        margin_calc = np.where(out["sum_use"].abs() > 1e-9, out["gp_use"] / out["sum_use"] * 100, 0.0)
+        margin_prev_calc = np.where(out["sum_prev_use"].abs() > 1e-9, out["gp_prev_use"] / out["sum_prev_use"] * 100, 0.0)
+        abc_margin_col = _ncol("abc_margin_pct", np.nan)
+        abc_margin_prev_col = _ncol("abc_margin_pct_prev_abc", np.nan)
+        out["margin"] = np.where(out["has_abc"] & abc_margin_col.notna(), abc_margin_col, margin_calc)
+        out["margin_prev"] = np.where(out["has_abc_prev"] & abc_margin_prev_col.notna(), abc_margin_prev_col, margin_prev_calc)
+        out["cpc"] = np.where(out["clicks"] > 0, out["ad_spend"] / out["clicks"], np.nan)
+        out["cpc_prev"] = np.where(out["clicks_prev"] > 0, out["ad_spend_prev"] / out["clicks_prev"], np.nan)
+        out["ad_ctr"] = np.where(out["impressions"] > 0, out["clicks"] / out["impressions"] * 100, np.nan)
+        out["ad_ctr_prev"] = np.where(out["impressions_prev"] > 0, out["clicks_prev"] / out["impressions_prev"] * 100, np.nan)
+        # CPC is kept as calculated. Low CPC is not a data error by itself
+        # because shelf-type ad formats may have much lower average CPC.
+
+        # Комиссия/эквайринг — доля ABC-выручки, если exact ABC есть.
+        out["commission_pct"] = np.where(out["has_abc"], pd.to_numeric(out.get("abc_commission_pct", np.nan), errors="coerce"), out["commission_pct"])
+        out["commission_pct_prev"] = np.where(out["has_abc_prev"], pd.to_numeric(out.get("abc_commission_pct_prev_abc", np.nan), errors="coerce"), out["commission_pct_prev"])
+        out["acquiring_pct"] = np.where(out["has_abc"], pd.to_numeric(out.get("abc_acquiring_pct", np.nan), errors="coerce"), out["acquiring_pct"])
+        out["acquiring_pct_prev"] = np.where(out["has_abc_prev"], pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", np.nan), errors="coerce"), out["acquiring_pct_prev"])
+        for _c in ["commission_pct", "commission_pct_prev", "acquiring_pct", "acquiring_pct_prev"]:
+            out[_c] = pd.to_numeric(out[_c], errors="coerce").fillna(0.0)
+        return out
+
+    def _current_week_prev_avg_comparison(current_df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+        """Replace current-week previous-period columns with previous-week daily average × elapsed days.
+
+        Business rule 2026-05-28:
+        - лист «Текущая неделя» is an operational partial-week report;
+        - if only N days have passed in the current week, compare current fact with
+          previous full week's average per day multiplied by N;
+        - order quantity and order sum are from WB Orders, ad spend/clicks/impressions are
+          from advertising reports;
+        - do not compare 2 current days with a full previous week and do not use ABC
+          revenue as the previous value for order-sum dynamics.
+        """
+        if current_df is None or current_df.empty:
+            return current_df
+
+        elapsed_days = int((pd.Timestamp(cur_actual_end).normalize() - pd.Timestamp(cur_start).normalize()).days) + 1
+        prev_days = int((pd.Timestamp(prev_end).normalize() - pd.Timestamp(prev_start).normalize()).days) + 1
+        elapsed_days = max(1, elapsed_days)
+        prev_days = max(1, prev_days)
+        scale = elapsed_days / prev_days
+
+        prev_full = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, keys)
+        if prev_full is None or prev_full.empty:
+            return current_df
+
+        prev_full = _normalize_pdf_merge_keys(prev_full.copy(), keys)
+        cur = _normalize_pdf_merge_keys(current_df.copy(), keys)
+
+        prev_value_cols = [
+            "order_sum", "sum_use", "orders", "gp_model", "gp_use", "ad_spend",
+            "clicks", "impressions", "opens", "carts", "demand", "demand_daily_sum",
+            "unique_queries", "duplicate_query_rows_removed", "raw_query_rows",
+        ]
+        prev_avg_cols = [
+            "search_share", "localization_direct", "localization", "rating",
+            "price_sale", "buyer_price", "price_with_disc_avg", "spp", "search_gp80_avg_position",
+            "commission_pct_model", "acquiring_pct_model",
+            "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit",
+        ]
+
+        keep_cols = list(dict.fromkeys(keys + [c for c in prev_value_cols + prev_avg_cols if c in prev_full.columns]))
+        prev = prev_full[keep_cols].copy()
+        rename_map = {c: f"__prev_avg_{c}" for c in keep_cols if c not in keys}
+        prev = prev.rename(columns=rename_map)
+        cur = cur.merge(prev, on=keys, how="left")
+
+        def _series(name: str, default: float = 0.0) -> pd.Series:
+            if name in cur.columns:
+                return pd.to_numeric(cur[name], errors="coerce").fillna(default)
+            return pd.Series(default, index=cur.index, dtype="float64")
+
+        # Absolute previous-period values = previous full week / 7 × elapsed current days.
+        scale_map = {
+            "order_sum": "order_sum_prev",
+            "orders": "orders_prev",
+            "gp_model": "gp_model_prev",
+            "gp_use": "gp_prev_use",
+            "ad_spend": "ad_spend_prev",
+            "clicks": "clicks_prev",
+            "impressions": "impressions_prev",
+            "opens": "opens_prev",
+            "carts": "carts_prev",
+            "demand": "demand_prev",
+            "demand_daily_sum": "demand_daily_sum_prev",
+            "unique_queries": "unique_queries_prev",
+            "duplicate_query_rows_removed": "duplicate_query_rows_removed_prev",
+            "raw_query_rows": "raw_query_rows_prev",
+        }
+        for src_col, dst_col in scale_map.items():
+            avg_col = f"__prev_avg_{src_col}"
+            if avg_col in cur.columns:
+                cur[dst_col] = _series(avg_col) * scale
+
+        # For current-week dynamics, «Сумма заказов» must stay tied to Orders priceWithDisc, not ABC revenue.
+        cur["sum_prev_use"] = _series("order_sum_prev")
+
+        # Non-absolute daily averages keep previous-week average levels for tooltip/secondary metrics.
+        for src_col in prev_avg_cols:
+            avg_col = f"__prev_avg_{src_col}"
+            dst_col = f"{src_col}_prev"
+            if avg_col in cur.columns:
+                cur[dst_col] = _series(avg_col, np.nan)
+
+        # Recalculate ratios from the scaled numerators/denominators.
+        cur["drr_prev"] = np.where(_series("sum_prev_use").abs() > 1e-9, _series("ad_spend_prev") / _series("sum_prev_use") * 100, 0.0)
+        cur["cpc_prev"] = np.where(_series("clicks_prev") > 0, _series("ad_spend_prev") / _series("clicks_prev"), np.nan)
+        cur["ad_ctr_prev"] = np.where(_series("impressions_prev") > 0, _series("clicks_prev") / _series("impressions_prev") * 100, np.nan)
+        cur["search_share_prev"] = np.where(_series("demand_prev") > 0, _series("opens_prev") / _series("demand_prev") * 100, np.nan)
+        cur["cart_conv_prev"] = np.where(_series("opens_prev") > 0, _series("carts_prev") / _series("opens_prev") * 100, np.nan)
+        cur["order_conv_prev"] = np.where(_series("carts_prev") > 0, _series("orders_prev") / _series("carts_prev") * 100, np.nan)
+        cur["order_from_open_conv_prev"] = np.where(_series("opens_prev") > 0, _series("orders_prev") / _series("opens_prev") * 100, np.nan)
+        cur["price_sale_prev"] = np.where(_series("orders_prev") > 0, _series("sum_prev_use") / _series("orders_prev"), _series("price_sale_prev", np.nan))
+
+        helper_cols = [c for c in cur.columns if c.startswith("__prev_avg_")]
+        if helper_cols:
+            cur = cur.drop(columns=helper_cols)
+        cur["prev_compare_mode"] = f"prev_week_daily_avg_x_{elapsed_days}_days"
+        cur["prev_compare_days"] = elapsed_days
+        return cur
+
+    def _prev_week_daily_average_totals(keys: List[str]) -> Dict[str, float]:
+        """Totals of previous full week divided by number of days, for day-row deltas on sheet 1."""
+        prev_full = _agg_daily(prev_start, prev_end, keys)
+        prev_days = int((pd.Timestamp(prev_end).normalize() - pd.Timestamp(prev_start).normalize()).days) + 1
+        prev_days = max(1, prev_days)
+        if prev_full is None or prev_full.empty:
+            return {"order_sum": 0.0, "ad_spend": 0.0, "demand": 0.0, "opens": 0.0}
+        return {
+            "order_sum": _num(prev_full.get("order_sum", pd.Series(dtype="float64")).sum()) / prev_days,
+            "ad_spend": _num(prev_full.get("ad_spend", pd.Series(dtype="float64")).sum()) / prev_days,
+            "demand": _num(prev_full.get("demand", pd.Series(dtype="float64")).sum()) / prev_days,
+            "opens": _num(prev_full.get("opens", pd.Series(dtype="float64")).sum()) / prev_days,
+        }
+
+    def _abc_periods_inside(start: pd.Timestamp, end: pd.Timestamp, keys: List[str], sources: Optional[List[str]] = None) -> pd.DataFrame:
+        """ABC gross profit for a period without double counting.
+
+        Default mode uses weekly/daily ABC plus full-month ABC when appropriate.
+        For current-month page use sources=["abc_weekly"] to enforce the rule:
+        current month = closed weekly ABC reports + daily ABC for an incomplete week,
+        never cumulative MTD files 01.MM-факт день.
+        """
+        start_n = pd.Timestamp(start).normalize()
+        end_n = pd.Timestamp(end).normalize()
+        frames = []
+        source_names = sources or ["abc_weekly", "abc_monthly"]
+        for nm in source_names:
+            src = outputs.get(nm, pd.DataFrame()).copy()
+            if src is None or src.empty or "period_start" not in src.columns or "period_end" not in src.columns:
+                continue
+            src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
+            src["period_end"] = pd.to_datetime(src["period_end"], errors="coerce").dt.normalize()
+            # Candidate periods fully contained in requested interval.
+            src = src[(src["period_start"] >= start_n) & (src["period_end"] <= end_n)].copy()
+            if "day" in keys:
+                # A day-level table must use real daily ABC files only.
+                # Weekly/monthly reports cannot be expanded into individual days here,
+                # otherwise yesterday's gross profit would be duplicated or allocated artificially.
+                src = src[src["period_start"].eq(src["period_end"])].copy()
+                src["day"] = src["period_start"]
+            if src.empty:
+                continue
+            if "subject_disp" not in src.columns:
+                src["subject_disp"] = src.get("subject", "").map(_subject_disp) if "subject" in src.columns else ""
+            if "product_code" not in src.columns:
+                src["product_code"] = src.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+            if "supplier_article" in src.columns:
+                src["supplier_article"] = src["supplier_article"].map(_clean_article_local)
+            src = src[src["subject_disp"].isin(CATEGORY_ORDER)].copy()
+            for c0 in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct"]:
+                if c0 not in src.columns:
+                    src[c0] = 0.0
+                src[c0] = pd.to_numeric(src[c0], errors="coerce").fillna(0.0)
+            src["_source_bucket"] = nm
+            frames.append(src)
+        if not frames:
+            return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end"])
+        x = pd.concat(frames, ignore_index=True)
+        x = _normalize_pdf_merge_keys(x, keys)
+        # Prefer one aggregated ABC report that starts exactly at the requested period start
+        # and reaches the furthest period end. This covers the user's Monday current-month ABC upload.
+        exact_start = x[x["period_start"].eq(start_n)].copy()
+        if not exact_start.empty:
+            max_end = exact_start["period_end"].max()
+            preferred = exact_start[exact_start["period_end"].eq(max_end)].copy()
+            # Use the preferred aggregated report when it covers more than one day or exactly matches the period.
+            # This prevents double-counting weekly + MTD ABC files.
+            if not preferred.empty and (max_end > start_n or (start_n == end_n)):
+                x = preferred
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        x["_abc_ad"] = np.where(x["gross_revenue"] > 0, x["gross_revenue"] * x["abc_drr_pct"] / 100.0, 0.0)
+        return x.groupby(keys, dropna=False, as_index=False).agg(
+            gp_abc=("gross_profit", "sum"),
+            revenue_abc=("gross_revenue", "sum"),
+            abc_ad_spend=("_abc_ad", "sum"),
+            abc_rows=("gross_profit", "size"),
+            abc_period_start=("period_start", "min"),
+            abc_period_end=("period_end", "max"),
+        )
+
+    cur_cat = _current_week_prev_avg_comparison(
+        _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"]),
+        ["subject_disp"],
+    )
+    prev_cat = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp"])
+    closed_cat = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
+    current_month_cat = _metrics_period(cur_start.replace(day=1), cur_actual_end, (cur_start.replace(day=1)-pd.offsets.MonthBegin(1)).normalize(), cur_start.replace(day=1)-pd.Timedelta(days=1), ["subject_disp"])
+
+    # Details per contour.
+    prev_prod = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp", "product_code"])
+    prev_art = _metrics_period(prev_start, prev_end, prev2_start, prev2_end, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+    closed_prod = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp", "product_code"])
+    closed_art = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+
+    def _filter_detail_products(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty: return pd.DataFrame()
+        x = df.copy()
+        x["product_code"] = x["product_code"].astype(str)
+        x = x[x["product_code"].ne("") & ~x["product_code"].isin(DETAIL_EXCLUDE)].copy()
+        x = x[(pd.to_numeric(x["sum_use"], errors="coerce").fillna(0).abs() > 0) | (pd.to_numeric(x["gp_use"], errors="coerce").fillna(0).abs() > 0) | (pd.to_numeric(x.get("sum_prev_use",0), errors="coerce").fillna(0).abs() > 0)].copy()
+        # Detailed product pages are created only for products with >=10% of category GP.
+        # Rows below threshold remain in the category table, but do not explode into dozens of article pages.
+        gp_abs = pd.to_numeric(x["gp_use"], errors="coerce").fillna(0).clip(lower=0)
+        x["_cat_gp_total"] = gp_abs.groupby(x["subject_disp"]).transform("sum").replace(0, np.nan)
+        x["_gp_share_cat"] = gp_abs / x["_cat_gp_total"] * 100
+        keep_detail = x["_gp_share_cat"].fillna(0) >= float(os.getenv("PDF_PRODUCT_DETAIL_MIN_GP_SHARE", "10"))
+        # Mandatory important products can still be forced into detail pages by config.
+        forced = set((os.getenv("PDF_FORCE_DETAIL_PRODUCTS", "901,614,617,618,154,155,156,157,158") or "").replace(";", ",").split(","))
+        forced = {v.strip() for v in forced if v.strip()}
+        keep_detail = keep_detail | x["product_code"].isin(forced)
+        x = x[keep_detail].copy()
+        x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+        return x.sort_values(["_cat_order", "gp_use", "sum_use"], ascending=[True, False, False])
+
+    prev_prod_detail = _filter_detail_products(prev_prod)
+    closed_prod_detail = _filter_detail_products(closed_prod)
+
+    def _select_articles(df: pd.DataFrame, prod_row: pd.Series) -> pd.DataFrame:
+        if df is None or df.empty: return pd.DataFrame()
+        q = df[(df["subject_disp"].astype(str) == str(prod_row["subject_disp"])) & (df["product_code"].astype(str) == str(prod_row["product_code"]))].copy()
+        # Для PDF-детализации больше не режем артикулы по 90% ВП/порогам: пользователь должен видеть все строки товара,
+        # где есть текущая или базовая сумма/ВП. Если нужно сжать PDF, это делается отдельным FAST/brief режимом, не в боевом отчете.
+        for c0 in ["sum_use", "gp_use", "sum_prev_use", "gp_prev_use"]:
+            if c0 not in q.columns:
+                q[c0] = 0.0
+        keep = (pd.to_numeric(q["sum_use"], errors="coerce").fillna(0).abs() > 0) | (pd.to_numeric(q["gp_use"], errors="coerce").fillna(0).abs() > 0) | (pd.to_numeric(q["sum_prev_use"], errors="coerce").fillna(0).abs() > 0) | (pd.to_numeric(q["gp_prev_use"], errors="coerce").fillna(0).abs() > 0)
+        q = q[keep].copy()
+        if q.empty: return q
+        q["_gp_sort"] = pd.to_numeric(q["gp_use"], errors="coerce").fillna(0)
+        q["_sum_sort"] = pd.to_numeric(q["sum_use"], errors="coerce").fillna(0)
+        return q.sort_values(["_gp_sort", "_sum_sort", "supplier_article"], ascending=[False, False, True])
+
+    # Build contour dictionaries and planned bookmarks.
+    contours = {
+        "prev": {
+            "label": "Прошлая неделя",
+            "period": f"{prev_start:%d.%m}-{prev_end:%d.%m.%Y}",
+            "start": prev_start, "end": prev_end, "prev_start": prev2_start, "prev_end": prev2_end,
+            "summary_key": "prev_summary", "cat_df": prev_cat, "prod_df": prev_prod_detail, "art_df": prev_art,
+            "back_label": "← прошлая неделя",
+        },
+        "closed": {
+            "label": "Закрытый месяц",
+            "period": f"{closed_start:%d.%m}-{closed_end:%d.%m.%Y}",
+            "start": closed_start, "end": closed_end, "prev_start": closed_prev_start, "prev_end": closed_prev_end,
+            "summary_key": "closed_summary", "cat_df": closed_cat, "prod_df": closed_prod_detail, "art_df": closed_art,
+            "back_label": "← закр. месяц",
+        },
+    }
+
+    def _slug(x):
+        # Bookmark names must be unique. Cyrillic category names used to collapse to the same "_" slug,
+        # so all category links could jump to the last category page. Use a stable hash.
+        raw = str(x)
+        latin = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")[:30]
+        h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+        return f"{latin}_{h}" if latin else h
+    def _cat_key(contour, cat): return f"{contour}_cat_{_slug(cat)}"
+    def _prod_key(contour, cat, prod): return f"{contour}_prod_{_slug(cat)}_{_slug(prod)}"
+    def _art_key(contour, cat, prod, art, n=1): return f"{contour}_art{n}_{_slug(cat)}_{_slug(prod)}_{_slug(art)}"
+    def _cat_factor_key(contour, cat): return f"{contour}_cat_factor_{_slug(cat)}"
+    def _prod_factor_key(contour, cat, prod): return f"{contour}_prod_factor_{_slug(cat)}_{_slug(prod)}"
+
+    # Entry points are weekly only. Use them only for prev contour.
+    entry_bridge = outputs.get("entry_points_bridge", pd.DataFrame()).copy()
+    if entry_bridge is None: entry_bridge = pd.DataFrame()
+    if not entry_bridge.empty:
+        if "subject_disp" not in entry_bridge.columns:
+            entry_bridge["subject_disp"] = entry_bridge.get("subject", "").map(_subject_disp) if "subject" in entry_bridge.columns else ""
+        if "product_code" not in entry_bridge.columns:
+            entry_bridge["product_code"] = entry_bridge.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        if "supplier_article" in entry_bridge.columns:
+            entry_bridge["supplier_article"] = entry_bridge["supplier_article"].map(_clean_article_local)
+        for col in ["transitions", "orders", "cart_conv_pct", "order_conv_pct", "transitions_prev", "orders_prev", "orders_share_pct", "effect_gp_rub"]:
+            if col not in entry_bridge.columns:
+                entry_bridge[col] = 0
+            entry_bridge[col] = pd.to_numeric(entry_bridge[col], errors="coerce").fillna(0)
+
+    # ---------- factor table ----------
+    def _factor_rows(row: pd.Series, level: str) -> List[Dict[str, Any]]:
+        cur_sum = _num(row.get("sum_use")); prev_sum = _num(row.get("sum_prev_use"))
+        cur_gp = _num(row.get("gp_use")); prev_gp = _num(row.get("gp_prev_use"))
+        cur_margin = _num(row.get("margin")); prev_margin = _num(row.get("margin_prev"))
+        cur_orders = _num(row.get("orders")); prev_orders = _num(row.get("orders_prev"))
+        gp_per_order = cur_gp / cur_orders if cur_orders > 0 else (prev_gp / prev_orders if prev_orders > 0 else 0)
+        rows = []
+        def add(factor, block, cur, prev, fmt, effect, lower=False, comment=""):
+            if abs(_num(effect)) < 50 and abs(_num(cur)-_num(prev)) < 1e-9:
+                return
+            d = _delta(cur, prev)
+            rows.append({"Фактор": factor, "Блок": block, "Текущее": fmt(cur), "База": fmt(prev), "Изменение": _arrow(d, lower), "Эффект ВП": effect, "Вывод": comment or ("потеря" if effect < 0 else "прирост" if effect > 0 else "нейтрально")})
+        prev_margin_rate = prev_margin/100 if abs(prev_margin) > 1e-9 else (cur_margin/100 if abs(cur_margin)>1e-9 else 0)
+        add("Объём / сумма заказов", "Экономика и продажи", cur_sum, prev_sum, _fmt_money, (cur_sum - prev_sum) * prev_margin_rate, False, "эффект изменения выручки при прежней рентабельности")
+        add("Рентабельность", "Экономика и продажи", cur_margin, prev_margin, _fmt_pct, cur_sum * (cur_margin - prev_margin) / 100.0, False, "изменение рентабельности в деньгах")
+        add("Расход РК", "Экономика и продажи", row.get("ad_spend"), row.get("ad_spend_prev"), _fmt_money, -(_num(row.get("ad_spend")) - _num(row.get("ad_spend_prev"))), True, "изменение рекламных расходов")
+        add("CPC", "Экономика и продажи", row.get("cpc"), row.get("cpc_prev"), _fmt_rub1, -(_num(row.get("cpc")) - _num(row.get("cpc_prev"))) * max(_num(row.get("clicks")), 0), True, "изменение стоимости клика")
+        add("СПП", "Экономика и продажи", row.get("spp"), row.get("spp_prev"), _fmt_pct, -cur_sum * (_num(row.get("spp_prev")) - _num(row.get("spp"))) / 100.0, True, "изменение скидки покупателя")
+        add("Комиссия, %", "Экономика и продажи", row.get("commission_pct"), row.get("commission_pct_prev"), _fmt_pct, -cur_sum * (_num(row.get("commission_pct")) - _num(row.get("commission_pct_prev"))) / 100.0, True, "комиссия как доля выручки")
+        add("Эквайринг, %", "Экономика и продажи", row.get("acquiring_pct"), row.get("acquiring_pct_prev"), _fmt_pct, -cur_sum * (_num(row.get("acquiring_pct")) - _num(row.get("acquiring_pct_prev"))) / 100.0, True, "эквайринг как доля выручки")
+        add("Логистика/шт", "Экономика и продажи", row.get("logistics_per_unit"), row.get("logistics_per_unit_prev"), _fmt_rub1, -(_num(row.get("logistics_per_unit")) - _num(row.get("logistics_per_unit_prev"))) * max(cur_orders, 0), True, "стоимость логистики на продажу")
+        add("Хранение/шт", "Экономика и продажи", row.get("storage_per_unit"), row.get("storage_per_unit_prev"), _fmt_rub1, -(_num(row.get("storage_per_unit")) - _num(row.get("storage_per_unit_prev"))) * max(cur_orders, 0), True, "стоимость хранения на продажу")
+        add("Себестоимость/шт", "Экономика и продажи", row.get("cost_per_unit"), row.get("cost_per_unit_prev"), _fmt_rub1, -(_num(row.get("cost_per_unit")) - _num(row.get("cost_per_unit_prev"))) * max(cur_orders, 0), True, "изменение себестоимости")
+        add("Прочие/шт", "Экономика и продажи", row.get("other_per_unit"), row.get("other_per_unit_prev"), _fmt_rub1, -(_num(row.get("other_per_unit")) - _num(row.get("other_per_unit_prev"))) * max(cur_orders, 0), True, "прочие расходы")
+        demand_eff = 0.0
+        if _num(row.get("demand_prev")) > 0:
+            demand_eff = (_num(row.get("demand")) / _num(row.get("demand_prev")) - 1.0) * prev_sum * prev_margin_rate
+        open_effect = (_num(row.get("opens")) - _num(row.get("opens_prev"))) * (_num(row.get("order_from_open_conv_prev"))/100.0) * gp_per_order
+        add("Открытия карточки", "Спрос / точки входа / конверсии", row.get("opens"), row.get("opens_prev"), _fmt_num, open_effect, False, "изменение входящего карточного трафика; эффект может тянуться на следующую неделю из-за лага заказов")
+        conv_effect = _num(row.get("opens")) * ((_num(row.get("order_from_open_conv")) - _num(row.get("order_from_open_conv_prev"))) / 100.0) * gp_per_order
+        add("Конверсия в заказ", "Спрос / точки входа / конверсии", row.get("order_from_open_conv"), row.get("order_from_open_conv_prev"), _fmt_pct, conv_effect, False, "заказы / все открытия карточки; заменяет раздельные конверсии корзины")
+        # Sort: biggest losses first, then biggest gains. Drop insignificant factors: less than 10%
+        # of the biggest absolute effect. This keeps the factor page focused on money, not noise.
+        if rows:
+            max_abs = max(abs(_num(r.get("Эффект ВП"))) for r in rows)
+            min_effect = max(max_abs * 0.05, 50.0)
+            rows = [r for r in rows if abs(_num(r.get("Эффект ВП"))) >= min_effect]
+        losses = sorted([r for r in rows if _num(r["Эффект ВП"]) < 0], key=lambda r: _num(r["Эффект ВП"]))
+        gains = sorted([r for r in rows if _num(r["Эффект ВП"]) >= 0], key=lambda r: _num(r["Эффект ВП"]), reverse=True)
+        return losses + gains
+
+    # ---------- drawing ----------
+    c = canvas.Canvas(str(path), pagesize=(W, H))
+    page_num = 0
+    def _link(target, rect):
+        if target:
+            c.linkRect("", str(target), rect, relative=0, thickness=0)
+
+    def _draw_text(txt, x, y, max_w, font=F_REG, size=12, color=BLACK, align="left", min_size=7):
+        txt = "" if txt is None else str(txt)
+        s = size
+        while s > min_size and stringWidth(txt, font, s) > max_w:
+            s -= 0.5
+        c.setFont(font, s); c.setFillColor(color)
+        if align == "right": c.drawRightString(x+max_w, y, txt)
+        elif align == "center": c.drawCentredString(x+max_w/2, y, txt)
+        else: c.drawString(x, y, txt)
+
+    def _wrap(txt, font, size, max_w, max_lines=5):
+        words = str(txt).split()
+        lines, cur = [], ""
+        for w in words:
+            test = (cur + " " + w).strip()
+            if stringWidth(test, font, size) <= max_w:
+                cur = test
+            else:
+                if cur: lines.append(cur)
+                cur = w
+            if len(lines) >= max_lines:
+                break
+        if cur and len(lines) < max_lines:
+            lines.append(cur)
+        return lines
+
+    def _start(title, subtitle="", section="", key=None, top_menu=False, back_buttons=None):
+        nonlocal page_num
+        if page_num > 0:
+            c.showPage()
+        page_num += 1
+        c.setFillColor(RED); c.rect(0,0,W,H,fill=1,stroke=0)
+        if key:
+            c.bookmarkPage(key)
+        c.setFillColor(WHITE); c.setFont(F_REG, 32); c.drawString(70, 835, "topface")
+        _draw_text(title, 70, 765, 820, F_BLACK, 46, WHITE)
+        if subtitle:
+            _draw_text(subtitle, 70, 722, 900, F_BOLD, 19, WHITE)
+        if section:
+            _draw_text(section, W-330, 720, 260, F_BOLD, 14, WHITE, align="right")
+        _draw_text(f"Страница {page_num}", W-210, 36, 140, F_BOLD, 13, WHITE, align="right")
+        if top_menu:
+            buttons=[("Прошлая", "prev_summary"), ("Закр. месяц", "closed_summary"), ("Тек. месяц", "current_month"), ("Год", "summary")]
+            bx = W - 620; by = 798
+            for lab, target in buttons:
+                bw = 135 if lab != "Закр. месяц" else 160
+                c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+                _draw_text(lab, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center")
+                _link(target, (bx,by,bx+bw,by+44)); bx += bw + 18
+        for b in back_buttons or []:
+            bx, by, bw, label, target = b
+            c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+            _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center")
+            _link(target, (bx,by,bx+bw,by+44))
+
+    def _metric_card(x, y, w, h, value, label, delta=None, metric="", sub=""):
+        c.setFillColor(WHITE); c.roundRect(x,y,w,h,14,fill=1,stroke=0)
+        # FIX11: карточки с денежной динамикой должны показывать рубли, а не "33495,0%".
+        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК", "Заказы за неделю", "Заказы, ₽"])
+        dtext = (_arrow_money(delta, _lower_bad(metric)) if money_metric else _arrow(delta, _lower_bad(metric))) if delta is not None else ""
+        # Значение крупно по центру, подпись внизу, динамика маленькая справа от подписи.
+        _draw_text(str(value), x+10, y+h-50, w-20, F_BLACK, 30, BLACK, align="center")
+        label_text = str(label)
+        label_size = 12
+        label_w_real = min(stringWidth(label_text, F_BOLD, label_size) + 8, w*0.68)
+        lx = x + max(10, (w - (label_w_real + (stringWidth(dtext, F_BOLD, 9) + 8 if dtext else 0))) / 2)
+        _draw_text(label_text, lx, y+18, label_w_real, F_BOLD, label_size, GRAY, align="left")
+        if dtext:
+            _draw_text(dtext, lx + label_w_real + 4, y+18, w - (lx-x) - label_w_real - 10, F_BOLD, 9, _tone(delta, _lower_bad(metric)), align="left")
+        if sub:
+            _draw_text(sub, x+10, y+6, w-20, F_REG, 9, GRAY, align="center")
+
+    def _section_bar(y, text):
+        c.setFillColor(RED_DARK); c.roundRect(75, y, W-150, 42, 10, fill=1, stroke=0)
+        _draw_text(text, 105, y+14, W-210, F_BLACK, 20, WHITE)
+
+    def _draw_cell_value(x, y, w, value, delta=None, metric="", size=12, align="left"):
+        txt = str(value)
+        val_size = size + 1
+        money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК", "Заказы за неделю", "Заказы, ₽"])
+        # Keep dynamic arrow next to the value, not at the far edge of the cell.
+        if align == "center":
+            _draw_text(txt, x, y, w*0.62 if delta is not None else w, F_BOLD, val_size, BLACK, align="center")
+            vx = x + w*0.60
+        else:
+            _draw_text(txt, x+5, y, w*0.62 if delta is not None else w-10, F_BOLD, val_size, BLACK)
+            vx = x + w*0.61
+        if delta is not None:
+            dtext = _arrow_money(delta, _lower_bad(metric)) if money_metric else _arrow(delta, _lower_bad(metric))
+            _draw_text(dtext, vx, y, w*0.38-4, F_BOLD, max(7, size-4), _tone(delta, _lower_bad(metric)), align="left")
+
+    def _draw_table(x, y, w, headers, widths, rows, row_h=36, font_size=11, link_col=None, max_rows=None):
+        rows = rows[:max_rows] if max_rows else rows
+        # Scale columns to the real table width so the right side is not empty.
+        total_width = float(sum(widths)) if widths else w
+        if total_width > 0 and abs(total_width - w) > 1:
+            widths = [ww * w / total_width for ww in widths]
+        h = 42 + row_h*len(rows)
+        # Basic PDFQualityGuard: never let a table overlap the header/navigation zone.
+        safe_top = 705
+        safe_bottom = 62
+        if y + h > safe_top:
+            y = max(safe_bottom, safe_top - h)
+        if y < safe_bottom:
+            # If still too tall, reduce row height and font before drawing.
+            available = max(120, safe_top - safe_bottom)
+            if len(rows) > 0:
+                row_h = max(24, int((available - 42) / max(1, len(rows))))
+                font_size = max(8, min(font_size, row_h - 18))
+                h = 42 + row_h*len(rows)
+                y = max(safe_bottom, safe_top - h)
+        c.setFillColor(WHITE); c.roundRect(x, y, w, h, 14, fill=1, stroke=0)
+        c.setFillColor(RED_DARK); c.roundRect(x, y+h-42, w, 42, 11, fill=1, stroke=0)
+        # column separators
+        c.setStrokeColor(LINE); c.setLineWidth(0.6)
+        xx = x
+        for head, ww in zip(headers, widths):
+            _draw_text(head, xx+4, y+h-26, ww-8, F_BOLD, max(11, font_size), WHITE, align="center")
+            if xx > x + 1:
+                c.line(xx, y, xx, y+h)
+            xx += ww
+        for ri, row in enumerate(rows):
+            ry = y+h-42-(ri+1)*row_h
+            c.setFillColor(SOFT if ri%2 else WHITE); c.rect(x, ry, w, row_h, fill=1, stroke=0)
+            c.setStrokeColor(LINE); c.setLineWidth(0.4); c.line(x, ry, x+w, ry)
+            xx=x
+            target = row.get("_target") if isinstance(row, dict) else None
+            cells = row.get("cells") if isinstance(row, dict) else row
+            for ci, cell in enumerate(cells):
+                ww = widths[ci]
+                if isinstance(cell, tuple):
+                    val, delta, metric = cell
+                    _draw_cell_value(xx+2, ry+row_h/2-5, ww-4, val, delta, metric, font_size, align="center")
+                else:
+                    _draw_text(cell, xx+5, ry+row_h/2-5, ww-10, F_BOLD if ci==0 else F_REG, font_size, RED_DARK if ci==0 else BLACK, align="center")
+                xx += ww
+            if target:
+                _link(target, (x, ry, x+w, ry+row_h))
+        c.setStrokeColor(LINE); c.setLineWidth(0.8); c.roundRect(x, y, w, h, 14, fill=0, stroke=1)
+        return h
+
+    def _period_label(s,e): return f"{s:%d.%m}-{e:%d.%m.%Y}"
+
+    def _summary_category_page(key, title, subtitle, section, df, target_contour=None):
+        _start(title, subtitle, section or title, key=key, top_menu=True)
+        x = df.copy()
+        x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+        x = x.sort_values("_cat_order")
+
+        def _summary_total_row(rows_df, current_only=False):
+            s = float(pd.to_numeric(rows_df.get("sum_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            sp = float(pd.to_numeric(rows_df.get("sum_prev_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            ad = float(pd.to_numeric(rows_df.get("ad_spend"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            adp = float(pd.to_numeric(rows_df.get("ad_spend_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            clk = float(pd.to_numeric(rows_df.get("clicks"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            clkp = float(pd.to_numeric(rows_df.get("clicks_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            dem = float(pd.to_numeric(rows_df.get("demand"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            demp = float(pd.to_numeric(rows_df.get("demand_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            opens = float(pd.to_numeric(rows_df.get("opens"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            opensp = float(pd.to_numeric(rows_df.get("opens_prev"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            gp = float(pd.to_numeric(rows_df.get("gp_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            gpp = float(pd.to_numeric(rows_df.get("gp_prev_use"), errors="coerce").fillna(0).sum()) if not rows_df.empty else 0
+            drr = ad/s*100 if s else 0
+            drrp = adp/sp*100 if sp else 0
+            cpc = ad/clk if clk else 0
+            cpcp = adp/clkp if clkp else 0
+            ss = opens/dem*100 if dem else np.nan
+            ssp = opensp/demp*100 if demp else np.nan
+            rent = gp/s*100 if s else 0
+            rentp = gpp/sp*100 if sp else 0
+            return dict(subject_disp="ИТОГО", sum_use=s, sum_prev_use=sp, gp_use=gp, gp_prev_use=gpp, margin=rent, margin_prev=rentp, ad_spend=ad, ad_spend_prev=adp, drr=drr, drr_prev=drrp, cpc=cpc, cpc_prev=cpcp, demand=dem, demand_prev=demp, search_share=ss, search_share_prev=ssp)
+
+        if key == "cur_categories":
+            rows=[]
+            for _, r in x.iterrows():
+                rows.append({"cells": [
+                    str(r["subject_disp"]),
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                    (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                    (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                    (_fmt_num(r.get("demand")), _delta(r.get("demand"), r.get("demand_prev")), "Спрос"),
+                    (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
+                ]})
+            t = _summary_total_row(x, current_only=True)
+            rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), "—", "—", "—"]})
+            _draw_table(75, 330, W-150, ["Категория", "Сумма", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [250,220,220,170,160,240,200], rows, row_h=72, font_size=15)
+            return
+
+        rows=[]
+        for _, r in x.iterrows():
+            cat = r["subject_disp"]
+            tgt = _cat_key(target_contour, cat) if target_contour and _has_category_detail(target_contour, cat) else None
+            rows.append({"_target": tgt, "cells": [
+                cat,
+                (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
+                (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                (_fmt_rub1(r.get("cpc")), _delta(r.get("cpc"), r.get("cpc_prev")), "CPC"),
+                (_fmt_num(r.get("demand")), _delta(r.get("demand"), r.get("demand_prev")), "Спрос"),
+                (_fmt_pct(r.get("search_share")), _delta(r.get("search_share"), r.get("search_share_prev")), "% поиска"),
+            ]})
+        t = _summary_total_row(x)
+        rows.append({"cells": ["ИТОГО", (_fmt_money(t["sum_use"]), _delta_abs(t["sum_use"], t["sum_prev_use"]), "Сумма"), (_fmt_money(t["gp_use"]), _delta_abs(t["gp_use"], t["gp_prev_use"]), "ВП"), (_fmt_pct(t["margin"]), _delta(t["margin"], t["margin_prev"]), "Рент."), (_fmt_money(t["ad_spend"]), _delta_abs(t["ad_spend"], t["ad_spend_prev"]), "Расход РК"), (_fmt_pct(t["drr"]), _delta(t["drr"], t["drr_prev"]), "ДРР"), (_fmt_rub1(t["cpc"]), _delta(t["cpc"], t["cpc_prev"]), "CPC"), (_fmt_num(t["demand"]), _delta(t["demand"], t["demand_prev"]), "Спрос"), (_fmt_pct(t["search_share"]), _delta(t["search_share"], t["search_share_prev"]), "% поиска")]})
+        _draw_table(75, 315, W-150, ["Категория", "Сумма", "ВП", "Рент.", "Расход РК", "ДРР", "CPC", "Спрос WB", "% поиска"], [190,170,160,125,170,115,100,170,140], rows, row_h=68, font_size=14)
+
+    def _pdf_truth_sum_period(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> Dict[str, float]:
+        """Page-1/Page-3 operational totals from the same truth sources as Telegram.
+
+        Orders/openings come from article_day_fact, but ad spend/clicks/impressions are taken
+        from the raw/category advertising source when it exists. This prevents duplicated
+        article-level advertising spend on daily rows and keeps PDF = Telegram.
+        Demand is unique Search Query demand, not duplicated article demand.
+        """
+        try:
+            _td = _tg_prepare_daily(outputs)
+            _ta, _ta_name = _tg_prepare_ads_truth(outputs)
+            _tq = _tg_prepare_unique_demand(outputs)
+            res = _tg_sum_period(_td, _ta, _tq, pd.Timestamp(start_dt).normalize(), pd.Timestamp(end_dt).normalize())
+            res["source"] = _ta_name or "article_day_fact"
+            return res
+        except Exception as exc:
+            log(f"PDF WARN: truth daily totals fallback for {pd.Timestamp(start_dt):%d.%m.%Y}-{pd.Timestamp(end_dt):%d.%m.%Y}: {exc}")
+            ag = _agg_daily(pd.Timestamp(start_dt), pd.Timestamp(end_dt), ["subject_disp"])
+            if ag is None or ag.empty:
+                return {"order_sum": 0.0, "orders": 0.0, "ad_spend": 0.0, "clicks": 0.0, "impressions": 0.0, "demand": 0.0, "opens": 0.0, "drr": 0.0, "cpc": np.nan, "ad_ctr": np.nan, "search_share": np.nan, "source": "fallback"}
+            order_sum = _num(ag.get("order_sum", pd.Series(dtype=float)).sum())
+            ad_spend = _num(ag.get("ad_spend", pd.Series(dtype=float)).sum())
+            clicks = _num(ag.get("clicks", pd.Series(dtype=float)).sum())
+            impressions = _num(ag.get("impressions", pd.Series(dtype=float)).sum())
+            demand = _num(ag.get("demand", pd.Series(dtype=float)).sum())
+            opens = _num(ag.get("opens", pd.Series(dtype=float)).sum())
+            return {"order_sum": order_sum, "orders": _num(ag.get("orders", pd.Series(dtype=float)).sum()), "ad_spend": ad_spend, "clicks": clicks, "impressions": impressions, "demand": demand, "opens": opens, "drr": ad_spend/order_sum*100 if order_sum else 0.0, "cpc": ad_spend/clicks if clicks else np.nan, "ad_ctr": clicks/impressions*100 if impressions else np.nan, "search_share": opens/demand*100 if demand else np.nan, "source": "fallback"}
+    def _current_week_overview():
+        top_start = pd.Timestamp(cur_start).normalize()
+        top_end = pd.Timestamp(cur_actual_end).normalize()
+        top_days = max(1, int((top_end - top_start).days) + 1)
+        top_prev_end = top_start - pd.Timedelta(days=1)
+        top_prev_start = top_prev_end - pd.Timedelta(days=top_days - 1)
+        _start(
+            "Текущая неделя",
+            f"{_period_label(top_start, top_end)} / верхние карточки = сумма за неделю; таблица = дни недели",
+            "Текущая неделя",
+            key="cur_overview",
+            top_menu=True,
+        )
+
+        # FIX27: top cards are WEEK totals, not the last day.
+        # Dynamics compare the same-length previous period: for 25.05-31.05 it is 18.05-24.05.
+        cur_week = _pdf_truth_sum_period(top_start, top_end)
+        prev_week = _pdf_truth_sum_period(top_prev_start, top_prev_end)
+
+        def _known_money(v):
+            return "—" if v is None or pd.isna(v) else _fmt_money(v)
+        def _known_num(v):
+            return "—" if v is None or pd.isna(v) else _fmt_num(v)
+        def _known_pct(v):
+            return "—" if v is None or pd.isna(v) else _fmt_pct(v)
+        def _known_delta(cur_v, prev_v, money=False):
+            if cur_v is None or prev_v is None or pd.isna(cur_v) or pd.isna(prev_v):
+                return None
+            return _delta_abs(cur_v, prev_v) if money else _delta(cur_v, prev_v)
+
+        # Weekly gross profit comes from ABC for the exact/contained week; fallback to model only if ABC is absent.
+        week_abc = _abc_periods_inside(top_start, top_end, ["subject_disp"])
+        prev_week_abc = _abc_periods_inside(top_prev_start, top_prev_end, ["subject_disp"])
+        week_gp = _num(week_abc["gp_abc"].sum()) if week_abc is not None and not week_abc.empty else _num(cur_week.get("gross_profit_model"), 0.0)
+        prev_week_gp = _num(prev_week_abc["gp_abc"].sum()) if prev_week_abc is not None and not prev_week_abc.empty else 0.0
+
+        ads_sub = "нет данных РК" if cur_week.get("ads_missing") else ""
+        demand_sub = "нет данных" if cur_week.get("demand_missing") else ""
+        cards = [
+            (_fmt_money(cur_week.get("order_sum")), "Сумма заказов", _known_delta(cur_week.get("order_sum"), prev_week.get("order_sum"), money=True), "Сумма", ""),
+            (_fmt_money(week_gp), "Валовая прибыль", _known_delta(week_gp, prev_week_gp, money=True), "ВП", ""),
+            (_known_money(cur_week.get("ad_spend")), "Расход РК", _known_delta(cur_week.get("ad_spend"), prev_week.get("ad_spend"), money=True), "Расход РК", ads_sub),
+            (_known_pct(cur_week.get("drr")), "ДРР", _known_delta(cur_week.get("drr"), prev_week.get("drr"), money=False), "ДРР", ads_sub),
+            (_known_num(cur_week.get("demand")), "Спрос WB", _known_delta(cur_week.get("demand"), prev_week.get("demand"), money=False), "Спрос", demand_sub),
+        ]
+        for i, card in enumerate(cards):
+            _metric_card(65+i*300, 590, 280, 105, *card)
+
+        prev_gp_day_avg = prev_week_gp / top_days if top_days else 0.0
+
+        # Daily overview by day: deltas compare each factual day with previous period average day.
+        dates = pd.date_range(cur_start, cur_end)
+        rows=[]
+        prev_week_truth = _pdf_truth_sum_period(prev_start, prev_end)
+        prev_days = max(1, int((pd.Timestamp(prev_end).normalize() - pd.Timestamp(prev_start).normalize()).days) + 1)
+        psum = _num(prev_week_truth.get("order_sum")) / prev_days
+        pad = _num(prev_week_truth.get("ad_spend")) / prev_days
+        pdemand = _num(prev_week_truth.get("demand")) / prev_days
+        opens_prev = _num(prev_week_truth.get("opens")) / prev_days
+        pss = opens_prev/pdemand*100 if pdemand else np.nan
+        pdrr = pad/psum*100 if psum else 0
+        for dt in dates:
+            cur = _pdf_truth_sum_period(dt, dt)
+            osum = _num(cur.get("order_sum"))
+            ad_raw = cur.get("ad_spend")
+            demand_raw = cur.get("demand")
+            ad_known = not (ad_raw is None or pd.isna(ad_raw))
+            demand_known = not (demand_raw is None or pd.isna(demand_raw))
+            ad = _num(ad_raw) if ad_known else np.nan
+            ddemand = _num(demand_raw) if demand_known else np.nan
+            opens = _num(cur.get("opens"))
+            ss = opens/ddemand*100 if demand_known and ddemand else np.nan
+            d = ad/osum*100 if osum and ad_known else np.nan
+            day_abc = _abc_periods_inside(dt, dt, ["day", "subject_disp"])
+            day_gp = _num(day_abc["gp_abc"].sum()) if day_abc is not None and not day_abc.empty else 0.0
+            # Будущие/пустые дни не показываем как падение на 100%.
+            if dt > cur_actual_end or (abs(osum) < 1e-9 and (not ad_known or abs(_num(ad)) < 1e-9) and (not demand_known or abs(_num(ddemand)) < 1e-9) and abs(day_gp) < 1e-9):
+                rows.append({"cells": [dt.strftime("%a %d.%m"), "—", "—", "—", "—", "—", "—"]})
+            else:
+                rows.append({"cells": [
+                    dt.strftime("%a %d.%m"),
+                    (_fmt_money(osum), _delta_abs(osum, psum), "Сумма"),
+                    (_fmt_money(day_gp), day_gp - prev_gp_day_avg if abs(day_gp) > 0.5 or abs(prev_gp_day_avg) > 0.5 else None, "ВП"),
+                    (_known_money(ad), _known_delta(ad, pad, money=True), "Расход РК") if ad_known else ("—", None, "Расход РК"),
+                    (_known_pct(d), _known_delta(d, pdrr, money=False), "ДРР") if ad_known else ("—", None, "ДРР"),
+                    (_known_num(ddemand), _known_delta(ddemand, pdemand, money=False), "Спрос") if demand_known else ("—", None, "Спрос"),
+                    (_known_pct(ss), _known_delta(ss, pss, money=False), "% поиска") if demand_known else ("—", None, "% поиска"),
+                ]})
+        widths=[150,235,210,205,135,205,180]
+        _draw_table(80, 155, W-160, ["День", "Сумма заказов", "ВП", "Расход РК", "ДРР", "Спрос WB", "% поиска"], widths, rows, row_h=48, font_size=11)
+
+    def _current_week_categories():
+        _summary_category_page("cur_categories", "Текущая неделя: категории", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y} / оперативный обзор", "Текущая неделя", cur_cat, target_contour=None)
+
+    def _current_month_page():
+        # Текущий месяц:
+        # - ВП считаем строго из недельных ABC-отчетов + дневных ABC за неполную неделю;
+        # - накопительные ABC 01.MM-факт день не используем;
+        # - заказы и сумму заказов берём из Orders;
+        # - расход РК — из отчетов по рекламе;
+        # - план = ВП прошлого месяца минус расчетный НДС 7% с учетом СПП.
+        month_start = cur_start.replace(day=1)
+
+        title_end = pd.Timestamp(cur_actual_end).normalize()
+        month_fact_end = pd.Timestamp(cur_actual_end).normalize()
+
+        def _orders_spp_rate(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
+            """Weighted SPP for VAT base.
+
+            priceWithDisc / order_sum is seller sale amount.
+            finishedPrice is buyer amount after SPP.
+            VAT base = seller sale amount - SPP = buyer amount.
+            """
+            x = daily[(daily["day"] >= pd.Timestamp(start_dt).normalize()) & (daily["day"] <= pd.Timestamp(end_dt).normalize())].copy()
+            if x.empty:
+                return np.nan
+            sale_total = pd.to_numeric(x.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+            orders_total = pd.to_numeric(x.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0)
+            buyer_price = pd.to_numeric(x.get("finished_price", pd.Series(dtype=float)), errors="coerce")
+            buyer_total = (buyer_price.fillna(0) * orders_total.fillna(0)).sum()
+            # Fallback when the cached technical file has no buyer total.
+            if sale_total > 0 and buyer_total <= 0 and "spp" in x.columns:
+                spp_pct = pd.to_numeric(x.get("spp"), errors="coerce")
+                weights = pd.to_numeric(x.get("order_sum"), errors="coerce").fillna(0)
+                valid = spp_pct.notna() & (weights > 0)
+                if valid.any():
+                    buyer_total = sale_total * (1.0 - float(np.average(spp_pct[valid], weights=weights[valid])) / 100.0)
+            if sale_total <= 0 or buyer_total <= 0:
+                return np.nan
+            rate = max(0.0, min(0.95, 1.0 - float(buyer_total) / float(sale_total)))
+            return rate
+
+        def _orders_vat_amount(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
+            """VAT included in buyer amount for a period.
+
+            priceWithDisc / order_sum is sale amount before SPP.
+            finishedPrice is buyer amount after SPP.
+            VAT base = order_sum - SPP = buyer amount.
+            VAT rate is 7/107 because VAT is already included in the buyer amount.
+            """
+            x = daily[(daily["day"] >= pd.Timestamp(start_dt).normalize()) & (daily["day"] <= pd.Timestamp(end_dt).normalize())].copy()
+            if x.empty:
+                return 0.0
+            sale_total = pd.to_numeric(x.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+            orders_total = pd.to_numeric(x.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0)
+            buyer_price = pd.to_numeric(x.get("finished_price", pd.Series(dtype=float)), errors="coerce")
+            buyer_total = (buyer_price.fillna(0) * orders_total.fillna(0)).sum()
+            if sale_total > 0 and buyer_total <= 0 and "spp" in x.columns:
+                spp_pct = pd.to_numeric(x.get("spp"), errors="coerce")
+                weights = pd.to_numeric(x.get("order_sum"), errors="coerce").fillna(0)
+                valid = spp_pct.notna() & (weights > 0)
+                if valid.any():
+                    buyer_total = sale_total * (1.0 - float(np.average(spp_pct[valid], weights=weights[valid])) / 100.0)
+            if buyer_total <= 0:
+                return 0.0
+            return max(0.0, float(buyer_total) * 7.0 / 107.0)
+
+        def _abc_weekly_overlap_alloc(start_dt: pd.Timestamp, end_dt: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+            """Allocate overlapping weekly ABC by calendar days.
+
+            Example: for 01.05-03.05 use 3/7 of ABC week 27.04-03.05.
+            This is used only for page 3 weekly rows where exact in-month ABC is absent.
+            """
+            start_n = pd.Timestamp(start_dt).normalize()
+            end_n = pd.Timestamp(end_dt).normalize()
+            src = outputs.get("abc_weekly", pd.DataFrame()).copy()
+            if src is None or src.empty or "period_start" not in src.columns or "period_end" not in src.columns:
+                return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end", "allocated_from_overlap"])
+            src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
+            src["period_end"] = pd.to_datetime(src["period_end"], errors="coerce").dt.normalize()
+            src = src[(src["period_start"] <= end_n) & (src["period_end"] >= start_n)].copy()
+            if src.empty:
+                return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end", "allocated_from_overlap"])
+            if "subject_disp" not in src.columns:
+                src["subject_disp"] = src.get("subject", "").map(_subject_disp) if "subject" in src.columns else ""
+            if "product_code" not in src.columns:
+                src["product_code"] = src.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+            if "supplier_article" in src.columns:
+                src["supplier_article"] = src["supplier_article"].map(_clean_article_local)
+            src = src[src["subject_disp"].isin(CATEGORY_ORDER)].copy()
+            for c0 in ["gross_profit", "gross_revenue", "orders", "abc_drr_pct"]:
+                if c0 not in src.columns:
+                    src[c0] = 0.0
+                src[c0] = pd.to_numeric(src[c0], errors="coerce").fillna(0.0)
+            src["_period_days"] = (src["period_end"] - src["period_start"]).dt.days + 1
+            src["_overlap_start"] = src["period_start"].map(lambda v: max(pd.Timestamp(v), start_n))
+            src["_overlap_end"] = src["period_end"].map(lambda v: min(pd.Timestamp(v), end_n))
+            src["_overlap_days"] = (src["_overlap_end"] - src["_overlap_start"]).dt.days + 1
+            src = src[(src["_period_days"] > 0) & (src["_overlap_days"] > 0)].copy()
+            if src.empty:
+                return pd.DataFrame(columns=keys + ["gp_abc", "revenue_abc", "abc_ad_spend", "abc_rows", "abc_period_start", "abc_period_end", "allocated_from_overlap"])
+            src["_coef"] = src["_overlap_days"] / src["_period_days"]
+            src["_gp_alloc"] = src["gross_profit"] * src["_coef"]
+            src["_revenue_alloc"] = src["gross_revenue"] * src["_coef"]
+            src["_abc_ad_alloc"] = np.where(src["gross_revenue"] > 0, src["gross_revenue"] * src["abc_drr_pct"] / 100.0, 0.0) * src["_coef"]
+            for k in keys:
+                if k not in src.columns:
+                    src[k] = ""
+            src = _normalize_pdf_merge_keys(src, keys)
+            out = src.groupby(keys, dropna=False, as_index=False).agg(
+                gp_abc=("_gp_alloc", "sum"),
+                revenue_abc=("_revenue_alloc", "sum"),
+                abc_ad_spend=("_abc_ad_alloc", "sum"),
+                abc_rows=("_gp_alloc", "size"),
+                abc_period_start=("period_start", "min"),
+                abc_period_end=("period_end", "max"),
+            )
+            out["allocated_from_overlap"] = True
+            return out
+
+        extra_note = "; ВП ABC = недели + дневные без MTD"
+        _start("Текущий месяц", f"{month_start:%d.%m}-{title_end:%d.%m.%Y} / факт и план после НДС 7% с учетом СПП{extra_note}", "Текущий месяц", key="current_month", top_menu=True)
+
+        month_days = calendar.monthrange(month_start.year, month_start.month)[1]
+        prev_month_df = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
+
+        # Base plan before VAT: fact GP of the previous closed month.
+        plan_gp_before_vat = max(0.0, _num(prev_month_df["gp_use"].sum()) if prev_month_df is not None and not prev_month_df.empty else 0.0)
+        prev_month_revenue = max(0.0, _num(prev_month_df["sum_use"].sum()) if prev_month_df is not None and not prev_month_df.empty and "sum_use" in prev_month_df.columns else 0.0)
+
+        # Estimate VAT base using current-month SPP from Orders up to the same cutoff.
+        # If current month has no Orders yet, fallback to previous closed month Orders.
+        spp_rate_for_plan = _orders_spp_rate(month_start, month_fact_end)
+        if pd.isna(spp_rate_for_plan):
+            spp_rate_for_plan = _orders_spp_rate(closed_start, closed_end)
+        if pd.isna(spp_rate_for_plan):
+            spp_rate_for_plan = 0.0
+        vat_base_for_plan = prev_month_revenue * (1.0 - float(spp_rate_for_plan))
+        vat_amount_for_plan = vat_base_for_plan * 7.0 / 107.0 if vat_base_for_plan > 0 else 0.0
+        month_plan = max(0.0, plan_gp_before_vat - vat_amount_for_plan)
+
+        elapsed = min((title_end - month_start).days + 1, month_days)
+        plan_to_date = month_plan / month_days * elapsed if month_days else 0.0
+
+        # Operational facts from Orders and Advertising reports only.
+        mtd_orders = _agg_daily(month_start, month_fact_end, ["subject_disp"])
+        mtd_orders_qty = _num(mtd_orders["orders"].sum()) if mtd_orders is not None and not mtd_orders.empty else 0.0
+        mtd_order_sum = _num(mtd_orders["order_sum"].sum()) if mtd_orders is not None and not mtd_orders.empty else 0.0
+        mtd_ad = _num(_pdf_truth_sum_period(month_start, month_fact_end).get("ad_spend", 0.0))
+
+        # Gross profit from ABC only, but never from cumulative MTD files.
+        # Current month = exact weekly ABC + daily ABC for an incomplete week.
+        def _current_month_gp_weekly_daily_total(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
+            total_gp = 0.0
+            has_any = False
+            _ws = pd.Timestamp(start_dt).normalize()
+            _end = pd.Timestamp(end_dt).normalize()
+            while _ws <= _end:
+                _we = min(_ws + pd.Timedelta(days=6-int(_ws.weekday())), _end)
+                _seg_abc = _abc_periods_inside(_ws, _we, ["subject_disp"], sources=["abc_weekly"])
+                _seg_gp = _num(_seg_abc["gp_abc"].sum()) if _seg_abc is not None and not _seg_abc.empty else np.nan
+                if pd.isna(_seg_gp) or abs(_seg_gp) <= 0.5:
+                    _day_frames = []
+                    _d = _ws
+                    while _d <= _we:
+                        _day_abc = _abc_periods_inside(_d, _d, ["day", "subject_disp"], sources=["abc_weekly"])
+                        if _day_abc is not None and not _day_abc.empty:
+                            _day_frames.append(_day_abc)
+                        _d = _d + pd.Timedelta(days=1)
+                    if _day_frames:
+                        _daily_abc = pd.concat(_day_frames, ignore_index=True)
+                        _daily_gp = _num(_daily_abc["gp_abc"].sum()) if "gp_abc" in _daily_abc.columns else np.nan
+                        if not pd.isna(_daily_gp) and abs(_daily_gp) > 0.5:
+                            _seg_gp = _daily_gp
+                if pd.isna(_seg_gp) or abs(_seg_gp) <= 0.5:
+                    _overlap_abc = _abc_weekly_overlap_alloc(_ws, _we, ["subject_disp"])
+                    _overlap_gp = _num(_overlap_abc["gp_abc"].sum()) if _overlap_abc is not None and not _overlap_abc.empty else np.nan
+                    if not pd.isna(_overlap_gp) and abs(_overlap_gp) > 0.5:
+                        _seg_gp = _overlap_gp
+                if not pd.isna(_seg_gp):
+                    total_gp += float(_seg_gp)
+                    has_any = True
+                _ws = _we + pd.Timedelta(days=1)
+            return total_gp if has_any else 0.0
+
+        mtd_gp = _current_month_gp_weekly_daily_total(month_start, title_end)
+        # Compare like with like: plan is after VAT, so fact GP must also be after VAT.
+        # ABC gross profit itself stays pre-VAT; VAT is deducted using Orders buyer amount
+        # (priceWithDisc - SPP = finishedPrice).
+        mtd_vat_amount = _orders_vat_amount(month_start, month_fact_end)
+        mtd_gp_after_vat = mtd_gp - mtd_vat_amount
+        pct_plan = mtd_gp_after_vat / plan_to_date * 100 if plan_to_date else np.nan
+
+        cards = [
+            (_fmt_money(mtd_gp_after_vat), "ВП после НДС", None, "ВП", ""),
+            (_fmt_pct(pct_plan), "% плана на дату", None, "% плана", ""),
+            (_fmt_money(month_plan), "План мес. после НДС", None, "План", ""),
+            (_fmt_num(mtd_orders_qty), "Заказы, шт", None, "Заказы", ""),
+            (_fmt_money(mtd_order_sum), "Сумма заказов", None, "Сумма", ""),
+        ]
+        for i, card in enumerate(cards):
+            _metric_card(65+i*300, 605, 280, 110, *card)
+
+        # Weekly rows:
+        # 1) exact in-month weekly ABC when available;
+        # 2) if weekly ABC is not yet available, use real daily ABC files downloaded by Torgstat;
+        # 3) for partial month rows like 01.05-03.05, allocate overlapping weekly ABC by days;
+        # 4) do NOT invent residual allocation: missing ABC periods stay blank until daily/weekly/monthly ABC exists.
+        periods = []
+        ws = month_start
+        while ws <= title_end:
+            we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), title_end)
+            wk_orders = _agg_daily(ws, we, ["subject_disp"])
+            wk_abc = _abc_periods_inside(ws, we, ["subject_disp"], sources=["abc_weekly"])
+            exact_gp = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
+            source_note = "exact" if not pd.isna(exact_gp) else ""
+            if pd.isna(exact_gp):
+                # Daily ABC fallback for a week that is not closed/uploaded yet.
+                day_frames = []
+                _d = ws
+                while _d <= we:
+                    _day_abc = _abc_periods_inside(_d, _d, ["day", "subject_disp"], sources=["abc_weekly"])
+                    if _day_abc is not None and not _day_abc.empty:
+                        day_frames.append(_day_abc)
+                    _d = _d + pd.Timedelta(days=1)
+                if day_frames:
+                    daily_abc = pd.concat(day_frames, ignore_index=True)
+                    daily_gp = _num(daily_abc["gp_abc"].sum()) if "gp_abc" in daily_abc.columns else np.nan
+                    if not pd.isna(daily_gp) and abs(daily_gp) > 0.5:
+                        exact_gp = daily_gp
+                        source_note = "daily"
+            if pd.isna(exact_gp):
+                overlap_abc = _abc_weekly_overlap_alloc(ws, we, ["subject_disp"])
+                overlap_gp = _num(overlap_abc["gp_abc"].sum()) if overlap_abc is not None and not overlap_abc.empty else np.nan
+                if not pd.isna(overlap_gp) and abs(overlap_gp) > 0.5:
+                    exact_gp = overlap_gp
+                    source_note = "overlap"
+            wk_orders_qty = _num(wk_orders["orders"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
+            wk_sum = _num(wk_orders["order_sum"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
+            wk_ad = _num(_pdf_truth_sum_period(ws, we).get("ad_spend", 0.0))
+            periods.append({"ws": ws, "we": we, "exact_gp": exact_gp, "orders_qty": wk_orders_qty, "sum": wk_sum, "ad": wk_ad, "source_note": source_note})
+            ws = we + pd.Timedelta(days=1)
+
+        # No MTD residual allocation: the uploaded 01.MM-NN.MM ABC is used for the MTD card,
+        # while rows in the weekly table require exact weekly ABC or a real overlapping weekly ABC.
+        for p in periods:
+            if pd.isna(p["exact_gp"]):
+                p["allocated_gp"] = np.nan
+                p["gp_allocated_from_mtd"] = False
+
+        rows = []
+        prev_week_gp = None
+        for p in periods:
+            ws, we = p["ws"], p["we"]
+            wk_gp_val = p["exact_gp"] if not pd.isna(p["exact_gp"]) else p.get("allocated_gp", np.nan)
+
+            if pd.isna(wk_gp_val):
+                gp_cell = "—"
+            else:
+                if p.get("gp_allocated_from_mtd", False):
+                    gp_label = "ВП*"
+                elif p.get("source_note") == "daily":
+                    gp_label = "ВПд"
+                elif p.get("source_note") == "overlap":
+                    gp_label = "ВП~"
+                else:
+                    gp_label = "ВП"
+                gp_cell = (_fmt_money(wk_gp_val), _delta_abs(wk_gp_val, prev_week_gp), gp_label)
+                prev_week_gp = wk_gp_val
+            rows.append({"cells": [f"{ws:%d.%m}-{we:%d.%m}", gp_cell, _fmt_num(p["orders_qty"]), _fmt_money(p["sum"]), _fmt_money(p["ad"])]})
+        _draw_table(85, 230, W-170, ["Неделя", "ВП ABC", "Заказы", "Сумма заказов", "Расход РК"], [210,300,190,310,270], rows, row_h=58, font_size=16, max_rows=8)
+
+    def _summary_page():
+        _start("Помесячная динамика", f"{closed_start.year} год / итого по 4 категориям", "Годовая динамика", key="summary", top_menu=True)
+        src = outputs.get("abc_monthly", pd.DataFrame()).copy()
+        rows=[]
+        if src is not None and not src.empty and "period_start" in src.columns:
+            src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
+            src = src[src["period_start"].dt.year.eq(int(closed_start.year))].copy()
+            src["subject_disp"] = src.get("subject", "").map(_subject_disp) if "subject" in src.columns else ""
+            src = src[src["subject_disp"].isin(CATEGORY_ORDER)].copy()
+            for col in ["gross_revenue", "gross_profit", "abc_drr_pct"]:
+                if col not in src.columns:
+                    src[col] = 0
+                src[col] = pd.to_numeric(src[col], errors="coerce").fillna(0)
+            src["_ad"] = src["gross_revenue"] * src["abc_drr_pct"] / 100.0
+            # Page 5 is an executive month-over-month summary.
+            # It must show one row per month, without category split.
+            mon = src.groupby(["period_start"], as_index=False).agg(
+                sum_use=("gross_revenue", "sum"),
+                gp_use=("gross_profit", "sum"),
+                ad_spend=("_ad", "sum"),
+            )
+            mon = mon.sort_values("period_start")
+            mon["sum_prev"] = mon["sum_use"].shift(1)
+            mon["gp_prev"] = mon["gp_use"].shift(1)
+            mon["ad_prev"] = mon["ad_spend"].shift(1)
+            mon = mon.sort_values("period_start", ascending=False)
+            for _, r in mon.iterrows():
+                month_name = MONTH_RU.get(int(r["period_start"].month), str(r["period_start"].month)).lower()
+                rows.append({"cells":[
+                    month_name,
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_prev")), "Расход РК"),
+                ]})
+        if not rows:
+            rows=[{"cells":["—","—","—","—"]}]
+        _draw_table(95, 150, W-190, ["Месяц", "Сумма заказов", "ВП", "Расход РК"], [220,390,390,390], rows, row_h=56, font_size=16, max_rows=12)
+
+    def _children_for_category(contour: str, cat: str) -> pd.DataFrame:
+        info = contours[contour]
+        prod = info["prod_df"]
+        if prod is None or prod.empty: return pd.DataFrame()
+        q = prod[prod["subject_disp"].astype(str).eq(cat)].copy()
+        return q.sort_values(["gp_use", "sum_use"], ascending=[False, False])
+
+    def _articles_for_product(contour: str, cat: str, prod_code: str) -> pd.DataFrame:
+        info = contours[contour]
+        prod_df = info["prod_df"]
+        prod_row = prod_df[(prod_df["subject_disp"].astype(str).eq(cat)) & (prod_df["product_code"].astype(str).eq(str(prod_code)))]
+        if prod_row.empty: return pd.DataFrame()
+        return _select_articles(info["art_df"], prod_row.iloc[0])
+
+    def _has_category_detail(contour: str, cat: str) -> bool:
+        if cat == "Кисти":
+            return not _articles_for_product(contour, cat, "901").empty
+        return not _children_for_category(contour, cat).empty
+
+    def _draw_factor_table_page(key, title, subtitle, section, row, back_buttons):
+        _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
+        factors = _factor_rows(row, section)
+        # Верхние итоги показывают именно факт изменения ВП из ABC: было/стало.
+        # Факторные строки ниже объясняют, но не суммируются как независимые причины,
+        # потому что открытия, объем и конверсии взаимозависимы.
+        actual_delta_gp = _num(row.get("gp_use")) - _num(row.get("gp_prev_use"))
+        loss_total = min(actual_delta_gp, 0.0)
+        gain_total = max(actual_delta_gp, 0.0)
+        net_total = actual_delta_gp
+        _metric_card(90, 620, 310, 90, _fmt_signed_money(loss_total), "Потери ВП ABC", None, "", "")
+        _metric_card(430, 620, 310, 90, _fmt_signed_money(gain_total), "Прирост ВП ABC", None, "", "")
+        _metric_card(770, 620, 310, 90, _fmt_signed_money(net_total), "Итог ABC", None, "", "")
+        _draw_text("Факторы ниже не являются полностью независимыми: открытия → заказы → сумма заказов связаны. Открытия оставлены как ранний сигнал на следующую неделю.", 75, 590, W-150, F_REG, 12, WHITE)
+        rows=[]
+        for fr in factors:
+            rows.append({"cells": [fr["Фактор"], fr["Блок"], fr["Текущее"], fr["База"], fr["Изменение"], _fmt_signed_money(fr["Эффект ВП"]), fr["Вывод"]]})
+        if not rows:
+            rows=[{"cells":["—", "—", "—", "—", "—", "0 ₽", "значимых денежных факторов нет"]}]
+        _draw_table(75, 70, W-150, ["Фактор", "Блок", "Текущее", "Прошлая неделя", "Изм.", "Эффект ВП", "Вывод"], [235,250,140,165,110,145,455], rows, row_h=31, font_size=10, max_rows=16)
+
+    def _draw_level_overview(title, subtitle, section, key, row, back_buttons, next_button=None):
+        _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
+        if next_button:
+            label, target = next_button
+            bx, by, bw = 1380, 798, 120
+            c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+            _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center")
+            _link(target, (bx,by,bx+bw,by+44))
+        _section_bar(640, "Блок 1. Экономика и продажи")
+        cards1 = [
+            (_fmt_money(row.get("sum_use")), "Сумма", _delta_abs(row.get("sum_use"), row.get("sum_prev_use")), "Сумма", ""),
+            (_fmt_loc_pair(row.get("localization_direct"), row.get("localization")), "Локализация", _delta(row.get("localization"), row.get("localization_prev")), "Локализация", ""),
+            (_fmt_money(row.get("gp_use")), "ВП ABC", _delta_abs(row.get("gp_use"), row.get("gp_prev_use")), "ВП", ""),
+            (_fmt_pct(row.get("margin")), "Рентабельность", _delta(row.get("margin"), row.get("margin_prev")), "Рент.", ""),
+            (_fmt_pct(row.get("drr")), "ДРР", _delta(row.get("drr"), row.get("drr_prev")), "ДРР", ""),
+            (_fmt_money(row.get("ad_spend")), "Расход РК", _delta_abs(row.get("ad_spend"), row.get("ad_spend_prev")), "Расход РК", ""),
+            (_fmt_rub1(row.get("cpc")), "CPC", _delta(row.get("cpc"), row.get("cpc_prev")), "CPC", ""),
+        ]
+        for i, card in enumerate(cards1):
+            _metric_card(65+i*215, 520, 200, 95, *card)
+        _section_bar(450, "Блок 2. Реклама, спрос и конверсии")
+        cards2 = [
+            (_fmt_num(row.get("demand")), "Спрос WB", _delta(row.get("demand"), row.get("demand_prev")), "Спрос", ""),
+            (_fmt_pct(row.get("search_share")), "% поиска", _delta(row.get("search_share"), row.get("search_share_prev")), "% поиска", ""),
+            (_fmt_num(row.get("search_gp80_avg_position")), "CORE запросы", _delta(row.get("search_gp80_avg_position"), row.get("search_gp80_avg_position_prev")), "Позиция", ""),
+            (_fmt_pct(row.get("ad_ctr")), "CTR РК", _delta(row.get("ad_ctr"), row.get("ad_ctr_prev")), "CTR РК", ""),
+            (_fmt_num(row.get("opens")), "Открытия", _delta(row.get("opens"), row.get("opens_prev")), "Открытия", ""),
+            (_fmt_pct(row.get("order_from_open_conv")), "Конв. в заказ", _delta(row.get("order_from_open_conv"), row.get("order_from_open_conv_prev")), "Конверсия", ""),
+            (_fmt_pct(row.get("order_conv")), "Корзина→заказ", _delta(row.get("order_conv"), row.get("order_conv_prev")), "Конверсия", ""),
+        ]
+        for i, card in enumerate(cards2):
+            _metric_card(65+i*215, 330, 200, 95, *card)
+        _section_bar(260, "Блок 3. Расходы на единицу / доля расходов")
+        cards3 = [
+            (_fmt_pct(row.get("commission_pct")), "Комиссия, %", _delta(row.get("commission_pct"), row.get("commission_pct_prev")), "Комиссия", ""),
+            (_fmt_pct(row.get("acquiring_pct")), "Эквайринг, %", _delta(row.get("acquiring_pct"), row.get("acquiring_pct_prev")), "Эквайринг", ""),
+            (_fmt_rub1(row.get("logistics_per_unit")), "Логистика/шт", _delta(row.get("logistics_per_unit"), row.get("logistics_per_unit_prev")), "Логистика", ""),
+            (_fmt_rub1(row.get("cost_per_unit")), "Себест./шт", _delta(row.get("cost_per_unit"), row.get("cost_per_unit_prev")), "Себест", ""),
+            (_fmt_rub1(row.get("price_sale")), "Цена продажи", _delta(row.get("price_sale"), row.get("price_sale_prev")), "Цена", ""),
+            (_fmt_rub1(row.get("buyer_price")), "Цена покупателя", _delta(row.get("buyer_price"), row.get("buyer_price_prev")), "Цена", ""),
+            (_fmt_pct(row.get("spp")), "Среднее СПП", _delta(row.get("spp"), row.get("spp_prev")), "СПП", ""),
+        ]
+        for i, card in enumerate(cards3):
+            _metric_card(65+i*215, 140, 200, 95, *card)
+
+    def _draw_listing_pages(title, subtitle, section, base_key, back_buttons, headers, widths, rows, row_h=50, font_size=14, rows_per_page=12):
+        chunks = [rows[i:i+rows_per_page] for i in range(0, len(rows), rows_per_page)] or [[]]
+        for idx, chunk in enumerate(chunks):
+            key = base_key if idx == 0 else f"{base_key}_p{idx+1}"
+            sec = section if len(chunks) == 1 else f"{section} {idx+1}/{len(chunks)}"
+            bb = list(back_buttons or [])
+            if idx > 0:
+                bb.append((1430, 798, 90, "стр.1", base_key))
+            _start(title, subtitle, sec, key=key, top_menu=False, back_buttons=bb)
+            table_h = 42 + row_h*len(chunk)
+            y = max(90, (H - table_h) / 2 - 20)
+            _draw_table(75, y, W-150, headers, widths, chunk, row_h=row_h, font_size=font_size, max_rows=rows_per_page)
+
+    def _draw_category_detail(contour: str, cat: str):
+        info = contours[contour]
+        row_df = info["cat_df"][info["cat_df"]["subject_disp"].astype(str).eq(cat)]
+        if row_df.empty: return
+        cat_key = _cat_key(contour, cat)
+        cat_factor = _cat_factor_key(contour, cat)
+        _draw_level_overview(f"Категория: {cat}", f"{info['period']} / управленческий разбор", "Категория 1/2", cat_key, row_df.iloc[0], [(1220, 798, 210, info["back_label"], info["summary_key"])], ("факторы", cat_factor))
+        # children list below metric cards, separate wide table replacing lower area if needed
+        # Add second content page with products/articles and factor table button.
+        rows=[]
+        if cat == "Кисти":
+            arts = _articles_for_product(contour, cat, "901")
+            for _, r in arts.iterrows():
+                art = _clean_article_local(r.get("supplier_article"))
+                rows.append({"_target": _art_key(contour, cat, "901", art, 1), "cells": [
+                    art,
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                    (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
+                    (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                ]})
+            headers=["Артикул", "Сумма", "ВП", "Расход РК", "Рент.", "ДРР"]
+            widths=[240,250,250,250,210,210]
+        else:
+            prods = _children_for_category(contour, cat)
+            for _, r in prods.iterrows():
+                prod = str(r.get("product_code"))
+                rows.append({"_target": _prod_key(contour, cat, prod), "cells": [
+                    prod,
+                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                    (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
+                    (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+                ]})
+            headers=["Товар", "Сумма", "ВП", "Расход РК", "Рент.", "ДРР"]
+            widths=[240,250,250,250,210,210]
+        _draw_listing_pages(f"Категория: {cat}", f"{info['period']} / переход на следующий уровень", "Категория 2/2", cat_key+"_list", [(1190,798,220,info["back_label"],info["summary_key"]),(1430,798,90,"стр.1",cat_key)], headers, widths, rows, row_h=52, font_size=14, rows_per_page=12)
+        _draw_factor_table_page(cat_factor, f"Категория: {cat}", f"{info['period']} / факторная таблица", "Категория факторы", row_df.iloc[0], [(1190,798,220,"← категория",cat_key+"_list"),(1430,798,90,"стр.1",cat_key)])
+
+    def _draw_product_detail(contour: str, prod_row: pd.Series):
+        info = contours[contour]
+        cat = str(prod_row["subject_disp"]); prod = str(prod_row["product_code"])
+        if cat == "Кисти":
+            return
+        pk = _prod_key(contour, cat, prod)
+        pf = _prod_factor_key(contour, cat, prod)
+        cat_list_key = _cat_key(contour, cat)+"_list"
+        _draw_level_overview(f"Товар: {prod}", f"{cat} / {info['period']}", "Товар 1/2", pk, prod_row, [(1160,798,220,"← категория",cat_list_key)], ("факторы", pf))
+        arts = _articles_for_product(contour, cat, prod)
+        rows=[]
+        for _, r in arts.iterrows():
+            art = _clean_article_local(r.get("supplier_article"))
+            rows.append({"_target": _art_key(contour, cat, prod, art, 1), "cells": [
+                art,
+                (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
+                (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
+                (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_spend_prev")), "Расход РК"),
+                (_fmt_pct(r.get("margin")), _delta(r.get("margin"), r.get("margin_prev")), "Рент."),
+                (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+            ]})
+        _draw_listing_pages(f"Товар: {prod}", f"{cat} / {info['period']} / артикулы", "Товар 2/2", pk+"_list", [(1160,798,220,"← категория",cat_list_key),(1400,798,100,"стр.1",pk)], ["Артикул", "Сумма", "ВП", "Расход РК", "Рент.", "ДРР"], [240,250,250,250,210,210], rows, row_h=52, font_size=14, rows_per_page=12)
+        _draw_entity_entry_factor_page("product", pf, f"Товар: {prod}", f"{cat} / {info['period']} / точки входа и факторы", "Товар факторы", prod_row, [(1160,798,220,"← товар",pk+"_list"),(1400,798,100,"стр.1",pk)])
+
+    def _entity_entry_rows(level: str, contour: str, row: pd.Series, max_items: int = 8) -> List[Dict[str, Any]]:
+        if contour != "prev" or entry_bridge.empty:
+            return []
+        cat = str(row.get("subject_disp")); prod = str(row.get("product_code")); art = _clean_article_local(row.get("supplier_article"))
+        q = entry_bridge[(entry_bridge["subject_disp"].astype(str).eq(cat)) & (entry_bridge["product_code"].astype(str).eq(prod))].copy()
+        if level == "article":
+            q = q[q["supplier_article"].astype(str).eq(art)].copy()
+        if q.empty:
+            return []
+        group = ["entry_section", "entry_point"]
+        q = q.groupby(group, dropna=False, as_index=False).agg(
+            transitions=("transitions", "sum"), transitions_prev=("transitions_prev", "sum"),
+            orders=("orders", "sum"), orders_prev=("orders_prev", "sum"),
+            effect_gp_rub=("effect_gp_rub", "sum"),
+        )
+        total_orders = pd.to_numeric(q["orders"], errors="coerce").fillna(0).sum()
+        q["orders_share_pct"] = np.where(total_orders > 0, pd.to_numeric(q["orders"], errors="coerce").fillna(0) / total_orders * 100, np.nan)
+        q = q.sort_values(["orders", "transitions"], ascending=False).head(max_items)
+        out=[]
+        for _, er in q.iterrows():
+            out.append({"cells": [
+                f"{er.get('entry_section','')} / {er.get('entry_point','')}",
+                (_fmt_num(er.get("transitions")), _delta(er.get("transitions"), er.get("transitions_prev")), "Переходы"),
+                (_fmt_num(er.get("orders")), _delta(er.get("orders"), er.get("orders_prev")), "Заказы"),
+                _fmt_pct(er.get("orders_share_pct")),
+                _fmt_signed_money(er.get("effect_gp_rub")),
+            ]})
+        return out
+
+    def _draw_entity_entry_factor_page(level: str, key: str, title: str, subtitle: str, section: str, row: pd.Series, back_buttons):
+        _start(title, subtitle, section, key=key, top_menu=False, back_buttons=back_buttons)
+        ep_rows = _entity_entry_rows(level, "prev", row, max_items=8)
+        if not ep_rows:
+            ep_rows=[{"cells":["Нет данных по точкам входа для этого периода", "—", "—", "—", "0 ₽"]}]
+        _draw_table(75, 470, W-150, ["Канал / точка входа", "Переходы", "Заказы", "Доля заказов", "Вклад ВП"], [600,210,170,190,190], ep_rows, row_h=38, font_size=12, max_rows=8)
+        factors = _factor_rows(row, section)
+        factor_rows=[]
+        for fr in factors[:9]:
+            factor_rows.append({"cells": [fr["Фактор"], fr["Блок"], fr["Текущее"], fr["База"], fr["Изменение"], _fmt_signed_money(fr["Эффект ВП"])]})
+        if not factor_rows:
+            factor_rows=[{"cells":["—", "—", "—", "—", "→ 0,0%", "0 ₽"]}]
+        _draw_table(75, 80, W-150, ["Фактор", "Блок", "Текущее", "Прошлая неделя", "Изм.", "Эффект ВП"], [280,390,180,180,150,180], factor_rows, row_h=32, font_size=11, max_rows=9)
+
+    def _draw_article_pages(contour: str, art_row: pd.Series):
+        info = contours[contour]
+        cat = str(art_row["subject_disp"]); prod = str(art_row["product_code"]); art = _clean_article_local(art_row.get("supplier_article"))
+        a1 = _art_key(contour, cat, prod, art, 1); a2 = _art_key(contour, cat, prod, art, 2)
+        cat_list_key = _cat_key(contour, cat)+"_list"
+        product_back = cat_list_key if cat == "Кисти" else _prod_key(contour, cat, prod)+"_list"
+        if cat == "Кисти":
+            back_buttons = [(1230,798,210,"← категория", product_back), (1480,798,80,"стр.2",a2)]
+        else:
+            back_buttons = [(1120,798,170,"← товар", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
+        _draw_level_overview(f"Артикул: {art}", f"{cat} / товар {prod} / {info['period']}", "Артикул 1/2", a1, art_row, back_buttons=None)
+        # overwrite top buttons on the page with correct buttons (because _draw_level_overview already started page)
+        for bx,by,bw,label,target in back_buttons:
+            c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
+            _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center"); _link(target, (bx,by,bx+bw,by+44))
+        # Page 2: entry points and full factor table.
+        if cat == "Кисти":
+            page2_buttons = [(1230,798,210,"← категория", product_back),(1480,798,80,"стр.1",a1)]
+        else:
+            page2_buttons = [(1120,798,170,"← товар", product_back),(1310,798,150,"← категория",cat_list_key),(1480,798,80,"стр.1",a1)]
+        _draw_entity_entry_factor_page("article", a2, f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", "Артикул 2/2", art_row, page2_buttons)
+
+    def _render_contour(contour: str):
+        for cat in CATEGORY_ORDER:
+            if contours[contour]["cat_df"][contours[contour]["cat_df"]["subject_disp"].astype(str).eq(cat)].empty:
+                continue
+            if not _has_category_detail(contour, cat):
+                continue
+            _draw_category_detail(contour, cat)
+            if cat == "Кисти":
+                arts = _articles_for_product(contour, cat, "901")
+                for _, ar in arts.iterrows():
+                    _draw_article_pages(contour, ar)
+            else:
+                prods = _children_for_category(contour, cat)
+                for _, prow in prods.iterrows():
+                    _draw_product_detail(contour, prow)
+                    arts = _articles_for_product(contour, str(prow["subject_disp"]), str(prow["product_code"]))
+                    for _, ar in arts.iterrows():
+                        _draw_article_pages(contour, ar)
+
+    # ---------- build pages in the requested order ----------
+    # 1) Current week.
+    _current_week_overview()
+    # 2) Previous full week summary.
+    _summary_category_page("prev_summary", "Прошлая полная неделя", f"{_period_label(prev_start, prev_end)} / категория → товар → артикул", "Прошлая неделя", prev_cat, target_contour="prev")
+    # 3) Current month.
+    _current_month_page()
+    # 4) Last closed month summary.
+    _summary_category_page("closed_summary", "Последний закрытый месяц", f"{_period_label(closed_start, closed_end)} / категория → товар → артикул", "Закрытый месяц", closed_cat, target_contour="closed")
+    # 5) Current-year monthly ABC dynamics.
+    _summary_page()
+    # Details go after the 5 executive pages.
+    _render_contour("prev")
+    _render_contour("closed")
+
+    c.save()
+
+    # ---------- audit/trace workbook ----------
+    # Делает не короткую сводку, а подробный след расчёта: откуда взялась каждая
+    # метрика в PDF, какие строки/периоды были использованы и какие формулы дали
+    # итоговые значения. Это нужно, чтобы быстро ловить смешение ABC/daily/search.
+    try:
+        trace_path = path.parent / PDF_CALC_TRACE_NAME
+
+        trace_rows: List[Dict[str, Any]] = []
+        sample_rows: List[Dict[str, Any]] = []
+        demand_rows: List[Dict[str, Any]] = []
+        formula_rows: List[Dict[str, Any]] = []
+        factor_rows_out: List[Dict[str, Any]] = []
+        source_rows: List[Dict[str, Any]] = []
+        nav_rows: List[Dict[str, Any]] = []
+        raw_sample_rows: List[Dict[str, Any]] = []
+
+        sample_category = os.getenv("PDF_TRACE_SAMPLE_CATEGORY", "Кисти").strip() or "Кисти"
+        sample_product = os.getenv("PDF_TRACE_SAMPLE_PRODUCT", "901").strip() or "901"
+        sample_article_env = os.getenv("PDF_TRACE_SAMPLE_ARTICLE", "").strip()
+
+        def _trace_entity_id(level: str, row: pd.Series) -> str:
+            cat = str(row.get("subject_disp", ""))
+            prod = str(row.get("product_code", ""))
+            art = str(row.get("supplier_article", ""))
+            nm = str(row.get("nm_id", ""))
+            if level == "category":
+                return cat
+            if level == "product":
+                return f"{cat} / {prod}"
+            if nm and nm != "0" and nm.lower() != "nan":
+                return f"{cat} / {prod} / {art} / nm={nm}"
+            return f"{cat} / {prod} / {art}"
+
+        def _trace_source(row: pd.Series, metric: str, current: bool = True) -> Tuple[str, str, str, bool, str]:
+            has = bool(row.get("has_abc" if current else "has_abc_prev", False))
+            suffix = "" if current else "_prev"
+            if metric in ["Сумма", "ВП ABC", "Рентабельность", "Расход РК", "ДРР", "Комиссия, %", "Эквайринг, %"]:
+                ad_src = str(row.get("ad_spend_source" + suffix, row.get("ad_spend_source", "")))
+                if metric in ["Расход РК", "ДРР"] and ad_src and ad_src != "article_day_fact":
+                    return "ads reports", f"Отчёты/Реклама → {ad_src}", "spend / order_sum", False, "расход рекламы взят из свежего рекламного отчета, не из article_day_fact"
+                if has:
+                    col_map = {
+                        "Сумма": "gross_revenue / revenue_abc",
+                        "ВП ABC": "gross_profit / gp_abc",
+                        "Рентабельность": "gp_abc / revenue_abc",
+                        "Расход РК": "gross_revenue * abc_drr_pct / 100 / abc_ad_spend",
+                        "ДРР": "abc_ad_spend / revenue_abc",
+                        "Комиссия, %": "abc_commission_amount / revenue_abc",
+                        "Эквайринг, %": "abc_acquiring_amount / revenue_abc",
+                    }
+                    return "ABC exact", "ABC weekly/monthly from Object Storage", col_map.get(metric, ""), False, "ABC exact найден для периода"
+                # fallback
+                fallback_cols = {
+                    "Сумма": "article_day_fact.order_sum",
+                    "ВП ABC": "article_day_fact.gross_profit_model",
+                    "Рентабельность": "gross_profit_model / order_sum",
+                    "Расход РК": "article_day_fact.ad_spend_total",
+                    "ДРР": "ad_spend_total / order_sum",
+                    "Комиссия, %": "article_day_fact.commission_%",
+                    "Эквайринг, %": "article_day_fact.acquiring_%",
+                }
+                return "daily/model fallback", "Технические_расчеты_TOPFACE.xlsx / article_day_fact", fallback_cols.get(metric, ""), True, "ABC exact не найден, использован оперативный/модельный расчёт"
+            if metric == "CPC":
+                spend_src = "ABC ad_spend" if has else "daily ad_spend_total"
+                return "mixed allowed", "ABC/daily + article_day_fact", f"{spend_src}; clicks=article_day_fact.ad_clicks_total", False, "CPC = Расход РК выбранного источника / клики рекламы"
+            if metric == "CTR РК":
+                return "ads reports", "Отчёты/Реклама → ads_truth", "clicks_truth / impressions_truth * 100", False, "CTR РК = все клики РК / все показы РК"
+            if metric in ["Спрос WB", "% поиска"]:
+                ds = str(row.get("demand_source" + suffix, row.get("demand_source", "")))
+                if ds == "unique_queries":
+                    return "unique search queries", "Технические_расчеты_TOPFACE.xlsx / search_unique_demand", "unique_search_frequency, unique_search_queries, duplicate_query_rows_removed", False, "спрос дедублирован по нормализованным поисковым запросам"
+                return "daily_sum_fallback", "Технические_расчеты_TOPFACE.xlsx / article_day_fact", "search_frequency", True, "нет листа search_unique_demand или нет строк уровня; спрос может быть завышен дублями"
+            if metric in ["Открытия", "Конв. в заказ", "Заказы", "Логистика/шт", "Хранение/шт", "Себест./шт", "Прочие/шт", "СПП"]:
+                return "daily operational", "Технические_расчеты_TOPFACE.xlsx / article_day_fact", "open_cards/add_to_cart/orders/cost fields", False, "оперативные карточные/юнит-метрики"
+            return "unknown", "", "", True, "источник не классифицирован"
+
+        def _value_pair(row: pd.Series, metric: str) -> Tuple[Any, Any, str, str]:
+            mapping = {
+                "Сумма": ("sum_use", "sum_prev_use", "sum_use = ABC gross_revenue если exact ABC найден, иначе SUM(order_sum)", "₽"),
+                "ВП ABC": ("gp_use", "gp_prev_use", "gp_use = ABC gross_profit если exact ABC найден, иначе gross_profit_model", "₽"),
+                "Рентабельность": ("margin", "margin_prev", "Рентабельность = ВП / Сумма * 100", "%"),
+                "Расход РК": ("ad_spend", "ad_spend_prev", "Расход РК = ABC promotion/ABC revenue*drr если ABC, иначе SUM(ad_spend_total)", "₽"),
+                "ДРР": ("drr", "drr_prev", "ДРР = Расход РК / Сумма * 100", "%"),
+                "CPC": ("cpc", "cpc_prev", "CPC = Расход РК / Клики РК", "₽"),
+                "CTR РК": ("ad_ctr", "ad_ctr_prev", "CTR РК = Клики РК / Показы РК * 100", "%"),
+                "Спрос WB": ("demand", "demand_prev", "Спрос WB = SUM(unique_search_frequency) по уникальным запросам; fallback=SUM(search_frequency)", "шт"),
+                "% поиска": ("search_share", "search_share_prev", "% поиска = Открытия карточки / Спрос WB * 100", "%"),
+                "Открытия": ("opens", "opens_prev", "Открытия = SUM(open_cards)", "шт"),
+                "Конв. в заказ": ("order_from_open_conv", "order_from_open_conv_prev", "Конв. в заказ = Заказы / Открытия карточки * 100", "%"),
+                "Заказы": ("orders", "orders_prev", "Заказы = SUM(orders) из отчёта WB Заказы после исключения отмен", "шт"),
+                "Комиссия, %": ("commission_pct", "commission_pct_prev", "Комиссия, % = ABC commission / ABC revenue * 100 если ABC, иначе commission_%", "%"),
+                "Эквайринг, %": ("acquiring_pct", "acquiring_pct_prev", "Эквайринг, % = ABC acquiring / ABC revenue * 100 если ABC, иначе acquiring_%", "%"),
+                "Логистика/шт": ("logistics_per_unit", "logistics_per_unit_prev", "Логистика/шт = среднее logistics_direct из daily", "₽/шт"),
+                "Хранение/шт": ("storage_per_unit", "storage_per_unit_prev", "Хранение/шт = среднее storage из daily", "₽/шт"),
+                "Себест./шт": ("cost_per_unit", "cost_per_unit_prev", "Себест./шт = среднее cost из daily", "₽/шт"),
+                "Прочие/шт": ("other_per_unit", "other_per_unit_prev", "Прочие/шт = среднее other_costs из daily", "₽/шт"),
+                "СПП": ("spp", "spp_prev", "СПП = среднее spp из daily", "%"),
+            }
+            cur_col, prev_col, formula, unit = mapping[metric]
+            return row.get(cur_col, np.nan), row.get(prev_col, np.nan), formula, unit
+
+        metrics_for_trace = [
+            "Сумма", "Заказы", "ВП ABC", "Рентабельность", "Расход РК", "ДРР", "CPC",
+            "Спрос WB", "% поиска", "CTR РК", "Открытия", "Конв. в заказ", "Заказы",
+            "Комиссия, %", "Эквайринг, %", "Логистика/шт", "Хранение/шт", "Себест./шт", "Прочие/шт", "СПП",
+        ]
+
+        # Determine one sample article: env override first, otherwise top GP article inside sample product.
+        sample_article = sample_article_env
+        if not sample_article and isinstance(prev_art, pd.DataFrame) and not prev_art.empty:
+            qsa = prev_art[(prev_art.get("subject_disp", "").astype(str).eq(sample_category)) & (prev_art.get("product_code", "").astype(str).eq(sample_product))].copy()
+            if not qsa.empty:
+                qsa["_gp"] = pd.to_numeric(qsa.get("gp_use"), errors="coerce").fillna(0)
+                qsa = qsa.sort_values("_gp", ascending=False)
+                sample_article = str(qsa.iloc[0].get("supplier_article", ""))
+        if not sample_article:
+            sample_article = "901/5"
+
+        frame_specs = [
+            ("current_week", "category", f"{cur_start:%d.%m}-{cur_actual_end:%d.%m.%Y}", cur_cat),
+            ("current_month", "category", f"{cur_start.replace(day=1):%d.%m}-{cur_actual_end:%d.%m.%Y}", current_month_cat),
+        ]
+        for cname, info in contours.items():
+            frame_specs.extend([
+                (cname, "category", info["period"], info.get("cat_df", pd.DataFrame())),
+                (cname, "product", info["period"], info.get("prod_df", pd.DataFrame())),
+                (cname, "article", info["period"], info.get("art_df", pd.DataFrame())),
+            ])
+
+        def _is_sample(level: str, row: pd.Series) -> bool:
+            cat = str(row.get("subject_disp", ""))
+            prod = str(row.get("product_code", ""))
+            art = str(row.get("supplier_article", ""))
+            if level == "category":
+                return cat == sample_category
+            if level == "product":
+                return cat == sample_category and prod == sample_product
+            if level == "article":
+                return cat == sample_category and prod == sample_product and art == sample_article
+            return False
+
+        for contour_name, level_name, period_label, df in frame_specs:
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            for _, row in df.iterrows():
+                row_s = row if isinstance(row, pd.Series) else pd.Series(row)
+                for metric in metrics_for_trace:
+                    cur_val, prev_val, formula, unit = _value_pair(row_s, metric)
+                    delta = _delta(cur_val, prev_val)
+                    src, src_file, src_cols, fallback, reason = _trace_source(row_s, metric, current=True)
+                    prev_src, prev_src_file, prev_src_cols, prev_fallback, prev_reason = _trace_source(row_s, metric, current=False)
+                    base_name = "прошлая неделя" if contour_name in ["prev", "current_week"] else "предыдущий месяц" if contour_name == "closed" else "прошлый период"
+                    rec = {
+                        "contour": contour_name,
+                        "level": level_name,
+                        "period": period_label,
+                        "entity": _trace_entity_id(level_name, row_s),
+                        "category": row_s.get("subject_disp", ""),
+                        "product": row_s.get("product_code", ""),
+                        "article": row_s.get("supplier_article", ""),
+                        "nm_id": row_s.get("nm_id", ""),
+                        "metric": metric,
+                        "current_value": cur_val,
+                        "base_value": prev_val,
+                        "base_name": base_name,
+                        "delta_pct": delta,
+                        "unit": unit,
+                        "source_current": src,
+                        "source_current_file_sheet": src_file,
+                        "source_current_columns": src_cols,
+                        "source_base": prev_src,
+                        "source_base_file_sheet": prev_src_file,
+                        "source_base_columns": prev_src_cols,
+                        "formula": formula,
+                        "fallback_used_current": fallback,
+                        "fallback_used_base": prev_fallback,
+                        "source_reason_current": reason,
+                        "source_reason_base": prev_reason,
+                        "daily_rows_current": row_s.get("daily_rows", np.nan),
+                        "daily_rows_base": row_s.get("daily_rows_prev", np.nan),
+                        "active_days_current": row_s.get("active_days", np.nan),
+                        "active_days_base": row_s.get("active_days_prev", np.nan),
+                        "abc_rows_current": row_s.get("abc_rows", np.nan),
+                        "abc_rows_base": row_s.get("abc_rows_prev_abc", np.nan),
+                        "has_abc_current": row_s.get("has_abc", False),
+                        "has_abc_base": row_s.get("has_abc_prev", False),
+                        "demand_source_current": row_s.get("demand_source", ""),
+                        "demand_source_base": row_s.get("demand_source_prev", ""),
+                        "unique_queries_current": row_s.get("unique_queries", np.nan),
+                        "unique_queries_base": row_s.get("unique_queries_prev", np.nan),
+                        "raw_query_rows_current": row_s.get("raw_query_rows", np.nan),
+                        "raw_query_rows_base": row_s.get("raw_query_rows_prev", np.nan),
+                        "duplicate_query_rows_removed_current": row_s.get("duplicate_query_rows_removed", np.nan),
+                        "duplicate_query_rows_removed_base": row_s.get("duplicate_query_rows_removed_prev", np.nan),
+                        "daily_demand_sum_before_unique_current": row_s.get("demand_daily_sum", np.nan),
+                        "daily_demand_sum_before_unique_base": row_s.get("demand_daily_sum_prev", np.nan),
+                    }
+                    trace_rows.append(rec)
+                    if _is_sample(level_name, row_s):
+                        sample_rows.append(rec)
+
+                # Demand-specific trace row per entity.
+                demand_rows.append({
+                    "contour": contour_name,
+                    "level": level_name,
+                    "period": period_label,
+                    "entity": _trace_entity_id(level_name, row_s),
+                    "category": row_s.get("subject_disp", ""),
+                    "product": row_s.get("product_code", ""),
+                    "article": row_s.get("supplier_article", ""),
+                    "demand_final": row_s.get("demand", np.nan),
+                    "demand_base": row_s.get("demand_prev", np.nan),
+                    "demand_source": row_s.get("demand_source", ""),
+                    "demand_source_base": row_s.get("demand_source_prev", ""),
+                    "unique_queries": row_s.get("unique_queries", np.nan),
+                    "unique_queries_base": row_s.get("unique_queries_prev", np.nan),
+                    "raw_query_rows": row_s.get("raw_query_rows", np.nan),
+                    "raw_query_rows_base": row_s.get("raw_query_rows_prev", np.nan),
+                    "duplicates_removed": row_s.get("duplicate_query_rows_removed", np.nan),
+                    "duplicates_removed_base": row_s.get("duplicate_query_rows_removed_prev", np.nan),
+                    "old_sum_by_articles_current": row_s.get("demand_daily_sum", np.nan),
+                    "old_sum_by_articles_base": row_s.get("demand_daily_sum_prev", np.nan),
+                    "formula": "unique demand: SUM(MAX(frequency) by date+level+normalized query); fallback: SUM(article_day_fact.search_frequency)",
+                    "WARNING": "если demand_source=daily_sum_fallback, спрос может быть задвоен по артикулам",
+                })
+
+                # Formula checks for key metrics.
+                sum_v = _num(row_s.get("sum_use")); gp_v = _num(row_s.get("gp_use")); ad_v = _num(row_s.get("ad_spend")); clicks_v = _num(row_s.get("clicks")); opens_v = _num(row_s.get("opens")); demand_v = _num(row_s.get("demand")); carts_v = _num(row_s.get("carts")); orders_v = _num(row_s.get("orders"))
+                checks = [
+                    ("Рентабельность", _num(row_s.get("margin")), gp_v / sum_v * 100 if abs(sum_v) > 1e-9 else np.nan, "gp_use / sum_use * 100"),
+                    ("ДРР", _num(row_s.get("drr")), ad_v / sum_v * 100 if abs(sum_v) > 1e-9 else np.nan, "ad_spend / sum_use * 100"),
+                    ("CPC", _num(row_s.get("cpc")), ad_v / clicks_v if clicks_v > 0 else 0.0, "ad_spend / clicks"),
+                    ("% поиска", _num(row_s.get("search_share")), opens_v / demand_v * 100 if demand_v > 0 else np.nan, "opens / demand * 100"),
+                    ("Конв. в заказ", _num(row_s.get("order_from_open_conv")), orders_v / opens_v * 100 if opens_v > 0 else np.nan, "orders / opens * 100"),
+                ]
+                for metric, shown, recomputed, formula in checks:
+                    diff = shown - recomputed if not pd.isna(recomputed) else np.nan
+                    formula_rows.append({
+                        "contour": contour_name,
+                        "level": level_name,
+                        "period": period_label,
+                        "entity": _trace_entity_id(level_name, row_s),
+                        "metric": metric,
+                        "shown_value": shown,
+                        "recomputed_value": recomputed,
+                        "diff": diff,
+                        "status": "OK" if (pd.isna(diff) or abs(diff) < 0.05) else "CHECK",
+                        "formula": formula,
+                        "sum_use": sum_v,
+                        "gp_use": gp_v,
+                        "ad_spend": ad_v,
+                        "clicks": clicks_v,
+                        "opens": opens_v,
+                        "demand": demand_v,
+                        "carts": carts_v,
+                        "orders": orders_v,
+                    })
+
+                if _is_sample(level_name, row_s):
+                    for fr in _factor_rows(row_s, level_name):
+                        rr = dict(fr)
+                        rr.update({
+                            "contour": contour_name,
+                            "level": level_name,
+                            "period": period_label,
+                            "entity": _trace_entity_id(level_name, row_s),
+                            "category": row_s.get("subject_disp", ""),
+                            "product": row_s.get("product_code", ""),
+                            "article": row_s.get("supplier_article", ""),
+                        })
+                        factor_rows_out.append(rr)
+
+        # Raw daily rows for the sample category/product/article; helps find where wrong values enter.
+        try:
+            raw_periods = [
+                ("current_week", cur_start, cur_actual_end),
+                ("prev_week", prev_start, prev_end),
+                ("prev_base_week", prev2_start, prev2_end),
+                ("closed_month", closed_start, closed_end),
+                ("closed_base_month", closed_prev_start, closed_prev_end),
+            ]
+            for pname, ps, pe in raw_periods:
+                rx = daily[(daily["day"] >= ps) & (daily["day"] <= pe)].copy()
+                for lvl, mask in [
+                    ("category", rx["subject_disp"].astype(str).eq(sample_category)),
+                    ("product", rx["subject_disp"].astype(str).eq(sample_category) & rx["product_code"].astype(str).eq(sample_product)),
+                    ("article", rx["subject_disp"].astype(str).eq(sample_category) & rx["product_code"].astype(str).eq(sample_product) & rx["supplier_article"].astype(str).map(_clean_article_local).eq(sample_article)),
+                ]:
+                    part = rx[mask].copy()
+                    raw_sample_rows.append({
+                        "period_name": pname,
+                        "level": lvl,
+                        "period_start": ps,
+                        "period_end": pe,
+                        "sample_category": sample_category,
+                        "sample_product": sample_product,
+                        "sample_article": sample_article,
+                        "raw_rows": len(part),
+                        "active_days": part["day"].nunique() if not part.empty else 0,
+                        "order_sum_sum": pd.to_numeric(part.get("order_sum", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "ad_spend_total_sum": pd.to_numeric(part.get("ad_spend_total", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "open_cards_sum": pd.to_numeric(part.get("open_cards", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "search_frequency_sum_raw_daily": pd.to_numeric(part.get("search_frequency", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                        "orders_sum": pd.to_numeric(part.get("orders", 0), errors="coerce").fillna(0).sum() if not part.empty else 0,
+                    })
+        except Exception as exc:
+            raw_sample_rows.append({"error": str(exc)})
+
+        # Sources + exact ABC usage overview.
+        source_rows.extend([
+            {"source": "article_day_fact", "file_sheet": "Технические_расчеты_TOPFACE.xlsx / article_day_fact", "used_for": "оперативная сумма, реклама, клики, открытия, корзины, конверсии, daily fallback", "risk": "не использовать как финансы закрытого периода при наличии ABC"},
+            {"source": "search_unique_demand", "file_sheet": "Технические_расчеты_TOPFACE.xlsx / search_unique_demand", "used_for": "Спрос WB на уровнях категория/товар/артикул", "risk": "если лист отсутствует, PDF падает в fallback и спрос может быть задвоен"},
+            {"source": "abc_weekly", "file_sheet": "ABC weekly/daily from Object Storage", "used_for": "закрытая неделя и дневной fallback: выручка, ВП, рентабельность, ДРР, комиссия, эквайринг", "risk": "для дневного fallback используются только файлы period_start=period_end"},
+            {"source": "abc_monthly", "file_sheet": "ABC monthly from Object Storage", "used_for": "только полностью закрытый календарный месяц; текущий месяц считается по abc_weekly/daily", "risk": "частичные MTD 01.MM-факт день игнорируются"},
+            {"source": "entry_points_bridge", "file_sheet": "Факторный_мост_ВП_TOPFACE.xlsx / entry_points_bridge", "used_for": "точки входа на странице артикула 2/2", "risk": "пока недельный контур"},
+        ])
+
+        for cname, info in contours.items():
+            for cat in CATEGORY_ORDER:
+                nav_rows.append({"contour": cname, "page_type": "category", "category": cat, "bookmark": _cat_key(cname, cat), "back_target": info["summary_key"], "list_target": _cat_key(cname, cat)+"_list", "factor_target": _cat_factor_key(cname, cat)})
+            pdfp = info.get("prod_df", pd.DataFrame())
+            if isinstance(pdfp, pd.DataFrame) and not pdfp.empty:
+                for _, pr in pdfp.iterrows():
+                    cat = str(pr.get("subject_disp", "")); prod = str(pr.get("product_code", ""))
+                    nav_rows.append({"contour": cname, "page_type": "product", "category": cat, "product": prod, "bookmark": _prod_key(cname, cat, prod), "back_target": _cat_key(cname, cat)+"_list", "list_target": _prod_key(cname, cat, prod)+"_list", "factor_target": _prod_factor_key(cname, cat, prod)})
+
+        with pd.ExcelWriter(trace_path, engine="openpyxl") as writer:
+            pd.DataFrame([{
+                "description": "Подробный лог расчётов PDF: каждая метрика, источник, формула, fallback и проверка формул.",
+                "sample_category": sample_category,
+                "sample_product": sample_product,
+                "sample_article": sample_article,
+                "important": "Если source_current=daily_sum_fallback для Спрос WB, значит нет search_unique_demand и спрос может быть неверным.",
+            }]).to_excel(writer, sheet_name="README", index=False)
+            pd.DataFrame(source_rows).to_excel(writer, sheet_name="sources", index=False)
+            fix_checklist_rows = [
+                {"check":"unique_demand_required", "status":"OK" if not search_unique_demand.empty else "FAIL", "how_to_fix":"полный запуск должен создать search_unique_demand; fallback запрещён"},
+                {"check":"report_order", "status":"OK", "how_to_fix":"страницы идут: 1 текущая неделя → 2 прошлая неделя → 3 текущий месяц → 4 закрытый месяц → 5 год → детализация"},
+                {"check":"current_month_daily_abc_fallback_gp_plan", "status":"OK", "how_to_fix":"лист current_month берет MTD/месячный ABC, затем недельные, затем реальные дневные ABC без двойного счета"},
+                {"check":"product_sort_by_gp", "status":"OK", "how_to_fix":"товары внутри категории сортируются по gp_use desc"},
+                {"check":"article_noise_filter", "status":"OK", "how_to_fix":"детализация товаров >=10% ВП категории; внутри детального товара выводятся все артикулы"},
+                {"check":"ad_source_current", "status":"OK" if not ads_truth.empty else "WARN", "how_to_fix":"для текущих периодов нужен ads_raw_source из рекламного отчёта, иначе article_day_fact может задваивать расход"},
+            ]
+            pd.DataFrame(fix_checklist_rows).to_excel(writer, sheet_name="fix_checklist", index=False)
+            pd.DataFrame(trace_rows).to_excel(writer, sheet_name="metric_trace_all", index=False)
+            pd.DataFrame(sample_rows).to_excel(writer, sheet_name="metric_trace_sample", index=False)
+            pd.DataFrame(demand_rows).to_excel(writer, sheet_name="demand_trace", index=False)
+            pd.DataFrame(formula_rows).to_excel(writer, sheet_name="formula_checks", index=False)
+            pd.DataFrame(factor_rows_out).to_excel(writer, sheet_name="factor_effects_sample", index=False)
+            pd.DataFrame(raw_sample_rows).to_excel(writer, sheet_name="raw_daily_sample", index=False)
+            pd.DataFrame(nav_rows).to_excel(writer, sheet_name="navigation_expected", index=False)
+            # Rendered product rows for quick category/product inspection.
+            for cname, info in contours.items():
+                if isinstance(info.get("prod_df"), pd.DataFrame) and not info["prod_df"].empty:
+                    info["prod_df"].to_excel(writer, sheet_name=(cname + "_products")[:31], index=False)
+                if isinstance(info.get("cat_df"), pd.DataFrame) and not info["cat_df"].empty:
+                    info["cat_df"].to_excel(writer, sheet_name=(cname + "_categories")[:31], index=False)
+
+        log(f"Saved detailed PDF metric trace: {trace_path} trace_rows={len(trace_rows):,}; sample_rows={len(sample_rows):,}; demand_rows={len(demand_rows):,}")
+        log(f"PDF TRACE SAMPLE: category={sample_category}; product={sample_product}; article={sample_article}")
+    except Exception as exc:
+        log(f"WARN PDF detailed calc trace was not saved: {exc}")
+    log(f"PDF v11 three-contour report created: pages={page_num}")
+    return path
+
+
+# ------------------------- Telegram daily summary + S3 report retention -------------------------
+TELEGRAM_REPORT_MONTHS_RU = {v: k for k, v in REPORT_MONTH_GENITIVE_RU.items()}
+
+
+def _tg_fmt_money(x: Any) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{int(round(float(v))):,} ₽".replace(",", " ")
+
+
+def _tg_fmt_num(x: Any) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{int(round(float(v))):,}".replace(",", " ")
+
+
+def _tg_fmt_pct(x: Any, digits: int = 1) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{float(v):.{digits}f}%".replace(".", ",")
+
+
+def _tg_fmt_rub1(x: Any) -> str:
+    v = to_number(x)
+    if pd.isna(v):
+        return "—"
+    return f"{float(v):.1f} ₽".replace(".", ",")
+
+
+def _tg_delta_pct(cur: Any, prev: Any) -> Optional[float]:
+    cur_v = to_number(cur)
+    prev_v = to_number(prev)
+    if pd.isna(cur_v) or pd.isna(prev_v) or abs(float(prev_v)) < 1e-9 or float(prev_v) < 0:
+        return None
+    d = (float(cur_v) / float(prev_v) - 1.0) * 100.0
+    if abs(d) > 999.0:
+        return None
+    return d
+
+
+def _tg_arrow_pct(cur: Any, prev: Any, lower_bad: bool = False, colored: bool = False) -> str:
+    d = _tg_delta_pct(cur, prev)
+    if d is None or abs(d) < 0.05:
+        return "⚪ → 0,0%" if colored else "→ 0,0%"
+    arrow = "↑ +" if d > 0 else "↓ -"
+    body = f"{abs(d):.1f}%".replace(".", ",")
+    if colored:
+        is_good = (d < 0) if lower_bad else (d > 0)
+        dot = "🟢 " if is_good else "🔴 "
+        return dot + arrow + body
+    return arrow + body
+
+
+def _tg_arrow_abs(cur: Any, prev: Any, suffix: str = "", colored: bool = False) -> str:
+    cur_v = to_number(cur)
+    prev_v = to_number(prev)
+    if pd.isna(cur_v) or pd.isna(prev_v):
+        return ("⚪ → 0" if colored else "→ 0") + suffix
+    d = float(cur_v) - float(prev_v)
+    if abs(d) < 0.5:
+        return ("⚪ → 0" if colored else "→ 0") + suffix
+    val = f"{int(round(abs(d))):,}".replace(",", " ")
+    if colored:
+        return ("🟢 ↑ +" if d > 0 else "🔴 ↓ -") + val + suffix
+    return ("↑ +" if d > 0 else "↓ -") + val + suffix
+
+
+def _tg_subject_disp(value: Any) -> str:
+    subj = canonical_subject(value)
+    mp = {
+        "Кисти косметические": "Кисти",
+        "Косметические карандаши": "Карандаши",
+        "Карандаши": "Карандаши",
+        "Кисти": "Кисти",
+        "Помады": "Помады",
+        "Блески": "Блески",
+    }
+    return mp.get(subj, normalize_text(value))
+
+
+def _tg_prepare_daily(outputs: Dict[str, Any]) -> pd.DataFrame:
+    daily = outputs.get("article_day_fact", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(daily, pd.DataFrame) or daily.empty:
+        return pd.DataFrame()
+    rejects: List[Dict[str, Any]] = []
+    daily = _filter_df_by_pdf_product_reference(daily, "telegram_article_day_fact", rejects)
+    if daily.empty:
+        return pd.DataFrame()
+    daily = daily.copy()
+    daily["day"] = pd.to_datetime(daily.get("day"), errors="coerce").dt.normalize()
+    daily["subject_disp"] = daily.get("subject", "").map(_tg_subject_disp) if "subject" in daily.columns else daily.get("subject_disp", "").map(_tg_subject_disp)
+    daily = daily[daily["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+    for col in ["order_sum", "orders", "open_cards", "search_frequency", "ad_spend_total", "ad_clicks_total", "ad_impressions_total", "manual_spend", "unified_spend", "unknown_spend", "manual_clicks", "unified_clicks", "unknown_clicks", "manual_impressions", "unified_impressions", "unknown_impressions"]:
+        if col not in daily.columns:
+            daily[col] = 0.0
+        daily[col] = pd.to_numeric(daily[col], errors="coerce").fillna(0.0)
+    if "ad_spend_total" not in daily.columns or daily["ad_spend_total"].abs().sum() < 1e-9:
+        daily["ad_spend_total"] = daily[[c for c in ["manual_spend", "unified_spend", "unknown_spend"] if c in daily.columns]].sum(axis=1)
+    if "ad_clicks_total" not in daily.columns or daily["ad_clicks_total"].abs().sum() < 1e-9:
+        daily["ad_clicks_total"] = daily[[c for c in ["manual_clicks", "unified_clicks", "unknown_clicks"] if c in daily.columns]].sum(axis=1)
+    if "ad_impressions_total" not in daily.columns or daily["ad_impressions_total"].abs().sum() < 1e-9:
+        daily["ad_impressions_total"] = daily[[c for c in ["manual_impressions", "unified_impressions", "unknown_impressions"] if c in daily.columns]].sum(axis=1)
+    return daily
+
+
+def _tg_prepare_ads_truth(outputs: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
+    """Pick the freshest advertising truth source for Telegram/PDF day totals.
+
+    FIX25: raw WB advertising files already contain a reliable subject column
+    ("Название предмета" -> subject). Do NOT require product/reference enrichment for
+    daily Telegram/category totals: product reference filtering must not drop raw ad rows even
+    when the subject/date/spend are valid. We filter raw ads by subject directly and only
+    try reference enrichment when a candidate has no usable subject at all.
+    """
+    if not isinstance(outputs, dict):
+        return pd.DataFrame(), ""
+
+    TARGET_DISP = ["Кисти", "Карандаши", "Помады", "Блески"]
+
+    def _ensure_numeric(ads: pd.DataFrame) -> pd.DataFrame:
+        rename_candidates = {
+            "ad_spend_total": "spend",
+            "ad_clicks_total": "clicks",
+            "ad_impressions_total": "impressions",
+            "shows": "impressions",
+            "views": "impressions",
+        }
+        for old, new in rename_candidates.items():
+            if new not in ads.columns and old in ads.columns:
+                ads[new] = ads[old]
+        for col in ["spend", "clicks", "impressions"]:
+            if col not in ads.columns:
+                ads[col] = 0.0
+            ads[col] = pd.to_numeric(ads[col], errors="coerce").fillna(0.0)
+        return ads
+
+    def _apply_subject_disp(ads: pd.DataFrame) -> pd.DataFrame:
+        if "subject_disp" in ads.columns:
+            ads["subject_disp"] = ads["subject_disp"].map(_tg_subject_disp)
+        elif "subject" in ads.columns:
+            ads["subject_disp"] = ads["subject"].map(_tg_subject_disp)
+        else:
+            ads["subject_disp"] = ""
+        return ads
+
+    def _normalize_ads_candidate(cand: pd.DataFrame, source_name: str) -> pd.DataFrame:
+        ads = cand.copy()
+        if ads.empty:
+            return pd.DataFrame()
+
+        ads["day"] = pd.to_datetime(ads.get("day"), errors="coerce").dt.normalize()
+        ads = ads[ads["day"].notna()].copy()
+        if ads.empty:
+            return pd.DataFrame()
+
+        ads = _ensure_numeric(ads)
+        ads = _apply_subject_disp(ads)
+
+        # Primary path: raw/category ads already have a subject. Use it directly.
+        by_subject = ads[ads["subject_disp"].isin(TARGET_DISP)].copy()
+
+        # Fallback only when subject is absent/unusable: enrich by nm_id/product reference.
+        if by_subject.empty:
+            try:
+                enriched = ads.copy()
+                if "subject" not in enriched.columns:
+                    enriched["subject"] = ""
+                for col in ["product", "supplier_article", "nm_id"]:
+                    if col not in enriched.columns:
+                        enriched[col] = "" if col != "nm_id" else np.nan
+                rejects: List[Dict[str, Any]] = []
+                enriched = _filter_df_by_pdf_product_reference(enriched, f"telegram_{source_name}", rejects)
+                if enriched is not None and not enriched.empty:
+                    enriched = _ensure_numeric(enriched)
+                    enriched = _apply_subject_disp(enriched)
+                    by_subject = enriched[enriched["subject_disp"].isin(TARGET_DISP)].copy()
+            except Exception as exc:
+                log(f"telegram_ads_truth WARN: subject fallback enrichment failed for {source_name}: {exc}")
+
+        if by_subject.empty:
+            try:
+                mx0 = pd.to_datetime(ads["day"], errors="coerce").dropna().max()
+                raw_subjects = sorted(set(map(str, ads.get("subject", pd.Series(dtype=str)).dropna().astype(str).head(20))))
+                log(f"telegram_ads_truth_candidate_rejected: {source_name}; max_day={mx0.date() if pd.notna(mx0) else '-'}; rows={len(ads):,}; subjects_sample={raw_subjects[:8]}")
+            except Exception:
+                pass
+            return pd.DataFrame()
+
+        # Keep fields useful for PDF/category, product and article fallback joins.
+        if "subject" not in by_subject.columns:
+            by_subject["subject"] = by_subject["subject_disp"].map({
+                "Кисти": "Кисти косметические",
+                "Карандаши": "Косметические карандаши",
+                "Помады": "Помады",
+                "Блески": "Блески",
+            })
+        for col in ["product", "supplier_article", "nm_id"]:
+            if col not in by_subject.columns:
+                by_subject[col] = "" if col != "nm_id" else np.nan
+
+        return by_subject
+
+    # Tie priority: when sources are equally fresh, category source is safer;
+    # store-scoped ads_daily_source is the scheduled fallback when the category sheet is absent.
+    priority = {"ads_category_source": 3, "ads_daily_source": 2, "ads_raw_source": 1}
+    best_df = pd.DataFrame()
+    best_name = ""
+    best_day = pd.NaT
+    best_priority = -1
+
+    # FIX40: for PDF/Telegram totals never take ads_raw_source by default.
+    # Use category sheet first. If the weekly export has no category sheet, use only
+    # store-scoped ads_daily_source. Raw can be enabled manually for diagnostics.
+    allow_raw_ads_fallback = os.getenv("REPORT_ALLOW_RAW_ADS_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "y"}
+    source_order = ["ads_category_source", "ads_daily_source"] if not allow_raw_ads_fallback else ["ads_category_source", "ads_daily_source", "ads_raw_source"]
+
+    for nm in source_order:
+        cand = outputs.get(nm, pd.DataFrame())
+        if not isinstance(cand, pd.DataFrame) or cand.empty:
+            continue
+        prepared = _normalize_ads_candidate(cand, nm)
+        if prepared.empty:
+            continue
+        mx = pd.to_datetime(prepared["day"], errors="coerce").dropna().max()
+        pr = priority.get(nm, 0)
+        if pd.isna(mx):
+            continue
+        if (best_name == "") or (mx > best_day) or (mx == best_day and pr > best_priority):
+            best_df = prepared
+            best_name = nm
+            best_day = mx
+            best_priority = pr
+
+    if best_name and not best_df.empty:
+        try:
+            mn = pd.to_datetime(best_df["day"], errors="coerce").dropna().min()
+            mx = pd.to_datetime(best_df["day"], errors="coerce").dropna().max()
+            spend_total = pd.to_numeric(best_df.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+            by_day = (
+                best_df.assign(_day=pd.to_datetime(best_df["day"], errors="coerce").dt.strftime("%Y-%m-%d"))
+                .groupby("_day")["spend"].sum().tail(5).to_dict()
+            )
+            log(
+                f"telegram_ads_truth: selected {best_name}; "
+                f"dates={mn.date() if pd.notna(mn) else '-'}..{mx.date() if pd.notna(mx) else '-'}; "
+                f"rows={len(best_df):,}; spend={spend_total:.2f}; by_day_tail={by_day}"
+            )
+        except Exception:
+            pass
+    return best_df, best_name
+
+def _tg_prepare_unique_demand(outputs: Dict[str, Any]) -> pd.DataFrame:
+    df = outputs.get("search_unique_demand", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    x["day"] = pd.to_datetime(x.get("day"), errors="coerce").dt.normalize()
+    if "level" in x.columns:
+        x = x[x["level"].astype(str).str.lower().eq("category")].copy()
+    if "subject_disp" in x.columns:
+        x["subject_disp"] = x["subject_disp"].map(_tg_subject_disp)
+    elif "subject" in x.columns:
+        x["subject_disp"] = x["subject"].map(_tg_subject_disp)
+    else:
+        x["subject_disp"] = ""
+    x = x[x["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+    if "unique_search_frequency" not in x.columns:
+        x["unique_search_frequency"] = 0.0
+    x["unique_search_frequency"] = pd.to_numeric(x["unique_search_frequency"], errors="coerce").fillna(0.0)
+    return x
+
+
+def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> Dict[str, float]:
+    start = pd.Timestamp(start).normalize(); end = pd.Timestamp(end).normalize()
+    d = daily[(daily["day"] >= start) & (daily["day"] <= end)].copy() if not daily.empty else pd.DataFrame()
+    a = ads[(ads["day"] >= start) & (ads["day"] <= end)].copy() if not ads.empty else pd.DataFrame()
+    q = demand_df[(demand_df["day"] >= start) & (demand_df["day"] <= end)].copy() if not demand_df.empty else pd.DataFrame()
+    order_sum = float(pd.to_numeric(d.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    orders = float(pd.to_numeric(d.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    opens = float(pd.to_numeric(d.get("open_cards", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+
+    # Если отдельный truth-source есть, но в нем нет нужной даты, это не 0,
+    # а «данные еще не обновились». Не подставляем article_day_fact/search_frequency,
+    # чтобы в Telegram/PDF не появлялись ложные 0 ₽, 0 спроса и 0,0% ДРР.
+    demand_missing = False
+    if not demand_df.empty:
+        if not q.empty:
+            demand = float(pd.to_numeric(q.get("unique_search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        else:
+            # FIX27: if unique demand is missing for one specific closed day, do not render blank.
+            # Use the operational article_day_fact demand as a fallback for the day row / weekly top cards.
+            # This keeps 31.05 visible instead of "—" while preserving unique-demand rows when they exist.
+            fallback_demand = float(pd.to_numeric(d.get("search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+            demand = fallback_demand if abs(fallback_demand) > 1e-9 else np.nan
+            demand_missing = pd.isna(demand)
+    else:
+        demand = float(pd.to_numeric(d.get("search_frequency", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+
+    ads_missing = False
+    if not ads.empty:
+        if not a.empty:
+            spend = float(pd.to_numeric(a.get("spend", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+            clicks = float(pd.to_numeric(a.get("clicks", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+            impressions = float(pd.to_numeric(a.get("impressions", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        else:
+            spend = np.nan
+            clicks = np.nan
+            impressions = np.nan
+            ads_missing = True
+    else:
+        spend = float(pd.to_numeric(d.get("ad_spend_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+        clicks = float(pd.to_numeric(d.get("ad_clicks_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+        impressions = float(pd.to_numeric(d.get("ad_impressions_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+
+    drr = spend / order_sum * 100.0 if order_sum and not pd.isna(spend) else np.nan
+    return {
+        "order_sum": order_sum,
+        "orders": orders,
+        "ad_spend": spend,
+        "clicks": clicks,
+        "impressions": impressions,
+        "demand": demand,
+        "opens": opens,
+        "drr": drr,
+        "cpc": spend / clicks if clicks and not pd.isna(spend) and not pd.isna(clicks) else np.nan,
+        "ad_ctr": clicks / impressions * 100.0 if impressions and not pd.isna(clicks) and not pd.isna(impressions) else np.nan,
+        "search_share": opens / demand * 100.0 if demand and not pd.isna(demand) else np.nan,
+        "ads_missing": ads_missing,
+        "demand_missing": demand_missing,
+    }
+
+
+def _tg_daily_abc_gross_profit(outputs: Dict[str, Any], day: pd.Timestamp) -> float:
+    """Raw gross profit from real daily Torgstat ABC for one closed day."""
+    day = pd.Timestamp(day).normalize()
+    frames = []
+    for src_name in ["abc_weekly", "abc_monthly"]:
+        src = outputs.get(src_name, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        if not isinstance(src, pd.DataFrame) or src.empty:
+            continue
+        if "period_start" not in src.columns or "period_end" not in src.columns or "gross_profit" not in src.columns:
+            continue
+        x = src.copy()
+        x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+        x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+        x = x[x["period_start"].eq(day) & x["period_end"].eq(day)].copy()
+        if x.empty:
+            continue
+        if "subject" in x.columns:
+            x["subject_disp"] = x["subject"].map(_tg_subject_disp)
+            x = x[x["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+        frames.append(x)
+    if not frames:
+        return 0.0
+    all_rows = pd.concat(frames, ignore_index=True)
+    return float(pd.to_numeric(all_rows.get("gross_profit", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+
+
+
+
+TELEGRAM_MANAGER_ORDER = ["Влад", "Игорь", "Эмиль", "Юля"]
+
+
+def _tg_normalize_manager(value: Any) -> str:
+    text = normalize_text(value)
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return ""
+    low = text.lower().replace("ё", "е")
+    if low.startswith("влад"):
+        return "Влад"
+    if low.startswith("игор"):
+        # In ABC лаковые категории can be exported as Игорь104 / Игорь110.
+        return "Игорь"
+    if low.startswith("эмил"):
+        return "Эмиль"
+    if low.startswith("юл"):
+        return "Юля"
+    return ""
+
+
+def _tg_clean_subject_full(value: Any) -> str:
+    # Telegram manager matching needs case-insensitive subject keys because
+    # WB ads export uses lowercase предмета while ABC uses title case.
+    text = canonical_subject(value)
+    return normalize_text(text).lower().replace("ё", "е")
+
+
+def build_manager_reference_from_abc(*frames: pd.DataFrame) -> pd.DataFrame:
+    """Build article/category -> manager reference from ABC column 'Ваша категория'.
+
+    This reference is intentionally broader than PDF target categories: Telegram manager
+    summaries need all TOPFACE categories, not only brushes/lipsticks/gloss/pencils.
+    """
+    parts: List[pd.DataFrame] = []
+    for df in frames:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        x = df.copy()
+        if "manager" not in x.columns:
+            if "manager_raw" in x.columns:
+                x["manager"] = x["manager_raw"]
+            elif "Ваша категория" in x.columns:
+                x["manager"] = x["Ваша категория"]
+            else:
+                x["manager"] = ""
+        if "manager_raw" not in x.columns:
+            x["manager_raw"] = x["manager"]
+        for col in ["period_start", "period_end", "day"]:
+            if col in x.columns:
+                x[col] = pd.to_datetime(x[col], errors="coerce").dt.normalize()
+        for col in ["nm_id", "supplier_article", "subject", "product", "gross_revenue", "gross_profit", "orders", "source_file"]:
+            if col not in x.columns:
+                x[col] = np.nan if col in {"nm_id", "gross_revenue", "gross_profit", "orders"} else ""
+        x["manager"] = x["manager"].map(_tg_normalize_manager)
+        x = x[x["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+        if x.empty:
+            continue
+        x["nm_id"] = pd.to_numeric(x["nm_id"], errors="coerce")
+        x["supplier_article"] = x["supplier_article"].map(clean_article)
+        x["subject"] = x["subject"].map(_tg_clean_subject_full)
+        x["product"] = x["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        for col in ["gross_revenue", "gross_profit", "orders"]:
+            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+        if "period_end" not in x.columns:
+            x["period_end"] = pd.NaT
+        if "period_start" not in x.columns:
+            x["period_start"] = pd.NaT
+        parts.append(x[["manager", "manager_raw", "subject", "product", "supplier_article", "nm_id", "gross_revenue", "gross_profit", "orders", "period_start", "period_end", "source_file"]])
+    if not parts:
+        return pd.DataFrame(columns=["manager", "manager_raw", "subject", "product", "supplier_article", "nm_id", "gross_revenue", "gross_profit", "orders", "period_start", "period_end", "source_file"])
+    ref = pd.concat(parts, ignore_index=True, sort=False)
+    ref = ref[ref["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+    ref = ref[(ref["nm_id"].notna()) | ref["supplier_article"].ne("") | ref["subject"].ne("")].copy()
+    # Latest rows win for exact article mapping; all rows remain available for subject weights.
+    ref = ref.sort_values(["period_end", "source_file", "manager"], na_position="first").drop_duplicates(
+        ["manager", "subject", "product", "supplier_article", "nm_id"], keep="last"
+    )
+    return ref.reset_index(drop=True)
+
+
+def _tg_manager_reference(outputs: Dict[str, Any]) -> pd.DataFrame:
+    frames: List[pd.DataFrame] = []
+    for nm in ["manager_reference", "manager_abc_source", "abc_weekly", "abc_monthly"]:
+        df = outputs.get(nm, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            frames.append(df)
+    return build_manager_reference_from_abc(*frames)
+
+
+def _tg_latest_reference_slice(ref: pd.DataFrame) -> pd.DataFrame:
+    if ref is None or ref.empty:
+        return pd.DataFrame()
+    x = ref.copy()
+    x["period_start"] = pd.to_datetime(x.get("period_start"), errors="coerce").dt.normalize()
+    x["period_end"] = pd.to_datetime(x.get("period_end"), errors="coerce").dt.normalize()
+    x["_days"] = (x["period_end"] - x["period_start"]).dt.days + 1
+    def _is_full_month(row: pd.Series) -> bool:
+        try:
+            ps = pd.Timestamp(row["period_start"]); pe = pd.Timestamp(row["period_end"])
+            return bool(ps.day == 1 and ps.year == pe.year and ps.month == pe.month and pe.day == calendar.monthrange(ps.year, ps.month)[1])
+        except Exception:
+            return False
+    x["_full_month"] = x.apply(_is_full_month, axis=1) if not x.empty else False
+    base = x[x["_full_month"]].copy()
+    if base.empty:
+        base = x.copy()
+    mx = pd.to_datetime(base["period_end"], errors="coerce").dropna().max()
+    if pd.notna(mx):
+        base = base[pd.to_datetime(base["period_end"], errors="coerce").dt.normalize().eq(pd.Timestamp(mx).normalize())].copy()
+    return base.drop(columns=["_days", "_full_month"], errors="ignore")
+
+
+def _tg_manager_subject_weights(ref: pd.DataFrame) -> pd.DataFrame:
+    base = _tg_latest_reference_slice(ref)
+    if base is None or base.empty:
+        return pd.DataFrame(columns=["subject", "manager", "manager_weight"])
+    x = base.copy()
+    x["subject"] = x.get("subject", "").map(_tg_clean_subject_full)
+    x["manager"] = x.get("manager", "").map(_tg_normalize_manager)
+    x = x[x["manager"].isin(TELEGRAM_MANAGER_ORDER) & x["subject"].ne("")].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["subject", "manager", "manager_weight"])
+    weight = pd.to_numeric(x.get("gross_revenue", 0), errors="coerce").fillna(0).clip(lower=0)
+    if float(weight.sum()) <= 0:
+        weight = pd.to_numeric(x.get("gross_profit", 0), errors="coerce").fillna(0).abs()
+    if float(weight.sum()) <= 0:
+        weight = pd.Series(1.0, index=x.index)
+    x["_weight"] = weight
+    g = x.groupby(["subject", "manager"], dropna=False, as_index=False).agg(_weight=("_weight", "sum"))
+    total = g.groupby("subject", dropna=False)["_weight"].transform("sum")
+    g["manager_weight"] = np.where(total > 0, g["_weight"] / total, 0.0)
+    g = g[g["manager_weight"] > 0].copy()
+    return g[["subject", "manager", "manager_weight"]]
+
+
+def _tg_attach_manager_exact(df: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    for col in ["manager", "manager_raw"]:
         if col not in out.columns:
             out[col] = ""
-    if not out.empty:
-        after_cols = [c for c in out.columns if c.startswith("after_")] + [
-            "impressions_delta_pct", "clicks_delta_pct", "ctr_delta_pp", "orders_qty_delta_pct",
-            "orders_sum_delta_pct", "gp_after_ads_delta_pct", "ad_spend_delta_pct", "drr_delta_pp",
-            "core80_position_delta", "core80_visibility_delta_pp", "traffic_share_delta_pp",
-        ]
-        no_after = pd.to_numeric(out.get("after_days", pd.Series(dtype=float)), errors="coerce").fillna(0).le(0)
-        if no_after.any():
-            # Pandas 3.x запрещает записывать строку "" в int64/float64 колонки пачкой.
-            # Для строк без зрелого after-периода делаем эти поля object и ставим пустоту,
-            # чтобы в Excel не появлялись ложные нули как будто это эффект изменения ставки.
-            for col in after_cols:
-                if col in out.columns:
-                    out[col] = out[col].astype("object")
-                    out.loc[no_after, col] = ""
-            out["after_period"] = out["after_period"].astype("object")
-            out.loc[no_after, "after_period"] = ""
-            out["diagnostic_conclusion"] = out["diagnostic_conclusion"].astype("object")
-            out.loc[no_after, "diagnostic_conclusion"] = (
-                "WAIT_AFTER_DATA: после изменения ставки ещё нет зрелых данных для сравнения; "
-                "нули не используются как эффект изменения"
-            )
-        out = out.sort_values(["subject_norm", "supplier_article", "campaign_id", "placement"], ascending=[True, True, True, True])
-    return out[BID_CAMPAIGN_COMPARE_COLUMNS]
-
-
-def write_outputs(
-    s3_client,
-    config: Config,
-    ctx: RunContext,
-    decisions: pd.DataFrame,
-    bid_history: pd.DataFrame,
-    effect_df: pd.DataFrame,
-    pause_candidates: pd.DataFrame,
-    pause_history: pd.DataFrame,
-    successful_changes: pd.DataFrame,
-    api_log: pd.DataFrame,
-    start_candidates: pd.DataFrame,
-    applied_pauses: pd.DataFrame,
-    applied_starts: pd.DataFrame,
-    min_bids_df: pd.DataFrame,
-    keyword_core_df: Optional[pd.DataFrame] = None,
-    keyword_effects_df: Optional[pd.DataFrame] = None,
-    keyword_loss_detail_df: Optional[pd.DataFrame] = None,
-    price_decisions: Optional[pd.DataFrame] = None,
-    price_history: Optional[pd.DataFrame] = None,
-    price_effects_df: Optional[pd.DataFrame] = None,
-    applied_price_changes: Optional[pd.DataFrame] = None,
-    bid_ramp_monitor: Optional[pd.DataFrame] = None,
-    ramp_selection: Optional[pd.DataFrame] = None,
-    one_campaign_experiment: Optional[pd.DataFrame] = None,
-    rename_plan: Optional[pd.DataFrame] = None,
-    bid_campaign_compare: Optional[pd.DataFrame] = None,
-) -> Dict[str, Any]:
-    summary = build_summary(ctx, decisions, successful_changes, pause_candidates, applied_pauses, start_candidates, applied_starts)
-    summary["Ключевых фраз CORE_80"] = int(len(keyword_core_df[keyword_core_df["keyword_group"] == "CORE_80"])) if keyword_core_df is not None and not keyword_core_df.empty and "keyword_group" in keyword_core_df.columns else 0
-    if PRICE_CORRECTION_ENABLED:
-        summary["Рекомендаций по цене"] = int(price_decisions["price_action"].isin(["Повысить цену", "Вернуть скидку"]).sum()) if price_decisions is not None and not price_decisions.empty and "price_action" in price_decisions.columns else 0
-        summary["Ценовых тестов без воронки"] = int(price_decisions.get("funnel_missing", pd.Series(dtype=bool)).astype(bool).sum()) if price_decisions is not None and not price_decisions.empty and "funnel_missing" in price_decisions.columns else 0
-        summary["Изменений цены отправлено"] = int(applied_price_changes["api_status"].astype(str).str.fullmatch(r"2\d\d", na=False).sum()) if applied_price_changes is not None and not applied_price_changes.empty and "api_status" in applied_price_changes.columns else 0
-        summary["Скидка продавца по умолчанию"] = DEFAULT_SELLER_DISCOUNT_PCT
-        summary["Минимальная скидка продавца"] = DEFAULT_MIN_SELLER_DISCOUNT_PCT
+    out["manager"] = out["manager"].map(_tg_normalize_manager)
+    if "day" in out.columns:
+        out["day"] = pd.to_datetime(out["day"], errors="coerce").dt.normalize()
     else:
-        summary["Корректировка цен"] = "отключено: цены ведёт внешний репрайсер"
-        summary["Рекомендаций по цене"] = 0
-        summary["Ценовых тестов без воронки"] = 0
-        summary["Изменений цены отправлено"] = 0
-    summary["Кандидатов на разгон показов"] = int(len(bid_ramp_monitor)) if bid_ramp_monitor is not None else 0
-    if bid_ramp_monitor is not None and not bid_ramp_monitor.empty and "ramp_mode_status" in bid_ramp_monitor.columns:
-        ramp_counts = bid_ramp_monitor["ramp_mode_status"].astype(str).value_counts().to_dict()
-        summary["Разгон: активен ежедневный контроль"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЕЖЕДНЕВНЫЙ_КОНТРОЛЬ", 0))
-        summary["Разгон: активен цель дня достигнута"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЦЕЛЬ_ДНЕВНАЯ_ДОСТИГНУТА", 0))
-        summary["Разгон: завершён обычный режим"] = int(ramp_counts.get("РАЗГОН_ЗАВЕРШЕН_ОБЫЧНЫЙ_РЕЖИМ", 0))
-        summary["Разгон: применён сейчас"] = int(ramp_counts.get("РАЗГОН_ПРИМЕНЕН_СЕЙЧАС_API_200", 0))
-        summary["Разгон: заблокирован min WB"] = int(ramp_counts.get("РАЗГОН_ПОДХОДИТ_НО_БЛОК_MIN_WB", 0))
-        summary["Разгон: активен ждём старый D+7"] = int(ramp_counts.get("РАЗГОН_АКТИВЕН_ЖДЕМ_D7", 0))
-        summary["Разгон: подходит по метрикам, но ждёт другой post-check"] = int(ramp_counts.get("РАЗГОН_ПОДХОДИТ_НО_ЖДЕМ_ДРУГОЙ_POSTCHECK", 0))
-    summary["Эксперимент 1РК групп"] = int(len(one_campaign_experiment)) if one_campaign_experiment is not None else 0
-    summary["Разгон цель расхода в день"] = RAMP_TARGET_SPEND_PER_DAY
-    summary["Разгон верхний порог расхода в день"] = RAMP_SCALE_MAX_SPEND_PER_DAY
-    summary["Разгон порог ДРР для масштабирования 500-1000"] = RAMP_SCALE_DRR_LIMIT_PCT
-    summary["Разгон срок дней"] = RAMP_CHECK_DAYS
-    summary["Разгон: выбранных РК товар+тип"] = int(len(ramp_selection)) if ramp_selection is not None else 0
-    summary["Контроль CORE-кликов включён"] = "да" if KEYWORD_CORE_CLICK_GUARD_ENABLED else "нет"
-    summary["Порог риска CORE-кликов, %"] = -KEYWORD_CORE_CLICK_RISK_DROP_PCT
-    summary["Порог критичной потери CORE-кликов, %"] = -KEYWORD_CORE_CLICK_BAD_DROP_PCT
-    summary["Порог паузы по показам"] = PAUSE_MIN_IMPRESSIONS
-    summary["Окно проверки паузы, дней"] = PAUSE_ANALYSIS_DAYS
-    summary["Правило автопаузы"] = "минимальная ставка WB + ДРР > лимита за 21 день + показы >= 10000; возврат после D+7/D+14"
-    summary["Кисти паузим"] = "нет"
-    summary["Кандидатов на переименование РК"] = 0
-    summary["Переименовано РК"] = 0
-    summary["Переименование РК"] = "отключено"
-    summary["Строк сравнения РК 7д"] = int(len(bid_campaign_compare)) if bid_campaign_compare is not None else 0
-    summary["Строк потерь CORE-запросов"] = int(len(keyword_loss_detail_df)) if keyword_loss_detail_df is not None else 0
-    if decisions is not None and not decisions.empty and "keyword_guard_status" in decisions.columns:
-        summary["CORE-клики: критичный риск"] = int(decisions["keyword_guard_status"].astype(str).isin(["CORE_CLICK_BAD_LOSS", "CORE_POSITION_BAD_LOSS", "CORE_VISIBILITY_BAD_LOSS"]).sum())
-        summary["CORE-клики: риск"] = int(decisions["keyword_guard_status"].astype(str).isin(["CORE_CLICK_RISK"]).sum())
-    experiment_docs = build_experiments_description(ctx)
-    summary["Ночные эксперименты"] = "включены" if NIGHT_EXPERIMENTS_ENABLED else "отключены"
-    summary["Окно ночных экспериментов МСК"] = night_experiment_window_text()
-    summary["Окно ночных экспериментов сейчас"] = "активно" if is_night_experiment_window(ctx) else "не активно"
-    summary["Режим только ночных экспериментов"] = "да" if bool(getattr(ctx, "night_experiment_only", False)) else "нет"
-    summary["Ночной слот YAML"] = night_experiment_slot(ctx)
-    summary["Окно по фактическому времени МСК"] = "активно" if is_night_experiment_window_by_clock(ctx) else "не активно"
-    if decisions is not None and not decisions.empty and "reason_code" in decisions.columns:
-        summary["Эксперимент 1: строк минимальной ночной ставки"] = int(decisions["reason_code"].astype(str).eq(EXPERIMENT_1_REASON_CODE).sum())
-    if pause_candidates is not None and not pause_candidates.empty and "reason_code" in pause_candidates.columns:
-        summary["Эксперимент 2: кандидатов на ночную паузу"] = int(pause_candidates["reason_code"].astype(str).eq(EXPERIMENT_2_REASON_CODE).sum())
-    if start_candidates is not None and not start_candidates.empty and "reason_code" in start_candidates.columns:
-        summary["Эксперимент 2: кандидатов на запуск после ночи"] = int(start_candidates["reason_code"].astype(str).eq(EXPERIMENT_2_START_REASON_CODE).sum())
-    summary_df = pd.DataFrame([{"Показатель": k, "Значение": v} for k, v in summary.items()])
+        out["day"] = pd.NaT
+    if "nm_id" not in out.columns:
+        out["nm_id"] = np.nan
+    if "supplier_article" not in out.columns:
+        out["supplier_article"] = ""
+    if "subject" not in out.columns:
+        out["subject"] = ""
+    out["nm_id"] = pd.to_numeric(out["nm_id"], errors="coerce")
+    out["supplier_article"] = out["supplier_article"].map(clean_article)
+    out["subject"] = out["subject"].map(_tg_clean_subject_full)
+    if ref is None or ref.empty:
+        return out
+    r = ref.copy()
+    r["manager"] = r.get("manager", "").map(_tg_normalize_manager)
+    r = r[r["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+    r["nm_id"] = pd.to_numeric(r.get("nm_id"), errors="coerce")
+    r["supplier_article"] = r.get("supplier_article", "").map(clean_article)
+    r["subject"] = r.get("subject", "").map(_tg_clean_subject_full)
+    r["period_end"] = pd.to_datetime(r.get("period_end"), errors="coerce").dt.normalize()
+    r = r.sort_values("period_end", na_position="first")
+    # nmId exact mapping
+    if r["nm_id"].notna().any():
+        map_nm = r[r["nm_id"].notna()].drop_duplicates("nm_id", keep="last")[["nm_id", "manager"]].rename(columns={"manager": "_manager_nm"})
+        out = out.merge(map_nm, on="nm_id", how="left")
+        out["manager"] = out["manager"].where(out["manager"].ne(""), out["_manager_nm"].fillna(""))
+        out = out.drop(columns=["_manager_nm"], errors="ignore")
+    # seller article exact mapping
+    if r["supplier_article"].ne("").any():
+        map_art = r[r["supplier_article"].ne("")].drop_duplicates("supplier_article", keep="last")[["supplier_article", "manager"]].rename(columns={"manager": "_manager_art"})
+        out = out.merge(map_art, on="supplier_article", how="left")
+        out["manager"] = out["manager"].where(out["manager"].ne(""), out["_manager_art"].fillna(""))
+        out = out.drop(columns=["_manager_art"], errors="ignore")
+    # subject fallback only for unambiguous subjects.
+    subj_mgr = r[r["subject"].ne("")].groupby("subject")["manager"].nunique().reset_index(name="_mgr_n")
+    subj_unique = r.merge(subj_mgr[subj_mgr["_mgr_n"].eq(1)][["subject"]], on="subject", how="inner")
+    if not subj_unique.empty:
+        map_subj = subj_unique.drop_duplicates("subject", keep="last")[["subject", "manager"]].rename(columns={"manager": "_manager_subj"})
+        out = out.merge(map_subj, on="subject", how="left")
+        out["manager"] = out["manager"].where(out["manager"].ne(""), out["_manager_subj"].fillna(""))
+        out = out.drop(columns=["_manager_subj"], errors="ignore")
+    return out
 
-    sheets = {
-        "Эксперименты": experiment_docs,
-        "Решения": decisions if decisions is not None else pd.DataFrame(columns=DECISION_COLUMNS),
-        "История_изменений_ставок": bid_history if bid_history is not None else pd.DataFrame(columns=BID_HISTORY_COLUMNS),
-        "Эффект_изменения_ставки": effect_df if effect_df is not None else pd.DataFrame(),
-        "Оценка_изменения_ставок": effect_df if effect_df is not None else pd.DataFrame(),
-        "Сравнение_РК_7дней": bid_campaign_compare if bid_campaign_compare is not None else pd.DataFrame(columns=BID_CAMPAIGN_COMPARE_COLUMNS),
-        "Ключевые_фразы_80": keyword_core_df if keyword_core_df is not None else pd.DataFrame(columns=KEYWORD_POSITION_COLUMNS),
-        "Эффект_по_ключевым_фразам": keyword_effects_df if keyword_effects_df is not None else pd.DataFrame(columns=KEYWORD_EFFECT_COLUMNS),
-        "Потери_CORE_запросов": keyword_loss_detail_df if keyword_loss_detail_df is not None else pd.DataFrame(columns=KEYWORD_LOSS_DETAIL_COLUMNS),
-        "Разгон_показов": bid_ramp_monitor if bid_ramp_monitor is not None else pd.DataFrame(columns=BID_RAMP_MONITOR_COLUMNS),
-        "Разгон_выбор_1РК": ramp_selection if ramp_selection is not None else pd.DataFrame(columns=RAMP_SELECTION_COLUMNS),
-        "Эксперимент_1РК_на_товар": one_campaign_experiment if one_campaign_experiment is not None else pd.DataFrame(columns=ONE_CAMPAIGN_EXPERIMENT_COLUMNS),
-        "Решения_по_цене": price_decisions if price_decisions is not None else pd.DataFrame(columns=PRICE_DECISION_COLUMNS),
-        "История_изменений_цен": price_history if price_history is not None else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS),
-        "Эффект_изменения_цен": price_effects_df if price_effects_df is not None else pd.DataFrame(),
-        "Оценка_изменения_цен": price_effects_df if price_effects_df is not None else pd.DataFrame(),
-        "Фактически_изменённые_цены": applied_price_changes if applied_price_changes is not None else pd.DataFrame(),
-        "Кандидаты_на_паузу": pause_candidates if pause_candidates is not None else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS),
-        "История_пауз": pause_history if pause_history is not None else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS),
-        "Фактически_изменённые_ставки": successful_changes if successful_changes is not None else pd.DataFrame(),
-        "Кандидаты_на_запуск": start_candidates if start_candidates is not None else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS),
-        "Минимальные_ставки_WB": min_bids_df if min_bids_df is not None else pd.DataFrame(columns=MIN_BID_COLUMNS),
-        "Переименование_РК": rename_plan if rename_plan is not None else pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS),
-        "Лог_API": api_log if api_log is not None else pd.DataFrame(),
-        "Сводка": summary_df,
+
+def _tg_allocate_subject_rows(df: pd.DataFrame, ref: pd.DataFrame, value_cols: Sequence[str]) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    x = _tg_attach_manager_exact(df, ref)
+    for col in value_cols:
+        if col not in x.columns:
+            x[col] = 0.0
+        x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+    assigned = x[x.get("manager", "").isin(TELEGRAM_MANAGER_ORDER)].copy()
+    unassigned = x[~x.get("manager", "").isin(TELEGRAM_MANAGER_ORDER)].copy()
+    frames = [assigned] if not assigned.empty else []
+    if not unassigned.empty:
+        weights = _tg_manager_subject_weights(ref)
+        if not weights.empty and "subject" in unassigned.columns:
+            unassigned["subject"] = unassigned["subject"].map(_tg_clean_subject_full)
+            alloc = unassigned.merge(weights, on="subject", how="inner")
+            if not alloc.empty:
+                for col in value_cols:
+                    alloc[col] = pd.to_numeric(alloc[col], errors="coerce").fillna(0.0) * pd.to_numeric(alloc["manager_weight"], errors="coerce").fillna(0.0)
+                frames.append(alloc)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    out["manager"] = out["manager"].map(_tg_normalize_manager)
+    out = out[out["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+    return out
+
+
+def _tg_manager_abc_finance_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
+    """Daily manager gross profit for Telegram from exact daily ABC rows.
+
+    FIX44: ABC is used for gross profit only. Telegram order_sum must come from
+    WB Orders (`manager_orders_source` / `article_day_fact`), not from ABC gross
+    revenue. The returned `order_sum` column is kept only for backward-compatible
+    diagnostics and is not used by `_tg_manager_orders_daily`.
+
+    Columns returned:
+    - order_sum = ABC gross_revenue, diagnostic only;
+    - gross_profit = ABC gross_profit / `Валовая прибыль`;
+    - orders = ABC orders count when present, diagnostic only.
+    """
+    src = outputs.get("manager_abc_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        frames = []
+        for nm in ["abc_weekly", "abc_monthly"]:
+            df = outputs.get(nm, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                frames.append(df)
+        src = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    x = src.copy()
+    if "period_start" not in x.columns or "period_end" not in x.columns:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    x["period_start"] = pd.to_datetime(x["period_start"], errors="coerce").dt.normalize()
+    x["period_end"] = pd.to_datetime(x["period_end"], errors="coerce").dt.normalize()
+    x = x[x["period_start"].notna() & x["period_start"].eq(x["period_end"])].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    x["day"] = x["period_start"]
+
+    if "manager" not in x.columns:
+        if "manager_raw" in x.columns:
+            x["manager"] = x["manager_raw"]
+        elif "Ваша категория" in x.columns:
+            x["manager"] = x["Ваша категория"]
+        else:
+            x["manager"] = ""
+    if "manager_raw" not in x.columns:
+        x["manager_raw"] = x["manager"]
+    for col in ["gross_revenue", "gross_profit", "orders"]:
+        if col not in x.columns:
+            x[col] = 0.0
+        x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+
+    # Raw ABC manager is primary. For rows where `Ваша категория` is empty, use the
+    # existing exact/subject reference only as a fallback (e.g. new PT619 liquid liners).
+    x = _tg_attach_manager_exact(x, ref)
+    x = x[x["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+    if x.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders", "gross_profit"])
+    out = x.groupby(["day", "manager"], dropna=False, as_index=False).agg(
+        order_sum=("gross_revenue", "sum"),
+        orders=("orders", "sum"),
+        gross_profit=("gross_profit", "sum"),
+    )
+    try:
+        mx = pd.to_datetime(out["day"], errors="coerce").dropna().max()
+        if pd.notna(mx):
+            mask = pd.to_datetime(out["day"], errors="coerce").dt.normalize().eq(pd.Timestamp(mx).normalize())
+            order_sum = pd.to_numeric(out.loc[mask, "order_sum"], errors="coerce").fillna(0).sum()
+            gp = pd.to_numeric(out.loc[mask, "gross_profit"], errors="coerce").fillna(0).sum()
+            log(f"telegram_manager_gp: source=daily_abc_gross_profit, latest={pd.Timestamp(mx).date()}, abc_gross_revenue_diagnostic={order_sum:.2f}, gross_profit_latest={gp:.2f}")
+    except Exception:
+        pass
+    return out
+
+
+def _tg_manager_orders_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
+    """Daily manager order sum for Telegram from WB Orders, not ABC revenue.
+
+    FIX44: `Сумма заказов` in Telegram is an orders metric. It is calculated
+    from WB Orders (`manager_orders_source`) where `order_sum` has already been
+    built by the loader from the Orders report. ABC is used only for gross profit.
+    """
+    src = outputs.get("manager_orders_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    source_name = "manager_orders_source"
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        src = outputs.get("article_day_fact", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        source_name = "article_day_fact"
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders"])
+
+    x = _tg_attach_manager_exact(src, ref)
+    if x.empty:
+        return pd.DataFrame(columns=["day", "manager", "order_sum", "orders"])
+    x = x[x["day"].notna() & x["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+    for col in ["order_sum", "orders"]:
+        if col not in x.columns:
+            x[col] = 0.0
+        x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+    out = x.groupby(["day", "manager"], dropna=False, as_index=False).agg(order_sum=("order_sum", "sum"), orders=("orders", "sum"))
+    try:
+        mx = pd.to_datetime(out["day"], errors="coerce").dropna().max()
+        if pd.notna(mx):
+            mask = pd.to_datetime(out["day"], errors="coerce").dt.normalize().eq(pd.Timestamp(mx).normalize())
+            order_sum = pd.to_numeric(out.loc[mask, "order_sum"], errors="coerce").fillna(0).sum()
+            orders_qty = pd.to_numeric(out.loc[mask, "orders"], errors="coerce").fillna(0).sum()
+            log(f"telegram_manager_orders: source={source_name}_WB_orders, latest={pd.Timestamp(mx).date()}, order_sum_latest={order_sum:.2f}, orders_latest={orders_qty:.0f}")
+    except Exception:
+        pass
+    return out
+
+def _tg_manager_ads_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
+    """Advertising spend by manager for Telegram.
+
+    FIX41:
+    - category sheet is preferred only when it contains the requested/current date;
+    - if category sheet is stale or absent, use manager_ads_daily_source = raw grouped TOPFACE
+      article/day advertising source, mapped to managers by nmId from ABC;
+    - do not use ads_raw_source directly here, because raw campaign rows can duplicate spend.
+    """
+    if not isinstance(outputs, dict):
+        return pd.DataFrame(columns=["day", "manager", "spend", "clicks", "impressions"])
+
+    target_day = _env_date("REPORT_AS_OF_DATE") or _env_date("REPORT_REQUIRE_ADS_DATE") or _env_date("WB_DAILY_TARGET_DATE")
+
+    candidate_names = [
+        "manager_ads_category_source",
+        "ads_category_source",
+        "manager_ads_daily_source",
+        "ads_daily_source",
+    ]
+
+    def _prep_source(src: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(src, pd.DataFrame) or src.empty:
+            return pd.DataFrame()
+        x = src.copy()
+        rename = {
+            "ad_spend_total": "spend",
+            "ad_clicks_total": "clicks",
+            "ad_impressions_total": "impressions",
+            "shows": "impressions",
+            "views": "impressions",
+        }
+        for old, new in rename.items():
+            if new not in x.columns and old in x.columns:
+                x[new] = x[old]
+        if "day" in x.columns:
+            x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+        else:
+            x["day"] = pd.NaT
+        for col in ["spend", "clicks", "impressions"]:
+            if col not in x.columns:
+                x[col] = 0.0
+            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
+        return x
+
+    chosen_name = ""
+    chosen = pd.DataFrame()
+    diagnostics: List[str] = []
+    prepared: List[Tuple[str, pd.DataFrame]] = []
+
+    for name in candidate_names:
+        src = outputs.get(name, pd.DataFrame())
+        x = _prep_source(src)
+        if x.empty:
+            diagnostics.append(f"{name}=empty")
+            continue
+        days = _active_days_from_source(x, ["spend", "clicks", "impressions"])
+        if days.empty:
+            diagnostics.append(f"{name}=no_active_days")
+            continue
+        diagnostics.append(f"{name}=latest:{pd.Timestamp(days.max()).strftime('%d.%m.%Y')}")
+        prepared.append((name, x))
+        if target_day is not None and (days.dt.normalize() == pd.Timestamp(target_day).normalize()).any():
+            chosen_name, chosen = name, x
+            break
+
+    if chosen.empty and target_day is None and prepared:
+        # No explicit date was requested: use the freshest safe source.
+        chosen_name, chosen = max(
+            prepared,
+            key=lambda item: pd.Timestamp(_active_days_from_source(item[1], ["spend", "clicks", "impressions"]).max()).normalize(),
+        )
+
+    if chosen.empty:
+        log("telegram_manager_ads: no current safe ad source; " + "; ".join(diagnostics))
+        return pd.DataFrame(columns=["day", "manager", "spend", "clicks", "impressions"])
+
+    x = _tg_allocate_subject_rows(chosen, ref, ["spend", "clicks", "impressions"])
+    if x.empty:
+        log(f"telegram_manager_ads: chosen={chosen_name}, but manager allocation produced 0 rows")
+        return pd.DataFrame(columns=["day", "manager", "spend", "clicks", "impressions"])
+    x = x[x["day"].notna()].copy()
+    out = x.groupby(["day", "manager"], dropna=False, as_index=False).agg(spend=("spend", "sum"), clicks=("clicks", "sum"), impressions=("impressions", "sum"))
+    try:
+        mx = pd.to_datetime(out["day"], errors="coerce").dropna().max()
+        if pd.notna(mx):
+            spend = pd.to_numeric(out.loc[pd.to_datetime(out["day"], errors="coerce").dt.normalize().eq(pd.Timestamp(mx).normalize()), "spend"], errors="coerce").fillna(0).sum()
+            log(f"telegram_manager_ads: source={chosen_name}, latest={pd.Timestamp(mx).date()}, spend_latest={spend:.2f}; " + "; ".join(diagnostics))
+    except Exception:
+        pass
+    return out
+
+def _tg_manager_demand_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
+    src = outputs.get("manager_search_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        src = outputs.get("search_unique_demand", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        return pd.DataFrame(columns=["day", "manager", "demand"])
+    x = src.copy()
+    if "frequency" not in x.columns and "unique_search_frequency" in x.columns:
+        x["frequency"] = x["unique_search_frequency"]
+    if "search_query" not in x.columns:
+        x["search_query"] = ""
+    x = _tg_allocate_subject_rows(x, ref, ["frequency"])
+    if x.empty:
+        return pd.DataFrame(columns=["day", "manager", "demand"])
+    x = x[x["day"].notna()].copy()
+    x["query_norm"] = x.get("search_query", "").map(lambda v: norm_key(v))
+    if x["query_norm"].ne("").any():
+        q = x.groupby(["day", "manager", "query_norm"], dropna=False, as_index=False).agg(frequency=("frequency", "max"))
+        return q.groupby(["day", "manager"], dropna=False, as_index=False).agg(demand=("frequency", "sum"))
+    return x.groupby(["day", "manager"], dropna=False, as_index=False).agg(demand=("frequency", "sum"))
+
+
+def _tg_manager_gp_daily(outputs: Dict[str, Any], ref: pd.DataFrame) -> pd.DataFrame:
+    finance = _tg_manager_abc_finance_daily(outputs, ref)
+    if isinstance(finance, pd.DataFrame) and not finance.empty:
+        return finance[["day", "manager", "gross_profit"]].copy()
+    return pd.DataFrame(columns=["day", "manager", "gross_profit"])
+
+def _tg_manager_value(df: pd.DataFrame, day: pd.Timestamp, col: str, manager: Optional[str] = None) -> float:
+    if not isinstance(df, pd.DataFrame) or df.empty or "day" not in df.columns or col not in df.columns:
+        return 0.0
+    x = df.copy()
+    x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+    x = x[x["day"].eq(pd.Timestamp(day).normalize())].copy()
+    if manager is not None and "manager" in x.columns:
+        x = x[x["manager"].eq(manager)].copy()
+    return float(pd.to_numeric(x[col], errors="coerce").fillna(0.0).sum())
+
+
+def _tg_arrow_abs_logic(cur: Any, prev: Any, suffix: str = "", lower_bad: bool = False) -> str:
+    cur_v = to_number(cur); prev_v = to_number(prev)
+    if pd.isna(cur_v) or pd.isna(prev_v):
+        return "⚪ → 0" + suffix
+    d = float(cur_v) - float(prev_v)
+    if abs(d) < 0.5:
+        return "⚪ → 0" + suffix
+    is_good = (d < 0) if lower_bad else (d > 0)
+    dot = "🟢 " if is_good else "🔴 "
+    arrow = "↑ +" if d > 0 else "↓ -"
+    val = f"{int(round(abs(d))):,}".replace(",", " ")
+    return dot + arrow + val + suffix
+
+
+def _tg_arrow_pp(cur: Any, prev: Any, lower_bad: bool = False) -> str:
+    cur_v = to_number(cur); prev_v = to_number(prev)
+    if pd.isna(cur_v) or pd.isna(prev_v):
+        return "⚪ → 0,0%"
+    d = float(cur_v) - float(prev_v)
+    if abs(d) < 0.05:
+        return "⚪ → 0,0%"
+    is_good = (d < 0) if lower_bad else (d > 0)
+    dot = "🟢 " if is_good else "🔴 "
+    arrow = "↑ +" if d > 0 else "↓ -"
+    body = f"{abs(d):.1f}%".replace(".", ",")
+    return dot + arrow + body
+
+
+def build_telegram_manager_daily_summary(outputs: Dict[str, Any]) -> str:
+    """Daily Telegram summary by manager using ABC 'Ваша категория'."""
+    ref = _tg_manager_reference(outputs)
+    if ref.empty:
+        return ""
+    orders = _tg_manager_orders_daily(outputs, ref)
+    ads = _tg_manager_ads_daily(outputs, ref)
+    demand = _tg_manager_demand_daily(outputs, ref)
+    gp = _tg_manager_gp_daily(outputs, ref)
+    day_candidates: List[pd.Timestamp] = []
+    for df, col in [(orders, "order_sum"), (ads, "spend"), (demand, "demand"), (gp, "gross_profit")]:
+        if isinstance(df, pd.DataFrame) and not df.empty and "day" in df.columns and col in df.columns:
+            y = df.copy(); y["day"] = pd.to_datetime(y["day"], errors="coerce").dt.normalize()
+            y[col] = pd.to_numeric(y[col], errors="coerce").fillna(0.0)
+            active = y[y[col].abs() > 1e-9]
+            if not active.empty:
+                mx = active["day"].dropna().max()
+                if pd.notna(mx):
+                    day_candidates.append(pd.Timestamp(mx).normalize())
+    if not day_candidates:
+        return ""
+    # Strict daily workflow already requires yesterday; this guard only prevents showing a day
+    # where one of the main truth sources lags behind the others.
+    latest = min(day_candidates)
+    if "REPORT_AS_OF_DATE" in os.environ and os.environ.get("REPORT_AS_OF_DATE", "").strip():
+        try:
+            env_day = pd.Timestamp(os.environ["REPORT_AS_OF_DATE"]).normalize()
+            if env_day in [pd.Timestamp(d).normalize() for d in day_candidates] or not orders.empty:
+                latest = env_day
+        except Exception:
+            pass
+    prev_day = latest - pd.Timedelta(days=1)
+    label = f"{int(latest.day)} {REPORT_MONTH_GENITIVE_RU.get(int(latest.month), latest.strftime('%m'))}"
+
+    def _block(title: str, manager: Optional[str] = None) -> List[str]:
+        cur_order = _tg_manager_value(orders, latest, "order_sum", manager)
+        prev_order = _tg_manager_value(orders, prev_day, "order_sum", manager)
+        cur_gp = _tg_manager_value(gp, latest, "gross_profit", manager)
+        prev_gp = _tg_manager_value(gp, prev_day, "gross_profit", manager)
+        cur_spend = _tg_manager_value(ads, latest, "spend", manager)
+        prev_spend = _tg_manager_value(ads, prev_day, "spend", manager)
+        cur_demand = _tg_manager_value(demand, latest, "demand", manager)
+        prev_demand = _tg_manager_value(demand, prev_day, "demand", manager)
+        cur_drr = cur_spend / cur_order * 100.0 if abs(cur_order) > 1e-9 else np.nan
+        prev_drr = prev_spend / prev_order * 100.0 if abs(prev_order) > 1e-9 else np.nan
+        return [
+            title,
+            "",
+            f"💰 Сумма заказов: {_tg_fmt_money(cur_order)}  {_tg_arrow_abs_logic(cur_order, prev_order, ' ₽', lower_bad=False)}",
+            f"💼 Валовая прибыль: {_tg_fmt_money(cur_gp)}  {_tg_arrow_abs_logic(cur_gp, prev_gp, ' ₽', lower_bad=False)}",
+            f"📣 Расход РК: {_tg_fmt_money(cur_spend)}  {_tg_arrow_abs_logic(cur_spend, prev_spend, ' ₽', lower_bad=True)}",
+            f"📊 ДРР: {_tg_fmt_pct(cur_drr)}  {_tg_arrow_pp(cur_drr, prev_drr, lower_bad=True)}",
+            f"🔎 Спрос WB: {_tg_fmt_num(cur_demand)}  {_tg_arrow_pct(cur_demand, prev_demand, lower_bad=False, colored=True)}",
+        ]
+
+    lines: List[str] = []
+    lines.extend(_block(f"TOPFACE — {label}", None))
+    for manager in TELEGRAM_MANAGER_ORDER:
+        lines.append("")
+        lines.extend(_block(manager, manager))
+    log(
+        "telegram_manager_summary: built; date=%s; managers=%s; rows orders/ads/demand/gp=%s/%s/%s/%s" % (
+            latest.date(), ",".join(TELEGRAM_MANAGER_ORDER), len(orders), len(ads), len(demand), len(gp)
+        )
+    )
+    return "\n".join(lines)
+
+def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
+    """Build the Telegram text block matching PDF sheet 1, but for the latest concrete day."""
+    manager_summary = build_telegram_manager_daily_summary(outputs)
+    if manager_summary:
+        return manager_summary
+    daily = _tg_prepare_daily(outputs)
+    if daily.empty or "day" not in daily.columns:
+        return "TOPFACE: дневная сводка не сформирована — нет article_day_fact."
+    meaningful = daily.copy()
+    metric_cols = [c for c in ["order_sum", "orders", "open_cards", "ad_spend_total", "search_frequency"] if c in meaningful.columns]
+    if metric_cols:
+        m = meaningful[metric_cols].apply(pd.to_numeric, errors="coerce").fillna(0).abs().sum(axis=1) > 0
+        meaningful = meaningful[m].copy()
+    if meaningful.empty:
+        return "TOPFACE: дневная сводка не сформирована — нет фактических строк за последний день."
+    latest = pd.to_datetime(meaningful["day"], errors="coerce").dropna().max().normalize()
+    ads, ads_source = _tg_prepare_ads_truth(outputs)
+    demand_df = _tg_prepare_unique_demand(outputs)
+    complete_limits = []
+    try:
+        if isinstance(ads, pd.DataFrame) and not ads.empty and "day" in ads.columns:
+            mx_ads = pd.to_datetime(ads["day"], errors="coerce").dropna().max()
+            if pd.notna(mx_ads):
+                complete_limits.append(pd.Timestamp(mx_ads).normalize())
+    except Exception:
+        pass
+    try:
+        if isinstance(demand_df, pd.DataFrame) and not demand_df.empty and "day" in demand_df.columns:
+            mx_demand = pd.to_datetime(demand_df["day"], errors="coerce").dropna().max()
+            if pd.notna(mx_demand):
+                complete_limits.append(pd.Timestamp(mx_demand).normalize())
+    except Exception:
+        pass
+    if complete_limits:
+        complete_latest = min([latest] + complete_limits)
+        if complete_latest < latest:
+            log(f"telegram complete-day guard: latest_day {latest.date()} -> {complete_latest.date()} because ads/demand are not complete")
+            latest = complete_latest
+    prev_day = latest - pd.Timedelta(days=1)
+    cur = _tg_sum_period(daily, ads, demand_df, latest, latest)
+    prev = _tg_sum_period(daily, ads, demand_df, prev_day, prev_day)
+    cur_gp = _tg_daily_abc_gross_profit(outputs, latest)
+    prev_gp = _tg_daily_abc_gross_profit(outputs, prev_day)
+    label = f"{int(latest.day)} {REPORT_MONTH_GENITIVE_RU.get(int(latest.month), latest.strftime('%m'))}"
+
+    def _max_day(df):
+        try:
+            if df is None or df.empty or "day" not in df.columns:
+                return "—"
+            m = pd.to_datetime(df["day"], errors="coerce").dropna().max()
+            return "—" if pd.isna(m) else f"{int(m.day):02d}.{int(m.month):02d}"
+        except Exception:
+            return "—"
+
+    if cur.get("ads_missing"):
+        log(f"telegram_ads_truth_missing: report_day={latest.date()}; selected_source={ads_source or '-'}; last_ads_day={_max_day(ads)}; ads_rows={len(ads) if isinstance(ads, pd.DataFrame) else 0}")
+        ads_line = f"📣 Расход РК: нет данных за {label} (последняя дата РК: {_max_day(ads)})"
+        drr_line = "📊 ДРР: нет данных"
+    else:
+        ads_line = f"📣 Расход РК: {_tg_fmt_money(cur['ad_spend'])}  {_tg_arrow_abs(cur['ad_spend'], prev['ad_spend'], ' ₽', colored=True)}"
+        drr_line = f"📊 ДРР: {_tg_fmt_pct(cur['drr'])}  {_tg_arrow_pct(cur['drr'], prev['drr'], lower_bad=True, colored=True)}"
+
+    if cur.get("demand_missing"):
+        demand_line = f"🔎 Спрос WB: нет данных за {label} (последняя дата спроса: {_max_day(demand_df)})"
+    else:
+        demand_line = f"🔎 Спрос WB: {_tg_fmt_num(cur['demand'])}  {_tg_arrow_pct(cur['demand'], prev['demand'], lower_bad=False, colored=True)}"
+
+    lines = [
+        f"TOPFACE — {label}",
+        "",
+        f"💰 Сумма заказов: {_tg_fmt_money(cur['order_sum'])}  {_tg_arrow_abs(cur['order_sum'], prev['order_sum'], ' ₽', colored=True)}",
+        f"💼 Валовая прибыль: {_tg_fmt_money(cur_gp)}  {_tg_arrow_abs(cur_gp, prev_gp, ' ₽', colored=True)}",
+        ads_line,
+        drr_line,
+        demand_line,
+    ]
+    return "\n".join(lines)
+
+
+def send_telegram_message(text: str) -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        log("Telegram: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы, текстовая сводка пропущена")
+        return False
+    if not text:
+        log("Telegram: пустая текстовая сводка, отправка пропущена")
+        return False
+    import urllib.parse
+    import urllib.request
+    fields = {"chat_id": chat_id, "text": text}
+    thread_id = os.getenv("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+    if thread_id:
+        fields["message_thread_id"] = thread_id
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body_resp = resp.read().decode("utf-8", errors="replace")[:500]
+            ok = 200 <= resp.status < 300
+            log(f"Telegram: daily summary {'sent' if ok else 'failed'} status={resp.status} response={body_resp}")
+            return ok
+    except Exception as exc:
+        log(f"Telegram: ошибка отправки текстовой сводки: {exc}")
+        return False
+
+
+def _parse_sales_pdf_report_date(file_name: str, latest_day: pd.Timestamp) -> Optional[pd.Timestamp]:
+    m = re.match(r"^Отчет по продажам Влад\s+(\d{1,2})\s+([а-яА-ЯёЁ]+)\.pdf$", file_name.strip())
+    if not m:
+        return None
+    day = int(m.group(1))
+    month = TELEGRAM_REPORT_MONTHS_RU.get(m.group(2).lower())
+    if not month:
+        return None
+    year = int(pd.Timestamp(latest_day).year)
+    try:
+        d = pd.Timestamp(date(year, month, day)).normalize()
+        # Around New Year, keep date inference sane.
+        if d > pd.Timestamp(latest_day).normalize() + pd.Timedelta(days=31):
+            d = pd.Timestamp(date(year - 1, month, day)).normalize()
+        return d
+    except Exception:
+        return None
+
+
+def cleanup_non_monday_sales_pdfs(storage: Storage, outputs: Dict[str, Any], keep_current_file_name: str) -> None:
+    """Delete old daily PDF reports from OUT_DIR, preserving Monday reports and the current PDF."""
+    enabled = os.getenv("WB_KEEP_ONLY_MONDAY_REPORTS", "1").strip().lower() in {"1", "true", "yes", "y"}
+    if not enabled:
+        log("cleanup: WB_KEEP_ONLY_MONDAY_REPORTS=0, старые PDF не удаляются")
+        return
+    if not getattr(storage, "is_s3", False):
+        log("cleanup: local mode, S3 PDF cleanup skipped")
+        return
+    latest_day = _max_report_day_from_outputs(outputs)
+    deleted = 0
+    kept_monday = 0
+    kept_current = 0
+    for key in storage.list_files(OUT_DIR):
+        name = Path(key).name
+        if not name.startswith("Отчет по продажам Влад ") or not name.endswith(".pdf"):
+            continue
+        if name == keep_current_file_name:
+            kept_current += 1
+            continue
+        d = _parse_sales_pdf_report_date(name, latest_day)
+        if d is None:
+            continue
+        if d.weekday() == 0:
+            kept_monday += 1
+            continue
+        # Do not touch reports that look newer than the current report date.
+        if d > pd.Timestamp(latest_day).normalize():
+            continue
+        try:
+            storage.delete_file(key)
+            deleted += 1
+            log(f"cleanup: deleted non-Monday daily PDF: {key}")
+        except Exception as exc:
+            log(f"WARN cleanup: не удалось удалить {key}: {exc}")
+    log(f"cleanup: done, deleted={deleted}, kept_monday={kept_monday}, kept_current={kept_current}")
+
+
+def send_telegram_report(outputs: Dict[str, Any], pdf_path: Path, caption: str = "", storage: Optional[Storage] = None) -> bool:
+    msg_ok = send_telegram_message(build_telegram_daily_summary(outputs))
+    doc_ok = send_telegram_document(pdf_path, caption)
+    if doc_ok and storage is not None:
+        cleanup_non_monday_sales_pdfs(storage, outputs, pdf_path.name)
+    strict_msg = os.getenv("WB_TELEGRAM_STRICT_MESSAGE", "0").strip().lower() in {"1", "true", "yes", "y"}
+    return bool(doc_ok and (msg_ok or not strict_msg))
+
+def send_telegram_document(file_path: Path, caption: str = "") -> bool:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not file_path.exists():
+        log(f"Telegram: файл не найден, отправка невозможна: {file_path}")
+        return False
+    if not token or not chat_id:
+        log("Telegram: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы, отправка пропущена")
+        return False
+    log(f"Telegram: отправка PDF file={file_path.name} size={file_path.stat().st_size:,} bytes chat_id={chat_id}")
+    import urllib.request
+    import uuid
+    boundary = "----WebKitFormBoundary" + uuid.uuid4().hex
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    fields = {"chat_id": chat_id, "caption": caption[:1000]}
+    thread_id = os.getenv("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+    if thread_id:
+        fields["message_thread_id"] = thread_id
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    data = file_path.read_bytes()
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(f'Content-Disposition: form-data; name="document"; filename="{file_path.name}"\r\n'.encode())
+    body.extend(b"Content-Type: application/pdf\r\n\r\n")
+    body.extend(data)
+    body.extend(f"\r\n--{boundary}--\r\n".encode())
+    req = urllib.request.Request(url, data=bytes(body), headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body_resp = resp.read().decode("utf-8", errors="replace")[:500]
+            ok = 200 <= resp.status < 300
+            log(f"Telegram: {'sent' if ok else 'failed'} status={resp.status} response={body_resp}")
+            return ok
+    except Exception as exc:
+        log(f"Telegram: ошибка отправки PDF: {exc}")
+        return False
+
+
+
+
+def run_smoke_test(root: str = ".") -> None:
+    """Fast self-test: no S3, no heavy Excel parsing, finishes in seconds.
+
+    Purpose: verify that the current code version imports, builds the PDF renderer,
+    handles the management-report data model, writes local PDF/XLSX artifacts, and exits 0.
+    It intentionally uses tiny synthetic data for March-April-May so the closed-month,
+    current-week and previous-week PDF contours are all exercised.
+    """
+    log("SMOKE_TEST: start synthetic report test; S3 is not used")
+    local_dir = Path(root) / OUT_DIR
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    latest = pd.Timestamp("2026-05-25")
+    days = pd.date_range("2026-03-01", latest, freq="D")
+    entities = [
+        ("Кисти косметические", "901", "901/5", 110254021),
+        ("Косметические карандаши", "605", "605/1", 213000001),
+        ("Помады", "154", "154/1", 101000001),
+        ("Блески", "207", "207/1", 102000001),
+    ]
+    rows = []
+    for subject, product, article, nm_id in entities:
+        base = 9000 if product == "901" else 5000 if subject == "Косметические карандаши" else 3500
+        for d in days:
+            weekday_mult = 1.15 if d.weekday() in (0, 1, 2) else 0.85
+            order_sum = base * weekday_mult
+            orders = max(1, int(order_sum / 450))
+            ad_spend = order_sum * (0.11 if subject in {"Кисти косметические", "Косметические карандаши"} else 0.14)
+            rows.append({
+                "day": d,
+                "subject": subject,
+                "product": product,
+                "supplier_article": article,
+                "nm_id": nm_id,
+                "orders": orders,
+                "order_sum": order_sum,
+                "gross_profit_model": order_sum * 0.32,
+                "open_cards": orders * 28,
+                "add_to_cart": orders * 7,
+                "search_frequency": orders * 450,
+                "search_traffic_capture_pct": 6.2,
+                "direct_localization_pct": 66.0,
+                "localization_with_replacements_pct": 91.0,
+                "rating_reviews": 4.8,
+                "finished_price": 450.0,
+                "price_with_disc": 430.0,
+                "spp": 12.0,
+                "commission_%": 18.0,
+                "acquiring_%": 1.5,
+                "logistics_direct": 38.0,
+                "storage": 4.0,
+                "other_costs": 8.0,
+                "cost": 120.0,
+                "cart_conv_pct": 25.0,
+                "order_conv_pct": 28.0,
+                "manual_spend": ad_spend * 0.65,
+                "unified_spend": ad_spend * 0.35,
+                "unknown_spend": 0.0,
+                "manual_clicks": max(1, int(ad_spend * 0.65 / 14)),
+                "unified_clicks": max(1, int(ad_spend * 0.35 / 18)),
+                "unknown_clicks": 0,
+                "manual_impressions": max(1, int(ad_spend * 0.65 / 14 / 0.035)),
+                "unified_impressions": max(1, int(ad_spend * 0.35 / 18 / 0.03)),
+                "unknown_impressions": 0,
+                "ad_spend_model": ad_spend,
+            })
+    daily = pd.DataFrame(rows)
+
+    # Unique demand for all levels and all days: this prevents strict demand crashes.
+    demand_rows = []
+    subj_disp_map = {"Кисти косметические": "Кисти", "Косметические карандаши": "Карандаши", "Помады": "Помады", "Блески": "Блески"}
+    for _, r in daily.iterrows():
+        sf = float(r["search_frequency"])
+        common = {"day": r["day"], "subject": r["subject"], "subject_disp": subj_disp_map[r["subject"]], "unique_search_frequency": sf, "unique_search_queries": 3, "duplicate_query_rows_removed": 1, "raw_query_rows": 4}
+        demand_rows.append({**common, "level": "category"})
+        demand_rows.append({**common, "level": "product", "product": r["product"], "product_code": r["product"]})
+        demand_rows.append({**common, "level": "article", "product": r["product"], "product_code": r["product"], "supplier_article": r["supplier_article"], "nm_id": r["nm_id"]})
+    search_unique = pd.DataFrame(demand_rows)
+
+    ads = daily[["day", "subject", "product", "supplier_article", "nm_id"]].copy()
+    ads["spend"] = daily[["manual_spend", "unified_spend", "unknown_spend"]].sum(axis=1)
+    ads["clicks"] = daily[["manual_clicks", "unified_clicks", "unknown_clicks"]].sum(axis=1)
+    ads["impressions"] = daily[["manual_impressions", "unified_impressions", "unknown_impressions"]].sum(axis=1)
+
+    # Exact ABC periods for weekly and monthly contours.
+    abc_rows = []
+    periods = [
+        (pd.Timestamp("2026-05-18"), pd.Timestamp("2026-05-24"), "weekly"),
+        (pd.Timestamp("2026-05-11"), pd.Timestamp("2026-05-17"), "weekly"),
+        (pd.Timestamp("2026-04-01"), pd.Timestamp("2026-04-30"), "monthly"),
+        (pd.Timestamp("2026-03-01"), pd.Timestamp("2026-03-31"), "monthly"),
+    ]
+    for start, end, kind in periods:
+        part = daily[(daily["day"] >= start) & (daily["day"] <= end)]
+        for keys, g in part.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
+            subject, product, article, nm_id = keys
+            gross_revenue = float(g["order_sum"].sum())
+            abc_rows.append({
+                "period_start": start,
+                "period_end": end,
+                "week_code": week_code(start),
+                "week_label": f"{start:%d.%m}-{end:%d.%m}",
+                "month_key": month_key(start),
+                "subject": subject,
+                "product": product,
+                "supplier_article": article,
+                "nm_id": nm_id,
+                "gross_profit": gross_revenue * 0.32,
+                "gross_revenue": gross_revenue,
+                "orders": float(g["orders"].sum()),
+                "abc_margin_pct": 32.0,
+                "abc_drr_pct": 12.0,
+                "abc_commission_amount": gross_revenue * 0.18,
+                "abc_acquiring_amount": gross_revenue * 0.015,
+            })
+    abc = pd.DataFrame(abc_rows)
+    abc_weekly = abc[abc["period_start"].isin([pd.Timestamp("2026-05-18"), pd.Timestamp("2026-05-11")])].copy()
+    abc_monthly = abc[abc["period_start"].isin([pd.Timestamp("2026-04-01"), pd.Timestamp("2026-03-01")])].copy()
+
+    outputs = {
+        "article_day_fact": daily,
+        "search_unique_demand": search_unique,
+        "ads_category_source": pd.DataFrame(),
+        "ads_raw_source": ads,
+        "ads_daily_source": ads,
+        "abc_weekly": abc_weekly,
+        "abc_monthly": abc_monthly,
+        "factor_bridge": pd.DataFrame(),
+        "entry_points_bridge": pd.DataFrame(),
+        "optimal_benchmarks": pd.DataFrame(),
+        "factor_summary_for_pdf": pd.DataFrame(),
     }
-    payload = dataframe_to_excel_bytes(sheets)
-    output_key = PREVIEW_OUTPUT_KEY if ctx.mode == "preview" else RUN_OUTPUT_KEY
-    upload_s3_bytes(s3_client, config.yc_bucket_name, output_key, payload, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    upload_s3_bytes(
-        s3_client,
-        config.yc_bucket_name,
-        SUMMARY_JSON_KEY,
-        json.dumps(summary, ensure_ascii=False, indent=2).encode("utf-8"),
-        content_type="application/json; charset=utf-8",
+    pdf_path = local_dir / "SMOKE_TEST_Управленческий_отчет_TOPFACE.pdf"
+    pdf_created = generate_management_pdf(outputs, pdf_path)
+    if not pdf_created or not pdf_path.exists() or pdf_path.stat().st_size < 10_000:
+        raise RuntimeError(f"SMOKE_TEST failed: PDF не создан или слишком маленький: {pdf_path}")
+    tg_preview = build_telegram_daily_summary(outputs)
+    if "Сумма заказов" not in tg_preview or "Расход РК" not in tg_preview or "ДРР" not in tg_preview:
+        raise RuntimeError(f"SMOKE_TEST failed: Telegram daily summary invalid: {tg_preview[:200]}")
+    log("SMOKE_TEST_OK: Telegram daily summary built")
+    ok_path = local_dir / "SMOKE_TEST_OK.txt"
+    ok_path.write_text(
+        "SMOKE_TEST_OK\n"
+        f"time={datetime.now():%Y-%m-%d %H:%M:%S}\n"
+        f"pdf={pdf_path}\n"
+        f"pdf_size={pdf_path.stat().st_size}\n",
+        encoding="utf-8",
     )
-    return summary
+    log(f"SMOKE_TEST_OK: PDF={pdf_path} size={pdf_path.stat().st_size:,} bytes")
 
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default=".", help="Local root used for local copies and local mode")
+    parser.add_argument("--reports-root", default="Отчёты")
+    parser.add_argument("--store", default="TOPFACE")
+    parser.add_argument("--no-pdf", action="store_true", help="Не формировать PDF")
+    parser.add_argument("--pdf-only", action="store_true", help="Сформировать только PDF из уже готовых Excel-файлов без пересчета источников")
+    parser.add_argument("--current-week-only", action="store_true", help="Быстро обновить только оперативный блок текущей недели из кэша/свежих данных")
+    parser.add_argument("--full-refresh", action="store_true", help="Явный полный пересчет всех источников; синоним обычного запуска")
+    parser.add_argument("--send-telegram", action="store_true", help="Отправить PDF в Telegram через TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID")
+    parser.add_argument("--smoke-test", action="store_true", help="Быстрый синтетический тест PDF/кода без S3 и тяжелых Excel; должен занимать секунды")
+    parser.add_argument("--preflight-date-check", action="store_true", help="Быстрая проверка реальных orders/funnel/ads за нужную дату перед тяжелым отчетом")
+    args = parser.parse_args()
+    if args.smoke_test:
+        run_smoke_test(args.root)
+        return
+    if args.preflight_date_check:
+        run_preflight_date_check(args.root, args.reports_root, args.store)
+        return
+    diagnostics = Diagnostics()
+    storage = make_storage(args.root)
+    local_dir = Path(args.root) / OUT_DIR
+    if args.current_week_only:
+        # Lightweight daily mode: load cached full-report outputs, then refresh only current-week
+        # operational rows from a limited set of current-week source files. It does NOT rebuild ABC/month/year details.
+        local_dir.mkdir(parents=True, exist_ok=True)
+        outputs = load_existing_outputs_for_pdf(storage, local_dir, args.reports_root, args.store, diagnostics)
+        os.environ["WB_CURRENT_WEEK_ONLY"] = "1"
+        try:
+            loader = Loader(storage, args.reports_root, args.store, diagnostics)
+            pack = loader.load_all()
+            builder = AnalyticsBuilder(pack)
+            upd = builder.build_all()
+            refreshed = upd.get("article_day_fact", pd.DataFrame())
+            if refreshed is not None and not refreshed.empty and "day" in refreshed.columns:
+                refreshed = refreshed.copy()
+                refreshed["day"] = pd.to_datetime(refreshed["day"], errors="coerce").dt.normalize()
+                latest = refreshed["day"].max()
+                cw_start = latest - pd.Timedelta(days=int(pd.Timestamp(latest).weekday()))
+                cw_end = cw_start + pd.Timedelta(days=6)
+                log(f"current_week_only: refresh cache dates {cw_start.date()}..{cw_end.date()} using limited source load")
+                for name in ["article_day_fact", "manager_reference", "manager_orders_source", "manager_search_source", "manager_ads_category_source", "manager_ads_daily_source", "manager_abc_source", "search_unique_demand", "ads_category_source", "ads_raw_source", "ads_daily_source"]:
+                    new_df = upd.get(name, pd.DataFrame())
+                    old_df = outputs.get(name, pd.DataFrame())
+                    if new_df is None or new_df.empty or "day" not in new_df.columns:
+                        continue
+                    new_df = new_df.copy(); new_df["day"] = pd.to_datetime(new_df["day"], errors="coerce").dt.normalize()
+                    new_df = new_df[(new_df["day"] >= cw_start) & (new_df["day"] <= cw_end)].copy()
+                    if old_df is not None and not old_df.empty and "day" in old_df.columns:
+                        old_df = old_df.copy(); old_df["day"] = pd.to_datetime(old_df["day"], errors="coerce").dt.normalize()
+                        old_df = old_df[~((old_df["day"] >= cw_start) & (old_df["day"] <= cw_end))].copy()
+                        outputs[name] = pd.concat([old_df, new_df], ignore_index=True, sort=False)
+                    else:
+                        outputs[name] = new_df
+                    log(f"current_week_only: merged {name}, new_rows={len(new_df):,}")
+            else:
+                log("current_week_only: WARN no refreshed article_day_fact rows; PDF will be rebuilt from existing cache only")
+        except Exception as exc:
+            log(f"current_week_only: WARN limited refresh failed, using existing cache only: {exc}")
+        _apply_auto_complete_report_date(outputs, "current_week_only")
+        _require_report_data_available(outputs, "current_week_only")
+        pdf_path = local_dir / sales_pdf_report_name(outputs)
+        pdf_created = generate_management_pdf(outputs, pdf_path)
+        if not pdf_created or not pdf_path.exists():
+            raise RuntimeError(f"PDF не создан: {pdf_path}")
+        log(f"Saved local PDF current-week-only: {pdf_path}")
+        if storage.is_s3:
+            storage.write_bytes(f"{OUT_DIR}/{pdf_path.name}", pdf_path.read_bytes())
+            log(f"Saved: {OUT_DIR}/{pdf_path.name}")
+            trace_path = pdf_path.parent / PDF_CALC_TRACE_NAME
+            if trace_path.exists():
+                storage.write_bytes(f"{OUT_DIR}/{trace_path.name}", trace_path.read_bytes())
+                log(f"Saved: {OUT_DIR}/{trace_path.name}")
+        if args.send_telegram:
+            caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
+            if not send_telegram_report(outputs, pdf_path, caption, storage=storage):
+                raise RuntimeError("Telegram: отчет не отправлен")
+        log("Done")
+        return
+    if args.pdf_only:
+        if args.no_pdf:
+            raise SystemExit("Нельзя одновременно использовать --pdf-only и --no-pdf")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        outputs = load_existing_outputs_for_pdf(storage, local_dir, args.reports_root, args.store, diagnostics)
+        _require_report_data_available(outputs, "pdf_only")
+        pdf_path = local_dir / sales_pdf_report_name(outputs)
+        pdf_created = generate_management_pdf(outputs, pdf_path)
+        if not pdf_created or not pdf_path.exists():
+            raise RuntimeError(f"PDF не создан: {pdf_path}")
+        log(f"Saved local PDF: {pdf_path}")
+        if storage.is_s3:
+            storage.write_bytes(f"{OUT_DIR}/{pdf_path.name}", pdf_path.read_bytes())
+            log(f"Saved: {OUT_DIR}/{pdf_path.name}")
+            audit_path = pdf_path.parent / PRODUCT_GROUP_AUDIT_NAME
+            if audit_path.exists():
+                storage.write_bytes(f"{OUT_DIR}/{audit_path.name}", audit_path.read_bytes())
+                log(f"Saved: {OUT_DIR}/{audit_path.name}")
+            trace_path = pdf_path.parent / PDF_CALC_TRACE_NAME
+            if trace_path.exists():
+                storage.write_bytes(f"{OUT_DIR}/{trace_path.name}", trace_path.read_bytes())
+                log(f"Saved: {OUT_DIR}/{trace_path.name}")
+        if args.send_telegram:
+            caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
+            if not send_telegram_report(outputs, pdf_path, caption, storage=storage):
+                raise RuntimeError("Telegram: отчет не отправлен")
+        log("Done")
+        return
+    loader = Loader(storage, args.reports_root, args.store, diagnostics)
+    pack = loader.load_all()
+    builder = AnalyticsBuilder(pack)
+    outputs = builder.build_all()
+    # Store ABC in the same canonical nmId/article contour as daily rows.
+    # Otherwise PDF exact ABC joins can split one WB article into 901/20 and 901_/20.
+    outputs["abc_weekly"] = builder.enrich(builder.pack.abc_weekly, "abc_weekly")
+    outputs["abc_monthly"] = builder.enrich(builder.pack.abc_monthly, "abc_monthly")
+    factor_outputs = build_factor_outputs(builder, outputs)
+    outputs.update(factor_outputs)
+    _require_report_data_available(outputs, "full_refresh")
+    local_dir = Path(args.root) / OUT_DIR
+    paths = export_outputs(outputs, local_dir)
+    # Отдельный техфайл по денежному факторному мосту, чтобы не ломать основные Excel-структуры.
+    factor_path = local_dir / FACTOR_REPORT_NAME
+    write_factor_report(factor_path, factor_outputs)
+    paths.append(factor_path)
 
-# =============================
-# CLI и main
-# =============================
+    # Save heavy Excel outputs before PDF generation. If the PDF block fails, the 20-minute
+    # source refresh is not lost and a follow-up --pdf-only/current-week run can reuse the cache.
+    pre_pdf_paths = list(paths)
+    if storage.is_s3:
+        for p in pre_pdf_paths:
+            storage.write_bytes(f"{OUT_DIR}/{p.name}", p.read_bytes())
+            log(f"Saved pre-PDF: {OUT_DIR}/{p.name}")
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WB TOPFACE strict ad bid manager")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    preview = subparsers.add_parser("preview", help="Предпросмотр без отправки изменений ставок")
-    preview.set_defaults(dry_run=False, apply_pause=False, apply_start=False, apply_price=False, apply_experiment=False, skip_price=False, night_experiment_only=False, night_experiment_slot="auto")
-
-    run = subparsers.add_parser("run", help="Боевой расчёт и отправка изменений ставок")
-    run.add_argument("--dry-run", action="store_true", help="Расчёт run-режима без реальных API-вызовов")
-    run.add_argument("--apply-pause", action="store_true", help="Разрешить отправку pause для кандидатов")
-    run.add_argument("--apply-start", action="store_true", help="Разрешить отправку start для кандидатов")
-    run.add_argument("--apply-price", action="store_true", help="Разрешить отправку изменений скидки продавца через Discounts & Prices API")
-    run.add_argument("--apply-experiment", action="store_true", help="Разрешить применение экспериментального блока 1 РК на товарную группу")
-    run.add_argument("--skip-price", action="store_true", help="Не строить контур цен в этом запуске")
-    run.add_argument("--night-experiment-only", action="store_true", help="Ночной режим: отправлять только действия Эксперимент 1/2, без обычных изменений ставок")
-    run.add_argument("--night-experiment-slot", choices=["auto", "start", "end"], default=os.environ.get("WB_NIGHT_EXPERIMENT_SLOT", "auto"), help="Слот ночного запуска: start=01:00, end=05:00, auto=по фактическому времени МСК")
-    return parser.parse_args(argv)
-
-
-def print_summary(summary: Dict[str, Any]) -> None:
-    print("=== Сводка запуска ===")
-    for key, value in summary.items():
-        print(f"{key}: {value}")
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    config = load_config()
-    ctx = build_run_context(args)
-    s3_client = make_s3_client(config)
-
-    print(f"[{ctx.run_datetime:%Y-%m-%d %H:%M:%S}] Старт {SCRIPT_NAME}: версия={SCRIPT_VERSION}, режим={ctx.mode}, dry_run={ctx.dry_run}, night_experiment_only={ctx.night_experiment_only}, night_experiment_slot={ctx.night_experiment_slot}")
-    print(f"Окна: база {ctx.base_start}..{ctx.base_end}; текущее {ctx.current_start}..{ctx.current_end}; mature_end={ctx.mature_end}")
-
-    ads_df = load_ads_report(s3_client, config)
-    print(f"Рекламный отчёт загружен: {len(ads_df):,} строк".replace(",", " "))
-
-    keyword_df = load_keyword_positions(s3_client, config)
-    keyword_core_df = classify_core_keywords(keyword_df, ctx)
-    print(
-        f"Мониторинг ключевых фраз: строк={len(keyword_df):,}; CORE_80={int((keyword_core_df.get('keyword_group', pd.Series(dtype=str)) == 'CORE_80').sum()) if not keyword_core_df.empty else 0}".replace(",", " "),
-        flush=True,
-    )
-
-    funnel_df = load_funnel_report(s3_client, config)
-    print(f"Воронка продаж загружена для анализа конверсий: {len(funnel_df):,} строк".replace(",", " "), flush=True)
-
-    economics_df = load_economics_report(s3_client, config)
-    abc_profitability_df = load_abc_profitability_report(s3_client, config)
-    ads_df = enrich_ads_with_estimated_gp(ads_df, economics_df)
-
-    bid_history_raw = load_bid_history(s3_client, config)
-    pause_history_raw = load_pause_history(s3_client, config)
-    # Контур цен отключён: внешний репрайсер управляет ценами. Историю цен не читаем и не перезаписываем.
-    price_history_raw = pd.DataFrame(columns=PRICE_HISTORY_COLUMNS)
-    bid_history = filter_bid_history_managed_only(bid_history_raw, ads_df)
-    pause_history = filter_pause_history_managed_only(pause_history_raw, ads_df)
-    print(
-        (
-            f"История ставок: {len(bid_history):,} строк из {len(bid_history_raw):,} после фильтра 4 предметов; "
-            f"история пауз: {len(pause_history):,} строк из {len(pause_history_raw):,} после фильтра 4 предметов; "
-            f"контур цен: отключён, история цен не читается"
-        ).replace(",", " ")
-    )
-
-    bid_history, effect_df = evaluate_postchecks(ads_df, bid_history, ctx)
-    keyword_effects_df = build_keyword_effects(bid_history, keyword_df, keyword_core_df, ctx)
-    bid_history = apply_keyword_effect_risk_to_bid_history(bid_history, keyword_effects_df)
-    effect_df = enrich_effects_with_keyword_monitoring(effect_df, keyword_effects_df)
-    keyword_guard_df, keyword_loss_detail_df = build_keyword_traffic_guard(keyword_df, keyword_core_df, ctx)
-    if not keyword_guard_df.empty:
-        print("Диагностика CORE-кликов: " + json.dumps(keyword_guard_df.get("keyword_guard_status", pd.Series(dtype=str)).astype(str).value_counts().to_dict(), ensure_ascii=False), flush=True)
-
-    # Price post-check отключён: цены ведёт внешний репрайсер.
-    price_history = pd.DataFrame(columns=PRICE_HISTORY_COLUMNS)
-    price_effects_df = pd.DataFrame()
-
-    pending_events = load_pending_events(bid_history, ctx)
-    postcheck_results = latest_postcheck_results(bid_history)
-
-    metrics_df = aggregate_campaign_metrics(ads_df, ctx)
-    metrics_df = enrich_supplier_articles_from_economics(metrics_df, economics_df)
-    metrics_df = enrich_metrics_with_abc_profitability(metrics_df, abc_profitability_df)
-    metrics_df = enrich_metrics_with_keyword_traffic_guard(metrics_df, keyword_guard_df)
-    print(f"Диагностика агрегации: строк метрик={len(metrics_df)}", flush=True)
-    if not metrics_df.empty:
-        print("Диагностика метрик по статусам: " + json.dumps(metrics_df.get("campaign_status", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-        print("Диагностика метрик по предметам: " + json.dumps(metrics_df.get("subject_norm", pd.Series(dtype=str)).map(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-    ramp_states = build_ramp_lifecycle_states(bid_history, ctx)
-    # Сначала получаем минимальные ставки WB/effective min, затем строим решения.
-    # Особенно важно для combined/полок: сейчас минимум WB = 80 ₽.
-    min_bids_df, min_bid_api_log = fetch_wb_min_bids_for_decisions(metrics_df, config, ctx)
-    metrics_df = enrich_frame_with_effective_min_bids(metrics_df, min_bids_df)
-    decisions = build_decisions(metrics_df, pending_events, postcheck_results, ctx, ramp_states)
-    decisions = enrich_supplier_articles_from_economics(decisions, economics_df)
-    decisions = enrich_decisions_with_min_bids(decisions, min_bids_df)
-    decisions, ramp_selection = select_ramp_campaigns_per_product_placement(decisions)
-    decisions = apply_night_bid_experiment_rules(decisions, ctx)
-    if not min_bids_df.empty:
-        print(f"Диагностика WB min bids: получено строк={len(min_bids_df)}", flush=True)
-    if ramp_selection is not None and not ramp_selection.empty:
-        print(f"Диагностика разгона: выбранных РК товар+тип={len(ramp_selection)}", flush=True)
-    if is_night_experiment_window(ctx):
-        exp1_count = int(decisions.get("reason_code", pd.Series(dtype=str)).astype(str).eq(EXPERIMENT_1_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0
-        print(f"Диагностика ночных экспериментов: окно {night_experiment_window_text()} активно; Эксперимент 1 строк={exp1_count}", flush=True)
-    if not decisions.empty:
-        print("Диагностика решений action: " + json.dumps(decisions["action"].value_counts().to_dict(), ensure_ascii=False), flush=True)
-        print("Диагностика решений reason_code: " + json.dumps(decisions["reason_code"].value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-
-    bid_ramp_monitor = build_bid_ramp_monitor(decisions)
-    if not bid_ramp_monitor.empty:
-        print(f"Диагностика разгона показов до API: строк статуса={len(bid_ramp_monitor)}", flush=True)
-
-    one_campaign_experiment = build_one_campaign_experiment(metrics_df, keyword_core_df)
-    if not one_campaign_experiment.empty:
-        print(f"Диагностика эксперимента 1РК: товарных групп={len(one_campaign_experiment)}", flush=True)
-
-    price_list_api_log = pd.DataFrame()
-    price_decisions = pd.DataFrame(columns=PRICE_DECISION_COLUMNS)
-    applied_price_changes = pd.DataFrame()
-    price_api_log = pd.DataFrame()
-    rename_plan = pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
-    rename_api_log = pd.DataFrame()
-    goods_prices = pd.DataFrame()
-    print("Контур цен отключён: корректировка скидок/цен не строится, Discounts & Prices API не вызывается", flush=True)
-
-    # Переименование РК отключено: кампании уже вернули к артикулам, больше не отправляем /adv/v0/rename.
-    rename_plan = pd.DataFrame(columns=RENAME_CAMPAIGN_COLUMNS)
-    rename_api_log = pd.DataFrame()
-    decisions = enrich_supplier_articles_from_economics(decisions, economics_df)
-
-    pause_candidates = build_pause_candidates(decisions, bid_history)
-    experiment2_pause_candidates = build_experiment_2_pause_candidates(decisions, ctx)
-    if experiment2_pause_candidates is not None and not experiment2_pause_candidates.empty:
-        pause_candidates = pd.concat([pause_candidates, experiment2_pause_candidates], ignore_index=True, sort=False)
-        print(f"Диагностика Эксперимент 2: ночных кандидатов на паузу combined={len(experiment2_pause_candidates)}", flush=True)
-
-    if ctx.apply_experiment and one_campaign_experiment is not None and not one_campaign_experiment.empty:
-        experiment_bid_decisions = build_experiment_bid_decisions(one_campaign_experiment, decisions)
-        if not experiment_bid_decisions.empty:
-            exp_keys = set(experiment_bid_decisions.apply(make_key, axis=1).tolist())
-            decisions = decisions.loc[~decisions.apply(lambda r: make_key(r) in exp_keys, axis=1)].copy() if not decisions.empty else decisions
-            decisions = pd.concat([decisions, experiment_bid_decisions], ignore_index=True, sort=False)
-            decisions = enrich_decisions_with_min_bids(decisions, min_bids_df)
-            decisions, ramp_selection = select_ramp_campaigns_per_product_placement(decisions)
-            decisions = apply_night_bid_experiment_rules(decisions, ctx)
-            print(f"Диагностика эксперимента 1РК: ставок к применению={len(experiment_bid_decisions)}", flush=True)
-        experiment_pause_candidates = build_experiment_pause_candidates(one_campaign_experiment, metrics_df)
-        if not experiment_pause_candidates.empty:
-            pause_candidates = pd.concat([pause_candidates, experiment_pause_candidates], ignore_index=True, sort=False)
-            print(f"Диагностика эксперимента 1РК: пауз кандидатов={len(experiment_pause_candidates)}", flush=True)
-
-    if bool(getattr(ctx, "night_experiment_only", False)):
-        decisions = filter_decisions_for_night_experiment_only(decisions, ctx)
-        if decisions is not None and not decisions.empty:
-            print("Диагностика night_experiment_only по ставкам: " + json.dumps(decisions.get("reason_code", pd.Series(dtype=str)).astype(str).value_counts().head(10).to_dict(), ensure_ascii=False), flush=True)
-        pause_candidates = filter_pause_candidates_for_night_experiment_only(pause_candidates, ctx)
-        print(f"Диагностика night_experiment_only по паузам: к API допущено {len(pause_candidates)} строк Эксперимента 2", flush=True)
-
-    successful_changes, bid_api_log = apply_bid_changes(decisions, config, ctx)
-    bid_history = record_bid_events(successful_changes, bid_history, ctx)
-    decisions = enrich_decisions_with_bid_api_status(decisions, successful_changes)
-    bid_campaign_compare = build_campaign_7d_comparison(
-        decisions=decisions,
-        bid_history=bid_history,
-        ads_df=ads_df,
-        keyword_df=keyword_df,
-        keyword_core_df=keyword_core_df,
-        funnel_df=funnel_df,
-        effect_df=effect_df,
-        ctx=ctx,
-    )
-    if not bid_campaign_compare.empty:
-        print(f"Диагностика сравнения РК 7д: строк={len(bid_campaign_compare)}", flush=True)
-    bid_ramp_monitor = build_bid_ramp_monitor(decisions)
-    if not bid_ramp_monitor.empty:
-        print("Диагностика разгона статус: " + json.dumps(bid_ramp_monitor["ramp_mode_status"].value_counts().to_dict(), ensure_ascii=False), flush=True)
-
-    applied_pauses, pause_api_log = apply_pause_actions(pause_candidates, config, ctx)
-    if not applied_pauses.empty:
-        pause_history = pd.concat([pause_history, applied_pauses[PAUSE_HISTORY_COLUMNS]], ignore_index=True, sort=False)
-
-    normal_start_candidates = build_start_candidates(pause_history, ads_df, ctx)
-    experiment2_start_candidates = build_experiment_2_start_candidates(pause_history, ctx)
-    rollback_start_candidates = build_wrong_subject_pause_rollback_candidates(pause_history_raw, ads_df, ctx)
-    if not experiment2_start_candidates.empty:
-        print(f"Диагностика Эксперимент 2: кандидатов на запуск после ночного окна={len(experiment2_start_candidates)}", flush=True)
-    if not rollback_start_candidates.empty:
-        print(f"Диагностика rollback ошибочных пауз вне 4 предметов: кандидатов на запуск={len(rollback_start_candidates)}", flush=True)
-    start_candidates = pd.concat(
-        [df for df in [normal_start_candidates, experiment2_start_candidates, rollback_start_candidates] if df is not None and not df.empty],
-        ignore_index=True,
-        sort=False,
-    ) if any(df is not None and not df.empty for df in [normal_start_candidates, experiment2_start_candidates, rollback_start_candidates]) else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS)
-    if bool(getattr(ctx, "night_experiment_only", False)):
-        start_candidates = filter_start_candidates_for_night_experiment_only(start_candidates, ctx)
-        print(f"Диагностика night_experiment_only по запускам: к API допущено {len(start_candidates)} строк Эксперимента 2", flush=True)
-
-    applied_starts, start_api_log = apply_start_actions(start_candidates, config, ctx)
-    if not applied_starts.empty:
-        pause_history = pd.concat([pause_history, applied_starts[PAUSE_HISTORY_COLUMNS]], ignore_index=True, sort=False)
-
-    all_api_log = pd.concat(
-        [df for df in [min_bid_api_log, bid_api_log, pause_api_log, start_api_log, price_list_api_log, price_api_log, rename_api_log] if df is not None and not df.empty],
-        ignore_index=True,
-        sort=False,
-    ) if any(df is not None and not df.empty for df in [min_bid_api_log, bid_api_log, pause_api_log, start_api_log, price_list_api_log, price_api_log, rename_api_log]) else pd.DataFrame()
-    full_api_log = append_api_log_to_s3(s3_client, config, all_api_log)
-
-    save_table_to_s3_excel(s3_client, config, BID_HISTORY_KEY, bid_history[BID_HISTORY_COLUMNS])
-    save_table_to_s3_excel(s3_client, config, PAUSE_HISTORY_KEY, pause_history[PAUSE_HISTORY_COLUMNS] if not pause_history.empty else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS))
-    if PRICE_CORRECTION_ENABLED:
-        save_table_to_s3_excel(s3_client, config, PRICE_HISTORY_KEY, price_history[PRICE_HISTORY_COLUMNS] if price_history is not None and not price_history.empty else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS))
-
-    summary = write_outputs(
-        s3_client=s3_client,
-        config=config,
-        ctx=ctx,
-        decisions=decisions,
-        bid_history=bid_history[BID_HISTORY_COLUMNS],
-        effect_df=effect_df,
-        pause_candidates=pause_candidates,
-        pause_history=pause_history[PAUSE_HISTORY_COLUMNS] if not pause_history.empty else pd.DataFrame(columns=PAUSE_HISTORY_COLUMNS),
-        successful_changes=successful_changes,
-        api_log=full_api_log,
-        start_candidates=start_candidates,
-        applied_pauses=applied_pauses,
-        applied_starts=applied_starts,
-        min_bids_df=min_bids_df,
-        keyword_core_df=keyword_core_df,
-        keyword_effects_df=keyword_effects_df,
-        keyword_loss_detail_df=keyword_loss_detail_df,
-        price_decisions=price_decisions,
-        price_history=price_history[PRICE_HISTORY_COLUMNS] if price_history is not None and not price_history.empty else pd.DataFrame(columns=PRICE_HISTORY_COLUMNS),
-        price_effects_df=price_effects_df,
-        applied_price_changes=applied_price_changes,
-        bid_ramp_monitor=bid_ramp_monitor,
-        ramp_selection=ramp_selection,
-        one_campaign_experiment=one_campaign_experiment,
-        rename_plan=rename_plan,
-        bid_campaign_compare=bid_campaign_compare,
-    )
-    print_summary(summary)
-    return 0
+    pdf_path = local_dir / sales_pdf_report_name(outputs)
+    if not args.no_pdf:
+        global builder_global_for_pdf
+        builder_global_for_pdf = builder
+        pdf_created = generate_management_pdf(outputs, pdf_path)
+        if pdf_created:
+            paths.append(pdf_path)
+            audit_path = pdf_path.parent / PRODUCT_GROUP_AUDIT_NAME
+            if audit_path.exists():
+                paths.append(audit_path)
+            trace_path = pdf_path.parent / PDF_CALC_TRACE_NAME
+            if trace_path.exists():
+                paths.append(trace_path)
+    log(f"Saved local copies: {local_dir}")
+    # Save PDF/audit/trace after PDF generation; Excel files were already saved pre-PDF.
+    if storage.is_s3:
+        already_saved = {str(p.resolve()) for p in pre_pdf_paths}
+        for p in paths:
+            if str(p.resolve()) in already_saved:
+                continue
+            storage.write_bytes(f"{OUT_DIR}/{p.name}", p.read_bytes())
+            log(f"Saved: {OUT_DIR}/{p.name}")
+    if args.send_telegram and pdf_path.exists():
+        caption = f"Отчет по продажам Влад {report_date_label_ru(outputs)}"
+        if not send_telegram_report(outputs, pdf_path, caption, storage=storage):
+            raise RuntimeError("Telegram: отчет не отправлен")
+    log("Done")
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:
-        print(f"ОШИБКА: {exc}", file=sys.stderr)
-        raise
+    main()
