@@ -1,5 +1,5 @@
 name: Daily TOPFACE sales report
-# FIX37_READY_GITHUB_UPLOAD_20260611: active workflow. Upload as .github/workflows/daily_report.yml
+# FIX45_ABC_1800_REPORT_1900_WAIT_ABC_20260611: active workflow. Upload as .github/workflows/daily_report.yml
 
 on:
   workflow_dispatch:
@@ -34,10 +34,10 @@ on:
         type: string
 
   schedule:
-    # План: PDF должен приходить около 15:00 по Москве.
-    # GitHub cron указывается в UTC. 11:35 UTC = 14:35 МСК.
-    # Отчёт обычно считается 15-25 минут, поэтому запуск ставим заранее.
-    - cron: "35 11 * * *"
+    # План: daily report запускается в 19:00 по Москве.
+    # GitHub cron указывается в UTC. 16:00 UTC = 19:00 МСК.
+    # В начале запуска workflow ждёт daily ABC за нужную дату; если файла нет, повторяет проверку каждый час.
+    - cron: "0 16 * * *"
 
 permissions:
   contents: read
@@ -49,11 +49,16 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 420
 
     env:
       REPORT_SCRIPT: report_runner.py
       EXPECTED_VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
+
+      # FIX45: отчёт стартует в 19:00 МСК и ждёт daily ABC за нужную дату.
+      # 6 попыток = 19:00, 20:00, 21:00, 22:00, 23:00, 00:00 МСК.
+      ABC_WAIT_MAX_ATTEMPTS: "6"
+      ABC_WAIT_SLEEP_SECONDS: "3600"
 
       WB_STORE: TOPFACE
       REPORT_STORE: TOPFACE
@@ -101,7 +106,8 @@ jobs:
           echo "Event: ${{ github.event_name }}"
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-          echo "Planned cron: 35 11 * * * = 14:35 MSK start, expected PDF around 15:00 MSK"
+          echo "Planned cron: 0 16 * * * = 19:00 MSK start"
+          echo "FIX45: before report run, workflow waits for daily ABC for target date"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -312,6 +318,109 @@ jobs:
           } >> "$GITHUB_ENV"
 
           echo "Telegram env OK"
+
+
+      - name: Wait for daily ABC report
+        if: steps.decide.outputs.mode != 'smoke'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set -a
+          source .env || true
+          set +a
+
+          REQUIRED_DATE="${WB_DAILY_TARGET_DATE:-${REPORT_REQUIRE_DATA_DATE:-}}"
+          if [ -z "$REQUIRED_DATE" ]; then
+            echo "abc_wait: skip because required date is empty"
+            exit 0
+          fi
+
+          ATTEMPT=1
+          MAX_ATTEMPTS="${ABC_WAIT_MAX_ATTEMPTS:-6}"
+          SLEEP_SECONDS="${ABC_WAIT_SLEEP_SECONDS:-3600}"
+
+          echo "abc_wait: required daily ABC date=$REQUIRED_DATE"
+          echo "abc_wait: max_attempts=$MAX_ATTEMPTS sleep_seconds=$SLEEP_SECONDS"
+
+          while true; do
+            echo "abc_wait: attempt $ATTEMPT/$MAX_ATTEMPTS, UTC=$(date -u '+%Y-%m-%d %H:%M:%S'), MSK=$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+
+            if ABC_REQUIRED_DATE="$REQUIRED_DATE" python - <<'PYABCWAIT'
+          import os
+          import sys
+          from datetime import datetime
+
+          import boto3
+          from botocore.config import Config
+
+          required = os.environ["ABC_REQUIRED_DATE"]
+          dt = datetime.strptime(required, "%Y-%m-%d").date()
+          dmy = dt.strftime("%d.%m.%Y")
+
+          bucket = os.environ.get("YC_BUCKET_NAME") or ""
+          access_key = os.environ.get("YC_ACCESS_KEY_ID") or ""
+          secret_key = os.environ.get("YC_SECRET_ACCESS_KEY") or ""
+          endpoint = os.environ.get("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net"
+
+          if not bucket or not access_key or not secret_key:
+              print("abc_wait: ERROR missing YC storage env", file=sys.stderr)
+              sys.exit(2)
+
+          s3 = boto3.client(
+              "s3",
+              aws_access_key_id=access_key,
+              aws_secret_access_key=secret_key,
+              endpoint_url=endpoint,
+              region_name="ru-central1",
+              config=Config(signature_version="s3v4"),
+          )
+
+          prefix = "Отчёты/ABC/"
+          exact_token = f"wb_abc_report_goods__{dmy}-{dmy}__at_"
+          related_tokens = [f"__{dmy}-", f"-{dmy}__"]
+
+          matches = []
+          related = []
+          count = 0
+          paginator = s3.get_paginator("list_objects_v2")
+          for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+              for obj in page.get("Contents", []):
+                  count += 1
+                  key = obj.get("Key", "")
+                  name = key.rsplit("/", 1)[-1]
+                  if exact_token in name:
+                      matches.append((key, obj.get("LastModified")))
+                  elif any(token in name for token in related_tokens):
+                      related.append(key)
+
+          if matches:
+              matches.sort(key=lambda x: str(x[1]), reverse=True)
+              print(f"abc_wait: FOUND daily ABC for {required}: {matches[0][0]}")
+              sys.exit(0)
+
+          print(f"abc_wait: NOT FOUND daily ABC for {required}: expected file like wb_abc_report_goods__{dmy}-{dmy}__at_*.xlsx")
+          print(f"abc_wait: scanned s3://{bucket}/{prefix}, objects={count}")
+          if related[:10]:
+              print("abc_wait: related ABC files:")
+              for key in related[:10]:
+                  print("  - " + key)
+          sys.exit(1)
+          PYABCWAIT
+            then
+              echo "abc_wait: OK, daily ABC is ready"
+              break
+            fi
+
+            if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+              echo "abc_wait: ERROR daily ABC for $REQUIRED_DATE was not found after $MAX_ATTEMPTS attempts"
+              exit 1
+            fi
+
+            echo "abc_wait: daily ABC is not ready; sleep ${SLEEP_SECONDS}s and retry"
+            sleep "$SLEEP_SECONDS"
+            ATTEMPT=$((ATTEMPT + 1))
+          done
 
       - name: Smoke test
         if: steps.decide.outputs.mode == 'smoke'
