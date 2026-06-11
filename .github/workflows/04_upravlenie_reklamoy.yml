@@ -184,7 +184,7 @@ jobs:
               raise SystemExit(f"ERROR: Неизвестный формат SCRIPT_VERSION: {version}")
           vnum = int(vm.group(1))
           if vnum < 51:
-              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v51+. В репозитории сейчас код ниже требуемой версии v51.")
+              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v52+. В репозитории сейчас код ниже требуемой версии v52.")
 
           markers = [
               "FIX46_CORE_RAMP_PAUSE_20260611",
@@ -200,7 +200,7 @@ jobs:
           missing = [marker for marker in markers if marker not in text]
           if missing:
               raise SystemExit("ERROR: В коде нет обязательных маркеров: " + ", ".join(missing))
-          print("Code marker check OK: v51+, FIX46 runner, rollback wrong pauses, guarded main run, night experiments, combined floor 80 present.")
+          print("Code marker check OK: v52+, FIX46 runner, rollback wrong pauses, guarded main run, night experiments, combined floor 80 present.")
           PY
 
           echo "=== Script SHA256 ==="
