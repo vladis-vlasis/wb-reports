@@ -3,6 +3,7 @@
 # INTERNAL_FIX: FIX30_STRICT_1330_NO_MTD_WEEKLY_DAILY_GP_20260604
 # CALC_REPAIR: 2026-06-02 nmId canonical article + May closed month + orders-rub card
 # FIX27: weekly page-1 cards + demand fallback for missing day + money dynamics for orders-rub cards
+# FIX38: advertising truth uses category-level ad report only; raw campaign rows are not allowed for PDF/Telegram totals
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -1278,15 +1279,32 @@ class Loader:
     def load_ads_category(self) -> pd.DataFrame:
         """Read category-level advertising spend from WB advertising report.
 
-        This is the source of truth for current-week category/current overview spend.
-        Raw campaign/article sheets can duplicate spend across articles, so they are not used
-        for the first PDF page when this category sheet exists.
+        FIX38:
+        Category ad spend is the only safe source for PDF/Telegram advertising totals.
+        Raw campaign/article sheets can duplicate one campaign spend across multiple nmId rows,
+        which inflates current-week spend and DRR. Therefore the category sheet must be searched
+        in the same broad set of S3 folders as raw advertising files.
         """
-        files = self.list_reports("Реклама", self.store, "Недельные")
+        files: List[str] = []
+        for parts in [
+            ("Реклама", self.store, "Недельные"),
+            ("Реклама", self.store),
+            ("Реклама", "Недельные", self.store),
+            ("Реклама",),
+        ]:
+            try:
+                files += self.list_reports(*parts)
+            except Exception as exc:
+                self.diag.add("WARN", "ads_category", f"Не удалось просканировать путь {'/'.join(parts)}", exc)
         consolidated = self.path("Реклама", self.store, "Анализ рекламы.xlsx")
         if self.storage.exists(consolidated):
             files.append(consolidated)
-        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=1)
+        files = sorted(set(f for f in files if f and not Path(f).name.startswith("~$")))
+        if files:
+            log(f"ads_category_scan: candidates before current-week filter={len(files)}; sample=" + "; ".join(Path(x).name for x in files[-8:]))
+        files = self._filter_current_week_files(files, keep_unparsed=True, fallback_tail=6)
+        if files:
+            log(f"ads_category_scan: selected files={len(files)}; " + "; ".join(files))
         frames = []
         wanted_sheets = {"отчет_по_категории", "отчет по категории", "отчет_по_категории_итог", "отчет по категории итог", "отчёт_по_категории", "отчёт по категории", "отчёт_по_категории_итог", "отчёт по категории итог"}
         for key, data in self._read_candidates(files):
@@ -3004,27 +3022,35 @@ def _require_report_data_available(outputs: Dict[str, Any], context: str = "") -
 
     required_ads = _env_date("REPORT_REQUIRE_ADS_DATE")
     if required_ads is not None:
-        ads_days_all = []
-        for source_name in ["ads_daily_source", "ads_raw_source", "ads_category_source"]:
+        # FIX38: the date check must validate category-level advertising facts only.
+        # ads_raw_source/ads_daily_source can be duplicated by campaign x nmId and must not
+        # allow a scheduled report to pass with inflated advertising spend.
+        category_src = outputs.get("ads_category_source", pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
+        category_days = _active_days_from_source(category_src, ["spend", "clicks", "impressions"])
+        raw_details = []
+        for source_name in ["ads_raw_source", "ads_daily_source"]:
             src = outputs.get(source_name, pd.DataFrame()) if isinstance(outputs, dict) else pd.DataFrame()
             days_ads = _active_days_from_source(src, ["spend", "clicks", "impressions", "ad_spend_total", "manual_spend", "unified_spend", "unknown_spend"])
             if not days_ads.empty:
-                ads_days_all.append((source_name, days_ads))
-        if not ads_days_all:
+                raw_details.append(f"{source_name}: {pd.Timestamp(days_ads.max()).strftime('%d.%m.%Y')}")
+        if category_days.empty:
             raise RuntimeError(
-                f"Нет активных рекламных данных для проверки даты {required_ads:%d.%m.%Y}. "
+                f"Нет категорийного рекламного отчёта для проверки даты {required_ads:%d.%m.%Y}. "
+                f"Сырые рекламные листы не принимаю как источник Расхода РК, потому что они могут задваивать расход по артикулам "
+                f"({', '.join(raw_details) if raw_details else 'raw источников нет'}). "
                 f"Отчёт не отправляю, чтобы не показать неверный ДРР. context={context}"
             )
-        has_ads_date = any((d.dt.normalize() == required_ads).any() for _, d in ads_days_all)
-        latest_ads = max(pd.Timestamp(d.max()).normalize() for _, d in ads_days_all)
+        has_ads_date = (category_days.dt.normalize() == required_ads).any()
+        latest_ads = pd.Timestamp(category_days.max()).normalize()
         if latest_ads < required_ads or not has_ads_date:
-            details = ", ".join(f"{name}: {pd.Timestamp(d.max()).strftime('%d.%m.%Y')}" for name, d in ads_days_all)
             raise RuntimeError(
-                f"Нет рекламных данных за нужную дату {required_ads:%d.%m.%Y}. "
-                f"Последняя активная дата рекламы: {latest_ads:%d.%m.%Y} ({details}). "
+                f"Нет категорийного рекламного отчёта за нужную дату {required_ads:%d.%m.%Y}. "
+                f"Последняя активная дата ads_category_source: {latest_ads:%d.%m.%Y}. "
+                f"Сырые рекламные листы игнорируются для Расхода РК/ДРР "
+                f"({', '.join(raw_details) if raw_details else 'raw источников нет'}). "
                 f"Отчёт не отправляю, чтобы не показать неверный ДРР. context={context}"
             )
-        log(f"ads_date_check: OK required={required_ads:%Y-%m-%d}, latest_ads={latest_ads:%Y-%m-%d}, context={context}")
+        log(f"ads_date_check: OK required={required_ads:%Y-%m-%d}, latest_ads_category={latest_ads:%Y-%m-%d}, context={context}")
 
     if _env_flag("REPORT_REQUIRE_ABC_PERIOD", False):
         period_end = required
@@ -8379,7 +8405,14 @@ def _tg_prepare_ads_truth(outputs: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
     best_day = pd.NaT
     best_priority = -1
 
-    for nm in ["ads_category_source", "ads_raw_source", "ads_daily_source"]:
+    # FIX38: for PDF/Telegram totals the raw ad source is no longer an automatic fallback.
+    # Raw campaign/article rows can repeat one campaign spend across several nmId rows and inflate
+    # Расход РК / ДРР. By default use only ads_category_source. Temporary raw fallback can be enabled
+    # explicitly with REPORT_ALLOW_RAW_ADS_FALLBACK=1 for diagnostics, not for scheduled reports.
+    allow_raw_ads_fallback = os.getenv("REPORT_ALLOW_RAW_ADS_FALLBACK", "0").strip().lower() in {"1", "true", "yes", "y"}
+    source_order = ["ads_category_source"] if not allow_raw_ads_fallback else ["ads_category_source", "ads_raw_source", "ads_daily_source"]
+
+    for nm in source_order:
         cand = outputs.get(nm, pd.DataFrame())
         if not isinstance(cand, pd.DataFrame) or cand.empty:
             continue
