@@ -51,7 +51,7 @@ import pandas as pd
 import requests
 from botocore.exceptions import ClientError
 
-SCRIPT_VERSION = "strict-drr-v47-fix46-working-runner-2026-06-11"
+SCRIPT_VERSION = "strict-drr-v51-fix46-rollback-guarded-runner-2026-06-11"
 VERSION = "FIX46_CORE_RAMP_PAUSE_20260611"
 
 # -------------------------
@@ -83,6 +83,50 @@ TARGET_SUBJECTS = {
     "карандаши": "Косметические карандаши",
     "косметические карандаши": "Косметические карандаши",
 }
+
+# Жёсткий контур управления: любые решения/API только по этим 4 предметам.
+MANAGED_SUBJECTS_CANON = {
+    "Кисти косметические",
+    "Помады",
+    "Блески",
+    "Косметические карандаши",
+}
+# Кисти не паузим автоматически: пауза разрешена только этим предметам.
+PAUSE_ALLOWED_SUBJECTS_CANON = {"Помады", "Блески", "Косметические карандаши"}
+
+
+def is_managed_subject_value(value: Any) -> bool:
+    return canon_subject(value) in MANAGED_SUBJECTS_CANON
+
+
+def is_pause_allowed_subject_value(value: Any) -> bool:
+    return canon_subject(value) in PAUSE_ALLOWED_SUBJECTS_CANON
+
+
+def filter_managed_subjects(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    """Оставляет только 4 управляемые категории перед расчётом решений/API.
+
+    Это hard guard: если предмет пустой или не входит в контур, строка не должна
+    попасть ни в решения, ни тем более в API.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df.copy()
+    if "subject_norm" not in df.columns:
+        print(f"Диагностика фильтра категорий {label}: нет subject_norm, строка/таблица исключена", flush=True)
+        return df.iloc[0:0].copy()
+    out = df.copy()
+    before = len(out)
+    out["subject_norm"] = out["subject_norm"].map(canon_subject)
+    mask = out["subject_norm"].map(lambda x: x in MANAGED_SUBJECTS_CANON)
+    removed = before - int(mask.sum())
+    if removed:
+        removed_subjects = out.loc[~mask, "subject_norm"].astype(str).value_counts().head(20).to_dict()
+        print(
+            f"Диагностика фильтра категорий {label}: оставлено {int(mask.sum())} из {before}; "
+            f"исключено {removed}; исключённые предметы={removed_subjects}",
+            flush=True,
+        )
+    return out.loc[mask].copy()
 
 # -------------------------
 # Column aliases
@@ -401,6 +445,28 @@ def load_ads_daily(path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         out["search_bid"] = np.nan
         out["reco_bid"] = np.nan
     out["placement"] = out["placement"].fillna("").replace("", "search")
+
+    # Сначала сохраняем предмет из ежедневной статистики. Если в списке кампаний
+    # предмет пустой/нецелевой, используем most frequent subject из daily по campaign_id.
+    if "subject_norm" in out.columns:
+        subject_by_campaign = (
+            out[["campaign_id", "subject_norm"]]
+            .dropna()
+            .assign(subject_norm=lambda d: d["subject_norm"].map(canon_subject))
+            .groupby("campaign_id")["subject_norm"]
+            .agg(lambda s: s.value_counts().index[0] if len(s) else "")
+            .to_dict()
+        )
+        if camp is not None and not camp.empty and "campaign_id" in camp.columns:
+            camp = camp.copy()
+            camp["subject_from_ads_daily"] = camp["campaign_id"].map(subject_by_campaign).fillna("")
+            bad_subject = ~camp.get("subject_norm", pd.Series([""] * len(camp), index=camp.index)).map(is_managed_subject_value)
+            camp.loc[bad_subject & camp["subject_from_ads_daily"].map(is_managed_subject_value), "subject_norm"] = camp.loc[bad_subject, "subject_from_ads_daily"]
+        if "subject_norm" in out.columns and "subject_norm_x" not in out.columns:
+            # Если после merge появились дубликаты, ниже они будут обработаны в build_campaign_base.
+            pass
+    out = filter_managed_subjects(out, "ads_daily")
+    camp = filter_managed_subjects(camp, "campaigns") if camp is not None and not camp.empty else camp
     return out, camp
 
 
@@ -497,18 +563,27 @@ def load_bid_history(path: Optional[str]) -> pd.DataFrame:
 
 def load_pause_history(path: Optional[str]) -> pd.DataFrame:
     df = read_sheet(path, ["Лист1", "История_пауз", "История пауз"])
+    columns = [
+        "campaign_id", "pause_date", "status", "reason_code", "api_status",
+        "nm_id", "placement", "supplier_article", "subject_norm", "new_bid_rub",
+    ]
     if df.empty:
-        return pd.DataFrame(columns=["campaign_id", "pause_date", "status"])
+        return pd.DataFrame(columns=columns)
     out = pd.DataFrame({
         "campaign_id": to_num(s(df, "campaign_id")).astype("Int64"),
-        "pause_date": to_date(df.get("pause_date", pd.Series([np.nan]*len(df)))),
-        "status": df.get("status", pd.Series([""]*len(df))).astype(str),
-        "reason_code": df.get("reason_code", pd.Series([""]*len(df))).astype(str),
-        "api_status": df.get("api_status", pd.Series([""]*len(df))).astype(str),
+        "pause_date": to_date(df.get("pause_date", pd.Series([np.nan] * len(df)))),
+        "status": df.get("status", pd.Series([""] * len(df))).astype(str),
+        "reason_code": df.get("reason_code", pd.Series([""] * len(df))).astype(str),
+        "api_status": df.get("api_status", pd.Series([""] * len(df))).astype(str),
+        "nm_id": df.get("nm_id", pd.Series([""] * len(df))),
+        "placement": df.get("placement", pd.Series([""] * len(df))).astype(str),
+        "supplier_article": df.get("supplier_article", pd.Series([""] * len(df))).astype(str),
+        "subject_norm": df.get("subject_norm", pd.Series([""] * len(df))).astype(str),
+        "new_bid_rub": df.get("new_bid_rub", pd.Series([np.nan] * len(df))),
     })
     out = out[out["campaign_id"].notna()].copy()
     out["campaign_id"] = out["campaign_id"].astype(int)
-    return out
+    return out[columns]
 
 
 def load_keywords_from_previous(path: Optional[str]) -> pd.DataFrame:
@@ -613,6 +688,30 @@ def build_campaign_base(ads: pd.DataFrame, campaigns: pd.DataFrame, orders: pd.D
     # First seen by ads stats/history.
     first_seen_ads = ads.groupby("campaign_id", as_index=False).agg(first_seen=("day", "min")) if not ads.empty else pd.DataFrame(columns=["campaign_id", "first_seen"])
     df = df.merge(first_seen_ads, on="campaign_id", how="left")
+
+    # Подтягиваем предмет из daily, если список кампаний не дал корректный subject_norm.
+    if ads is not None and not ads.empty and "subject_norm" in ads.columns:
+        ads_subjects = (
+            ads[["campaign_id", "subject_norm"]]
+            .dropna()
+            .assign(subject_from_ads_daily=lambda d: d["subject_norm"].map(canon_subject))
+            .groupby("campaign_id")["subject_from_ads_daily"]
+            .agg(lambda s: s.value_counts().index[0] if len(s) else "")
+            .reset_index()
+        )
+        if "subject_from_ads_daily" not in ads_subjects.columns:
+            ads_subjects["subject_from_ads_daily"] = ""
+        df = df.merge(ads_subjects[["campaign_id", "subject_from_ads_daily"]], on="campaign_id", how="left")
+        if "subject_norm" not in df.columns:
+            df["subject_norm"] = ""
+        if "subject_from_ads_daily" not in df.columns:
+            df["subject_from_ads_daily"] = ""
+        bad_subject = ~df["subject_norm"].map(is_managed_subject_value)
+        fill_mask = bad_subject & df["subject_from_ads_daily"].map(is_managed_subject_value)
+        df.loc[fill_mask, "subject_norm"] = df.loc[fill_mask, "subject_from_ads_daily"]
+        df = df.drop(columns=["subject_from_ads_daily"], errors="ignore")
+
+    df = filter_managed_subjects(df, "campaign_base")
 
     if not bid_history.empty:
         last = bid_history.dropna(subset=["event_date"]).sort_values("event_date").groupby("campaign_id", as_index=False).tail(1)
@@ -813,7 +912,9 @@ def rank_blocks(df: pd.DataFrame) -> pd.DataFrame:
 # -------------------------
 
 def decide_all(campaigns: pd.DataFrame, core: pd.DataFrame, pause_history: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
-    df = campaigns.copy()
+    df = filter_managed_subjects(campaigns.copy(), "decide_all_input")
+    if df.empty:
+        return pd.DataFrame(columns=["campaign_id", "action", "reason_code", "reason_text"])
     core_summary = summarize_core_by_product(core[core["query_role"].eq("flagship")]) if not core.empty else pd.DataFrame()
     if not core_summary.empty:
         df = df.merge(core_summary, on="product_root", how="left")
@@ -879,8 +980,12 @@ def decide_campaign(r: pd.Series, pause_history: pd.DataFrame, windows: Dict[str
     active_in_block = int(r.get("active_in_block", 1) or 1)
     ramp_slot = bool(r.get("ramp_slot_selected", False))
     recent_bid = bool(r.get("recent_bid_change", False))
-    subject = str(r.get("subject_norm", ""))
+    subject = canon_subject(r.get("subject_norm", ""))
     root = str(r.get("product_root", ""))
+
+    if subject not in MANAGED_SUBJECTS_CANON:
+        safe_bid = current_bid if pd.notna(current_bid) else np.nan
+        return decision(cid, "hold", safe_bid, "OUT_OF_SCOPE_SUBJECT_HOLD", f"Предмет вне контура управления: {subject}. API запрещён.")
 
     # Normalize bid and step.
     if placement == "search":
@@ -910,14 +1015,14 @@ def decide_campaign(r: pd.Series, pause_history: pd.DataFrame, windows: Dict[str
         return decision(cid, "hold", bid_effective, "NEW_UNDER_14D_NO_PAUSE", f"NEW<{NEW_NO_PAUSE_DAYS}д: пауза запрещена; ждём трафик/позиции/клики")
 
     # Hard pause: high mature traffic and high DRR, but keep leader/last active.
-    if (impressions_14 >= 10000 and pd.notna(drr_14) and drr_14 > DRR_PAUSE_LIMIT_PCT and active_in_block > 1 and not is_leader):
+    if (subject in PAUSE_ALLOWED_SUBJECTS_CANON and impressions_14 >= 10000 and pd.notna(drr_14) and drr_14 > DRR_PAUSE_LIMIT_PCT and active_in_block > 1 and not is_leader):
         return decision(cid, "pause", bid_effective, "PAUSE_HIGH_DRR_14D_10000_REALLOCATE", f"14д: показы={impressions_14:.0f} >=10000, ДРР={drr_14:.1f}% >15%; не лидер блока; пауза для перелива бюджета в лидеров")
 
     # Low-volume ramp flow: if not enough impressions, do not judge by orders yet. Ramp only selected slots, pause/queue others.
     if impressions_cur < RAMP_TARGET_IMPRESSIONS:
         if ramp_slot and can_raise(next_up, max_bid):
             return decision(cid, "raise", next_up, "RAMP_ACTIVE_TO_5000_IMPRESSIONS", f"Разгон: показов в зрелом окне {impressions_cur:.0f}<5000; слот выбран по CTR/кликам; ставка {bid_effective}->{next_up}; cap={max_bid}")
-        if not is_leader and active_in_block > 1:
+        if subject in PAUSE_ALLOWED_SUBJECTS_CANON and not is_leader and active_in_block > 1:
             return decision(cid, "pause", bid_effective, "PAUSE_TO_RAMP_QUEUE_LOW_VOLUME", f"Не лидер и не выбран в текущий слот разгона; ставим в очередь/паузу, чтобы не разгонять много РК одновременно")
         return decision(cid, "hold", bid_effective, "LOW_VOLUME_LEADER_HOLD", f"Лидер/единственная РК блока, но показов {impressions_cur:.0f}<5000; держим без резких действий")
 
@@ -1119,6 +1224,15 @@ WB_ADVERT_BASE_URL = "https://advert-api.wildberries.ru"
 WB_BIDS_ENDPOINT = "/api/advert/v1/bids"
 WB_PAUSE_ENDPOINT = "/adv/v0/pause"
 WB_START_ENDPOINT = "/adv/v0/start"
+WB_BIDS_MIN_ENDPOINT = "/api/advert/v1/bids/min"
+
+# Разовый откат ошибочных пауз, созданных слишком широкой v47-версией FIX46-runner.
+# Откатываем только новые reason_code из v47/v50-контура, не трогаем старые штатные паузы и ночные эксперименты.
+WRONG_FIX46_PAUSE_REASON_CODES = {
+    "PAUSE_HIGH_DRR_14D_10000_REALLOCATE",
+    "PAUSE_TO_RAMP_QUEUE_LOW_VOLUME",
+}
+ROLLBACK_WRONG_FIX46_PAUSE_REASON_CODE = "ROLLBACK_WRONG_FIX46_PAUSE_START"
 
 
 @dataclass
@@ -1296,7 +1410,119 @@ def build_wb_bid_payload(row: pd.Series) -> Optional[Dict[str, Any]]:
     }
 
 
-def apply_api_actions(decisions: pd.DataFrame, config: RunnerConfig, mode: str, dry_run: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+def _placement_for_min_endpoint(value: Any) -> str:
+    placement = str(value or "").strip().lower()
+    if placement == "recommendations":
+        return "recommendation"
+    if placement in {"search", "combined", "recommendation"}:
+        return placement
+    return "combined" if "combined" in placement else "search"
+
+
+def _payment_type_for_min(value: Any) -> str:
+    placement = str(value or "").strip().lower()
+    return "cpm" if placement == "combined" else "cpc"
+
+
+def fetch_wb_min_bid_for_row(row: pd.Series, config: RunnerConfig) -> Tuple[Optional[float], List[Dict[str, Any]]]:
+    """Точечная проверка минимальной ставки WB перед PATCH ставки.
+
+    Это защита от ошибок WB вида "bid value must be no less than ...".
+    Если минимум WB выше расчётной ставки, PATCH не отправляем, а пишем SKIP в лог.
+    """
+    advert_id = _clean_int(row.get("campaign_id"))
+    nm_id = _clean_int(row.get("nm_id"))
+    placement = str(row.get("placement", "") or "").strip().lower()
+    logs: List[Dict[str, Any]] = []
+    if advert_id is None or nm_id is None:
+        return None, logs
+    payload = {
+        "advert_id": int(advert_id),
+        "nm_ids": [int(nm_id)],
+        "payment_type": _payment_type_for_min(placement),
+        "placement_types": [_placement_for_min_endpoint(placement)],
+    }
+    try:
+        resp = requests.post(config.wb_base_url.rstrip("/") + WB_BIDS_MIN_ENDPOINT, headers=wb_headers(config), json=payload, timeout=60)
+        logs.append(_api_log_row("POST", WB_BIDS_MIN_ENDPOINT, payload, str(resp.status_code), resp.text, advert_id, nm_id, placement))
+        if not (200 <= resp.status_code < 300):
+            return None, logs
+        try:
+            data = resp.json()
+        except Exception:
+            return None, logs
+        values: List[float] = []
+        for item in data.get("bids", []) or []:
+            item_nm = _clean_int(item.get("nm_id"))
+            if item_nm is not None and item_nm != int(nm_id):
+                continue
+            for bid_item in item.get("bids", []) or []:
+                value_kopecks = pd.to_numeric(bid_item.get("value"), errors="coerce")
+                if pd.notna(value_kopecks) and float(value_kopecks) > 0:
+                    values.append(float(value_kopecks) / 100.0)
+        if values:
+            return max(values), logs
+    except Exception as exc:
+        logs.append(_api_log_row("POST", WB_BIDS_MIN_ENDPOINT, payload, "exception", repr(exc), advert_id, nm_id, placement))
+    return None, logs
+
+
+def build_wrong_fix46_pause_rollback_decisions(pause_history: pd.DataFrame) -> pd.DataFrame:
+    """Формирует START только для ошибочных пауз, созданных v47/v50 FIX46-контуром.
+
+    Логика безопасная:
+    - берём только reason_code из WRONG_FIX46_PAUSE_REASON_CODES;
+    - по campaign_id смотрим последнюю запись истории;
+    - если последняя запись уже started — не трогаем;
+    - категорийный guard намеренно не применяется: v47 могла ошибочно поставить на паузу товары вне 4 категорий.
+    """
+    columns = [
+        "campaign_id", "nm_id", "supplier_article", "subject_norm", "placement", "action", "new_bid_rub",
+        "reason_code", "reason_text", "product_root", "campaign_status", "is_active", "spend_cur", "orders_cur", "clicks_cur",
+    ]
+    if pause_history is None or pause_history.empty or "campaign_id" not in pause_history.columns:
+        return pd.DataFrame(columns=columns)
+    ph = pause_history.copy()
+    for col in ["status", "reason_code", "pause_date", "nm_id", "placement", "supplier_article", "subject_norm"]:
+        if col not in ph.columns:
+            ph[col] = ""
+    ph["campaign_id_int"] = ph["campaign_id"].map(_clean_int)
+    ph = ph[ph["campaign_id_int"].notna()].copy()
+    if ph.empty:
+        return pd.DataFrame(columns=columns)
+    ph["pause_dt"] = pd.to_datetime(ph["pause_date"], errors="coerce")
+    ph["_row_order"] = range(len(ph))
+    ph = ph.sort_values(["campaign_id_int", "pause_dt", "_row_order"], na_position="first")
+    latest = ph.drop_duplicates("campaign_id_int", keep="last").copy()
+    status = latest["status"].astype(str).str.strip().str.lower()
+    reason = latest["reason_code"].astype(str).str.strip()
+    candidates = latest[status.eq("paused") & reason.isin(WRONG_FIX46_PAUSE_REASON_CODES)].copy()
+    rows: List[Dict[str, Any]] = []
+    for _, r in candidates.iterrows():
+        placement = str(r.get("placement", "") or "").strip().lower() or "combined"
+        new_bid = COMBINED_MIN_BID_RUB if placement == "combined" else SEARCH_MIN_BID_RUB
+        article = clean_article(r.get("supplier_article", ""))
+        rows.append({
+            "campaign_id": int(r["campaign_id_int"]),
+            "nm_id": r.get("nm_id", ""),
+            "supplier_article": article,
+            "subject_norm": r.get("subject_norm", ""),
+            "placement": placement,
+            "action": "start",
+            "new_bid_rub": new_bid,
+            "reason_code": ROLLBACK_WRONG_FIX46_PAUSE_REASON_CODE,
+            "reason_text": f"Разовый откат ошибочной паузы v47/FIX46: последняя пауза reason={r.get('reason_code', '')}; запускаем обратно",
+            "product_root": product_root(article),
+            "campaign_status": "paused",
+            "is_active": False,
+            "spend_cur": 0.0,
+            "orders_cur": 0.0,
+            "clicks_cur": 0.0,
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+def apply_api_actions(decisions: pd.DataFrame, config: RunnerConfig, mode: str, dry_run: bool, apply_pause: bool = False, apply_start: bool = False, bypass_subject_guard: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if decisions is None or decisions.empty:
         return pd.DataFrame(), pd.DataFrame()
     logs: List[Dict[str, Any]] = []
@@ -1308,11 +1534,30 @@ def apply_api_actions(decisions: pd.DataFrame, config: RunnerConfig, mode: str, 
         campaign_id = row.get("campaign_id", "")
         nm_id = row.get("nm_id", "")
         placement = row.get("placement", "")
+        subject = canon_subject(row.get("subject_norm", ""))
+        if (not bypass_subject_guard) and subject not in MANAGED_SUBJECTS_CANON:
+            logs.append(_api_log_row("SKIP", "managed_subject_guard", {}, "blocked_out_of_scope", f"Предмет вне контура: {subject}", campaign_id, nm_id, placement))
+            continue
+        if (not bypass_subject_guard) and action == "pause" and subject not in PAUSE_ALLOWED_SUBJECTS_CANON:
+            logs.append(_api_log_row("SKIP", "pause_subject_guard", {}, "blocked_pause_subject", f"Автопауза запрещена для предмета: {subject}", campaign_id, nm_id, placement))
+            continue
+        if action == "pause" and not apply_pause:
+            logs.append(_api_log_row("SKIP", WB_PAUSE_ENDPOINT, {"id": campaign_id}, "not_sent_apply_pause_false", "Пауза не отправлена: нужен --apply-pause", campaign_id, nm_id, placement))
+            continue
+        if action == "start" and not apply_start:
+            logs.append(_api_log_row("SKIP", WB_START_ENDPOINT, {"id": campaign_id}, "not_sent_apply_start_false", "Запуск не отправлен: нужен --apply-start", campaign_id, nm_id, placement))
+            continue
         if action in {"raise", "lower"}:
             endpoint = WB_BIDS_ENDPOINT
             payload = build_wb_bid_payload(row)
             if payload is None:
                 logs.append(_api_log_row("PATCH", endpoint, {}, "payload_error", "Не удалось собрать payload", campaign_id, nm_id, placement))
+                continue
+            min_bid, min_logs = fetch_wb_min_bid_for_row(row, config)
+            logs.extend(min_logs)
+            target_bid = _normal_bid_for_api(placement, row.get("new_bid_rub"))
+            if min_bid is not None and target_bid is not None and float(target_bid) < float(min_bid):
+                logs.append(_api_log_row("SKIP", WB_BIDS_ENDPOINT, payload, "skip_below_wb_min_bid", f"Расчётная ставка {target_bid} ₽ ниже минимальной WB {min_bid:.2f} ₽; PATCH не отправлен", campaign_id, nm_id, placement))
                 continue
             if mode == "preview" or dry_run:
                 status = "preview_no_call" if mode == "preview" else "dry_run_no_call"
@@ -1420,6 +1665,13 @@ def record_successful_events(successful: pd.DataFrame, bid_history_path: Optiona
     return bid_history, pause_history
 
 
+def count_api_errors(api_log: pd.DataFrame) -> int:
+    if api_log is None or api_log.empty or "api_status" not in api_log.columns:
+        return 0
+    statuses = api_log["api_status"].astype(str).str.strip()
+    numeric = pd.to_numeric(statuses, errors="coerce")
+    return int(((numeric >= 400) | statuses.str.contains("exception|error|payload_error", case=False, na=False)).sum())
+
 def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
     actions = decisions["action"].value_counts(dropna=False).to_dict() if decisions is not None and not decisions.empty and "action" in decisions.columns else {}
     return {
@@ -1443,7 +1695,9 @@ def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFra
         "Режим только ночных экспериментов": "да" if getattr(args, "night_experiment_only", False) else "нет",
         "Ночной слот YAML": getattr(args, "night_experiment_slot", "") or "",
         "Эксперимент 1: строк минимальной ночной ставки": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == EXPERIMENT_1_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0,
-        "Ошибок API": int((api_log.get("api_status", pd.Series(dtype=str)).astype(str).str.contains("exception|error|payload_error", case=False, na=False)).sum()) if api_log is not None and not api_log.empty else 0,
+        "Разовый откат ошибочных пауз": "да" if getattr(args, "rollback_wrong_pauses_only", False) else "нет",
+        "Разовый откат: кандидатов на start": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == ROLLBACK_WRONG_FIX46_PAUSE_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0,
+        "Ошибок API": count_api_errors(api_log) if api_log is not None and not api_log.empty else 0,
     }
 
 
@@ -1547,23 +1801,38 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
         pause_history_path = maybe_download_key_to_dir(s3, bucket, PAUSE_HISTORY_KEY, workdir)
 
         local_out = workdir / ("Предпросмотр_последнего_запуска.xlsx" if mode == "preview" else "Итог_последнего_запуска.xlsx")
-        engine_args = argparse.Namespace(
-            ads=";".join(ads_paths),
-            orders=";".join(order_paths) if order_paths else None,
-            previous_output=previous_output_path,
-            bid_history=bid_history_path,
-            pause_history=pause_history_path,
-            as_of=None,
-            out=str(local_out),
-            print_summary=True,
-        )
-        decisions, core, payload, windows = compute_engine(engine_args)
-        if getattr(args, "night_experiment_only", False):
-            ph = load_pause_history(pause_history_path)
-            decisions = _filter_night_decisions(decisions, ph, getattr(args, "night_experiment_slot", "") or "")
+        ph_for_rollback = load_pause_history(pause_history_path)
+        if getattr(args, "rollback_wrong_pauses_only", False):
+            windows = date_windows(pd.Timestamp(datetime.now().date()))
+            decisions = build_wrong_fix46_pause_rollback_decisions(ph_for_rollback)
+            core = pd.DataFrame()
             payload = build_payload_preview(decisions)
+            print(f"Разовый откат ошибочных пауз: кандидатов на START={len(decisions)}", flush=True)
+        else:
+            engine_args = argparse.Namespace(
+                ads=";".join(ads_paths),
+                orders=";".join(order_paths) if order_paths else None,
+                previous_output=previous_output_path,
+                bid_history=bid_history_path,
+                pause_history=pause_history_path,
+                as_of=None,
+                out=str(local_out),
+                print_summary=True,
+            )
+            decisions, core, payload, windows = compute_engine(engine_args)
+            if getattr(args, "night_experiment_only", False):
+                decisions = _filter_night_decisions(decisions, ph_for_rollback, getattr(args, "night_experiment_slot", "") or "")
+                payload = build_payload_preview(decisions)
         write_outputs(str(local_out), decisions, core, payload, windows)
-        successful, api_log = apply_api_actions(decisions, config, mode, bool(args.dry_run))
+        successful, api_log = apply_api_actions(
+            decisions,
+            config,
+            mode,
+            bool(args.dry_run),
+            bool(getattr(args, "apply_pause", False)),
+            bool(getattr(args, "apply_start", False) or getattr(args, "rollback_wrong_pauses_only", False)),
+            bool(getattr(args, "rollback_wrong_pauses_only", False)),
+        )
         bid_history, pause_history = record_successful_events(successful, bid_history_path, pause_history_path)
 
         # Append API log to existing log if any.
@@ -1618,6 +1887,7 @@ def build_legacy_runner_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply-start", action="store_true")
     p.add_argument("--night-experiment-only", action="store_true")
     p.add_argument("--night-experiment-slot", choices=["start", "end", ""], default="")
+    p.add_argument("--rollback-wrong-pauses-only", action="store_true", help="Разово запустить обратно кампании, ошибочно поставленные на паузу FIX46 v47")
     return p
 
 
