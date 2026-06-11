@@ -51,8 +51,8 @@ import pandas as pd
 import requests
 from botocore.exceptions import ClientError
 
-SCRIPT_VERSION = "strict-drr-v52-fix46-subject-fill-hotfix-2026-06-11"
-VERSION = "FIX46_CORE_RAMP_PAUSE_20260611"
+SCRIPT_VERSION = "strict-drr-v54-summary-api-current-run-2026-06-11"
+VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V53_ROLLBACK_OUTPUT_HOTFIX"
 
 # -------------------------
 # Business constants
@@ -1132,9 +1132,23 @@ def build_payload_preview(decisions: pd.DataFrame) -> pd.DataFrame:
 
 
 def block_reallocation_summary(decisions: pd.DataFrame) -> pd.DataFrame:
-    if decisions.empty:
+    if decisions is None or decisions.empty:
         return pd.DataFrame()
-    g = decisions.groupby(["product_root", "placement"], dropna=False).agg(
+    work = decisions.copy()
+    # Rollback-only mode contains only START rows from pause history, so some engine metrics
+    # such as ramp_queue_rank / current spend can be absent. Create safe defaults for report sheets.
+    for col, default in {
+        "product_root": "",
+        "placement": "",
+        "campaign_id": "",
+        "spend_cur": 0.0,
+        "orders_cur": 0.0,
+        "clicks_cur": 0.0,
+        "action": "",
+    }.items():
+        if col not in work.columns:
+            work[col] = default
+    g = work.groupby(["product_root", "placement"], dropna=False).agg(
         active_campaigns=("campaign_id", "count"),
         spend_cur=("spend_cur", "sum"),
         orders_cur=("orders_cur", "sum"),
@@ -1142,10 +1156,11 @@ def block_reallocation_summary(decisions: pd.DataFrame) -> pd.DataFrame:
         pause_count=("action", lambda x: (x == "pause").sum()),
         raise_count=("action", lambda x: (x == "raise").sum()),
         lower_count=("action", lambda x: (x == "lower").sum()),
+        start_count=("action", lambda x: (x == "start").sum()),
         leaders=("campaign_id", lambda x: ",".join(map(str, list(x.head(3))))),
     ).reset_index()
     g["cpo_cur"] = np.where(g["orders_cur"] > 0, g["spend_cur"] / g["orders_cur"], np.nan)
-    g["method_comment"] = "Цель: pause_and_reallocate, расход не просто срезать, а перелить в лидеров; успех = orders_index/spend_index > 1"
+    g["method_comment"] = "Цель: pause_and_reallocate, расход не просто срезать, а перелить в лидеров; rollback-режим может содержать только START без engine-метрик."
     return g
 
 
@@ -1193,7 +1208,10 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
         pause_cols = [c for c in ["campaign_id", "supplier_article", "product_root", "placement", "action", "reason_code", "reason_text", "impressions_14d", "drr_pct_14d", "active_in_block", "is_block_leader", "is_new"] if c in decisions.columns]
         decisions[decisions["action"].isin(["pause", "start", "hold_paused"])][pause_cols].to_excel(writer, sheet_name="Паузы_и_возвраты", index=False)
         ramp_cols = [c for c in ["campaign_id", "supplier_article", "product_root", "placement", "ramp_queue_rank", "ramp_slot_selected", "action", "reason_code", "impressions_cur", "ctr_pct_cur", "orders_cur", "drr_pct_cur", "real_bid_rub", "new_bid_rub", "max_allowed_bid_rub"] if c in decisions.columns]
-        decisions.sort_values(["product_root", "placement", "ramp_queue_rank"], na_position="last")[ramp_cols].to_excel(writer, sheet_name="Разгон_очередь", index=False)
+        # In rollback-only mode there are no ramp columns. Sort only by columns that exist.
+        sort_cols = [c for c in ["product_root", "placement", "ramp_queue_rank"] if c in decisions.columns]
+        ramp_source = decisions.sort_values(sort_cols, na_position="last") if sort_cols else decisions.copy()
+        ramp_source[ramp_cols].to_excel(writer, sheet_name="Разгон_очередь", index=False)
         block_reallocation_summary(decisions).to_excel(writer, sheet_name="Блоки_перелива", index=False)
         payload.to_excel(writer, sheet_name="API_payload_preview", index=False)
 
@@ -1666,12 +1684,42 @@ def record_successful_events(successful: pd.DataFrame, bid_history_path: Optiona
     return bid_history, pause_history
 
 
-def count_api_errors(api_log: pd.DataFrame) -> int:
+def _api_status_series(api_log: pd.DataFrame) -> pd.Series:
     if api_log is None or api_log.empty or "api_status" not in api_log.columns:
+        return pd.Series(dtype=str)
+    return api_log["api_status"].astype(str).str.strip()
+
+
+def count_api_errors(api_log: pd.DataFrame) -> int:
+    """Counts only real errors from the current run log.
+
+    Historical API log is appended later for storage, but summary must describe
+    only the current launch. SKIP/dry-run/preview statuses are expected control
+    flow and must not be counted as API errors.
+    """
+    statuses = _api_status_series(api_log)
+    if statuses.empty:
         return 0
-    statuses = api_log["api_status"].astype(str).str.strip()
     numeric = pd.to_numeric(statuses, errors="coerce")
-    return int(((numeric >= 400) | statuses.str.contains("exception|error|payload_error", case=False, na=False)).sum())
+    is_numeric_error = numeric.ge(400).fillna(False)
+    is_text_error = statuses.str.contains("exception|payload_error", case=False, na=False)
+    return int((is_numeric_error | is_text_error).sum())
+
+
+def count_api_sent(api_log: pd.DataFrame) -> int:
+    statuses = _api_status_series(api_log)
+    if statuses.empty:
+        return 0
+    numeric = pd.to_numeric(statuses, errors="coerce")
+    return int(numeric.notna().sum())
+
+
+def count_api_skipped(api_log: pd.DataFrame) -> int:
+    statuses = _api_status_series(api_log)
+    if statuses.empty:
+        return 0
+    return int(statuses.str.contains("not_sent|dry_run_no_call|preview_no_call|skip_", case=False, na=False).sum())
+
 
 def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
     actions = decisions["action"].value_counts(dropna=False).to_dict() if decisions is not None and not decisions.empty and "action" in decisions.columns else {}
@@ -1698,7 +1746,9 @@ def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFra
         "Эксперимент 1: строк минимальной ночной ставки": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == EXPERIMENT_1_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0,
         "Разовый откат ошибочных пауз": "да" if getattr(args, "rollback_wrong_pauses_only", False) else "нет",
         "Разовый откат: кандидатов на start": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == ROLLBACK_WRONG_FIX46_PAUSE_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0,
-        "Ошибок API": count_api_errors(api_log) if api_log is not None and not api_log.empty else 0,
+        "API-запросов отправлено в текущем запуске": count_api_sent(api_log),
+        "API-действий пропущено без отправки": count_api_skipped(api_log),
+        "Ошибок API": count_api_errors(api_log),
     }
 
 
@@ -1839,7 +1889,7 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
         # Append API log to existing log if any.
         api_log_path = maybe_download_key_to_dir(s3, bucket, API_LOG_KEY, workdir)
         full_api_log = append_excel(api_log_path, api_log)
-        summary = make_summary_json(mode, decisions, successful, full_api_log, windows, args)
+        summary = make_summary_json(mode, decisions, successful, api_log, windows, args)
         summary_path = workdir / "Сводка_последнего_запуска.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         bid_history_out = workdir / "История_ставок.xlsx"
