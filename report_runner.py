@@ -7850,27 +7850,319 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             factor_rows=[{"cells":["—", "—", "—", "—", "→ 0,0%", "0 ₽"]}]
         _draw_table(75, 80, W-150, ["Фактор", "Блок", "Текущее", "Прошлая неделя", "Изм.", "Эффект ВП"], [280,390,180,180,150,180], factor_rows, row_h=32, font_size=11, max_rows=9)
 
+    # FIX49: отдельный лист PDF по артикулу — реклама и ключи на одном листе.
+    # В этом блоке не пересчитываем ВП: показываем операционные рекламные и поисковые
+    # метрики для текущей недели относительно прошлой, чтобы по артикулу сразу было видно,
+    # какие РК дают трафик/заказы и какие запросы реально конвертируют.
+    _article_ads_keys_cache: Dict[str, pd.DataFrame] = {}
+
+    def _pdf_article_map_for_ads_keys() -> pd.DataFrame:
+        if "article_map" in _article_ads_keys_cache:
+            return _article_ads_keys_cache["article_map"]
+        cols = ["subject_disp", "product_code", "supplier_article", "nm_id"]
+        m = daily[[c for c in cols if c in daily.columns]].copy()
+        for c_name in cols:
+            if c_name not in m.columns:
+                m[c_name] = ""
+        m = _normalize_pdf_merge_keys(m, cols)
+        m = m[(m["nm_id"].astype(str).ne("")) | (m["supplier_article"].astype(str).ne(""))].copy()
+        if not m.empty:
+            # nm_id is the most stable key; keep one approved article per nm_id.
+            m = m.drop_duplicates(["nm_id"], keep="first")
+        _article_ads_keys_cache["article_map"] = m
+        return m
+
+    def _fill_article_keys_from_map(src: pd.DataFrame) -> pd.DataFrame:
+        if src is None or src.empty:
+            return pd.DataFrame()
+        x = src.copy()
+        for col_name in ["day", "subject", "subject_disp", "product", "product_code", "supplier_article", "nm_id"]:
+            if col_name not in x.columns:
+                x[col_name] = "" if col_name != "day" else pd.NaT
+        if "day" in x.columns:
+            x["day"] = pd.to_datetime(x["day"], errors="coerce").dt.normalize()
+        if "subject_disp" not in x.columns or x["subject_disp"].astype(str).eq("").all():
+            x["subject_disp"] = x.get("subject", "").map(_subject_disp) if "subject" in x.columns else ""
+        if "product_code" not in x.columns or x["product_code"].astype(str).eq("").all():
+            x["product_code"] = x.apply(lambda r: _prod(r.get("product", "")) or _prod(r.get("supplier_article", "")), axis=1)
+        x["supplier_article"] = x["supplier_article"].map(_clean_article_local)
+        x = _normalize_pdf_merge_keys(x, ["nm_id"])
+        m = _pdf_article_map_for_ads_keys()
+        if not m.empty:
+            x = x.merge(m.rename(columns={
+                "subject_disp": "subject_disp_dict",
+                "product_code": "product_code_dict",
+                "supplier_article": "supplier_article_dict",
+            }), on="nm_id", how="left")
+            for col_name in ["subject_disp", "product_code", "supplier_article"]:
+                dict_col = f"{col_name}_dict"
+                if dict_col in x.columns:
+                    src_vals = x[col_name].map(normalize_text) if col_name != "supplier_article" else x[col_name].map(_clean_article_local)
+                    dict_vals = x[dict_col].map(normalize_text) if col_name != "supplier_article" else x[dict_col].map(_clean_article_local)
+                    x[col_name] = src_vals.where(src_vals.ne(""), dict_vals)
+        x = _normalize_pdf_merge_keys(x, ["subject_disp", "product_code", "supplier_article", "nm_id"])
+        return x
+
+    def _pdf_ads_campaign_source() -> pd.DataFrame:
+        if "ads_campaign" in _article_ads_keys_cache:
+            return _article_ads_keys_cache["ads_campaign"]
+        src = outputs.get("ads_raw_source", pd.DataFrame())
+        if src is None or src.empty:
+            src = outputs.get("manager_ads_daily_source", pd.DataFrame())
+        if src is None or src.empty:
+            _article_ads_keys_cache["ads_campaign"] = pd.DataFrame()
+            return _article_ads_keys_cache["ads_campaign"]
+        x = _fill_article_keys_from_map(src)
+        if x.empty:
+            _article_ads_keys_cache["ads_campaign"] = pd.DataFrame()
+            return x
+        if "campaign_id" not in x.columns:
+            x["campaign_id"] = ""
+        x["campaign_id"] = x["campaign_id"].map(lambda v: str(int(v)) if pd.notna(to_number(v)) else normalize_text(v))
+        x["campaign_id"] = x["campaign_id"].replace("", "без ID")
+        if "ad_type" not in x.columns:
+            x["ad_type"] = "unknown"
+        x["ad_type"] = x["ad_type"].map(normalize_text).str.lower().replace("", "unknown")
+        def _placement(v: Any) -> str:
+            vv = normalize_text(v).lower()
+            if vv == "manual" or "поиск" in vv or "каталог" in vv:
+                return "Поиск"
+            if vv == "unified" or "полк" in vv or "карточ" in vv or "един" in vv or "авто" in vv:
+                return "Полки"
+            return "РК"
+        x["placement_label"] = x["ad_type"].map(_placement)
+        for col_name in ["impressions", "clicks", "orders", "order_sum", "spend"]:
+            if col_name not in x.columns:
+                x[col_name] = 0.0
+            x[col_name] = pd.to_numeric(x[col_name], errors="coerce").fillna(0.0)
+        x = x[x["day"].notna()].copy()
+        _article_ads_keys_cache["ads_campaign"] = x
+        return x
+
+    def _pdf_search_detail_source() -> pd.DataFrame:
+        if "search_detail" in _article_ads_keys_cache:
+            return _article_ads_keys_cache["search_detail"]
+        src = outputs.get("manager_search_source", pd.DataFrame())
+        if src is None or src.empty:
+            src = outputs.get("search_query_gp_position", pd.DataFrame())
+        if src is None or src.empty:
+            _article_ads_keys_cache["search_detail"] = pd.DataFrame()
+            return _article_ads_keys_cache["search_detail"]
+        x = _fill_article_keys_from_map(src)
+        if x.empty:
+            _article_ads_keys_cache["search_detail"] = pd.DataFrame()
+            return x
+        if "search_query" not in x.columns:
+            x["search_query"] = x.get("query", "") if "query" in x.columns else ""
+        x["search_query"] = x["search_query"].map(normalize_text)
+        rename_candidates = {
+            "transitions": ["transitions", "search_transitions", "clicks", "open_cards"],
+            "frequency": ["frequency", "search_frequency", "unique_search_frequency"],
+            "visibility_pct": ["visibility_pct", "visibility", "Видимость, %", "Видимость"],
+            "orders": ["orders", "search_orders"],
+            "order_sum": ["order_sum", "search_order_sum"],
+        }
+        for target_col, candidates in rename_candidates.items():
+            if target_col not in x.columns:
+                found = next((cnd for cnd in candidates if cnd in x.columns), None)
+                x[target_col] = x[found] if found else 0.0
+        for col_name in ["frequency", "transitions", "orders", "order_sum", "visibility_pct"]:
+            x[col_name] = pd.to_numeric(x[col_name], errors="coerce").fillna(0.0)
+        x = x[x["day"].notna() & x["search_query"].ne("")].copy()
+        _article_ads_keys_cache["search_detail"] = x
+        return x
+
+    def _article_source_filter(df: pd.DataFrame, row: pd.Series) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        cat = normalize_text(row.get("subject_disp"))
+        prod = normalize_text(row.get("product_code"))
+        art = _clean_article_local(row.get("supplier_article"))
+        nm = normalize_text(row.get("nm_id"))
+        x = df.copy()
+        mask = pd.Series(True, index=x.index)
+        if nm:
+            mask = x.get("nm_id", pd.Series("", index=x.index)).astype(str).eq(nm)
+        elif art:
+            mask = x.get("supplier_article", pd.Series("", index=x.index)).astype(str).eq(art)
+        else:
+            mask = pd.Series(False, index=x.index)
+        if cat and "subject_disp" in x.columns:
+            mask = mask & x["subject_disp"].astype(str).eq(cat)
+        if prod and "product_code" in x.columns:
+            mask = mask & x["product_code"].astype(str).eq(prod)
+        return x.loc[mask].copy()
+
+    def _campaign_agg_for_article(row: pd.Series, start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+        src = _article_source_filter(_pdf_ads_campaign_source(), row)
+        if src.empty:
+            return pd.DataFrame(columns=["campaign_id", "placement_label", "orders", "order_sum", "clicks", "impressions", "spend", "ctr", "drr"])
+        x = src[(src["day"] >= pd.Timestamp(start_dt).normalize()) & (src["day"] <= pd.Timestamp(end_dt).normalize())].copy()
+        if x.empty:
+            return pd.DataFrame(columns=["campaign_id", "placement_label", "orders", "order_sum", "clicks", "impressions", "spend", "ctr", "drr"])
+        g = x.groupby(["campaign_id", "placement_label"], dropna=False, as_index=False).agg(
+            orders=("orders", "sum"),
+            order_sum=("order_sum", "sum"),
+            clicks=("clicks", "sum"),
+            impressions=("impressions", "sum"),
+            spend=("spend", "sum"),
+        )
+        g["ctr"] = np.where(g["impressions"] > 0, g["clicks"] / g["impressions"] * 100.0, np.nan)
+        g["drr"] = np.where(g["order_sum"] > 0, g["spend"] / g["order_sum"] * 100.0, np.nan)
+        return g
+
+    def _ad_campaign_rows_for_article(row: pd.Series, start_dt: pd.Timestamp, end_dt: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, max_items: int = 6) -> List[Dict[str, Any]]:
+        cur = _campaign_agg_for_article(row, start_dt, end_dt)
+        prev = _campaign_agg_for_article(row, prev_s, prev_e)
+        keys = ["campaign_id", "placement_label"]
+        out = cur.merge(prev, on=keys, how="outer", suffixes=("", "_prev"))
+        if out.empty:
+            return [{"cells": ["Нет данных по РК за период", "—", "—", "—", "—", "—", "—", "—"]}]
+        for col_name in ["orders", "order_sum", "clicks", "impressions", "spend", "ctr", "drr"]:
+            if col_name not in out.columns:
+                out[col_name] = np.nan
+            if col_name + "_prev" not in out.columns:
+                out[col_name + "_prev"] = np.nan
+            out[col_name] = pd.to_numeric(out[col_name], errors="coerce").fillna(0.0)
+            out[col_name + "_prev"] = pd.to_numeric(out[col_name + "_prev"], errors="coerce").fillna(0.0)
+        out["_sort"] = out["orders"] * 1000000 + out["spend"] * 10 + out["clicks"]
+        out = out.sort_values("_sort", ascending=False).head(max_items)
+        rows: List[Dict[str, Any]] = []
+        for _, r in out.iterrows():
+            label = f"{normalize_text(r.get('placement_label'))} / {normalize_text(r.get('campaign_id'))}"
+            rows.append({"cells": [
+                label,
+                (_fmt_num(r.get("orders")), _delta(r.get("orders"), r.get("orders_prev")), "Заказы"),
+                (_fmt_money(r.get("order_sum")), _delta_abs(r.get("order_sum"), r.get("order_sum_prev")), "Сумма"),
+                (_fmt_num(r.get("clicks")), _delta(r.get("clicks"), r.get("clicks_prev")), "Клики"),
+                (_fmt_num(r.get("impressions")), _delta(r.get("impressions"), r.get("impressions_prev")), "Показы"),
+                (_fmt_pct(r.get("ctr")), _delta(r.get("ctr"), r.get("ctr_prev")), "CTR"),
+                (_fmt_money(r.get("spend")), _delta_abs(r.get("spend"), r.get("spend_prev")), "Расход РК"),
+                (_fmt_pct(r.get("drr")), _delta(r.get("drr"), r.get("drr_prev")), "ДРР"),
+            ]})
+        return rows or [{"cells": ["Нет данных по РК за период", "—", "—", "—", "—", "—", "—", "—"]}]
+
+    def _search_query_rows_for_article(row: pd.Series, start_dt: pd.Timestamp, end_dt: pd.Timestamp, max_items: int = 8) -> List[Dict[str, Any]]:
+        src = _article_source_filter(_pdf_search_detail_source(), row)
+        if src.empty:
+            return [{"cells": ["Нет данных по поисковым запросам за период", "—", "—", "—", "—", "—", "—", "—"]}]
+        x = src[(src["day"] >= pd.Timestamp(start_dt).normalize()) & (src["day"] <= pd.Timestamp(end_dt).normalize())].copy()
+        if x.empty:
+            return [{"cells": ["Нет данных по поисковым запросам за период", "—", "—", "—", "—", "—", "—", "—"]}]
+        # Query rows are already deduped by loader, but this keeps the page stable for PDF-only mode.
+        x["_vis_weight"] = x["frequency"].where(x["frequency"] > 0, x["transitions"]).fillna(0.0)
+        q = x.groupby("search_query", dropna=False, as_index=False).agg(
+            frequency=("frequency", "sum"),
+            transitions=("transitions", "sum"),
+            orders=("orders", "sum"),
+            order_sum=("order_sum", "sum"),
+            visibility_num=("visibility_pct", lambda s: float((s * x.loc[s.index, "_vis_weight"]).sum())),
+            visibility_den=("_vis_weight", "sum"),
+        )
+        q = q[pd.to_numeric(q["orders"], errors="coerce").fillna(0) > 0].copy()
+        if q.empty:
+            return [{"cells": ["Нет запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—"]}]
+        # If query file has no order sum, estimate it from the article average order value for the same week.
+        article_orders = _num(row.get("orders"), 0.0)
+        article_sum = _num(row.get("sum_use"), 0.0)
+        aov = article_sum / article_orders if article_orders > 0 else 0.0
+        q["order_sum_calc"] = np.where(pd.to_numeric(q["order_sum"], errors="coerce").fillna(0) > 0, q["order_sum"], q["orders"] * aov)
+        q["click_to_order_conv"] = np.where(q["transitions"] > 0, q["orders"] / q["transitions"] * 100.0, np.nan)
+        q["visibility_pct_calc"] = np.where(q["visibility_den"] > 0, q["visibility_num"] / q["visibility_den"], np.nan)
+        q["traffic_taken_pct"] = np.where(q["frequency"] > 0, q["transitions"] / q["frequency"] * 100.0, np.nan)
+        q = q.sort_values(["orders", "order_sum_calc", "transitions", "frequency"], ascending=[False, False, False, False]).head(max_items)
+        rows: List[Dict[str, Any]] = []
+        for _, r in q.iterrows():
+            rows.append({"cells": [
+                normalize_text(r.get("search_query")),
+                _fmt_num(r.get("frequency")),
+                _fmt_num(r.get("transitions")),
+                _fmt_num(r.get("orders")),
+                _fmt_money(r.get("order_sum_calc")),
+                _fmt_pct(r.get("click_to_order_conv")),
+                _fmt_pct(r.get("visibility_pct_calc")),
+                _fmt_pct(r.get("traffic_taken_pct")),
+            ]})
+        return rows or [{"cells": ["Нет запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—"]}]
+
+    def _draw_article_ads_keys_page(contour: str, key: str, row: pd.Series, back_buttons: List[Tuple[int, int, int, str, str]]):
+        info = contours[contour]
+        cat = str(row.get("subject_disp")); prod = str(row.get("product_code")); art = _clean_article_local(row.get("supplier_article"))
+        _start(
+            f"Артикул: {art}",
+            f"{cat} / товар {prod} / реклама и ключи / {info['period']}",
+            "Артикул 3/3",
+            key=key,
+            top_menu=False,
+            back_buttons=back_buttons,
+        )
+        _section_bar(650, "Блок 4. Реклама: текущая неделя vs прошлая")
+        ad_rows = _ad_campaign_rows_for_article(row, info["start"], info["end"], info["prev_start"], info["prev_end"], max_items=6)
+        _draw_table(
+            75, 435, W-150,
+            ["РК / тип", "Заказы", "Сумма", "Клики", "Показы", "CTR", "Расход", "ДРР"],
+            [270,115,160,115,135,110,155,110],
+            ad_rows,
+            row_h=27,
+            font_size=9,
+            max_rows=6,
+        )
+        _section_bar(352, "Блок 5. Поисковые запросы, которые дали заказы")
+        query_rows = _search_query_rows_for_article(row, info["start"], info["end"], max_items=8)
+        _draw_table(
+            75, 76, W-150,
+            ["Поисковый запрос", "Част.", "Клики", "Заказы", "Сумма", "CR клик→заказ", "Видим.", "% трафика"],
+            [395,115,95,95,135,145,110,125],
+            query_rows,
+            row_h=25,
+            font_size=8.5,
+            max_rows=8,
+        )
+
     def _draw_article_pages(contour: str, art_row: pd.Series):
         info = contours[contour]
         cat = str(art_row["subject_disp"]); prod = str(art_row["product_code"]); art = _clean_article_local(art_row.get("supplier_article"))
-        a1 = _art_key(contour, cat, prod, art, 1); a2 = _art_key(contour, cat, prod, art, 2)
+        a1 = _art_key(contour, cat, prod, art, 1)
+        a2 = _art_key(contour, cat, prod, art, 2)
+        has_ads_keys_page = contour == "prev"
+        a3 = _art_key(contour, cat, prod, art, 3) if has_ads_keys_page else ""
         cat_list_key = _cat_key(contour, cat)+"_list"
         product_back = cat_list_key if cat == "Кисти" else _prod_key(contour, cat, prod)+"_list"
-        if cat == "Кисти":
-            back_buttons = [(1230,798,210,"← категория", product_back), (1480,798,80,"стр.2",a2)]
+        if has_ads_keys_page:
+            if cat == "Кисти":
+                back_buttons = [(1165,798,210,"← категория", product_back), (1390,798,75,"стр.2",a2), (1475,798,75,"стр.3",a3)]
+            else:
+                back_buttons = [(1035,798,160,"← товар", product_back), (1215,798,135,"← категория",cat_list_key), (1370,798,75,"стр.2",a2), (1465,798,75,"стр.3",a3)]
+            section1 = "Артикул 1/3"
+            section2 = "Артикул 2/3"
         else:
-            back_buttons = [(1120,798,170,"← товар", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
-        _draw_level_overview(f"Артикул: {art}", f"{cat} / товар {prod} / {info['period']}", "Артикул 1/2", a1, art_row, back_buttons=None)
+            if cat == "Кисти":
+                back_buttons = [(1230,798,210,"← категория", product_back), (1480,798,80,"стр.2",a2)]
+            else:
+                back_buttons = [(1120,798,170,"← товар", product_back), (1310,798,150,"← категория",cat_list_key), (1480,798,80,"стр.2",a2)]
+            section1 = "Артикул 1/2"
+            section2 = "Артикул 2/2"
+        _draw_level_overview(f"Артикул: {art}", f"{cat} / товар {prod} / {info['period']}", section1, a1, art_row, back_buttons=None)
         # overwrite top buttons on the page with correct buttons (because _draw_level_overview already started page)
         for bx,by,bw,label,target in back_buttons:
             c.setFillColor(WHITE); c.roundRect(bx, by, bw, 44, 15, fill=1, stroke=0)
             _draw_text(label, bx+8, by+16, bw-16, F_BOLD, 12, RED_DARK, align="center"); _link(target, (bx,by,bx+bw,by+44))
         # Page 2: entry points and full factor table.
-        if cat == "Кисти":
-            page2_buttons = [(1230,798,210,"← категория", product_back),(1480,798,80,"стр.1",a1)]
+        if has_ads_keys_page:
+            if cat == "Кисти":
+                page2_buttons = [(1165,798,210,"← категория", product_back),(1390,798,75,"стр.1",a1),(1475,798,75,"стр.3",a3)]
+                page3_buttons = [(1165,798,210,"← категория", product_back),(1390,798,75,"стр.1",a1),(1475,798,75,"стр.2",a2)]
+            else:
+                page2_buttons = [(1035,798,160,"← товар", product_back),(1215,798,135,"← категория",cat_list_key),(1370,798,75,"стр.1",a1),(1465,798,75,"стр.3",a3)]
+                page3_buttons = [(1035,798,160,"← товар", product_back),(1215,798,135,"← категория",cat_list_key),(1370,798,75,"стр.1",a1),(1465,798,75,"стр.2",a2)]
         else:
-            page2_buttons = [(1120,798,170,"← товар", product_back),(1310,798,150,"← категория",cat_list_key),(1480,798,80,"стр.1",a1)]
-        _draw_entity_entry_factor_page("article", a2, f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", "Артикул 2/2", art_row, page2_buttons)
+            if cat == "Кисти":
+                page2_buttons = [(1230,798,210,"← категория", product_back),(1480,798,80,"стр.1",a1)]
+            else:
+                page2_buttons = [(1120,798,170,"← товар", product_back),(1310,798,150,"← категория",cat_list_key),(1480,798,80,"стр.1",a1)]
+        _draw_entity_entry_factor_page("article", a2, f"Артикул: {art}", f"{cat} / товар {prod} / точки входа и факторы", section2, art_row, page2_buttons)
+        if has_ads_keys_page:
+            _draw_article_ads_keys_page(contour, a3, art_row, page3_buttons)
 
     def _render_contour(contour: str):
         for cat in CATEGORY_ORDER:
