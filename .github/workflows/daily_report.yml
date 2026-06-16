@@ -1,5 +1,5 @@
 name: Daily TOPFACE sales report
-# FIX52_STRICT_PREV_DAY_CORE_LOC_ABC_20260616: active workflow. Upload as .github/workflows/daily_report.yml
+# FIX53_LOCKED_PREV_DAY_NO_ENV_OVERRIDE_20260616: active workflow. Upload as .github/workflows/daily_report.yml
 
 on:
   workflow_dispatch:
@@ -53,9 +53,9 @@ jobs:
 
     env:
       REPORT_SCRIPT: report_runner.py
-      EXPECTED_VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
+      EXPECTED_VERSION: FIX53_DAILY_LOCKED_LAYOUT_BID_HISTORY_20260616
 
-      # FIX52: schedule/auto = strictly previous day by MSK; full_refresh only by manual choice.
+      # FIX53: schedule/auto/manual = strictly previous day by MSK; REPORT_ENV cannot override date/mode.
       # current_week waits exact daily ABC for yesterday; weekly full_refresh waits exact closed-week ABC.
       ABC_WAIT_MAX_ATTEMPTS: "6"
       ABC_WAIT_SLEEP_SECONDS: "600"
@@ -108,7 +108,7 @@ jobs:
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
           echo "Planned cron: 0 16 * * * = 19:00 MSK start"
-          echo "FIX52: schedule/auto sends only previous-day daily report; full_refresh is manual only"
+          echo "FIX53: schedule/manual sends only previous-day daily report; REPORT_ENV cannot override date"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -191,11 +191,13 @@ jobs:
             # иначе 16.06 снова может уйти отчёт за закрытую неделю 08.06-14.06.
             MODE="current_week"
           else
-            MODE="${INPUT_MODE:-auto}"
+            MODE="${INPUT_MODE:-current_week}"
             SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
 
-            if [ "$MODE" = "auto" ]; then
-              # FIX50: auto = current_week. full_refresh только ручным выбором.
+            if [ "$MODE" = "auto" ] || [ "$MODE" = "full_refresh" ]; then
+              # FIX53: этот workflow всегда ежедневный. Даже ручной full_refresh здесь переводим в current_week,
+              # чтобы REPORT_ENV/.env не отправлял закрытую неделю вместо предыдущего дня.
+              echo "FIX53: requested mode=$MODE; force MODE=current_week for daily report"
               MODE="current_week"
             fi
           fi
@@ -259,6 +261,17 @@ jobs:
             echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
             echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
             echo "WB_DAILY_TARGET_DATE=$WB_DAILY_TARGET_DATE"
+            # FIX53 locked values: after source .env, restore these values so REPORT_ENV cannot override date/mode.
+            echo "WF_LOCKED_MODE=$MODE"
+            echo "WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
+            echo "WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
+            echo "WF_LOCKED_REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
+            echo "WF_LOCKED_REPORT_DAILY_STRICT=1"
+            echo "WF_LOCKED_REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
+            echo "WF_LOCKED_REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
+            echo "WF_LOCKED_REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
+            echo "WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
+            echo "WF_LOCKED_WB_DAILY_TARGET_DATE=$WB_DAILY_TARGET_DATE"
           } >> "$GITHUB_ENV"
 
           {
@@ -285,6 +298,19 @@ jobs:
           source .env || true
           set +a
 
+          # FIX53: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
+          # Restore workflow-decided values after sourcing .env.
+          export MODE="${WF_LOCKED_MODE:-current_week}"
+          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
+          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
+          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
+          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
+          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
+          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
+          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
+          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
+          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
+
           test -n "${YC_ACCESS_KEY_ID:-}" || { echo "ERROR: YC_ACCESS_KEY_ID is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
           test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
           test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
@@ -302,6 +328,19 @@ jobs:
           set -a
           source .env || true
           set +a
+
+          # FIX53: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
+          # Restore workflow-decided values after sourcing .env.
+          export MODE="${WF_LOCKED_MODE:-current_week}"
+          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
+          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
+          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
+          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
+          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
+          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
+          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
+          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
+          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
 
           # Fallback на старые временные имена, если вдруг они попали в окружение.
           export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
@@ -330,6 +369,19 @@ jobs:
           source .env || true
           set +a
 
+          # FIX53: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
+          # Restore workflow-decided values after sourcing .env.
+          export MODE="${WF_LOCKED_MODE:-current_week}"
+          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
+          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
+          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
+          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
+          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
+          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
+          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
+          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
+          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
+
           # FIX47:
           # - current_week должен ждать daily ABC за WB_DAILY_TARGET_DATE;
           # - full_refresh / закрытая неделя должен ждать недельный ABC вида
@@ -339,7 +391,7 @@ jobs:
 
           ATTEMPT=1
           MAX_ATTEMPTS="${ABC_WAIT_MAX_ATTEMPTS:-6}"
-          SLEEP_SECONDS="${ABC_WAIT_SLEEP_SECONDS:-3600}"
+          SLEEP_SECONDS="${ABC_WAIT_SLEEP_SECONDS:-600}"
 
           echo "abc_wait: mode=${MODE:-}"
           echo "abc_wait: REPORT_REQUIRE_ABC_PERIOD=${REPORT_REQUIRE_ABC_PERIOD:-}"
@@ -473,6 +525,19 @@ jobs:
           source .env || true
           set +a
 
+          # FIX53: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
+          # Restore workflow-decided values after sourcing .env.
+          export MODE="${WF_LOCKED_MODE:-current_week}"
+          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
+          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
+          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
+          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
+          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
+          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
+          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
+          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
+          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
+
           echo "Preflight before long report run"
           echo "MODE=$MODE"
           echo "REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE:-}"
@@ -490,6 +555,19 @@ jobs:
           set -a
           source .env || true
           set +a
+
+          # FIX53: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
+          # Restore workflow-decided values after sourcing .env.
+          export MODE="${WF_LOCKED_MODE:-current_week}"
+          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
+          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
+          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
+          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
+          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
+          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
+          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
+          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
+          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
 
           export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
           export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
@@ -512,6 +590,19 @@ jobs:
           set -a
           source .env || true
           set +a
+
+          # FIX53: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
+          # Restore workflow-decided values after sourcing .env.
+          export MODE="${WF_LOCKED_MODE:-current_week}"
+          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
+          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
+          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
+          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
+          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
+          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
+          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
+          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
+          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
 
           export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
           export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
