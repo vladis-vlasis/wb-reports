@@ -12,6 +12,7 @@
 # FIX38: advertising truth uses category-level ad report only; raw campaign rows are not allowed for PDF/Telegram totals
 # FIX50: strict daily report date, daily ABC validation, no Telegram fallback to previous day
 # FIX52: previous-day strict PDF, search filter dedupe, 60d CORE, ABC unit expenses/localization windows
+# FIX53: daily date lock cannot be overridden by closed-week flags; article ads/key layout; bid history by source file
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -40,6 +41,8 @@ Outputs are overwritten every run:
 """
 
 from __future__ import annotations
+
+# FIX53_DAILY_LOCKED_LAYOUT_BID_HISTORY_20260616: daily date lock, article ads/key layout, bid history by source file
 
 import argparse
 import calendar
@@ -1305,17 +1308,44 @@ class Loader:
             raw = raw.drop_duplicates(subset=dedup_cols).copy()
             if len(raw) != before_dedup:
                 log(f"ads: removed duplicated source rows {before_dedup - len(raw):,}; weekly/consolidated overlap")
-        campaigns = pd.concat(campaign_frames, ignore_index=True) if campaign_frames else pd.DataFrame(columns=["campaign_id", "nm_id", "subject", "ad_type", "bid_type_raw", "bid_current", "bid_search", "bid_recommendations"])
+        campaigns = pd.concat(campaign_frames, ignore_index=True) if campaign_frames else pd.DataFrame(columns=["campaign_id", "nm_id", "subject", "ad_type", "bid_type_raw", "bid_current", "bid_search", "bid_recommendations", "source_file"])
         if not campaigns.empty:
             before_camp_dedup = len(campaigns)
-            campaigns = campaigns.drop_duplicates(["campaign_id", "nm_id", "ad_type", "bid_type_raw"]).copy()
+            # FIX53: keep campaign-list snapshots by source_file.
+            # The old dedupe by campaign_id+nm_id applied one static bid to all weeks, so avg bid dynamics was always 0.
+            dedup_keys = [c for c in ["source_file", "campaign_id", "nm_id", "ad_type", "bid_type_raw"] if c in campaigns.columns]
+            campaigns = campaigns.drop_duplicates(dedup_keys, keep="last").copy() if dedup_keys else campaigns.drop_duplicates().copy()
             if len(campaigns) != before_camp_dedup:
                 log(f"ads: removed duplicated campaign rows {before_camp_dedup - len(campaigns):,}")
         if not raw.empty:
             if not campaigns.empty:
-                cmap_cols = [c for c in ["campaign_id", "nm_id", "ad_type", "bid_type_raw", "bid_current", "bid_search", "bid_recommendations"] if c in campaigns.columns]
-                cmap = campaigns.drop_duplicates(["campaign_id", "nm_id"])[cmap_cols]
-                raw = raw.merge(cmap, on=["campaign_id", "nm_id"], how="left")
+                cmap_cols = [c for c in ["source_file", "campaign_id", "nm_id", "ad_type", "bid_type_raw", "bid_current", "bid_search", "bid_recommendations"] if c in campaigns.columns]
+                if "source_file" in raw.columns and "source_file" in cmap_cols:
+                    cmap_file = campaigns.drop_duplicates(["source_file", "campaign_id", "nm_id"], keep="last")[cmap_cols]
+                    raw = raw.merge(cmap_file, on=["source_file", "campaign_id", "nm_id"], how="left")
+                else:
+                    raw["ad_type"] = np.nan
+                    raw["bid_type_raw"] = np.nan
+                    raw["bid_current"] = np.nan
+                    raw["bid_search"] = np.nan
+                    raw["bid_recommendations"] = np.nan
+                # Fallback for files without a matching campaign snapshot: use the latest known campaign row.
+                fb_cols = [c for c in ["campaign_id", "nm_id", "ad_type", "bid_type_raw", "bid_current", "bid_search", "bid_recommendations"] if c in campaigns.columns]
+                fb = campaigns.drop_duplicates(["campaign_id", "nm_id"], keep="last")[fb_cols].rename(columns={
+                    "ad_type": "ad_type_fb",
+                    "bid_type_raw": "bid_type_raw_fb",
+                    "bid_current": "bid_current_fb",
+                    "bid_search": "bid_search_fb",
+                    "bid_recommendations": "bid_recommendations_fb",
+                })
+                raw = raw.merge(fb, on=["campaign_id", "nm_id"], how="left")
+                for _base in ["ad_type", "bid_type_raw", "bid_current", "bid_search", "bid_recommendations"]:
+                    _fb = _base + "_fb"
+                    if _base not in raw.columns:
+                        raw[_base] = np.nan
+                    if _fb in raw.columns:
+                        raw[_base] = raw[_base].where(raw[_base].notna() & raw[_base].astype(str).ne(""), raw[_fb])
+                        raw = raw.drop(columns=[_fb])
             raw["ad_type"] = raw.get("ad_type", "unknown")
             raw["ad_type"] = raw["ad_type"].fillna("unknown").replace("", "unknown")
             if "bid_current" not in raw.columns:
@@ -6398,23 +6428,25 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             if _complete_latest < latest:
                 log(f"complete-day guard: latest_day {latest.date()} -> {_complete_latest.date()} because ads/demand are not complete")
                 latest = _complete_latest
-    # FIX52: scheduled/current_week report is a strict previous-day report.
-    # Full weekly mode is still available only via REPORT_CLOSED_WEEK_AS_PREVIOUS=1/full_refresh.
+    # FIX53: daily/scheduled/current-week report is always a strict one-day report.
+    # Even if .env/REPORT_ENV accidentally contains REPORT_CLOSED_WEEK_AS_PREVIOUS=1,
+    # daily strict mode must not fall back to the closed Sunday/week.
     daily_strict_mode = _env_flag("REPORT_DAILY_STRICT", False) or _env_flag("WB_CURRENT_WEEK_ONLY", False)
-    if daily_strict_mode and not _env_flag("REPORT_CLOSED_WEEK_AS_PREVIOUS", False):
+    closed_week_mode = _env_flag("REPORT_CLOSED_WEEK_AS_PREVIOUS", False) and not daily_strict_mode
+    if daily_strict_mode:
         cur_start = latest
         cur_end = latest
         cur_actual_end = latest
-        prev_start = latest - pd.Timedelta(days=7)
-        prev_end = latest - pd.Timedelta(days=7)
-        prev2_start = latest - pd.Timedelta(days=14)
-        prev2_end = latest - pd.Timedelta(days=14)
+        prev_start = latest - pd.Timedelta(days=1)
+        prev_end = latest - pd.Timedelta(days=1)
+        prev2_start = latest - pd.Timedelta(days=2)
+        prev2_end = latest - pd.Timedelta(days=2)
         log(f"Daily strict mode: report day={latest:%d.%m.%Y}; comparison day={prev_start:%d.%m.%Y}")
     else:
         cur_start = latest - pd.Timedelta(days=int(latest.weekday()))
         cur_end = cur_start + pd.Timedelta(days=6)
         cur_actual_end = latest
-    if _env_flag("REPORT_CLOSED_WEEK_AS_PREVIOUS", False):
+    if closed_week_mode:
         if int(latest.weekday()) != 6:
             raise RuntimeError(
                 f"REPORT_CLOSED_WEEK_AS_PREVIOUS=1 требует дату-воскресенье, получено {latest:%d.%m.%Y}"
@@ -7299,12 +7331,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         txt = str(value)
         val_size = size + 1
         money_metric = any(k in str(metric) for k in ["Сумма", "ВП", "Расход РК", "Заказы за неделю", "Заказы, ₽"])
-        # Keep dynamic arrow next to the value, not at the far edge of the cell.
-        if align == "center":
-            _draw_text(txt, x, y, w*0.62 if delta is not None else w, F_BOLD, val_size, BLACK, align="center")
+        # Keep dynamic arrow next to the value.
+        # FIX53: when there is no comparison/delta, do not center the value in half-empty cells;
+        # keep it left-aligned so columns do not look visually shifted.
+        if delta is None:
+            _draw_text(txt, x+5, y, w-10, F_BOLD, val_size, BLACK, align="left")
+            vx = x + w*0.61
+        elif align == "center":
+            _draw_text(txt, x, y, w*0.62, F_BOLD, val_size, BLACK, align="center")
             vx = x + w*0.60
         else:
-            _draw_text(txt, x+5, y, w*0.62 if delta is not None else w-10, F_BOLD, val_size, BLACK)
+            _draw_text(txt, x+5, y, w*0.62, F_BOLD, val_size, BLACK)
             vx = x + w*0.61
         if delta is not None:
             dtext = _arrow_money(delta, _lower_bad(metric)) if money_metric else _arrow(delta, _lower_bad(metric))
@@ -8314,10 +8351,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 q[col_name + "_prev"] = np.nan
             q[col_name] = pd.to_numeric(q[col_name], errors="coerce").fillna(0.0)
             q[col_name + "_prev"] = pd.to_numeric(q[col_name + "_prev"], errors="coerce").fillna(0.0)
+        # Keep only queries that have orders in the current period, but rank by current+previous
+        # so falling important queries do not disappear and the page does not show only winners.
         q = q[pd.to_numeric(q["orders"], errors="coerce").fillna(0) > 0].copy()
         if q.empty:
             return [{"cells": ["Нет запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—"]}]
-        q = q.sort_values(["orders", "order_sum_calc", "transitions", "frequency"], ascending=[False, False, False, False]).head(max_items)
+        q["_orders_union"] = pd.to_numeric(q["orders"], errors="coerce").fillna(0) + pd.to_numeric(q.get("orders_prev", 0), errors="coerce").fillna(0)
+        q["_sum_union"] = pd.to_numeric(q["order_sum_calc"], errors="coerce").fillna(0) + pd.to_numeric(q.get("order_sum_calc_prev", 0), errors="coerce").fillna(0)
+        q["_clicks_union"] = pd.to_numeric(q["transitions"], errors="coerce").fillna(0) + pd.to_numeric(q.get("transitions_prev", 0), errors="coerce").fillna(0)
+        q = q.sort_values(["_orders_union", "orders", "_sum_union", "_clicks_union", "frequency"], ascending=[False, False, False, False, False]).head(max_items)
         rows: List[Dict[str, Any]] = []
         for _, r in q.iterrows():
             rows.append({"cells": [
@@ -8345,25 +8387,34 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         )
         _section_bar(650, "Блок 4. Реклама: текущая неделя vs прошлая")
         ad_rows = _ad_campaign_rows_for_article(row, info["start"], info["end"], info["prev_start"], info["prev_end"], max_items=6)
+        real_ad_rows = 0 if (len(ad_rows) == 1 and str(ad_rows[0].get("cells", [""])[0]).startswith("Нет данных")) else len(ad_rows)
+        ad_row_h = 31
+        ad_table_h = 42 + ad_row_h * max(1, min(6, len(ad_rows)))
+        # FIX53: most articles have only 1-2 campaigns. Move the ad table up and give the freed space to queries.
+        ad_y = max(410, 642 - ad_table_h)
         _draw_table(
-            75, 414, W-150,
+            75, ad_y, W-150,
             ["РК / тип", "Ср. ставка", "Заказы", "Сумма", "Клики", "Показы", "CTR", "Расход", "ДРР"],
             [255,115,105,145,95,120,95,145,95],
             ad_rows,
-            row_h=31,
+            row_h=ad_row_h,
             font_size=10.5,
             max_rows=6,
         )
-        _section_bar(374, "Блок 5. Поисковые запросы, которые дали заказы")
-        query_rows = _search_query_rows_for_article(row, info["start"], info["end"], info["prev_start"], info["prev_end"], max_items=12)
+        query_bar_y = max(330, ad_y - 54)
+        _section_bar(query_bar_y, "Блок 5. Поисковые запросы, которые дали заказы")
+        query_row_h = 20
+        query_y = 58
+        max_query_rows = max(12, min(20, int((query_bar_y - query_y - 48) / query_row_h)))
+        query_rows = _search_query_rows_for_article(row, info["start"], info["end"], info["prev_start"], info["prev_end"], max_items=max_query_rows)
         _draw_table(
-            75, 64, W-150,
+            75, query_y, W-150,
             ["Поисковый запрос", "Част.", "Клики", "Заказы", "Сумма", "CR клик→заказ", "Видим.", "% трафика"],
-            [380,110,95,95,130,145,105,115],
+            [390,110,95,95,130,145,105,115],
             query_rows,
-            row_h=22,
-            font_size=9.2,
-            max_rows=12,
+            row_h=query_row_h,
+            font_size=8.8,
+            max_rows=max_query_rows,
         )
 
     def _draw_article_pages(contour: str, art_row: pd.Series):
