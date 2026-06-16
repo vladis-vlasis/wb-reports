@@ -1,5 +1,5 @@
 name: Daily TOPFACE sales report
-# FIX48_REPORT_DAILY_15_GP_DEMAND_20260616: active workflow. Upload as .github/workflows/daily_report.yml
+# FIX52_STRICT_PREV_DAY_CORE_LOC_ABC_20260616: active workflow. Upload as .github/workflows/daily_report.yml
 
 on:
   workflow_dispatch:
@@ -55,13 +55,14 @@ jobs:
       REPORT_SCRIPT: report_runner.py
       EXPECTED_VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
 
-      # FIX47: отчёт стартует в 19:00 МСК и ждёт нужный ABC.
-      # current_week ждёт daily ABC за вчера; full_refresh ждёт недельный ABC за закрытую неделю.
+      # FIX52: schedule/auto = strictly previous day by MSK; full_refresh only by manual choice.
+      # current_week waits exact daily ABC for yesterday; weekly full_refresh waits exact closed-week ABC.
       ABC_WAIT_MAX_ATTEMPTS: "6"
       ABC_WAIT_SLEEP_SECONDS: "600"
 
       WB_STORE: TOPFACE
       REPORT_STORE: TOPFACE
+      REPORT_DAILY_STRICT: "1"
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
 
@@ -82,9 +83,9 @@ jobs:
       TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
-      WB_MAX_SEARCH_QUERY_FILES: "4"
-      WB_MAX_ENTRY_POINT_FILES: "4"
-      WB_MAX_STOCK_FILES: "5"
+      WB_MAX_SEARCH_QUERY_FILES: "12"
+      WB_MAX_ENTRY_POINT_FILES: "8"
+      WB_MAX_STOCK_FILES: "12"
 
       PDF_FAIL_ON_MISSING_DEMAND: "0"
       PDF_ALLOW_DEMAND_FALLBACK: "0"
@@ -107,7 +108,7 @@ jobs:
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
           echo "Planned cron: 0 16 * * * = 19:00 MSK start"
-          echo "FIX47: current_week waits for daily ABC; full_refresh waits for weekly ABC period"
+          echo "FIX52: schedule/auto sends only previous-day daily report; full_refresh is manual only"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -184,15 +185,17 @@ jobs:
           set -euo pipefail
 
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            # FIX48: scheduled daily_report must always send yesterday's daily report.
-            # Full weekly refresh is allowed only by explicit manual mode=full_refresh.
             SEND_TELEGRAM="true"
+            # FIX50: ежедневный workflow всегда формирует оперативный отчёт за вчера.
+            # Full refresh больше не запускается автоматически по понедельникам,
+            # иначе 16.06 снова может уйти отчёт за закрытую неделю 08.06-14.06.
             MODE="current_week"
           else
             MODE="${INPUT_MODE:-auto}"
             SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
 
             if [ "$MODE" = "auto" ]; then
+              # FIX50: auto = current_week. full_refresh только ручным выбором.
               MODE="current_week"
             fi
           fi
@@ -212,7 +215,6 @@ jobs:
 
             REPORT_CLOSED_WEEK_AS_PREVIOUS="1"
             REPORT_REQUIRE_ABC_PERIOD="1"
-            REPORT_REQUIRE_DAILY_ABC="0"
             REPORT_REQUIRE_DAILY_ABC_DATE=""
             REPORT_AUTO_COMPLETE_DATE="0"
             REPORT_AS_OF_DATE="$AS_OF_DATE"
@@ -225,7 +227,6 @@ jobs:
             WB_DAILY_TARGET_DATE="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
             REPORT_REQUIRE_ABC_PERIOD="0"
-            REPORT_REQUIRE_DAILY_ABC="1"
             REPORT_REQUIRE_DAILY_ABC_DATE="$WB_DAILY_TARGET_DATE"
             REPORT_AUTO_COMPLETE_DATE="0"
             REPORT_AS_OF_DATE="$WB_DAILY_TARGET_DATE"
@@ -234,7 +235,6 @@ jobs:
           elif [ "$MODE" = "smoke" ]; then
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
             REPORT_REQUIRE_ABC_PERIOD="0"
-            REPORT_REQUIRE_DAILY_ABC="0"
             REPORT_REQUIRE_DAILY_ABC_DATE=""
             REPORT_AUTO_COMPLETE_DATE="0"
             REPORT_AS_OF_DATE=""
@@ -252,12 +252,12 @@ jobs:
             echo "SEND_TELEGRAM=$SEND_TELEGRAM"
             echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
             echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
-            echo "REPORT_REQUIRE_DAILY_ABC=$REPORT_REQUIRE_DAILY_ABC"
-            echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
             echo "REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
+            echo "REPORT_DAILY_STRICT=1"
             echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
             echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
             echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
+            echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
             echo "WB_DAILY_TARGET_DATE=$WB_DAILY_TARGET_DATE"
           } >> "$GITHUB_ENV"
 
@@ -271,9 +271,9 @@ jobs:
           echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
           echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
           echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
-          echo "REPORT_REQUIRE_DAILY_ABC=$REPORT_REQUIRE_DAILY_ABC"
           echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
           echo "REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
+          echo "REPORT_DAILY_STRICT=1"
 
       - name: Validate storage env
         if: steps.decide.outputs.mode != 'smoke'
@@ -343,7 +343,6 @@ jobs:
 
           echo "abc_wait: mode=${MODE:-}"
           echo "abc_wait: REPORT_REQUIRE_ABC_PERIOD=${REPORT_REQUIRE_ABC_PERIOD:-}"
-          echo "abc_wait: REPORT_REQUIRE_DAILY_ABC=${REPORT_REQUIRE_DAILY_ABC:-}"
           echo "abc_wait: REPORT_REQUIRE_DAILY_ABC_DATE=${REPORT_REQUIRE_DAILY_ABC_DATE:-}"
           echo "abc_wait: REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE:-}"
           echo "abc_wait: REPORT_REQUIRE_DATA_DATE=${REPORT_REQUIRE_DATA_DATE:-}"
@@ -375,6 +374,7 @@ jobs:
           report_as_of = os.environ.get("REPORT_AS_OF_DATE") or ""
           require_date = os.environ.get("REPORT_REQUIRE_DATA_DATE") or ""
           daily_target = os.environ.get("WB_DAILY_TARGET_DATE") or ""
+          daily_abc_date = os.environ.get("REPORT_REQUIRE_DAILY_ABC_DATE") or ""
 
 
           def parse_iso(value: str):
@@ -393,7 +393,7 @@ jobs:
               exact_token = f"wb_abc_report_goods__{start_dmy}-{end_dmy}__at_"
               related_tokens = [f"__{start_dmy}-", f"-{end_dmy}__", f"__{end_dmy}-{end_dmy}__at_"]
           else:
-              target_value = daily_target or require_date or report_as_of
+              target_value = daily_abc_date or daily_target or require_date or report_as_of
               if not target_value:
                   print("abc_wait: skip because required daily date is empty")
                   sys.exit(0)
