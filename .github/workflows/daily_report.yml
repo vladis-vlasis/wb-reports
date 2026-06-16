@@ -1,5 +1,5 @@
 name: Daily TOPFACE sales report
-# FIX47_REPORT_WAIT_ABC_PERIOD_20260616: active workflow. Upload as .github/workflows/daily_report.yml
+# FIX48_REPORT_DAILY_15_GP_DEMAND_20260616: active workflow. Upload as .github/workflows/daily_report.yml
 
 on:
   workflow_dispatch:
@@ -58,7 +58,7 @@ jobs:
       # FIX47: отчёт стартует в 19:00 МСК и ждёт нужный ABC.
       # current_week ждёт daily ABC за вчера; full_refresh ждёт недельный ABC за закрытую неделю.
       ABC_WAIT_MAX_ATTEMPTS: "6"
-      ABC_WAIT_SLEEP_SECONDS: "3600"
+      ABC_WAIT_SLEEP_SECONDS: "600"
 
       WB_STORE: TOPFACE
       REPORT_STORE: TOPFACE
@@ -184,26 +184,16 @@ jobs:
           set -euo pipefail
 
           if [ "${{ github.event_name }}" = "schedule" ]; then
+            # FIX48: scheduled daily_report must always send yesterday's daily report.
+            # Full weekly refresh is allowed only by explicit manual mode=full_refresh.
             SEND_TELEGRAM="true"
-            MSK_DOW="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo("Europe/Moscow")).isoweekday())')"
-
-            if [ "$MSK_DOW" = "1" ]; then
-              MODE="full_refresh"
-            else
-              MODE="current_week"
-            fi
+            MODE="current_week"
           else
             MODE="${INPUT_MODE:-auto}"
             SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
 
             if [ "$MODE" = "auto" ]; then
-              MSK_DOW="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; print(datetime.now(ZoneInfo("Europe/Moscow")).isoweekday())')"
-
-              if [ "$MSK_DOW" = "1" ]; then
-                MODE="full_refresh"
-              else
-                MODE="current_week"
-              fi
+              MODE="current_week"
             fi
           fi
 
@@ -222,6 +212,8 @@ jobs:
 
             REPORT_CLOSED_WEEK_AS_PREVIOUS="1"
             REPORT_REQUIRE_ABC_PERIOD="1"
+            REPORT_REQUIRE_DAILY_ABC="0"
+            REPORT_REQUIRE_DAILY_ABC_DATE=""
             REPORT_AUTO_COMPLETE_DATE="0"
             REPORT_AS_OF_DATE="$AS_OF_DATE"
             REPORT_REQUIRE_DATA_DATE="$REQUIRE_DATE"
@@ -233,6 +225,8 @@ jobs:
             WB_DAILY_TARGET_DATE="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
             REPORT_REQUIRE_ABC_PERIOD="0"
+            REPORT_REQUIRE_DAILY_ABC="1"
+            REPORT_REQUIRE_DAILY_ABC_DATE="$WB_DAILY_TARGET_DATE"
             REPORT_AUTO_COMPLETE_DATE="0"
             REPORT_AS_OF_DATE="$WB_DAILY_TARGET_DATE"
             REPORT_REQUIRE_DATA_DATE="$WB_DAILY_TARGET_DATE"
@@ -240,6 +234,8 @@ jobs:
           elif [ "$MODE" = "smoke" ]; then
             REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
             REPORT_REQUIRE_ABC_PERIOD="0"
+            REPORT_REQUIRE_DAILY_ABC="0"
+            REPORT_REQUIRE_DAILY_ABC_DATE=""
             REPORT_AUTO_COMPLETE_DATE="0"
             REPORT_AS_OF_DATE=""
             REPORT_REQUIRE_DATA_DATE=""
@@ -256,6 +252,8 @@ jobs:
             echo "SEND_TELEGRAM=$SEND_TELEGRAM"
             echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
             echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
+            echo "REPORT_REQUIRE_DAILY_ABC=$REPORT_REQUIRE_DAILY_ABC"
+            echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
             echo "REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
             echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
             echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
@@ -273,6 +271,8 @@ jobs:
           echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
           echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
           echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
+          echo "REPORT_REQUIRE_DAILY_ABC=$REPORT_REQUIRE_DAILY_ABC"
+          echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
           echo "REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
 
       - name: Validate storage env
@@ -343,6 +343,8 @@ jobs:
 
           echo "abc_wait: mode=${MODE:-}"
           echo "abc_wait: REPORT_REQUIRE_ABC_PERIOD=${REPORT_REQUIRE_ABC_PERIOD:-}"
+          echo "abc_wait: REPORT_REQUIRE_DAILY_ABC=${REPORT_REQUIRE_DAILY_ABC:-}"
+          echo "abc_wait: REPORT_REQUIRE_DAILY_ABC_DATE=${REPORT_REQUIRE_DAILY_ABC_DATE:-}"
           echo "abc_wait: REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE:-}"
           echo "abc_wait: REPORT_REQUIRE_DATA_DATE=${REPORT_REQUIRE_DATA_DATE:-}"
           echo "abc_wait: WB_DAILY_TARGET_DATE=${WB_DAILY_TARGET_DATE:-}"
