@@ -1,5 +1,5 @@
 name: Daily TOPFACE sales report
-# FIX45_ABC_1800_REPORT_1900_WAIT_ABC_20260611: active workflow. Upload as .github/workflows/daily_report.yml
+# FIX47_REPORT_WAIT_ABC_PERIOD_20260616: active workflow. Upload as .github/workflows/daily_report.yml
 
 on:
   workflow_dispatch:
@@ -55,8 +55,8 @@ jobs:
       REPORT_SCRIPT: report_runner.py
       EXPECTED_VERSION: ORDERS_ONLY_TG_FIX26_ABC_DEDUPE_GP_MONTH_AVG_ADS_20260602
 
-      # FIX45: отчёт стартует в 19:00 МСК и ждёт daily ABC за нужную дату.
-      # 6 попыток = 19:00, 20:00, 21:00, 22:00, 23:00, 00:00 МСК.
+      # FIX47: отчёт стартует в 19:00 МСК и ждёт нужный ABC.
+      # current_week ждёт daily ABC за вчера; full_refresh ждёт недельный ABC за закрытую неделю.
       ABC_WAIT_MAX_ATTEMPTS: "6"
       ABC_WAIT_SLEEP_SECONDS: "3600"
 
@@ -107,7 +107,7 @@ jobs:
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
           echo "Planned cron: 0 16 * * * = 19:00 MSK start"
-          echo "FIX45: before report run, workflow waits for daily ABC for target date"
+          echo "FIX47: current_week waits for daily ABC; full_refresh waits for weekly ABC period"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -320,7 +320,7 @@ jobs:
           echo "Telegram env OK"
 
 
-      - name: Wait for daily ABC report
+      - name: Wait for required ABC report
         if: steps.decide.outputs.mode != 'smoke'
         shell: bash
         run: |
@@ -330,33 +330,34 @@ jobs:
           source .env || true
           set +a
 
-          REQUIRED_DATE="${WB_DAILY_TARGET_DATE:-${REPORT_REQUIRE_DATA_DATE:-}}"
-          if [ -z "$REQUIRED_DATE" ]; then
-            echo "abc_wait: skip because required date is empty"
-            exit 0
-          fi
+          # FIX47:
+          # - current_week должен ждать daily ABC за WB_DAILY_TARGET_DATE;
+          # - full_refresh / закрытая неделя должен ждать недельный ABC вида
+          #   wb_abc_report_goods__ПН.ММ.ГГГГ-ВС.ММ.ГГГГ__at_*.xlsx.
+          # Ошибка FIX45: full_refresh за воскресенье 14.06 ждал daily файл 14.06-14.06,
+          # хотя ABC-скачиватель уже положил корректный weekly файл 08.06-14.06.
 
           ATTEMPT=1
           MAX_ATTEMPTS="${ABC_WAIT_MAX_ATTEMPTS:-6}"
           SLEEP_SECONDS="${ABC_WAIT_SLEEP_SECONDS:-3600}"
 
-          echo "abc_wait: required daily ABC date=$REQUIRED_DATE"
+          echo "abc_wait: mode=${MODE:-}"
+          echo "abc_wait: REPORT_REQUIRE_ABC_PERIOD=${REPORT_REQUIRE_ABC_PERIOD:-}"
+          echo "abc_wait: REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE:-}"
+          echo "abc_wait: REPORT_REQUIRE_DATA_DATE=${REPORT_REQUIRE_DATA_DATE:-}"
+          echo "abc_wait: WB_DAILY_TARGET_DATE=${WB_DAILY_TARGET_DATE:-}"
           echo "abc_wait: max_attempts=$MAX_ATTEMPTS sleep_seconds=$SLEEP_SECONDS"
 
           while true; do
             echo "abc_wait: attempt $ATTEMPT/$MAX_ATTEMPTS, UTC=$(date -u '+%Y-%m-%d %H:%M:%S'), MSK=$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
 
-            if ABC_REQUIRED_DATE="$REQUIRED_DATE" python - <<'PYABCWAIT'
+            if python - <<'PYABCWAIT'
           import os
           import sys
-          from datetime import datetime
+          from datetime import datetime, timedelta
 
           import boto3
           from botocore.config import Config
-
-          required = os.environ["ABC_REQUIRED_DATE"]
-          dt = datetime.strptime(required, "%Y-%m-%d").date()
-          dmy = dt.strftime("%d.%m.%Y")
 
           bucket = os.environ.get("YC_BUCKET_NAME") or ""
           access_key = os.environ.get("YC_ACCESS_KEY_ID") or ""
@@ -366,6 +367,39 @@ jobs:
           if not bucket or not access_key or not secret_key:
               print("abc_wait: ERROR missing YC storage env", file=sys.stderr)
               sys.exit(2)
+
+          mode = os.environ.get("MODE") or ""
+          require_period = (os.environ.get("REPORT_REQUIRE_ABC_PERIOD") or "0") == "1"
+          report_as_of = os.environ.get("REPORT_AS_OF_DATE") or ""
+          require_date = os.environ.get("REPORT_REQUIRE_DATA_DATE") or ""
+          daily_target = os.environ.get("WB_DAILY_TARGET_DATE") or ""
+
+
+          def parse_iso(value: str):
+              return datetime.strptime(value, "%Y-%m-%d").date()
+
+          if require_period:
+              end_value = report_as_of or require_date or daily_target
+              if not end_value:
+                  print("abc_wait: skip because period end date is empty")
+                  sys.exit(0)
+              end_dt = parse_iso(end_value)
+              start_dt = end_dt - timedelta(days=6)
+              start_dmy = start_dt.strftime("%d.%m.%Y")
+              end_dmy = end_dt.strftime("%d.%m.%Y")
+              expected_label = f"weekly ABC period {start_dt.isoformat()}..{end_dt.isoformat()}"
+              exact_token = f"wb_abc_report_goods__{start_dmy}-{end_dmy}__at_"
+              related_tokens = [f"__{start_dmy}-", f"-{end_dmy}__", f"__{end_dmy}-{end_dmy}__at_"]
+          else:
+              target_value = daily_target or require_date or report_as_of
+              if not target_value:
+                  print("abc_wait: skip because required daily date is empty")
+                  sys.exit(0)
+              target_dt = parse_iso(target_value)
+              dmy = target_dt.strftime("%d.%m.%Y")
+              expected_label = f"daily ABC {target_dt.isoformat()}"
+              exact_token = f"wb_abc_report_goods__{dmy}-{dmy}__at_"
+              related_tokens = [f"__{dmy}-", f"-{dmy}__"]
 
           s3 = boto3.client(
               "s3",
@@ -377,9 +411,6 @@ jobs:
           )
 
           prefix = "Отчёты/ABC/"
-          exact_token = f"wb_abc_report_goods__{dmy}-{dmy}__at_"
-          related_tokens = [f"__{dmy}-", f"-{dmy}__"]
-
           matches = []
           related = []
           count = 0
@@ -396,10 +427,10 @@ jobs:
 
           if matches:
               matches.sort(key=lambda x: str(x[1]), reverse=True)
-              print(f"abc_wait: FOUND daily ABC for {required}: {matches[0][0]}")
+              print(f"abc_wait: FOUND {expected_label}: {matches[0][0]}")
               sys.exit(0)
 
-          print(f"abc_wait: NOT FOUND daily ABC for {required}: expected file like wb_abc_report_goods__{dmy}-{dmy}__at_*.xlsx")
+          print(f"abc_wait: NOT FOUND {expected_label}: expected file like {exact_token}*.xlsx")
           print(f"abc_wait: scanned s3://{bucket}/{prefix}, objects={count}")
           if related[:10]:
               print("abc_wait: related ABC files:")
@@ -408,19 +439,20 @@ jobs:
           sys.exit(1)
           PYABCWAIT
             then
-              echo "abc_wait: OK, daily ABC is ready"
+              echo "abc_wait: OK, required ABC is ready"
               break
             fi
 
             if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-              echo "abc_wait: ERROR daily ABC for $REQUIRED_DATE was not found after $MAX_ATTEMPTS attempts"
+              echo "abc_wait: ERROR required ABC was not found after $MAX_ATTEMPTS attempts"
               exit 1
             fi
 
-            echo "abc_wait: daily ABC is not ready; sleep ${SLEEP_SECONDS}s and retry"
+            echo "abc_wait: required ABC is not ready; sleep ${SLEEP_SECONDS}s and retry"
             sleep "$SLEEP_SECONDS"
             ATTEMPT=$((ATTEMPT + 1))
           done
+
 
       - name: Smoke test
         if: steps.decide.outputs.mode == 'smoke'
