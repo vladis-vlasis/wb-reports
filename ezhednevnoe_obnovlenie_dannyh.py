@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-06-11_v23_KEYWORDS_ALL_ARTICLES_FROM_2026_06_01"
+SCRIPT_VERSION = "2026-06-18_v25_ACTUAL_DAILY_YESTERDAY_ONLY"
 
 # ========================== КЛАСС ДЛЯ РАБОТЫ С YANDEX CLOUD ==========================
 
@@ -1083,22 +1083,35 @@ class WildberriesDailyUpdater:
         self.log(f"📌 ОБНОВЛЕНИЕ: Позиции по ключам для магазина {store_name}")
 
         end_date = (datetime.now(pytz.timezone('Europe/Moscow')) - timedelta(days=1)).date()
-        start_date = KEYWORDS_BACKFILL_START_DATE
+
+        # v24:
+        # Ежедневный запуск должен собирать только вчерашний день.
+        # Историческую догрузку с 2026-06-01 включаем только явно через env:
+        # WB_KEYWORDS_BACKFILL_FROM=YYYY-MM-DD
+        backfill_from = _parse_optional_date_env("WB_KEYWORDS_BACKFILL_FROM")
+        if backfill_from:
+            start_date = backfill_from
+            self.log(
+                f"📅 Ручная догрузка keywords включена: {start_date:%Y-%m-%d} — {end_date:%Y-%m-%d}. "
+                f"Если данные за день уже есть, день будет пропущен."
+            )
+        else:
+            start_date = end_date
+            self.log(
+                f"📅 Ежедневный режим keywords: загружаем только вчерашний день {end_date:%Y-%m-%d}. "
+                f"Историческая догрузка отключена."
+            )
 
         if end_date < start_date:
-            self.log(f"⏭️ Целевая дата {end_date:%Y-%m-%d} раньше старта keywords {start_date:%Y-%m-%d}; пропускаем")
+            self.log(f"⏭️ Конечная дата {end_date:%Y-%m-%d} раньше старта {start_date:%Y-%m-%d}; пропускаем")
             return True
 
-        self.log(
-            f"📅 Диапазон проверки keywords: {start_date:%Y-%m-%d} — {end_date:%Y-%m-%d}. "
-            f"Если данные за день уже есть, день будет пропущен."
-        )
-
-        # v23: все категории/предметы. Артикулы берём из заказов с 1 июня.
+        # Все категории/предметы. Артикулы берём из заказов с 1 июня,
+        # чтобы в keywords попадали новые категории, но сам daily-цикл не гонял историю каждый день.
         articles = self._get_articles_by_subjects(
             store_name,
             self.target_subjects,
-            min_order_date=start_date,
+            min_order_date=KEYWORDS_DEFAULT_START_DATE,
         )
         if not articles:
             self.log("⚠️ Не найдено артикулов из заказов. Отчёт будет пропущен.")
@@ -1767,8 +1780,18 @@ STORE_ALIASES = {
     'ALL': 'ALL',
 }
 
-KEYWORDS_BACKFILL_START_DATE = datetime(2026, 6, 1).date()
-MISSTAIS_KEYWORDS_START_DATE = KEYWORDS_BACKFILL_START_DATE
+KEYWORDS_DEFAULT_START_DATE = datetime(2026, 6, 1).date()
+MISSTAIS_KEYWORDS_START_DATE = KEYWORDS_DEFAULT_START_DATE
+
+
+def _parse_optional_date_env(env_name: str) -> Optional[datetime.date]:
+    raw = (os.environ.get(env_name, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"Некорректная дата в {env_name}: {raw}. Нужен формат YYYY-MM-DD")
 
 
 def normalize_store_name(value: str) -> str:
