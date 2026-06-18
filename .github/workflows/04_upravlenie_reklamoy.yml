@@ -18,11 +18,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: wb-ads-manager-topface-${{ github.ref }}
-  cancel-in-progress: true
+  # Разделяем очереди по конкретному cron/manual, чтобы night/main/brush не отменяли друг друга.
+  group: wb-ads-manager-topface-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
+  cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v65_report_env_restore_2026-06-18"
+  WORKFLOW_VERSION: "v66_report_env_fixed_2026-06-18"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -35,12 +36,10 @@ jobs:
 
     env:
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONUNBUFFERED: "1"
+      TZ: "Europe/Moscow"
 
     steps:
       - name: Checkout repository
@@ -65,7 +64,7 @@ jobs:
           echo "=== Workflow file hash and markers ==="
           if [[ -f "${WORKFLOW_FILE}" ]]; then
             sha256sum "${WORKFLOW_FILE}"
-            grep -nE "WORKFLOW_VERSION|cron:|18:|19:05|01:05|05:05|МСК|RUN_SLOT|brush_tg" "${WORKFLOW_FILE}" || true
+            grep -nE "WORKFLOW_VERSION|cron:|18:|19:05|01:05|05:05|МСК|RUN_SLOT|brush_tg|REPORT_ENV" "${WORKFLOW_FILE}" || true
           else
             echo "WARNING: ${WORKFLOW_FILE} not found after checkout"
             find .github/workflows -maxdepth 1 -type f -print || true
@@ -81,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install pandas openpyxl boto3 requests numpy
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
 
       - name: Load secrets from REPORT_ENV
         shell: bash
@@ -124,8 +123,7 @@ jobs:
               for key in allowed:
                   value = os.getenv(key) or parsed.get(key)
                   if value:
-                      f.write(f"{key}={value}
-")
+                      f.write(f"{key}={value}\n")
                       loaded.append(key)
 
           print("Loaded secret names: " + (", ".join(loaded) if loaded else "none"))
