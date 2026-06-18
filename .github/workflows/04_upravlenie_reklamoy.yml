@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  WORKFLOW_VERSION: "v63_schedule_new_ramp_tg_2026-06-18"
+  WORKFLOW_VERSION: "v65_report_env_restore_2026-06-18"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -34,6 +34,7 @@ jobs:
     timeout-minutes: 90
 
     env:
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
@@ -81,6 +82,74 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install pandas openpyxl boto3 requests numpy
+
+      - name: Load secrets from REPORT_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+              "TELEGRAM_BOT_TOKEN",
+              "TELEGRAM_CHAT_ID",
+          ]
+
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+          for raw_line in report_env.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('"').strip("'")
+              if key in allowed and value:
+                  parsed[key] = value
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if not github_env:
+              raise SystemExit("GITHUB_ENV is not available")
+
+          loaded = []
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in allowed:
+                  value = os.getenv(key) or parsed.get(key)
+                  if value:
+                      f.write(f"{key}={value}
+")
+                      loaded.append(key)
+
+          print("Loaded secret names: " + (", ".join(loaded) if loaded else "none"))
+          PY
+
+      - name: Verify required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+          ]
+          missing = [name for name in required if not os.getenv(name)]
+          if missing:
+              raise SystemExit("Missing secrets after REPORT_ENV load: " + ", ".join(missing))
+          print("All required secrets are present after REPORT_ENV load.")
+          if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
+              print("WARNING: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not fully set; TG send may be skipped by code.")
+          PY
 
       - name: Resolve slot and guard time
         id: guard
