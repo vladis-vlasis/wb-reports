@@ -52,8 +52,8 @@ import pandas as pd
 import requests
 from botocore.exceptions import ClientError
 
-SCRIPT_VERSION = "v63-new-ramp-tg-schedule-guard-2026-06-18"
-VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V63_NEW_RAMP_TG_SCHEDULE_GUARD"
+SCRIPT_VERSION = "v65-report-env-restore-2026-06-18"
+VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V65_REPORT_ENV_RESTORE"
 
 # -------------------------
 # Business constants
