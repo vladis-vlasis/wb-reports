@@ -1,4 +1,4 @@
-# version: v21_cron_1800_msk_REPORT_ENV_MISSTAIS
+# version: v22_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS
 # В GitHub заменить содержимое файла:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -17,29 +17,60 @@ on:
           - TOPFACE
           - MISSTAIS
   schedule:
-    # Каждый день в 18:00 МСК = 15:00 UTC
-    - cron: "0 15 * * *"
+    # Каждый день с 15:04 до 23:54 МСК, попытка каждые 10 минут.
+    # GitHub cron работает в UTC: 12:04-20:54 UTC = 15:04-23:54 МСК.
+    - cron: "4-59/10 12-20 * * *"
+
+concurrency:
+  group: daily-update-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     name: Ежедневное обновление данных
     runs-on: ubuntu-latest
+    timeout-minutes: 570
 
     steps:
+      - name: MSK time guard — не запускать до 15:04 и после полуночи
+        id: time_guard
+        run: |
+          MSK_TIME=$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')
+          MSK_HOUR=$(TZ=Europe/Moscow date '+%H')
+          MSK_MIN=$(TZ=Europe/Moscow date '+%M')
+          MSK_HOUR_NUM=$((10#$MSK_HOUR))
+          MSK_MIN_NUM=$((10#$MSK_MIN))
+
+          echo "MSK now: $MSK_TIME"
+          echo "event_name=${{ github.event_name }}"
+
+          if [ "$MSK_HOUR_NUM" -lt 15 ] || { [ "$MSK_HOUR_NUM" -eq 15 ] && [ "$MSK_MIN_NUM" -lt 4 ]; }; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️ Сейчас раньше 15:04 МСК. Ежедневное обновление не запускаем, чтобы не брать некорректные данные."
+            exit 0
+          fi
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "✅ Окно запуска разрешено: после 15:04 МСК и до полуночи."
+
       - name: Скачать репозиторий
+        if: steps.time_guard.outputs.should_run == 'true'
         uses: actions/checkout@v4
 
       - name: Установить Python
+        if: steps.time_guard.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Установить зависимости
+        if: steps.time_guard.outputs.should_run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Загрузить REPORT_ENV и secrets
+        if: steps.time_guard.outputs.should_run == 'true'
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
           WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
@@ -48,7 +79,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
-          echo "YML_VERSION=v21_cron_1800_msk_REPORT_ENV_MISSTAIS"
+          echo "YML_VERSION=v22_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS"
 
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не найден secret REPORT_ENV. Он нужен для Yandex Cloud: YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME, YC_ENDPOINT_URL."
@@ -77,7 +108,62 @@ jobs:
             echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
           fi
 
+
+      - name: Проверить маркер успешного запуска за сегодня
+        if: steps.time_guard.outputs.should_run == 'true'
+        id: marker_guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "already_done=false" >> "$GITHUB_OUTPUT"
+            echo "Ручной запуск: маркер успешного scheduled-запуска не блокирует выполнение."
+            exit 0
+          fi
+
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import boto3
+          from botocore.client import Config
+          from botocore.exceptions import ClientError
+
+          bucket = os.environ["YC_BUCKET_NAME"]
+          endpoint = os.environ.get("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net"
+          today = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d")
+          key = f"Служебные файлы/GitHub Actions/01_ezhednevnoe_obnovlenie_dannyh/success/{today}.json"
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=endpoint,
+              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
+              region_name="ru-central1",
+              config=Config(signature_version="s3v4"),
+          )
+
+          already_done = False
+          try:
+              s3.head_object(Bucket=bucket, Key=key)
+              already_done = True
+          except ClientError as e:
+              code = str(e.response.get("Error", {}).get("Code", ""))
+              if code not in {"404", "NoSuchKey", "NotFound"}:
+                  raise
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"already_done={'true' if already_done else 'false'}\n")
+              fh.write(f"marker_key={key}\n")
+
+          if already_done:
+              print(f"⏭️ Сегодня successful scheduled-запуск уже был. Маркер: {key}")
+          else:
+              print(f"✅ Successful scheduled-запуска за сегодня ещё не было. Маркер будет записан после успешного завершения: {key}")
+          PY
+
       - name: Проверить обязательные переменные
+        if: steps.time_guard.outputs.should_run == 'true' && steps.marker_guard.outputs.already_done != 'true'
         env:
           STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
         run: |
@@ -115,7 +201,69 @@ jobs:
           fi
 
       - name: Запустить ежедневное обновление данных
+        if: steps.time_guard.outputs.should_run == 'true' && steps.marker_guard.outputs.already_done != 'true'
         env:
           STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
         run: |
-          python ezhednevnoe_obnovlenie_dannyh.py --full --store "$STORE_INPUT"
+          MSK_TIME=$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')
+          MSK_HOUR=$(TZ=Europe/Moscow date '+%H')
+          MSK_MIN=$(TZ=Europe/Moscow date '+%M')
+          MSK_HOUR_NUM=$((10#$MSK_HOUR))
+          MSK_MIN_NUM=$((10#$MSK_MIN))
+
+          echo "MSK before python: $MSK_TIME"
+
+          if [ "$MSK_HOUR_NUM" -lt 15 ] || { [ "$MSK_HOUR_NUM" -eq 15 ] && [ "$MSK_MIN_NUM" -lt 4 ]; }; then
+            echo "⏭️ Перед запуском python уже неразрешённое окно. Код не запускаем."
+            exit 0
+          fi
+
+          SECONDS_TO_STOP=$(python - <<'PY'
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("Europe/Moscow"))
+          next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+          # Остановить чуть до полуночи, чтобы код не продолжал работать в новом дне.
+          print(max(1, int((next_midnight - now).total_seconds()) - 30))
+          PY
+          )
+
+          echo "До автоостановки перед полуночью осталось секунд: $SECONDS_TO_STOP"
+          timeout "$SECONDS_TO_STOP"s python ezhednevnoe_obnovlenie_dannyh.py --full --store "$STORE_INPUT"
+
+      - name: Записать маркер успешного запуска за сегодня
+        if: github.event_name == 'schedule' && steps.time_guard.outputs.should_run == 'true' && steps.marker_guard.outputs.already_done != 'true'
+        run: |
+          python - <<'PY'
+          import os, json
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import boto3
+          from botocore.client import Config
+
+          bucket = os.environ["YC_BUCKET_NAME"]
+          endpoint = os.environ.get("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net"
+          now = datetime.now(ZoneInfo("Europe/Moscow"))
+          today = now.strftime("%Y-%m-%d")
+          key = f"Служебные файлы/GitHub Actions/01_ezhednevnoe_obnovlenie_dannyh/success/{today}.json"
+
+          body = json.dumps({
+              "workflow": "01_ezhednevnoe_obnovlenie_dannyh",
+              "status": "success",
+              "msk_finished_at": now.isoformat(),
+              "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "github_run_number": os.environ.get("GITHUB_RUN_NUMBER"),
+              "version": "v22_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS",
+          }, ensure_ascii=False, indent=2).encode("utf-8")
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=endpoint,
+              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
+              region_name="ru-central1",
+              config=Config(signature_version="s3v4"),
+          )
+          s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json; charset=utf-8")
+          print(f"✅ Записан маркер успешного запуска: {key}")
+          PY
