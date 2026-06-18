@@ -1,400 +1,284 @@
-
-name: TOPFACE WB Ads Manager
+name: WB Ads Manager TOPFACE
 
 on:
   workflow_dispatch:
-    inputs:
-      run_slot:
-        description: "Что запустить вручную"
-        required: true
-        default: "main_preview"
-        type: choice
-        options:
-          - main_preview
-          - main_run
-          - rollback_wrong_pauses
-          - night_start
-          - night_end
-      dry_run:
-        description: "Dry-run: рассчитать без отправки в WB"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-
   schedule:
-    # GitHub Actions schedule может задерживаться. Поэтому ставим несколько попыток НЕ в начало часа.
-    # Timezone задаём явно: Москва = Europe/Moscow.
-    # Автоматический scheduled-запуск — только PREVIEW, без изменения ставок.
-    - cron: "7 18 * * *"
-      timezone: "Europe/Moscow"
-    - cron: "22 18 * * *"
-      timezone: "Europe/Moscow"
-    - cron: "37 18 * * *"
-      timezone: "Europe/Moscow"
-    - cron: "52 18 * * *"
-      timezone: "Europe/Moscow"
+    # GitHub cron работает в UTC. Москва = UTC+3.
+    # Ночной эксперимент: 01:05 МСК -> 22:05 UTC предыдущего дня.
+    - cron: "5 22 * * *"
+    # Ночной эксперимент: 05:05 МСК -> 02:05 UTC.
+    - cron: "5 2 * * *"
+    # Основной контур: каждые 10 минут с 18:00 до 23:50 МСК.
+    # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
+    - cron: "*/10 15-20 * * *"
+    # Telegram по проблемным кистям: понедельник 19:05, затем каждые 10 минут до 23:55 МСК.
+    - cron: "5,15,25,35,45,55 16-20 * * 1"
+
+permissions:
+  contents: read
 
 concurrency:
-  group: topface-wb-ads-manager
-  cancel-in-progress: false
+  group: wb-ads-manager-topface-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORKFLOW_VERSION: "v63_schedule_new_ramp_tg_2026-06-18"
+  WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
+  PYTHON_VERSION: "3.11"
+  STORE_NAME: "TOPFACE"
+  DAILY_LOCK_PREFIX: "Служебные файлы/Ассистент WB/TOPFACE/locks"
 
 jobs:
-  run-topface-ads-manager:
+  wb_ads_manager:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
-      REPORT_ENV: ${{ secrets.REPORT_ENV }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
-
-      PYTHONUNBUFFERED: "1"
-      TZ: "Europe/Moscow"
-      SHOULD_RUN: "true"
-      WB_NIGHT_EXPERIMENTS_ENABLED: "1"
-      WB_NIGHT_EXPERIMENT_START_HOUR_MSK: "1"
-      WB_NIGHT_EXPERIMENT_END_HOUR_MSK: "5"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Workflow identity diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Workflow identity diagnostics ==="
+          echo "WORKFLOW_VERSION=${WORKFLOW_VERSION}"
+          echo "WORKFLOW_FILE=${WORKFLOW_FILE}"
+          echo "GITHUB_WORKFLOW=${GITHUB_WORKFLOW}"
+          echo "github.workflow_ref=${{ github.workflow_ref }}"
+          echo "github.workflow_sha=${{ github.workflow_sha }}"
+          echo "github.ref=${{ github.ref }}"
+          echo "github.sha=${{ github.sha }}"
+          echo "github.event_name=${{ github.event_name }}"
+          echo "github.event.schedule=${{ github.event.schedule }}"
+          echo "UTC now=$(date -u '+%Y-%m-%d %H:%M:%S')"
+          TZ=Europe/Moscow date '+MSK now=%Y-%m-%d %H:%M:%S'
+          echo "=== Workflow file hash and markers ==="
+          if [[ -f "${WORKFLOW_FILE}" ]]; then
+            sha256sum "${WORKFLOW_FILE}"
+            grep -nE "WORKFLOW_VERSION|cron:|18:|19:05|01:05|05:05|МСК|RUN_SLOT|brush_tg" "${WORKFLOW_FILE}" || true
+          else
+            echo "WARNING: ${WORKFLOW_FILE} not found after checkout"
+            find .github/workflows -maxdepth 1 -type f -print || true
+          fi
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
+        shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+          pip install pandas openpyxl boto3 requests numpy
 
-      - name: Load secrets from REPORT_ENV
+      - name: Resolve slot and guard time
+        id: guard
+        shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os
-
-          allowed = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "YC_BUCKET_NAME",
-              "WB_PROMO_KEY_TOPFACE",
-          ]
-
-          report_env = os.getenv("REPORT_ENV", "") or ""
-          parsed = {}
-          for raw_line in report_env.splitlines():
-              line = raw_line.strip()
-              if not line or line.startswith("#"):
-                  continue
-              if line.startswith("export "):
-                  line = line[len("export "):].strip()
-              if "=" not in line:
-                  continue
-              key, value = line.split("=", 1)
-              key = key.strip()
-              value = value.strip().strip('"').strip("'")
-              if key in allowed and value:
-                  parsed[key] = value
-
-          github_env = os.environ.get("GITHUB_ENV")
-          if not github_env:
-              raise SystemExit("GITHUB_ENV is not available")
-
-          loaded = []
-          with open(github_env, "a", encoding="utf-8") as f:
-              for key in allowed:
-                  value = os.getenv(key) or parsed.get(key)
-                  if value:
-                      f.write(f"{key}={value}\n")
-                      loaded.append(key)
-
-          print("Loaded secret names: " + ", ".join(loaded))
-          PY
-
-      - name: Verify required secrets
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          required = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "YC_BUCKET_NAME",
-              "WB_PROMO_KEY_TOPFACE",
-          ]
-          missing = [name for name in required if not os.getenv(name)]
-          if missing:
-              raise SystemExit("Missing secrets: " + ", ".join(missing))
-          print("All required secrets are present.")
-          PY
-
-      - name: Schedule time guard and daily lock
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
-        run: |
-          set -euo pipefail
-
-          echo "=== Schedule guard diagnostics ==="
-          echo "Event: $EVENT_NAME"
-          echo "Schedule cron: ${SCHEDULE_CRON:-manual}"
-          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-
-          if [ "$EVENT_NAME" != "schedule" ]; then
-            echo "Manual workflow_dispatch: bypass schedule time guard and daily lock."
-            echo "SHOULD_RUN=true" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          MSK_HOUR="$(TZ=Europe/Moscow date '+%H')"
-          MSK_MIN="$(TZ=Europe/Moscow date '+%M')"
-          MSK_DATE="$(TZ=Europe/Moscow date '+%Y-%m-%d')"
-
-          # Разрешаем scheduled-запуск только вечером по МСК.
-          # Если GitHub вдруг задержит job до ночи, Python вообще не стартует.
-          ALLOWED="false"
-          if [ "$MSK_HOUR" = "18" ] || [ "$MSK_HOUR" = "19" ]; then
-            ALLOWED="true"
-          fi
-          if [ "$MSK_HOUR" = "20" ] && [ "$MSK_MIN" -le 30 ]; then
-            ALLOWED="true"
-          fi
-
-          if [ "$ALLOWED" != "true" ]; then
-            echo "BLOCKED_BY_MSK_TIME_GUARD: scheduled run outside allowed 18:00-20:30 MSK window."
-            echo "SHOULD_RUN=false" >> "$GITHUB_ENV"
-            exit 0
-          fi
-
-          python - <<'PY'
-          import json
           import os
           from datetime import datetime
           from zoneinfo import ZoneInfo
+
+          event_name = "${{ github.event_name }}"
+          schedule = "${{ github.event.schedule }}"
+          now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+          minutes = now_msk.hour * 60 + now_msk.minute
+          weekday = now_msk.weekday()  # Monday=0
+
+          run_slot = "manual_main"
+          allowed = True
+          reason = "manual_dispatch_single_mode"
+          lock_name = f"manual_main_{now_msk:%Y-%m-%d_%H%M%S}"
+
+          if event_name == "schedule":
+              if schedule == "5 22 * * *":
+                  run_slot = "night_start"
+                  allowed = (1 * 60) <= minutes <= (1 * 60 + 35)
+                  reason = "night_start_0105_msk_window" if allowed else "BLOCKED_NIGHT_START_TIME_GUARD"
+                  lock_name = f"night_start_{now_msk:%Y-%m-%d}"
+              elif schedule == "5 2 * * *":
+                  run_slot = "night_end"
+                  allowed = (5 * 60) <= minutes <= (5 * 60 + 35)
+                  reason = "night_end_0505_msk_window" if allowed else "BLOCKED_NIGHT_END_TIME_GUARD"
+                  lock_name = f"night_end_{now_msk:%Y-%m-%d}"
+              elif schedule == "5,15,25,35,45,55 16-20 * * 1":
+                  run_slot = "brush_tg"
+                  allowed = (weekday == 0) and ((19 * 60 + 5) <= minutes <= (23 * 60 + 59))
+                  reason = "brush_tg_monday_1905_2359_msk_window" if allowed else "BLOCKED_BRUSH_TG_TIME_GUARD"
+                  lock_name = f"brush_tg_{now_msk:%Y-%m-%d}"
+              else:
+                  run_slot = "main_run"
+                  allowed = 18 <= now_msk.hour <= 23
+                  reason = "main_18_00_23_59_msk_window" if allowed else "BLOCKED_MAIN_TIME_GUARD"
+                  lock_name = f"main_run_{now_msk:%Y-%m-%d}"
+
+          print("=== Slot resolution ===")
+          print(f"event_name={event_name}")
+          print(f"schedule={schedule}")
+          print(f"MSK now={now_msk:%Y-%m-%d %H:%M:%S}")
+          print(f"resolved_run_slot={run_slot}")
+          print(f"run_allowed={allowed}")
+          print(f"guard_reason={reason}")
+          print(f"lock_name={lock_name}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"RUN_SLOT={run_slot}\n")
+              f.write(f"RUN_ALLOWED={'true' if allowed else 'false'}\n")
+              f.write(f"GUARD_REASON={reason}\n")
+              f.write(f"MSK_RUN_DATE={now_msk:%Y-%m-%d}\n")
+              f.write(f"LOCK_NAME={lock_name}\n")
+          PY
+
+      - name: Stop if blocked by time guard
+        if: env.RUN_ALLOWED != 'true'
+        shell: bash
+        run: |
+          echo "${GUARD_REASON}: запуск заблокирован до старта Python. WB API не трогаем."
+          exit 0
+
+      - name: Check schedule marker
+        if: github.event_name == 'schedule' && env.RUN_ALLOWED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
           import boto3
           from botocore.exceptions import ClientError
 
           bucket = os.environ["YC_BUCKET_NAME"]
+          lock_key = f"{os.environ['DAILY_LOCK_PREFIX']}/{os.environ['LOCK_NAME']}.json"
           s3 = boto3.client(
               "s3",
               endpoint_url="https://storage.yandexcloud.net",
               aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
               aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
           )
-          today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
-          key = f"Служебные файлы/Ассистент WB/TOPFACE/locks/18msk_main_preview_{today}.json"
-
+          already_done = False
           try:
-              s3.head_object(Bucket=bucket, Key=key)
-              print(f"DAILY_LOCK_EXISTS: {key}")
-              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-                  f.write("SHOULD_RUN=false\n")
-              raise SystemExit(0)
+              s3.head_object(Bucket=bucket, Key=lock_key)
+              already_done = True
           except ClientError as exc:
               code = str(exc.response.get("Error", {}).get("Code", ""))
               if code not in {"404", "NoSuchKey", "NotFound"}:
                   raise
-
-          payload = {
-              "lock": "18msk_main_preview",
-              "created_at_msk": datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"),
-              "github_run_id": os.getenv("GITHUB_RUN_ID", ""),
-              "github_event_schedule": os.getenv("SCHEDULE_CRON", ""),
-          }
-          s3.put_object(
-              Bucket=bucket,
-              Key=key,
-              Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
-              ContentType="application/json",
-          )
-          print(f"DAILY_LOCK_CREATED: {key}")
+          print("=== Marker check ===")
+          print(f"lock_key={lock_key}")
+          print(f"already_done={already_done}")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              f.write("SHOULD_RUN=true\n")
+              f.write(f"SCHEDULE_ALREADY_DONE={'true' if already_done else 'false'}\n")
+              f.write(f"SCHEDULE_LOCK_KEY={lock_key}\n")
           PY
 
-      - name: Resolve and verify script
-        if: env.SHOULD_RUN == 'true'
+      - name: Stop if schedule already completed
+        if: github.event_name == 'schedule' && env.SCHEDULE_ALREADY_DONE == 'true'
+        shell: bash
+        run: |
+          echo "Schedule already completed: ${SCHEDULE_LOCK_KEY}"
+          exit 0
+
+      - name: Validate Python syntax
+        shell: bash
         run: |
           set -euo pipefail
-          echo "=== Time diagnostics ==="
-          echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "MSK: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+          python -m py_compile upravlenie_reklamoy.py
 
-          echo "=== Current directory ==="
-          pwd
-          echo "=== Repository files ==="
-          ls -la
+      - name: Run WB Ads Manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Run command resolution ==="
+          echo "WORKFLOW_VERSION=${WORKFLOW_VERSION}"
+          echo "RUN_SLOT=${RUN_SLOT}"
+          echo "GUARD_REASON=${GUARD_REASON}"
+          TZ=Europe/Moscow date '+MSK before run=%Y-%m-%d %H:%M:%S'
 
-          SCRIPT_PATH="upravlenie_reklamoy.py"
-          if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "ERROR: не найден обязательный файл ./$SCRIPT_PATH"
-            echo "Нужно положить рекламный код именно в корень репозитория как ./upravlenie_reklamoy.py"
-            exit 1
-          fi
+          case "${RUN_SLOT}" in
+            manual_main)
+              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start --send-brush-tg --force-brush-tg"
+              ;;
+            main_run)
+              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start --send-brush-tg --brush-tg-schedule-only"
+              ;;
+            brush_tg)
+              CMD="python upravlenie_reklamoy.py preview --skip-price --send-brush-tg --brush-tg-schedule-only"
+              ;;
+            night_start)
+              CMD="python upravlenie_reklamoy.py run --skip-price --night-experiment-only --night-experiment-slot start --apply-pause"
+              ;;
+            night_end)
+              CMD="python upravlenie_reklamoy.py run --skip-price --night-experiment-only --night-experiment-slot end --apply-start"
+              ;;
+            *)
+              echo "Unknown RUN_SLOT=${RUN_SLOT}"
+              exit 2
+              ;;
+          esac
+          echo "Running: ${CMD}"
+          eval "${CMD}"
+          TZ=Europe/Moscow date '+MSK after run=%Y-%m-%d %H:%M:%S'
 
-          echo "SCRIPT_PATH=$SCRIPT_PATH" >> "$GITHUB_ENV"
-          export SCRIPT_PATH
-          echo "Resolved script: $SCRIPT_PATH"
-
-          echo "=== Script version marker ==="
-          grep -n "SCRIPT_VERSION" "$SCRIPT_PATH" || true
-
-          echo "=== Old dayfirst bug check ==="
-          if grep -q "dayfirst=True" "$SCRIPT_PATH"; then
-            echo "ERROR: В $SCRIPT_PATH есть старый dayfirst=True"
-            exit 1
-          fi
-
-          echo "=== Required code markers ==="
+      - name: Write schedule marker after success
+        if: success() && github.event_name == 'schedule' && env.RUN_ALLOWED == 'true' && env.SCHEDULE_ALREADY_DONE != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
           import os
-          import re
-          from pathlib import Path
+          import json
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+          import boto3
 
-          script_path = os.environ.get("SCRIPT_PATH") or "upravlenie_reklamoy.py"
-          text = Path(script_path).read_text(encoding="utf-8", errors="replace")
-
-          m = re.search(r'SCRIPT_VERSION\s*=\s*["\']([^"\']+)["\']', text)
-          if not m:
-              raise SystemExit(f"ERROR: В {script_path} нет SCRIPT_VERSION")
-          version = m.group(1)
-          print(f"SCRIPT_VERSION={version}")
-
-          vm = re.search(r'strict-drr-v(\d+)', version)
-          if not vm:
-              raise SystemExit(f"ERROR: Неизвестный формат SCRIPT_VERSION: {version}")
-          vnum = int(vm.group(1))
-          if vnum < 53:
-              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v53+.")
-
-          markers = [
-              "FIX46_CORE_RAMP_PAUSE_20260611",
-              "night_experiment_only",
-              "EXPERIMENT_1_NIGHT_MIN_BID_MSK_1_5",
-              "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE",
-              "night_experiment_slot",
-              "TECHNICAL_COMBINED_MIN_BID_80_FIX",
-              "RAMP_ACTIVE_TO_5000_IMPRESSIONS",
-              "ROLLBACK_WRONG_FIX46_PAUSE_START",
-              "--rollback-wrong-pauses-only",
-          ]
-          missing = [marker for marker in markers if marker not in text]
-          if missing:
-              raise SystemExit("ERROR: В коде нет обязательных маркеров: " + ", ".join(missing))
-          print("Code marker check OK.")
+          bucket = os.environ["YC_BUCKET_NAME"]
+          lock_key = os.environ["SCHEDULE_LOCK_KEY"]
+          payload = {
+              "workflow_version": os.environ.get("WORKFLOW_VERSION"),
+              "workflow_file": os.environ.get("WORKFLOW_FILE"),
+              "run_slot": os.environ.get("RUN_SLOT"),
+              "guard_reason": os.environ.get("GUARD_REASON"),
+              "github_workflow": os.environ.get("GITHUB_WORKFLOW"),
+              "github_sha": "${{ github.sha }}",
+              "github_ref": "${{ github.ref }}",
+              "github_workflow_ref": "${{ github.workflow_ref }}",
+              "github_workflow_sha": "${{ github.workflow_sha }}",
+              "utc_completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+              "msk_completed_at": datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"),
+          }
+          s3 = boto3.client(
+              "s3",
+              endpoint_url="https://storage.yandexcloud.net",
+              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
+          )
+          s3.put_object(Bucket=bucket, Key=lock_key, Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), ContentType="application/json")
+          print(f"Marker written: {lock_key}")
           PY
 
-          echo "=== Script SHA256 ==="
-          sha256sum "$SCRIPT_PATH"
-
-      - name: Compile Python script
-        if: env.SHOULD_RUN == 'true'
-        run: |
-          set -euo pipefail
-          python -m py_compile "$SCRIPT_PATH"
-
-      - name: Run TOPFACE WB Ads Manager
-        if: env.SHOULD_RUN == 'true'
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
-          INPUT_RUN_SLOT: ${{ github.event.inputs.run_slot || 'main_preview' }}
-          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-        run: |
-          set -euo pipefail
-
-          SLOT="main_preview"
-          COMMAND="preview"
-          EXTRA_ARGS=()
-
-          if [ "$EVENT_NAME" = "schedule" ]; then
-            # Автоматический вечерний запуск — только preview, чтобы schedule не менял ставки.
-            SLOT="main_preview"
-            COMMAND="preview"
-            EXTRA_ARGS=()
-          else
-            case "$INPUT_RUN_SLOT" in
-              "rollback_wrong_pauses")
-                SLOT="rollback_wrong_pauses"
-                COMMAND="run"
-                EXTRA_ARGS=(--rollback-wrong-pauses-only --apply-start)
-                ;;
-              "night_start")
-                SLOT="night_start"
-                COMMAND="run"
-                EXTRA_ARGS=(--night-experiment-only --night-experiment-slot start --apply-pause)
-                ;;
-              "night_end")
-                SLOT="night_end"
-                COMMAND="run"
-                EXTRA_ARGS=(--night-experiment-only --night-experiment-slot end --apply-start)
-                ;;
-              "main_run")
-                SLOT="main_run"
-                COMMAND="run"
-                EXTRA_ARGS=()
-                ;;
-              "main_preview"|"")
-                SLOT="main_preview"
-                COMMAND="preview"
-                EXTRA_ARGS=()
-                ;;
-              *)
-                echo "ERROR: неизвестный run_slot: $INPUT_RUN_SLOT"
-                exit 1
-                ;;
-            esac
-          fi
-
-          CMD=(python "$SCRIPT_PATH" "$COMMAND" --skip-price "${EXTRA_ARGS[@]}")
-          if [ "$INPUT_DRY_RUN" = "true" ]; then
-            CMD+=(--dry-run)
-          fi
-
-          echo "=== Run slot diagnostics ==="
-          echo "Event: $EVENT_NAME"
-          echo "Schedule cron: ${SCHEDULE_CRON:-manual}"
-          echo "Manual input slot: ${INPUT_RUN_SLOT:-none}"
-          echo "Resolved slot: $SLOT"
-          echo "Resolved command: $COMMAND"
-          echo "Resolved script: $SCRIPT_PATH"
-          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-          printf 'Running:'
-          printf ' %q' "${CMD[@]}"
-          printf '\n'
-
-          "${CMD[@]}"
-
-      - name: Show local result files
-        if: always()
-        run: |
-          echo "=== SHOULD_RUN=${SHOULD_RUN:-unknown} ==="
-          echo "=== Local XLSX/JSON files after run ==="
-          find . -maxdepth 4 -type f \( -name "*.xlsx" -o -name "*.json" \) -print || true
-
-      - name: Upload local artifacts
+      - name: Upload GitHub artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: topface-ads-manager-results
+          name: wb-ads-manager-${{ env.RUN_SLOT }}-${{ github.run_number }}
+          if-no-files-found: ignore
           path: |
-            *.xlsx
-            *.json
-            **/Итог_последнего_запуска*.xlsx
-            **/Предпросмотр_последнего_запуска*.xlsx
-            **/Сводка_последнего_запуска*.json
-            **/Лог_API*.xlsx
-            **/История_ставок*.xlsx
-            **/История_пауз*.xlsx
-          if-no-files-found: warn
-          retention-days: 14
+            Предпросмотр_последнего_запуска.xlsx
+            Итог_последнего_запуска.xlsx
+            Сводка_последнего_запуска.json
+            Лог_API.xlsx
+            История_ставок.xlsx
+            История_пауз.xlsx
+            Проблемные_кисти_TG.xlsx
