@@ -52,8 +52,8 @@ import pandas as pd
 import requests
 from botocore.exceptions import ClientError
 
-SCRIPT_VERSION = "v65-report-env-restore-2026-06-18"
-VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V65_REPORT_ENV_RESTORE"
+SCRIPT_VERSION = "v68-brush-pdf-only-2026-06-18"
+VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V68_BRUSH_PDF_ONLY"
 
 # -------------------------
 # Business constants
@@ -1431,6 +1431,7 @@ API_LOG_KEY = SERVICE_PREFIX + "Лог_API.xlsx"
 BID_HISTORY_KEY = SERVICE_PREFIX + "История_ставок.xlsx"
 PAUSE_HISTORY_KEY = SERVICE_PREFIX + "История_пауз.xlsx"
 BRUSH_TG_ALERT_KEY = SERVICE_PREFIX + "Проблемные_кисти_TG.xlsx"
+BRUSH_TG_PDF_KEY = SERVICE_PREFIX + "Проблемные_кисти_WB_Ads.pdf"
 BRUSH_TG_LOCK_PREFIX = SERVICE_PREFIX + "locks/brush_tg"
 WB_ADVERT_BASE_URL = "https://advert-api.wildberries.ru"
 WB_BIDS_ENDPOINT = "/api/advert/v1/bids"
@@ -2016,6 +2017,70 @@ def _telegram_env() -> Tuple[str, str]:
     return token.strip(), chat_id.strip()
 
 
+
+def _brush_campaign_article_fallback() -> Dict[int, str]:
+    """Fallback for old rows where campaign_id -> supplier_article was lost upstream.
+
+    This is only a safety net for the current WB Ads report mapping issue. The normal path must
+    still fill supplier_article before the Telegram/PDF report is built.
+    """
+    return {
+        29651217: "901/6",
+        29656882: "901/20",
+        33303545: "901/16",
+        33303562: "901/6",
+        33303580: "901/10",
+        33303619: "901/7",
+        33303650: "901/20",
+        33303804: "901/19",
+        33937828: "901/3",
+    }
+
+
+def _restore_brush_article(row: pd.Series) -> str:
+    article = str(row.get("supplier_article", "") or "").strip()
+    if article and article.lower() not in {"nan", "none", "без артикула"}:
+        return article
+    try:
+        campaign_id = int(float(row.get("campaign_id")))
+    except Exception:
+        return ""
+    return _brush_campaign_article_fallback().get(campaign_id, "")
+
+
+def _brush_campaign_type_label(value: Any) -> str:
+    v = str(value or "").strip().lower()
+    if v in {"search", "cpc", "поиск"}:
+        return "ПОИСК"
+    return "ПОЛКИ"
+
+
+def _brush_article_sort_key(article: Any) -> Tuple[int, int, str]:
+    s = str(article or "").strip()
+    # 901/14, 901.14, PT901.F24, 901/F24
+    m = re.search(r"(?:PT)?901[/.]?([A-Z]?)(\d+)", s, re.I)
+    if "/" in s and s.split("/")[-1].isdigit():
+        return (0, int(s.split("/")[-1]), s)
+    if m:
+        prefix = 1 if m.group(1) else 0
+        return (prefix, int(m.group(2)), s)
+    return (9, 9999, s)
+
+
+def _short_brush_reason(reason: Any) -> str:
+    s = str(reason or "").strip()
+    replacements = {
+        ">=5000 показов, ставка минимальная, ДРР >10%": "min ставка, ДРР >10%",
+        "<5000 показов и ставка уже максимальная": "<5000 показов, max ставка",
+        "достиг max ставки, сумма заказов упала >15%": "max ставка, заказы -15%",
+        "ставка уже максимальная": "max ставка",
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+    s = s.replace(";  ", "; ").strip("; ").strip()
+    return s
+
+
 def build_brush_problem_alerts(decisions: pd.DataFrame) -> pd.DataFrame:
     if decisions is None or decisions.empty:
         return pd.DataFrame()
@@ -2026,75 +2091,268 @@ def build_brush_problem_alerts(decisions: pd.DataFrame) -> pd.DataFrame:
     d = d[d["subject_norm"].eq("Кисти косметические")].copy()
     if d.empty:
         return pd.DataFrame()
-    for col in ["impressions_7d", "clicks_7d", "spend_7d", "order_sum_7d", "orders_7d", "drr_pct_7d", "ctr_pct_7d", "real_bid_rub", "max_allowed_bid_rub", "order_sum_cur", "order_sum_base", "order_sum_drop_vs_base_pct"]:
+
+    numeric_cols = [
+        "impressions_7d", "clicks_7d", "spend_7d", "order_sum_7d", "orders_7d",
+        "drr_pct_7d", "ctr_pct_7d", "real_bid_rub", "max_allowed_bid_rub",
+        "order_sum_cur", "order_sum_base", "order_sum_drop_vs_base_pct",
+    ]
+    for col in numeric_cols:
         if col not in d.columns:
             d[col] = np.nan
         d[col] = pd.to_numeric(d[col], errors="coerce")
+
+    d["supplier_article"] = d.apply(_restore_brush_article, axis=1)
+    # Final TG/PDF must not contain "без артикула". If mapping is still absent, keep it out of the report.
+    d = d[d["supplier_article"].astype(str).str.strip().ne("")].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    d["Тип кампании"] = d["placement"].map(_brush_campaign_type_label)
     d["is_min_bid_now"] = np.where(
         d["placement"].astype(str).str.lower().eq("search"),
         d["real_bid_rub"].fillna(999999) <= SEARCH_MIN_BID_RUB,
         d["real_bid_rub"].fillna(999999) <= COMBINED_MIN_BID_RUB,
     )
     d["is_max_bid_now"] = d["real_bid_rub"].fillna(-1) >= d["max_allowed_bid_rub"].fillna(10**9)
+
     cond_low_traffic_at_max = (d["impressions_7d"].fillna(0) < RAMP_TARGET_IMPRESSIONS) & d["is_max_bid_now"]
-    cond_high_traffic_min_high_drr = (d["impressions_7d"].fillna(0) >= RAMP_TARGET_IMPRESSIONS) & d["is_min_bid_now"] & (d["drr_pct_7d"].fillna(-1) > DRR_RAISE_GATE_PCT)
-    cond_max_bid_orders_drop = d["is_max_bid_now"] & (d["order_sum_base"].fillna(0) > 0) & (d["order_sum_drop_vs_base_pct"].fillna(0) > 15.0)
+    cond_high_traffic_min_high_drr = (
+        (d["impressions_7d"].fillna(0) >= RAMP_TARGET_IMPRESSIONS)
+        & d["is_min_bid_now"]
+        & (d["drr_pct_7d"].fillna(-1) > DRR_RAISE_GATE_PCT)
+    )
+    cond_max_bid_orders_drop = (
+        d["is_max_bid_now"]
+        & (d["order_sum_base"].fillna(0) > 0)
+        & (d["order_sum_drop_vs_base_pct"].fillna(0) > 15.0)
+    )
+
     d["tg_problem_reason"] = ""
-    d.loc[cond_low_traffic_at_max, "tg_problem_reason"] = "<5000 показов и ставка уже максимальная"
-    d.loc[cond_high_traffic_min_high_drr, "tg_problem_reason"] = ">=5000 показов, ставка минимальная, ДРР >10%"
-    d.loc[cond_max_bid_orders_drop, "tg_problem_reason"] = d.loc[cond_max_bid_orders_drop, "tg_problem_reason"].astype(str).where(
-        d.loc[cond_max_bid_orders_drop, "tg_problem_reason"].astype(str).str.len() == 0,
-        d.loc[cond_max_bid_orders_drop, "tg_problem_reason"].astype(str) + "; ",
-    ) + "достиг max ставки, сумма заказов упала >15%"
+    d.loc[cond_low_traffic_at_max, "tg_problem_reason"] = "<5000 показов, max ставка"
+    d.loc[cond_high_traffic_min_high_drr, "tg_problem_reason"] = "min ставка, ДРР >10%"
+    base_reason = d.loc[cond_max_bid_orders_drop, "tg_problem_reason"].astype(str)
+    d.loc[cond_max_bid_orders_drop, "tg_problem_reason"] = np.where(
+        base_reason.str.len() > 0,
+        base_reason + "; max ставка, заказы -15%",
+        "max ставка, заказы -15%",
+    )
+
     out = d[d["tg_problem_reason"].astype(str).str.len() > 0].copy()
     if out.empty:
         return out
-    cols = [c for c in [
-        "supplier_article", "campaign_id", "placement", "impressions_7d", "clicks_7d", "ctr_pct_7d", "spend_7d", "order_sum_7d", "orders_7d", "drr_pct_7d", "real_bid_rub", "max_allowed_bid_rub", "order_sum_base", "order_sum_drop_vs_base_pct", "tg_problem_reason"
-    ] if c in out.columns]
-    return out[cols].sort_values(["supplier_article", "placement", "campaign_id"])
+
+    out["tg_problem_reason"] = out["tg_problem_reason"].map(_short_brush_reason)
+    out["_type_sort"] = np.where(out["Тип кампании"].eq("ПОИСК"), 0, 1)
+    out["_article_sort"] = out["supplier_article"].map(_brush_article_sort_key)
+    cols = [
+        "supplier_article", "campaign_id", "placement", "Тип кампании",
+        "impressions_7d", "clicks_7d", "ctr_pct_7d", "spend_7d", "order_sum_7d",
+        "orders_7d", "drr_pct_7d", "real_bid_rub", "max_allowed_bid_rub",
+        "order_sum_base", "order_sum_drop_vs_base_pct", "tg_problem_reason",
+        "_type_sort", "_article_sort",
+    ]
+    cols = [c for c in cols if c in out.columns]
+    out = out[cols].sort_values(["_type_sort", "_article_sort", "supplier_article", "campaign_id"]).drop(columns=["_type_sort", "_article_sort"], errors="ignore")
+    return out
 
 
-def format_brush_tg_message(alerts: pd.DataFrame) -> str:
-    header = "Проблемные кисти WB Ads"
-    if alerts is None or alerts.empty:
-        return header + "\nПроблемных артикулов по условиям нет."
-    lines = [header]
-    current_article = None
-    for _, r in alerts.iterrows():
-        article = str(r.get("supplier_article", "")).strip() or "без артикула"
-        if article != current_article:
-            lines.append("")
-            lines.append(article)
-            current_article = article
-        ctr = r.get("ctr_pct_7d", np.nan)
-        drr = r.get("drr_pct_7d", np.nan)
-        lines.append(
-            f"РК {r.get('campaign_id','')} / {r.get('placement','')} - "
-            f"Показы {float(r.get('impressions_7d',0) or 0):.0f} - "
-            f"Клики {float(r.get('clicks_7d',0) or 0):.0f} - "
-            f"CTR {ctr:.2f}% - " if pd.notna(ctr) else f"РК {r.get('campaign_id','')} / {r.get('placement','')} - Показы {float(r.get('impressions_7d',0) or 0):.0f} - Клики {float(r.get('clicks_7d',0) or 0):.0f} - CTR н/д - "
-        )
-        # append remaining fields to the just-created line without risking formatting in conditional above
-        lines[-1] += (
-            f"Расход {float(r.get('spend_7d',0) or 0):.2f} - "
-            f"Сумма заказов {float(r.get('order_sum_7d',0) or 0):.2f} - "
-            f"ДРР {drr:.2f}% - " if pd.notna(drr) else f"Расход {float(r.get('spend_7d',0) or 0):.2f} - Сумма заказов {float(r.get('order_sum_7d',0) or 0):.2f} - ДРР н/д - "
-        )
-        lines[-1] += f"Ставка текущая {float(r.get('real_bid_rub',0) or 0):.0f} - {r.get('tg_problem_reason','')}"
-    text = "\n".join(lines)
-    # Telegram message safety: keep under 3900 chars.
-    return text[:3900]
+def _fmt_int_pdf(v: Any) -> str:
+    try:
+        x = float(v)
+        if math.isfinite(x):
+            return f"{int(round(x)):,}".replace(",", " ")
+    except Exception:
+        pass
+    return "—"
 
 
-def maybe_send_brush_tg_alert(s3_client, bucket: str, decisions: pd.DataFrame, force: bool = False, schedule_only: bool = False) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def _fmt_money_pdf(v: Any) -> str:
+    try:
+        x = float(v)
+        if math.isfinite(x):
+            return f"{int(round(x)):,} ₽".replace(",", " ")
+    except Exception:
+        pass
+    return "—"
+
+
+def _fmt_pct_pdf(v: Any) -> str:
+    try:
+        x = float(v)
+        if math.isfinite(x):
+            return f"{x:.2f}%"
+    except Exception:
+        pass
+    return "—"
+
+
+def _fmt_bid_pdf(v: Any) -> str:
+    try:
+        x = float(v)
+        if math.isfinite(x):
+            return f"{int(round(x))} ₽"
+    except Exception:
+        pass
+    return "—"
+
+
+def build_brush_problem_pdf(alerts: pd.DataFrame, pdf_path: Path, period_label: str = "") -> Path:
+    """Build PDF report exactly for Telegram: only the agreed table, no extra KPI blocks."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+
+    font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    try:
+        if "DejaVuSans" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("DejaVuSans", font_regular))
+        if "DejaVuSans-Bold" not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", font_bold))
+        regular_name, bold_name = "DejaVuSans", "DejaVuSans-Bold"
+    except Exception:
+        regular_name, bold_name = "Helvetica", "Helvetica-Bold"
+
+    data = alerts.copy() if alerts is not None else pd.DataFrame()
+    if not data.empty:
+        data["Тип кампании"] = data.get("Тип кампании", data.get("placement", "")).map(_brush_campaign_type_label)
+        data["_type_sort"] = np.where(data["Тип кампании"].eq("ПОИСК"), 0, 1)
+        data["_article_sort"] = data["supplier_article"].map(_brush_article_sort_key)
+        data = data.sort_values(["_type_sort", "_article_sort", "supplier_article", "campaign_id"]).drop(columns=["_type_sort", "_article_sort"], errors="ignore")
+
+    page_w, page_h = landscape(A4)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Cell", fontName=regular_name, fontSize=6.7, leading=8.2, textColor=colors.HexColor("#222222"), alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="CellCenter", fontName=regular_name, fontSize=6.7, leading=8.2, textColor=colors.HexColor("#222222"), alignment=TA_CENTER))
+    styles.add(ParagraphStyle(name="HeaderCell", fontName=bold_name, fontSize=6.25, leading=7.5, textColor=colors.HexColor("#333333"), alignment=TA_CENTER))
+    styles.add(ParagraphStyle(name="Reason", fontName=regular_name, fontSize=6.2, leading=7.4, textColor=colors.HexColor("#222222"), alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="ReportTitle", fontName=bold_name, fontSize=15, leading=17, textColor=colors.HexColor("#111111"), alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="Subtitle", fontName=regular_name, fontSize=8, leading=10, textColor=colors.HexColor("#565656"), alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="Section", fontName=bold_name, fontSize=10.5, leading=13, textColor=colors.HexColor("#111111"), alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="Empty", fontName=regular_name, fontSize=8, leading=10, textColor=colors.HexColor("#565656"), alignment=TA_LEFT))
+
+    def par(text: Any, style: str = "Cell") -> Paragraph:
+        return Paragraph(str(text if text is not None else "—"), styles[style])
+
+    def make_table(rows: pd.DataFrame) -> Table:
+        header = [
+            "Артикул", "Тип кампании", "Показы", "Клики", "CTR", "Расход",
+            "Сумма заказов", "ДРР", "Ставка текущая", "Макс ставка рассчитанная", "Причина",
+        ]
+        table_data = [[par(h, "HeaderCell") for h in header]]
+        for _, r in rows.iterrows():
+            table_data.append([
+                par(r.get("supplier_article"), "Cell"),
+                par(r.get("Тип кампании"), "CellCenter"),
+                par(_fmt_int_pdf(r.get("impressions_7d")), "CellCenter"),
+                par(_fmt_int_pdf(r.get("clicks_7d")), "CellCenter"),
+                par(_fmt_pct_pdf(r.get("ctr_pct_7d")), "CellCenter"),
+                par(_fmt_money_pdf(r.get("spend_7d")), "CellCenter"),
+                par(_fmt_money_pdf(r.get("order_sum_7d")), "CellCenter"),
+                par(_fmt_pct_pdf(r.get("drr_pct_7d")), "CellCenter"),
+                par(_fmt_bid_pdf(r.get("real_bid_rub")), "CellCenter"),
+                par(_fmt_bid_pdf(r.get("max_allowed_bid_rub")), "CellCenter"),
+                par(_short_brush_reason(r.get("tg_problem_reason")), "Reason"),
+            ])
+        col_widths = [43, 58, 48, 38, 38, 55, 70, 39, 56, 74, 188]
+        tbl = Table(table_data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+        tbl.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), regular_name),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F3F5")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#333333")),
+            ("LINEABOVE", (0, 0), (-1, 0), 0.8, colors.HexColor("#D9DDE3")),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.8, colors.HexColor("#D9DDE3")),
+            ("LINEBELOW", (0, 1), (-1, -1), 0.35, colors.HexColor("#E5E7EB")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FBFBFC")]),
+        ]))
+        return tbl
+
+    def on_page(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(regular_name, 8)
+        canvas.setFillColor(colors.HexColor("#111111"))
+        canvas.drawString(15 * mm, page_h - 12 * mm, "topface / WB Ads")
+        canvas.setFont(regular_name, 7)
+        canvas.setFillColor(colors.HexColor("#777777"))
+        canvas.drawRightString(page_w - 15 * mm, page_h - 12 * mm, f"Страница {doc.page}")
+        canvas.setStrokeColor(colors.HexColor("#E6E8EC"))
+        canvas.setLineWidth(0.5)
+        canvas.line(15 * mm, page_h - 15.5 * mm, page_w - 15 * mm, page_h - 15.5 * mm)
+        canvas.restoreState()
+
+    doc = SimpleDocTemplate(
+        str(pdf_path), pagesize=landscape(A4),
+        leftMargin=14 * mm, rightMargin=14 * mm,
+        topMargin=21 * mm, bottomMargin=12 * mm,
+    )
+
+    subtitle = period_label or "проблемные кисти / сначала ПОИСК, затем ПОЛКИ"
+    story: List[Any] = []
+    groups = [("ПОИСК", data[data["Тип кампании"].eq("ПОИСК")])] if not data.empty else [("ПОИСК", pd.DataFrame())]
+    groups.append(("ПОЛКИ", data[data["Тип кампании"].eq("ПОЛКИ")] if not data.empty else pd.DataFrame()))
+    for idx, (section, rows) in enumerate(groups):
+        if idx:
+            story.append(PageBreak())
+        story.append(par("Проблемные кисти WB Ads", "ReportTitle"))
+        story.append(Spacer(1, 2.5 * mm))
+        story.append(par(subtitle, "Subtitle"))
+        story.append(Spacer(1, 5 * mm))
+        story.append(par(section, "Section"))
+        story.append(Spacer(1, 2.5 * mm))
+        if rows.empty:
+            story.append(par("Проблемных строк нет", "Empty"))
+        else:
+            story.append(make_table(rows))
+
+    doc.build(story, onFirstPage=on_page, onLaterPages=on_page)
+    return pdf_path
+
+
+def maybe_send_brush_tg_alert(
+    s3_client,
+    bucket: str,
+    decisions: pd.DataFrame,
+    force: bool = False,
+    schedule_only: bool = False,
+    pdf_path: Optional[Path] = None,
+    period_label: str = "",
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     alerts = build_brush_problem_alerts(decisions)
     now = _now_msk()
     lock_key = f"{BRUSH_TG_LOCK_PREFIX}/brush_tg_{now.date().isoformat()}.json"
-    result = {"tg_attempted": False, "tg_sent": False, "tg_status": "not_requested", "tg_lock_key": lock_key, "tg_rows": int(len(alerts))}
+    result = {
+        "tg_attempted": False,
+        "tg_sent": False,
+        "tg_status": "not_requested",
+        "tg_lock_key": lock_key,
+        "tg_rows": int(len(alerts)),
+        "tg_pdf_path": str(pdf_path) if pdf_path else "",
+    }
+
+    if pdf_path is not None:
+        try:
+            build_brush_problem_pdf(alerts, Path(pdf_path), period_label=period_label)
+            result["tg_pdf_created"] = True
+        except Exception as exc:
+            result["tg_status"] = "pdf_build_exception"
+            result["tg_response"] = repr(exc)[:500]
+            result["tg_pdf_created"] = False
+            return alerts, result
 
     if schedule_only:
-        if now.weekday() != 0 or (now.hour * 60 + now.minute) < (19 * 60 + 5) or now.hour >= 24:
+        # Monday 19:05 MSK or later. After midnight it becomes Tuesday and is blocked by weekday guard.
+        if now.weekday() != 0 or (now.hour * 60 + now.minute) < (19 * 60 + 5):
             result["tg_status"] = "blocked_by_monday_1905_guard"
             return alerts, result
 
@@ -2112,15 +2370,19 @@ def maybe_send_brush_tg_alert(s3_client, bucket: str, decisions: pd.DataFrame, f
     if not token or not chat_id:
         result["tg_status"] = "missing_telegram_env"
         return alerts, result
+    if pdf_path is None or not Path(pdf_path).exists():
+        result["tg_status"] = "missing_pdf_file"
+        return alerts, result
 
-    message = format_brush_tg_message(alerts)
     result["tg_attempted"] = True
     try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
-            timeout=60,
-        )
+        with open(pdf_path, "rb") as fh:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendDocument",
+                data={"chat_id": chat_id},
+                files={"document": (Path(pdf_path).name, fh, "application/pdf")},
+                timeout=90,
+            )
         result["tg_status"] = str(resp.status_code)
         if 200 <= resp.status_code < 300:
             result["tg_sent"] = True
@@ -2128,8 +2390,14 @@ def maybe_send_brush_tg_alert(s3_client, bucket: str, decisions: pd.DataFrame, f
                 "sent_at_msk": now.strftime("%Y-%m-%d %H:%M:%S"),
                 "rows": int(len(alerts)),
                 "force": bool(force),
+                "pdf_only": True,
             }
-            s3_client.put_object(Bucket=bucket, Key=lock_key, Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), ContentType="application/json")
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=lock_key,
+                Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+                ContentType="application/json",
+            )
         else:
             result["tg_response"] = resp.text[:500]
     except Exception as exc:
@@ -2328,16 +2596,21 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
 
         brush_tg_alerts = pd.DataFrame()
         brush_tg_result: Dict[str, Any] = {"tg_status": "not_requested"}
+        brush_tg_pdf_out = workdir / "Проблемные_кисти_WB_Ads.pdf"
         if bool(getattr(args, "send_brush_tg", False)):
+            period_label = f"{windows['current_start'].date().strftime('%d.%m')}-{windows['current_end'].date().strftime('%d.%m.%Y')} / сначала ПОИСК, затем ПОЛКИ"
             brush_tg_alerts, brush_tg_result = maybe_send_brush_tg_alert(
                 s3,
                 bucket,
                 decisions,
                 force=bool(getattr(args, "force_brush_tg", False)),
                 schedule_only=bool(getattr(args, "brush_tg_schedule_only", False)),
+                pdf_path=brush_tg_pdf_out,
+                period_label=period_label,
             )
             summary["TG кисти: статус"] = brush_tg_result.get("tg_status", "")
             summary["TG кисти: строк"] = int(brush_tg_result.get("tg_rows", 0) or 0)
+            summary["TG кисти: PDF"] = "да" if brush_tg_result.get("tg_pdf_created") else "нет"
             summary["TG кисти: отправлено"] = "да" if brush_tg_result.get("tg_sent") else "нет"
 
         summary_path = workdir / "Сводка_последнего_запуска.json"
@@ -2357,6 +2630,8 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
         upload_s3_bytes(s3, bucket, BID_HISTORY_KEY, bid_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, PAUSE_HISTORY_KEY, pause_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, BRUSH_TG_ALERT_KEY, brush_tg_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if brush_tg_pdf_out.exists():
+            upload_s3_bytes(s3, bucket, BRUSH_TG_PDF_KEY, brush_tg_pdf_out.read_bytes(), "application/pdf")
 
         # Copy to repository workspace for GitHub artifacts.
         Path(local_out.name).write_bytes(local_out.read_bytes())
@@ -2365,6 +2640,8 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
         Path(bid_history_out.name).write_bytes(bid_history_out.read_bytes())
         Path(pause_history_out.name).write_bytes(pause_history_out.read_bytes())
         Path(brush_tg_out.name).write_bytes(brush_tg_out.read_bytes())
+        if brush_tg_pdf_out.exists():
+            Path(brush_tg_pdf_out.name).write_bytes(brush_tg_pdf_out.read_bytes())
 
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     return 0
