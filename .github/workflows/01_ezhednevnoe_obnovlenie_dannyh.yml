@@ -1,4 +1,4 @@
-# version: v22_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS
+# version: v25_strict_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS
 # В GitHub заменить содержимое файла:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -79,7 +79,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
         run: |
-          echo "YML_VERSION=v22_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS"
+          echo "YML_VERSION=v25_strict_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS"
 
           if [ -z "$REPORT_ENV" ]; then
             echo "::error::Не найден secret REPORT_ENV. Он нужен для Yandex Cloud: YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME, YC_ENDPOINT_URL."
@@ -253,7 +253,7 @@ jobs:
               "msk_finished_at": now.isoformat(),
               "github_run_id": os.environ.get("GITHUB_RUN_ID"),
               "github_run_number": os.environ.get("GITHUB_RUN_NUMBER"),
-              "version": "v22_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS",
+              "version": "v25_strict_1504_retry10m_msk_guard_REPORT_ENV_MISSTAIS",
           }, ensure_ascii=False, indent=2).encode("utf-8")
 
           s3 = boto3.client(
