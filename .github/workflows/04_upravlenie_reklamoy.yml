@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v66_report_env_fixed_2026-06-18"
+  WORKFLOW_VERSION: "v67_restore_direct_secrets_2026-06-18"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -35,7 +35,13 @@ jobs:
     timeout-minutes: 90
 
     env:
+      # Старый рабочий формат: часть ключей может лежать отдельными secrets, часть — внутри REPORT_ENV.
+      # Сначала передаём прямые secrets, затем шаг Load secrets from REPORT_ENV добирает недостающее из REPORT_ENV.
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       PYTHONUNBUFFERED: "1"
