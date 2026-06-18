@@ -13,7 +13,7 @@
 # FIX50: strict daily report date, daily ABC validation, no Telegram fallback to previous day
 # FIX52: previous-day strict PDF, search filter dedupe, 60d CORE, ABC unit expenses/localization windows
 # FIX53: daily date lock cannot be overridden by closed-week flags; article ads/key layout; bid history by source file
-# FIX54: workflow waits every 10 minutes from 18:05 to 00:00 MSK; previous-day report only; ads/date readiness is checked before heavy run
+# FIX55: 18:05 MSK hard run window, 10-min source retry, strict previous-day daily report
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -44,6 +44,7 @@ Outputs are overwritten every run:
 from __future__ import annotations
 
 # FIX53_DAILY_LOCKED_LAYOUT_BID_HISTORY_20260616: daily date lock, article ads/key layout, bid history by source file
+# FIX55_1805_RETRY_PREV_DAY_SOURCES_20260618: hard MSK run window + retry-ready daily sources
 
 import argparse
 import calendar
@@ -3382,7 +3383,71 @@ def _apply_auto_complete_report_date(outputs: Dict[str, Any], context: str = "")
         f"previous={prev or 'empty'}; incomplete newer days are skipped; context={context}"
     )
 
+
+def _enforce_msk_run_window_if_needed(allow_smoke: bool = False) -> None:
+    """FIX55: daily report is allowed only from 18:05 MSK until 23:59:59 MSK.
+
+    This protects scheduled/manual runs from starting before WB/ABC/ads data are ready
+    and prevents stale previous-day targets after midnight.
+    """
+    if not _env_flag("REPORT_ENFORCE_MSK_RUN_WINDOW", False):
+        return
+    if allow_smoke:
+        return
+    try:
+        from zoneinfo import ZoneInfo
+        now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    except Exception:
+        now_msk = datetime.utcnow() + timedelta(hours=3)
+    current_minutes = now_msk.hour * 60 + now_msk.minute
+    start_minutes = 18 * 60 + 5
+    if current_minutes < start_minutes:
+        log(
+            "msk_run_guard: skip; current MSK time "
+            f"{now_msk:%Y-%m-%d %H:%M:%S}, allowed window is 18:05-23:59. "
+            "Daily report is not allowed before 18:05 MSK."
+        )
+        raise SystemExit(0)
+    # At 00:00 a new reporting day starts; do not continue old retries.
+    if now_msk.hour == 0:
+        log(
+            "msk_run_guard: skip; current MSK time "
+            f"{now_msk:%Y-%m-%d %H:%M:%S}. After 00:00 MSK daily report must not run."
+        )
+        raise SystemExit(0)
+
+
 def _preflight_abc_period_exists(storage: Storage, reports_root: str, required: pd.Timestamp) -> None:
+    daily_abc_required = _env_date("REPORT_REQUIRE_DAILY_ABC_DATE")
+    if daily_abc_required is not None and not _env_flag("REPORT_REQUIRE_ABC_PERIOD", False):
+        period_start = pd.Timestamp(daily_abc_required).normalize()
+        period_end = pd.Timestamp(daily_abc_required).normalize()
+        expected_prefix = f"wb_abc_report_goods__{period_start:%d.%m.%Y}-{period_end:%d.%m.%Y}__at_"
+        prefixes = [
+            f"{reports_root.strip('/')}/ABC",
+            f"{reports_root.strip('/')}/ABC/TOPFACE",
+            f"{reports_root.strip('/')}/АБС анализ/TOPFACE",
+        ]
+        found_keys: List[str] = []
+        for prefix in prefixes:
+            try:
+                keys = storage.list_files(prefix)
+            except Exception as exc:
+                log(f"preflight daily ABC: WARN cannot list {prefix}: {exc}")
+                continue
+            for key in keys:
+                name = Path(key).name
+                if name.startswith(expected_prefix) and name.lower().endswith((".xlsx", ".xlsm", ".zip")):
+                    found_keys.append(key)
+        if not found_keys:
+            raise RuntimeError(
+                f"preflight: нет точного daily ABC/АБС файла за дату {period_start:%d.%m.%Y}. "
+                f"Ожидал файл {expected_prefix}*.xlsx в Отчёты/ABC. "
+                f"Daily report не запускаю, чтобы не показать Валовую прибыль 0 ₽."
+            )
+        log(f"preflight daily ABC: OK exact day {period_start:%Y-%m-%d}; key={found_keys[0]}")
+        return
+
     if not _env_flag("REPORT_REQUIRE_ABC_PERIOD", False):
         return
     period_end = pd.Timestamp(required).normalize()
@@ -10157,6 +10222,7 @@ def main() -> None:
     if args.smoke_test:
         run_smoke_test(args.root)
         return
+    _enforce_msk_run_window_if_needed(allow_smoke=False)
     if args.preflight_date_check:
         run_preflight_date_check(args.root, args.reports_root, args.store)
         return
