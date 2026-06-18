@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v67_restore_direct_secrets_2026-06-18"
+  WORKFLOW_VERSION: "v68_brush_pdf_only_2026-06-18"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz reportlab
 
       - name: Load secrets from REPORT_ENV
         shell: bash
@@ -355,3 +355,4 @@ jobs:
             История_ставок.xlsx
             История_пауз.xlsx
             Проблемные_кисти_TG.xlsx
+            Проблемные_кисти_WB_Ads.pdf
