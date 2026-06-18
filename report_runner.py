@@ -13,6 +13,7 @@
 # FIX50: strict daily report date, daily ABC validation, no Telegram fallback to previous day
 # FIX52: previous-day strict PDF, search filter dedupe, 60d CORE, ABC unit expenses/localization windows
 # FIX53: daily date lock cannot be overridden by closed-week flags; article ads/key layout; bid history by source file
+# FIX54: workflow waits every 10 minutes from 18:05 to 00:00 MSK; previous-day report only; ads/date readiness is checked before heavy run
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
