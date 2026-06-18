@@ -1,1 +1,400 @@
 
+name: TOPFACE WB Ads Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_slot:
+        description: "Что запустить вручную"
+        required: true
+        default: "main_preview"
+        type: choice
+        options:
+          - main_preview
+          - main_run
+          - rollback_wrong_pauses
+          - night_start
+          - night_end
+      dry_run:
+        description: "Dry-run: рассчитать без отправки в WB"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+  schedule:
+    # GitHub Actions schedule может задерживаться. Поэтому ставим несколько попыток НЕ в начало часа.
+    # Timezone задаём явно: Москва = Europe/Moscow.
+    # Автоматический scheduled-запуск — только PREVIEW, без изменения ставок.
+    - cron: "7 18 * * *"
+      timezone: "Europe/Moscow"
+    - cron: "22 18 * * *"
+      timezone: "Europe/Moscow"
+    - cron: "37 18 * * *"
+      timezone: "Europe/Moscow"
+    - cron: "52 18 * * *"
+      timezone: "Europe/Moscow"
+
+concurrency:
+  group: topface-wb-ads-manager
+  cancel-in-progress: false
+
+jobs:
+  run-topface-ads-manager:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+
+      PYTHONUNBUFFERED: "1"
+      TZ: "Europe/Moscow"
+      SHOULD_RUN: "true"
+      WB_NIGHT_EXPERIMENTS_ENABLED: "1"
+      WB_NIGHT_EXPERIMENT_START_HOUR_MSK: "1"
+      WB_NIGHT_EXPERIMENT_END_HOUR_MSK: "5"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+
+      - name: Load secrets from REPORT_ENV
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+          ]
+
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+          for raw_line in report_env.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('"').strip("'")
+              if key in allowed and value:
+                  parsed[key] = value
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if not github_env:
+              raise SystemExit("GITHUB_ENV is not available")
+
+          loaded = []
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in allowed:
+                  value = os.getenv(key) or parsed.get(key)
+                  if value:
+                      f.write(f"{key}={value}\n")
+                      loaded.append(key)
+
+          print("Loaded secret names: " + ", ".join(loaded))
+          PY
+
+      - name: Verify required secrets
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+          ]
+          missing = [name for name in required if not os.getenv(name)]
+          if missing:
+              raise SystemExit("Missing secrets: " + ", ".join(missing))
+          print("All required secrets are present.")
+          PY
+
+      - name: Schedule time guard and daily lock
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Schedule guard diagnostics ==="
+          echo "Event: $EVENT_NAME"
+          echo "Schedule cron: ${SCHEDULE_CRON:-manual}"
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+
+          if [ "$EVENT_NAME" != "schedule" ]; then
+            echo "Manual workflow_dispatch: bypass schedule time guard and daily lock."
+            echo "SHOULD_RUN=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          MSK_HOUR="$(TZ=Europe/Moscow date '+%H')"
+          MSK_MIN="$(TZ=Europe/Moscow date '+%M')"
+          MSK_DATE="$(TZ=Europe/Moscow date '+%Y-%m-%d')"
+
+          # Разрешаем scheduled-запуск только вечером по МСК.
+          # Если GitHub вдруг задержит job до ночи, Python вообще не стартует.
+          ALLOWED="false"
+          if [ "$MSK_HOUR" = "18" ] || [ "$MSK_HOUR" = "19" ]; then
+            ALLOWED="true"
+          fi
+          if [ "$MSK_HOUR" = "20" ] && [ "$MSK_MIN" -le 30 ]; then
+            ALLOWED="true"
+          fi
+
+          if [ "$ALLOWED" != "true" ]; then
+            echo "BLOCKED_BY_MSK_TIME_GUARD: scheduled run outside allowed 18:00-20:30 MSK window."
+            echo "SHOULD_RUN=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import boto3
+          from botocore.exceptions import ClientError
+
+          bucket = os.environ["YC_BUCKET_NAME"]
+          s3 = boto3.client(
+              "s3",
+              endpoint_url="https://storage.yandexcloud.net",
+              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
+          )
+          today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+          key = f"Служебные файлы/Ассистент WB/TOPFACE/locks/18msk_main_preview_{today}.json"
+
+          try:
+              s3.head_object(Bucket=bucket, Key=key)
+              print(f"DAILY_LOCK_EXISTS: {key}")
+              with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+                  f.write("SHOULD_RUN=false\n")
+              raise SystemExit(0)
+          except ClientError as exc:
+              code = str(exc.response.get("Error", {}).get("Code", ""))
+              if code not in {"404", "NoSuchKey", "NotFound"}:
+                  raise
+
+          payload = {
+              "lock": "18msk_main_preview",
+              "created_at_msk": datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"),
+              "github_run_id": os.getenv("GITHUB_RUN_ID", ""),
+              "github_event_schedule": os.getenv("SCHEDULE_CRON", ""),
+          }
+          s3.put_object(
+              Bucket=bucket,
+              Key=key,
+              Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+              ContentType="application/json",
+          )
+          print(f"DAILY_LOCK_CREATED: {key}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write("SHOULD_RUN=true\n")
+          PY
+
+      - name: Resolve and verify script
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          set -euo pipefail
+          echo "=== Time diagnostics ==="
+          echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+
+          echo "=== Current directory ==="
+          pwd
+          echo "=== Repository files ==="
+          ls -la
+
+          SCRIPT_PATH="upravlenie_reklamoy.py"
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "ERROR: не найден обязательный файл ./$SCRIPT_PATH"
+            echo "Нужно положить рекламный код именно в корень репозитория как ./upravlenie_reklamoy.py"
+            exit 1
+          fi
+
+          echo "SCRIPT_PATH=$SCRIPT_PATH" >> "$GITHUB_ENV"
+          export SCRIPT_PATH
+          echo "Resolved script: $SCRIPT_PATH"
+
+          echo "=== Script version marker ==="
+          grep -n "SCRIPT_VERSION" "$SCRIPT_PATH" || true
+
+          echo "=== Old dayfirst bug check ==="
+          if grep -q "dayfirst=True" "$SCRIPT_PATH"; then
+            echo "ERROR: В $SCRIPT_PATH есть старый dayfirst=True"
+            exit 1
+          fi
+
+          echo "=== Required code markers ==="
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          script_path = os.environ.get("SCRIPT_PATH") or "upravlenie_reklamoy.py"
+          text = Path(script_path).read_text(encoding="utf-8", errors="replace")
+
+          m = re.search(r'SCRIPT_VERSION\s*=\s*["\']([^"\']+)["\']', text)
+          if not m:
+              raise SystemExit(f"ERROR: В {script_path} нет SCRIPT_VERSION")
+          version = m.group(1)
+          print(f"SCRIPT_VERSION={version}")
+
+          vm = re.search(r'strict-drr-v(\d+)', version)
+          if not vm:
+              raise SystemExit(f"ERROR: Неизвестный формат SCRIPT_VERSION: {version}")
+          vnum = int(vm.group(1))
+          if vnum < 53:
+              raise SystemExit(f"ERROR: В {script_path} версия v{vnum}, нужна v53+.")
+
+          markers = [
+              "FIX46_CORE_RAMP_PAUSE_20260611",
+              "night_experiment_only",
+              "EXPERIMENT_1_NIGHT_MIN_BID_MSK_1_5",
+              "EXPERIMENT_2_NIGHT_COMBINED_DRR_GT_15_PAUSE",
+              "night_experiment_slot",
+              "TECHNICAL_COMBINED_MIN_BID_80_FIX",
+              "RAMP_ACTIVE_TO_5000_IMPRESSIONS",
+              "ROLLBACK_WRONG_FIX46_PAUSE_START",
+              "--rollback-wrong-pauses-only",
+          ]
+          missing = [marker for marker in markers if marker not in text]
+          if missing:
+              raise SystemExit("ERROR: В коде нет обязательных маркеров: " + ", ".join(missing))
+          print("Code marker check OK.")
+          PY
+
+          echo "=== Script SHA256 ==="
+          sha256sum "$SCRIPT_PATH"
+
+      - name: Compile Python script
+        if: env.SHOULD_RUN == 'true'
+        run: |
+          set -euo pipefail
+          python -m py_compile "$SCRIPT_PATH"
+
+      - name: Run TOPFACE WB Ads Manager
+        if: env.SHOULD_RUN == 'true'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule || '' }}
+          INPUT_RUN_SLOT: ${{ github.event.inputs.run_slot || 'main_preview' }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          SLOT="main_preview"
+          COMMAND="preview"
+          EXTRA_ARGS=()
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # Автоматический вечерний запуск — только preview, чтобы schedule не менял ставки.
+            SLOT="main_preview"
+            COMMAND="preview"
+            EXTRA_ARGS=()
+          else
+            case "$INPUT_RUN_SLOT" in
+              "rollback_wrong_pauses")
+                SLOT="rollback_wrong_pauses"
+                COMMAND="run"
+                EXTRA_ARGS=(--rollback-wrong-pauses-only --apply-start)
+                ;;
+              "night_start")
+                SLOT="night_start"
+                COMMAND="run"
+                EXTRA_ARGS=(--night-experiment-only --night-experiment-slot start --apply-pause)
+                ;;
+              "night_end")
+                SLOT="night_end"
+                COMMAND="run"
+                EXTRA_ARGS=(--night-experiment-only --night-experiment-slot end --apply-start)
+                ;;
+              "main_run")
+                SLOT="main_run"
+                COMMAND="run"
+                EXTRA_ARGS=()
+                ;;
+              "main_preview"|"")
+                SLOT="main_preview"
+                COMMAND="preview"
+                EXTRA_ARGS=()
+                ;;
+              *)
+                echo "ERROR: неизвестный run_slot: $INPUT_RUN_SLOT"
+                exit 1
+                ;;
+            esac
+          fi
+
+          CMD=(python "$SCRIPT_PATH" "$COMMAND" --skip-price "${EXTRA_ARGS[@]}")
+          if [ "$INPUT_DRY_RUN" = "true" ]; then
+            CMD+=(--dry-run)
+          fi
+
+          echo "=== Run slot diagnostics ==="
+          echo "Event: $EVENT_NAME"
+          echo "Schedule cron: ${SCHEDULE_CRON:-manual}"
+          echo "Manual input slot: ${INPUT_RUN_SLOT:-none}"
+          echo "Resolved slot: $SLOT"
+          echo "Resolved command: $COMMAND"
+          echo "Resolved script: $SCRIPT_PATH"
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+          printf 'Running:'
+          printf ' %q' "${CMD[@]}"
+          printf '\n'
+
+          "${CMD[@]}"
+
+      - name: Show local result files
+        if: always()
+        run: |
+          echo "=== SHOULD_RUN=${SHOULD_RUN:-unknown} ==="
+          echo "=== Local XLSX/JSON files after run ==="
+          find . -maxdepth 4 -type f \( -name "*.xlsx" -o -name "*.json" \) -print || true
+
+      - name: Upload local artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: topface-ads-manager-results
+          path: |
+            *.xlsx
+            *.json
+            **/Итог_последнего_запуска*.xlsx
+            **/Предпросмотр_последнего_запуска*.xlsx
+            **/Сводка_последнего_запуска*.json
+            **/Лог_API*.xlsx
+            **/История_ставок*.xlsx
+            **/История_пауз*.xlsx
+          if-no-files-found: warn
+          retention-days: 14
