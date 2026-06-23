@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-06-18_v25_ACTUAL_DAILY_YESTERDAY_ONLY"
+SCRIPT_VERSION = "2026-06-18_v26_MANUAL_OK_DAILY_YESTERDAY_ONLY"
 
 # ========================== КЛАСС ДЛЯ РАБОТЫ С YANDEX CLOUD ==========================
 
