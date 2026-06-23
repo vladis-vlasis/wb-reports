@@ -14,6 +14,8 @@
 # FIX52: previous-day strict PDF, search filter dedupe, 60d CORE, ABC unit expenses/localization windows
 # FIX53: daily date lock cannot be overridden by closed-week flags; article ads/key layout; bid history by source file
 # FIX55: 18:05 MSK hard run window, 10-min source retry, strict previous-day daily report
+# FIX57_AUTO_WINDOW_MANUAL_BYPASS_20260623: auto schedule window only; manual workflow_dispatch bypasses time guard
+# FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: localization pool coverage by snapshot date; stale stock snapshots are not carried indefinitely
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -45,6 +47,8 @@ from __future__ import annotations
 
 # FIX53_DAILY_LOCKED_LAYOUT_BID_HISTORY_20260616: daily date lock, article ads/key layout, bid history by source file
 # FIX55_1805_RETRY_PREV_DAY_SOURCES_20260618: hard MSK run window + retry-ready daily sources
+# FIX57_AUTO_WINDOW_MANUAL_BYPASS_20260623: manual runs bypass MSK time window; auto schedule remains guarded
+# FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: pool stock/need grouped by stock_day and localization merge uses limited staleness tolerance
 
 import argparse
 import calendar
@@ -2280,11 +2284,17 @@ class AnalyticsBuilder:
         detail = base_grid.merge(st, on=["stock_day", "subject", "product", "supplier_article", "nm_id", "warehouse"], how="left")
         detail["stock_qty"] = detail["stock_qty"].fillna(0)
         detail["is_direct_covered"] = detail["stock_qty"] >= detail["needed_stock_2d"]
-        # Replacement: same regional pool has enough stock in aggregate.
-        pool_stock = detail.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], dropna=False)["stock_qty"].sum().rename("pool_stock_qty").reset_index()
-        pool_need = detail.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], dropna=False)["needed_stock_2d"].sum().rename("pool_need_qty").reset_index()
-        detail = detail.merge(pool_stock, on=["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], how="left").merge(pool_need, on=["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], how="left")
-        detail["is_covered_with_replacement"] = detail["is_direct_covered"] | (detail["pool_stock_qty"] >= detail["needed_stock_2d"])
+        # Replacement: same regional pool has enough stock in aggregate FOR THE SAME STOCK SNAPSHOT.
+        # FIX58: the previous code grouped pool_stock/pool_need without stock_day, so it summed
+        # leftovers across all historical stock dates and almost always made localization_with_replacements
+        # look like ~99-100%. That was the reason localization dynamics looked frozen/over-optimistic.
+        pool_keys = ["stock_day", "subject", "product", "supplier_article", "nm_id", "warehouse_pool"]
+        pool_stock = detail.groupby(pool_keys, dropna=False)["stock_qty"].sum().rename("pool_stock_qty").reset_index()
+        pool_need = detail.groupby(pool_keys, dropna=False)["needed_stock_2d"].sum().rename("pool_need_qty").reset_index()
+        detail = detail.merge(pool_stock, on=pool_keys, how="left").merge(pool_need, on=pool_keys, how="left")
+        # Pool replacement covers a warehouse only if the whole regional pool has enough stock
+        # for the whole pool demand, not merely enough for one individual warehouse.
+        detail["is_covered_with_replacement"] = detail["is_direct_covered"] | (detail["pool_stock_qty"] >= detail["pool_need_qty"])
         detail["direct_coverage_weight_pct"] = np.where(detail["is_direct_covered"], detail["warehouse_weight_pct"], 0)
         detail["replacement_coverage_weight_pct"] = np.where(detail["is_covered_with_replacement"], detail["warehouse_weight_pct"], 0)
         summary = detail.groupby(["stock_day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
@@ -2376,12 +2386,17 @@ class AnalyticsBuilder:
                 loc = loc_summary[["day"] + loc_cols].copy()
                 loc["day"] = pd.to_datetime(loc["day"], errors="coerce").dt.normalize()
                 out["day"] = pd.to_datetime(out["day"], errors="coerce").dt.normalize()
+                # FIX58: do not carry an old stock snapshot indefinitely.
+                # If the last localization snapshot is stale, PDF should show missing localization
+                # instead of repeating the old percentage and creating fake 0.0% dynamics.
+                max_stale_days = int(os.getenv("WB_LOCALIZATION_MAX_STALE_DAYS", "2"))
                 out = pd.merge_asof(
                     out.sort_values("day"),
                     loc.sort_values("day"),
                     on="day",
                     by=["supplier_article", "nm_id"],
                     direction="backward",
+                    tolerance=pd.Timedelta(days=max_stale_days),
                 ).sort_index()
             else:
                 out = out.merge(loc_summary[loc_cols], on=["supplier_article", "nm_id"], how="left")
@@ -3385,15 +3400,26 @@ def _apply_auto_complete_report_date(outputs: Dict[str, Any], context: str = "")
 
 
 def _enforce_msk_run_window_if_needed(allow_smoke: bool = False) -> None:
-    """FIX55: daily report is allowed only from 18:05 MSK until 23:59:59 MSK.
+    """FIX57: MSK time guard applies only to scheduled auto runs.
 
-    This protects scheduled/manual runs from starting before WB/ABC/ads data are ready
-    and prevents stale previous-day targets after midnight.
+    Manual workflow_dispatch runs must work at any time. The workflow sets
+    REPORT_RUN_SOURCE=schedule for cron and REPORT_RUN_SOURCE=manual for manual runs.
     """
     if not _env_flag("REPORT_ENFORCE_MSK_RUN_WINDOW", False):
         return
     if allow_smoke:
         return
+
+    run_source = normalize_text(os.getenv("REPORT_RUN_SOURCE", "")).lower()
+    github_event = normalize_text(os.getenv("GITHUB_EVENT_NAME", "")).lower()
+    manual_bypass = _env_flag("REPORT_MANUAL_BYPASS_MSK_WINDOW", False)
+    if manual_bypass or (run_source and run_source != "schedule") or (github_event and github_event != "schedule"):
+        log(
+            "msk_run_guard: bypass for manual run; "
+            f"REPORT_RUN_SOURCE={run_source or '-'}, GITHUB_EVENT_NAME={github_event or '-'}"
+        )
+        return
+
     try:
         from zoneinfo import ZoneInfo
         now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
@@ -3401,18 +3427,14 @@ def _enforce_msk_run_window_if_needed(allow_smoke: bool = False) -> None:
         now_msk = datetime.utcnow() + timedelta(hours=3)
     current_minutes = now_msk.hour * 60 + now_msk.minute
     start_minutes = 18 * 60 + 5
-    if current_minutes < start_minutes:
+    # Auto schedule is allowed to start only from 18:05 to 23:05 MSK.
+    # Later starts can finish after midnight, so the workflow should skip them.
+    end_minutes = 23 * 60 + 5
+    if current_minutes < start_minutes or current_minutes > end_minutes:
         log(
-            "msk_run_guard: skip; current MSK time "
-            f"{now_msk:%Y-%m-%d %H:%M:%S}, allowed window is 18:05-23:59. "
-            "Daily report is not allowed before 18:05 MSK."
-        )
-        raise SystemExit(0)
-    # At 00:00 a new reporting day starts; do not continue old retries.
-    if now_msk.hour == 0:
-        log(
-            "msk_run_guard: skip; current MSK time "
-            f"{now_msk:%Y-%m-%d %H:%M:%S}. After 00:00 MSK daily report must not run."
+            "msk_run_guard: skip scheduled auto run; current MSK time "
+            f"{now_msk:%Y-%m-%d %H:%M:%S}, allowed auto start window is 18:05-23:05. "
+            "Manual runs bypass this window."
         )
         raise SystemExit(0)
 
