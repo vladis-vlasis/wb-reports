@@ -1370,6 +1370,23 @@ def summary_table(decisions: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> 
     return pd.DataFrame(rows, columns=["metric", "value"])
 
 
+
+
+def _safe_pause_start_subset(decisions: pd.DataFrame, pause_cols: list[str]) -> pd.DataFrame:
+    work = decisions.copy() if isinstance(decisions, pd.DataFrame) else pd.DataFrame()
+    if work.empty:
+        return pd.DataFrame(columns=pause_cols)
+    if "action" not in work.columns:
+        for col in pause_cols:
+            if col not in work.columns:
+                work[col] = pd.Series(index=work.index, dtype="object")
+        return work.iloc[0:0][pause_cols]
+    mask = work["action"].astype(str).isin(["pause", "start", "hold_paused"])
+    for col in pause_cols:
+        if col not in work.columns:
+            work[col] = pd.Series(index=work.index, dtype="object")
+    return work.loc[mask, pause_cols]
+
 def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payload: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> None:
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1396,7 +1413,7 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
         cap_cols = [c for c in ["campaign_id", "supplier_article", "placement", "real_bid_rub", "economic_max_bid_raw", "max_allowed_bid_rub", "max_allowed_ceiling_bid_rub", "hard_cap_step_rub", "target_drr_cap_pct", "below_target_drr_at_wb_min_bid", "bid_at_calculated_max", "order_sum_cur", "order_sum_base", "order_sum_drop_vs_base_pct", "forecast_cpo_next_step", "forecast_drr_next_step_pct", "avg_finished_price", "clicks_per_order_cur", "impressions_per_order_cur", "max_bid_reason"] if c in decisions.columns]
         decisions[cap_cols].to_excel(writer, sheet_name="Предельные_ставки", index=False)
         pause_cols = [c for c in ["campaign_id", "supplier_article", "product_root", "placement", "action", "reason_code", "reason_text", "impressions_7d", "orders_7d", "drr_pct_7d", "impressions_14d", "drr_pct_14d", "active_in_block", "is_block_leader", "is_flagship_campaign", "is_new"] if c in decisions.columns]
-        decisions[decisions["action"].isin(["pause", "start", "hold_paused"])][pause_cols].to_excel(writer, sheet_name="Паузы_и_возвраты", index=False)
+        _safe_pause_start_subset(decisions, pause_cols).to_excel(writer, sheet_name="Паузы_и_возвраты", index=False)
         ramp_cols = [c for c in ["campaign_id", "supplier_article", "product_root", "placement", "ramp_queue_rank", "ramp_slot_selected", "ramp_status", "is_flagship_campaign", "flagship_rank", "action", "reason_code", "impressions_7d", "impressions_yday", "ctr_pct_cur", "orders_cur", "drr_pct_7d", "real_bid_rub", "new_bid_rub", "max_allowed_bid_rub", "max_allowed_ceiling_bid_rub"] if c in decisions.columns]
         # In rollback-only mode there are no ramp columns. Sort only by columns that exist.
         sort_cols = [c for c in ["product_root", "placement", "ramp_queue_rank"] if c in decisions.columns]
@@ -1998,8 +2015,8 @@ def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFra
         "Окно паузы с": windows["pause_start"].date().isoformat(),
         "Окно паузы по": windows["pause_end"].date().isoformat(),
         "ABC-рентабельность используется": "нет",
-        "Режим только ночных экспериментов": "да" if getattr(args, "night_experiment_only", False) else "нет",
-        "Ночной слот YAML": getattr(args, "night_experiment_slot", "") or "",
+        "Режим только ночных экспериментов": "нет",
+        "Ночной слот YAML": "",
         "API ставок: разрешённое окно": "основной 18:00-23:59 МСК; ночной эксперимент 01:05/05:05 МСК",
         "Текущее время МСК для API guard": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
         "Эксперимент 1: строк минимальной ночной ставки": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == EXPERIMENT_1_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0,
@@ -2692,8 +2709,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 # V69 OVERRIDES: GP + CORE + POSTCHECK
 # =========================
 
-SCRIPT_VERSION = "v69-gp-core-postcheck-2026-06-25"
-VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V69_GP_CORE_POSTCHECK"
+SCRIPT_VERSION = "v70-gp-core-postcheck-night-guard-fix-2026-06-25"
+VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V70_GP_CORE_POSTCHECK"
 
 DRR_FORECAST_CAP_PCT = 15.0
 BRUSH_BID_CAP_DRR_PCT = 15.0
@@ -3727,7 +3744,7 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
         decisions[cap_cols].to_excel(writer, sheet_name="Предельные_ставки", index=False)
 
         pause_cols = [c for c in ["campaign_id", "supplier_article", "product_root", "placement", "action", "reason_code", "reason_text", "impressions_7d", "orders_7d", "drr_pct_7d", "impressions_14d", "drr_pct_14d", "active_in_block", "is_block_leader", "is_flagship_campaign", "is_new"] if c in decisions.columns]
-        decisions[decisions["action"].isin(["pause", "start", "hold_paused"])][pause_cols].to_excel(writer, sheet_name="Паузы_и_возвраты", index=False)
+        _safe_pause_start_subset(decisions, pause_cols).to_excel(writer, sheet_name="Паузы_и_возвраты", index=False)
 
         ramp_cols = [c for c in ["campaign_id", "supplier_article", "product_root", "placement", "ramp_queue_rank", "ramp_slot_selected", "ramp_status", "is_flagship_campaign", "flagship_rank", "action", "reason_code", "impressions_7d", "impressions_yday", "ctr_pct_cur", "orders_cur", "drr_pct_7d", "real_bid_rub", "new_bid_rub", "max_allowed_bid_rub", "max_allowed_ceiling_bid_rub"] if c in decisions.columns]
         sort_cols = [c for c in ["product_root", "placement", "ramp_queue_rank"] if c in decisions.columns]
