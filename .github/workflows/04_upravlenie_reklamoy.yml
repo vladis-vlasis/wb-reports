@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v68_brush_pdf_only_2026-06-18"
+  WORKFLOW_VERSION: "v69_gp_core_postcheck_2026-06-25"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
