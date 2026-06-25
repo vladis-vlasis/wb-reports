@@ -4,10 +4,6 @@ on:
   workflow_dispatch:
   schedule:
     # GitHub cron работает в UTC. Москва = UTC+3.
-    # Ночной эксперимент: 01:05 МСК -> 22:05 UTC предыдущего дня.
-    - cron: "5 22 * * *"
-    # Ночной эксперимент: 05:05 МСК -> 02:05 UTC.
-    - cron: "5 2 * * *"
     # Основной контур: каждые 10 минут с 18:00 до 23:50 МСК.
     # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
     - cron: "*/10 15-20 * * *"
@@ -18,12 +14,12 @@ permissions:
   contents: read
 
 concurrency:
-  # Разделяем очереди по конкретному cron/manual, чтобы night/main/brush не отменяли друг друга.
+  # Разделяем очереди по cron/manual, чтобы повторные schedule не отменяли друг друга.
   group: wb-ads-manager-topface-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v69_gp_core_postcheck_2026-06-25"
+  WORKFLOW_VERSION: "v71_no_night_mode_2026-06-25"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -70,7 +66,7 @@ jobs:
           echo "=== Workflow file hash and markers ==="
           if [[ -f "${WORKFLOW_FILE}" ]]; then
             sha256sum "${WORKFLOW_FILE}"
-            grep -nE "WORKFLOW_VERSION|cron:|18:|19:05|01:05|05:05|МСК|RUN_SLOT|brush_tg|REPORT_ENV" "${WORKFLOW_FILE}" || true
+            grep -nE "WORKFLOW_VERSION|cron:|18:|19:05|МСК|RUN_SLOT|brush_tg|REPORT_ENV" "${WORKFLOW_FILE}" || true
           else
             echo "WARNING: ${WORKFLOW_FILE} not found after checkout"
             find .github/workflows -maxdepth 1 -type f -print || true
@@ -175,19 +171,8 @@ jobs:
           allowed = True
           reason = "manual_dispatch_single_mode"
           lock_name = f"manual_main_{now_msk:%Y-%m-%d_%H%M%S}"
-
           if event_name == "schedule":
-              if schedule == "5 22 * * *":
-                  run_slot = "night_start"
-                  allowed = (1 * 60) <= minutes <= (1 * 60 + 35)
-                  reason = "night_start_0105_msk_window" if allowed else "BLOCKED_NIGHT_START_TIME_GUARD"
-                  lock_name = f"night_start_{now_msk:%Y-%m-%d}"
-              elif schedule == "5 2 * * *":
-                  run_slot = "night_end"
-                  allowed = (5 * 60) <= minutes <= (5 * 60 + 35)
-                  reason = "night_end_0505_msk_window" if allowed else "BLOCKED_NIGHT_END_TIME_GUARD"
-                  lock_name = f"night_end_{now_msk:%Y-%m-%d}"
-              elif schedule == "5,15,25,35,45,55 16-20 * * 1":
+              if schedule == "5,15,25,35,45,55 16-20 * * 1":
                   run_slot = "brush_tg"
                   allowed = (weekday == 0) and ((19 * 60 + 5) <= minutes <= (23 * 60 + 59))
                   reason = "brush_tg_monday_1905_2359_msk_window" if allowed else "BLOCKED_BRUSH_TG_TIME_GUARD"
@@ -270,6 +255,7 @@ jobs:
           python -m py_compile upravlenie_reklamoy.py
 
       - name: Run WB Ads Manager
+        if: env.RUN_ALLOWED == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -288,12 +274,6 @@ jobs:
               ;;
             brush_tg)
               CMD="python upravlenie_reklamoy.py preview --skip-price --send-brush-tg --brush-tg-schedule-only"
-              ;;
-            night_start)
-              CMD="python upravlenie_reklamoy.py run --skip-price --night-experiment-only --night-experiment-slot start --apply-pause"
-              ;;
-            night_end)
-              CMD="python upravlenie_reklamoy.py run --skip-price --night-experiment-only --night-experiment-slot end --apply-start"
               ;;
             *)
               echo "Unknown RUN_SLOT=${RUN_SLOT}"
