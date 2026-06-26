@@ -20,6 +20,7 @@
 # FIX60_MSK_TARGET_WINDOW_NO_CANCEL_20260626: scheduled/manual daily runs never cancel by time; 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1
 # FIX62_STORAGE_ENV_RESTORE_20260626: restore GitHub Object Storage env aliases and apply MSK target to all report modes
 # FIX64_REPORT_ENV_LOADER_20260626: load credentials from multiline REPORT_ENV before storage init
+# FIX65_TELEGRAM_PREFLIGHT_ALIAS_20260626: normalize Telegram aliases from REPORT_ENV and fail before heavy calculations if --send-telegram cannot send
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -977,6 +978,103 @@ def _apply_report_env_blob_to_os_environ() -> None:
             loaded += 1
     if loaded:
         log(f"REPORT_ENV loader: loaded {loaded} variables into process environment")
+
+
+def _first_nonempty_env(names: Sequence[str]) -> Tuple[str, str]:
+    """Return first non-empty env value and the variable name used. Values are never logged."""
+    for name in names:
+        value = os.getenv(name, "")
+        if value is not None and str(value).strip():
+            return str(value).strip(), name
+    return "", ""
+
+
+TELEGRAM_TOKEN_ENV_ALIASES: Tuple[str, ...] = (
+    "TELEGRAM_BOT_TOKEN",
+    "TG_BOT_TOKEN",
+    "TELEGRAM_TOKEN",
+    "TG_TOKEN",
+    "BOT_TOKEN",
+    "WB_TELEGRAM_BOT_TOKEN",
+    "TOPFACE_TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN_TOPFACE",
+    "TELEGRAM_TOPFACE_BOT_TOKEN",
+    "TG_TOPFACE_BOT_TOKEN",
+)
+
+TELEGRAM_CHAT_ENV_ALIASES: Tuple[str, ...] = (
+    "TELEGRAM_CHAT_ID",
+    "TG_CHAT_ID",
+    "TELEGRAM_CHAT",
+    "TG_CHAT",
+    "CHAT_ID",
+    "WB_TELEGRAM_CHAT_ID",
+    "TOPFACE_TELEGRAM_CHAT_ID",
+    "TELEGRAM_CHAT_ID_TOPFACE",
+    "TELEGRAM_TOPFACE_CHAT_ID",
+    "TG_TOPFACE_CHAT_ID",
+)
+
+TELEGRAM_THREAD_ENV_ALIASES: Tuple[str, ...] = (
+    "TELEGRAM_MESSAGE_THREAD_ID",
+    "TELEGRAM_THREAD_ID",
+    "TG_MESSAGE_THREAD_ID",
+    "TG_THREAD_ID",
+    "MESSAGE_THREAD_ID",
+    "THREAD_ID",
+    "WB_TELEGRAM_MESSAGE_THREAD_ID",
+    "TOPFACE_TELEGRAM_MESSAGE_THREAD_ID",
+)
+
+
+def _normalize_telegram_env_aliases() -> Tuple[str, str, str, str, str, str]:
+    """Normalize historical Telegram env names to TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID.
+
+    Runtime secrets may be stored inside multiline REPORT_ENV or as individual
+    workflow variables. The report sender itself uses canonical names, so we
+    map old names once at startup and never print secret values.
+    """
+    _apply_report_env_blob_to_os_environ()
+    token, token_src = _first_nonempty_env(TELEGRAM_TOKEN_ENV_ALIASES)
+    chat_id, chat_src = _first_nonempty_env(TELEGRAM_CHAT_ENV_ALIASES)
+    thread_id, thread_src = _first_nonempty_env(TELEGRAM_THREAD_ENV_ALIASES)
+
+    if token:
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
+    if chat_id:
+        os.environ["TELEGRAM_CHAT_ID"] = chat_id
+    if thread_id:
+        os.environ["TELEGRAM_MESSAGE_THREAD_ID"] = thread_id
+
+    return token, chat_id, thread_id, token_src, chat_src, thread_src
+
+
+def _require_telegram_ready(send_requested: bool, context: str = "") -> None:
+    """Fail before heavy calculations when Telegram delivery was requested but impossible."""
+    if not send_requested:
+        return
+    token, chat_id, thread_id, token_src, chat_src, thread_src = _normalize_telegram_env_aliases()
+    missing: List[str] = []
+    if not token:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not chat_id:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        raise RuntimeError(
+            "Telegram preflight failed before heavy calculations: missing "
+            + ", ".join(missing)
+            + ". Поддерживаются старые имена: token="
+            + "/".join(TELEGRAM_TOKEN_ENV_ALIASES)
+            + "; chat="
+            + "/".join(TELEGRAM_CHAT_ENV_ALIASES)
+            + f". context={context}"
+        )
+    log(
+        "Telegram preflight: OK; "
+        f"token_source={token_src}; chat_source={chat_src}; "
+        f"thread_source={thread_src or '-'}; context={context}"
+    )
+
 
 def make_storage(root: str) -> Storage:
     _apply_report_env_blob_to_os_environ()
@@ -10164,11 +10262,11 @@ def build_telegram_daily_summary(outputs: Dict[str, Any]) -> str:
 
 
 def send_telegram_message(text: str) -> bool:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    token, chat_id, _, token_src, chat_src, _ = _normalize_telegram_env_aliases()
     if not token or not chat_id:
         log("Telegram: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы, текстовая сводка пропущена")
         return False
+    log(f"Telegram: daily summary credentials OK token_source={token_src}; chat_source={chat_src}")
     if not text:
         log("Telegram: пустая текстовая сводка, отправка пропущена")
         return False
@@ -10258,14 +10356,14 @@ def send_telegram_report(outputs: Dict[str, Any], pdf_path: Path, caption: str =
     return bool(doc_ok and (msg_ok or not strict_msg))
 
 def send_telegram_document(file_path: Path, caption: str = "") -> bool:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    token, chat_id, _, token_src, chat_src, _ = _normalize_telegram_env_aliases()
     if not file_path.exists():
         log(f"Telegram: файл не найден, отправка невозможна: {file_path}")
         return False
     if not token or not chat_id:
         log("Telegram: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы, отправка пропущена")
         return False
+    log(f"Telegram: document credentials OK token_source={token_src}; chat_source={chat_src}")
     log(f"Telegram: отправка PDF file={file_path.name} size={file_path.stat().st_size:,} bytes chat_id={chat_id}")
     import urllib.request
     import uuid
@@ -10472,6 +10570,7 @@ def main() -> None:
     if args.preflight_date_check:
         run_preflight_date_check(args.root, args.reports_root, args.store)
         return
+    _require_telegram_ready(args.send_telegram, "main")
     diagnostics = Diagnostics()
     storage = make_storage(args.root)
     local_dir = Path(args.root) / OUT_DIR
