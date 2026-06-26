@@ -2,8 +2,8 @@ name: WB TOPFACE Daily Report
 
 on:
   schedule:
-    # GitHub cron uses UTC. 22:05 UTC = 01:05 MSK next day.
-    # report_runner.py FIX60/FIX61 chooses report date by Moscow time:
+    # GitHub cron is UTC. 22:05 UTC = 01:05 MSK next day.
+    # report_runner.py FIX62 chooses report date by Moscow time:
     # 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1.
     - cron: '5 22 * * *'
   workflow_dispatch:
@@ -25,7 +25,7 @@ on:
         default: true
         type: boolean
       target_date:
-        description: 'Дата отчета YYYY-MM-DD для ручного запуска. Пусто = авто по МСК.'
+        description: 'Дата отчета YYYY-MM-DD. Пусто = авто по МСК.'
         required: false
         default: ''
         type: string
@@ -43,24 +43,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
+    # В старых репозиториях секреты часто лежат не в Repository secrets, а в Environment secrets.
+    # Если у вас environment называется не production, поменяйте только эту строку на старое имя environment.
+    environment: production
+
     env:
       PYTHONUTF8: '1'
       PYTHONIOENCODING: 'utf-8'
       TZ: Europe/Moscow
 
-      # Yandex Object Storage. Поддержаны несколько возможных имен secrets/vars.
-      # Главные имена для report_runner.py: YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME, YC_ENDPOINT_URL.
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID || vars.YC_ACCESS_KEY_ID || secrets.AWS_ACCESS_KEY_ID || vars.AWS_ACCESS_KEY_ID || secrets.YANDEX_ACCESS_KEY_ID || vars.YANDEX_ACCESS_KEY_ID || secrets.S3_ACCESS_KEY_ID || vars.S3_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY || vars.YC_SECRET_ACCESS_KEY || secrets.AWS_SECRET_ACCESS_KEY || vars.AWS_SECRET_ACCESS_KEY || secrets.YANDEX_SECRET_ACCESS_KEY || vars.YANDEX_SECRET_ACCESS_KEY || secrets.S3_SECRET_ACCESS_KEY || vars.S3_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME || vars.YC_BUCKET_NAME || secrets.S3_BUCKET_NAME || vars.S3_BUCKET_NAME || secrets.YANDEX_BUCKET_NAME || vars.YANDEX_BUCKET_NAME || secrets.BUCKET_NAME || vars.BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL || vars.YC_ENDPOINT_URL || secrets.S3_ENDPOINT_URL || vars.S3_ENDPOINT_URL || secrets.YANDEX_ENDPOINT_URL || vars.YANDEX_ENDPOINT_URL || 'https://storage.yandexcloud.net' }}
+      # Canonical env names expected by report_runner.py.
+      # Ниже перечислены старые/частые алиасы, чтобы не ломать годами работающий workflow из-за имени секрета.
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID || vars.YC_ACCESS_KEY_ID || secrets.ACCESS_KEY_ID || vars.ACCESS_KEY_ID || secrets.AWS_ACCESS_KEY_ID || vars.AWS_ACCESS_KEY_ID || secrets.AWS_ACCESS_KEY || vars.AWS_ACCESS_KEY || secrets.S3_ACCESS_KEY_ID || vars.S3_ACCESS_KEY_ID || secrets.S3_ACCESS_KEY || vars.S3_ACCESS_KEY || secrets.YANDEX_ACCESS_KEY_ID || vars.YANDEX_ACCESS_KEY_ID || secrets.YANDEX_ACCESS_KEY || vars.YANDEX_ACCESS_KEY || secrets.YANDEX_STORAGE_ACCESS_KEY_ID || vars.YANDEX_STORAGE_ACCESS_KEY_ID || secrets.YANDEX_CLOUD_ACCESS_KEY_ID || vars.YANDEX_CLOUD_ACCESS_KEY_ID || secrets.YANDEX_OBJECT_STORAGE_ACCESS_KEY_ID || vars.YANDEX_OBJECT_STORAGE_ACCESS_KEY_ID || secrets.OBJECT_STORAGE_ACCESS_KEY_ID || vars.OBJECT_STORAGE_ACCESS_KEY_ID || secrets.OBJECT_STORAGE_ACCESS_KEY || vars.OBJECT_STORAGE_ACCESS_KEY }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY || vars.YC_SECRET_ACCESS_KEY || secrets.SECRET_ACCESS_KEY || vars.SECRET_ACCESS_KEY || secrets.SECRET_KEY || vars.SECRET_KEY || secrets.AWS_SECRET_ACCESS_KEY || vars.AWS_SECRET_ACCESS_KEY || secrets.AWS_SECRET_KEY || vars.AWS_SECRET_KEY || secrets.S3_SECRET_ACCESS_KEY || vars.S3_SECRET_ACCESS_KEY || secrets.S3_SECRET_KEY || vars.S3_SECRET_KEY || secrets.YANDEX_SECRET_ACCESS_KEY || vars.YANDEX_SECRET_ACCESS_KEY || secrets.YANDEX_SECRET_KEY || vars.YANDEX_SECRET_KEY || secrets.YANDEX_STORAGE_SECRET_ACCESS_KEY || vars.YANDEX_STORAGE_SECRET_ACCESS_KEY || secrets.YANDEX_CLOUD_SECRET_ACCESS_KEY || vars.YANDEX_CLOUD_SECRET_ACCESS_KEY || secrets.YANDEX_OBJECT_STORAGE_SECRET_ACCESS_KEY || vars.YANDEX_OBJECT_STORAGE_SECRET_ACCESS_KEY || secrets.OBJECT_STORAGE_SECRET_ACCESS_KEY || vars.OBJECT_STORAGE_SECRET_ACCESS_KEY || secrets.OBJECT_STORAGE_SECRET_KEY || vars.OBJECT_STORAGE_SECRET_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME || vars.YC_BUCKET_NAME || secrets.YC_BUCKET || vars.YC_BUCKET || secrets.BUCKET_NAME || vars.BUCKET_NAME || secrets.BUCKET || vars.BUCKET || secrets.S3_BUCKET_NAME || vars.S3_BUCKET_NAME || secrets.S3_BUCKET || vars.S3_BUCKET || secrets.AWS_BUCKET_NAME || vars.AWS_BUCKET_NAME || secrets.AWS_S3_BUCKET || vars.AWS_S3_BUCKET || secrets.YANDEX_BUCKET_NAME || vars.YANDEX_BUCKET_NAME || secrets.YANDEX_BUCKET || vars.YANDEX_BUCKET || secrets.YANDEX_STORAGE_BUCKET || vars.YANDEX_STORAGE_BUCKET || secrets.YANDEX_OBJECT_STORAGE_BUCKET || vars.YANDEX_OBJECT_STORAGE_BUCKET || secrets.OBJECT_STORAGE_BUCKET || vars.OBJECT_STORAGE_BUCKET || secrets.WB_BUCKET_NAME || vars.WB_BUCKET_NAME || secrets.WB_S3_BUCKET || vars.WB_S3_BUCKET }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL || vars.YC_ENDPOINT_URL || secrets.ENDPOINT_URL || vars.ENDPOINT_URL || secrets.S3_ENDPOINT_URL || vars.S3_ENDPOINT_URL || secrets.AWS_ENDPOINT_URL || vars.AWS_ENDPOINT_URL || secrets.YANDEX_ENDPOINT_URL || vars.YANDEX_ENDPOINT_URL || secrets.YANDEX_STORAGE_ENDPOINT_URL || vars.YANDEX_STORAGE_ENDPOINT_URL || secrets.YANDEX_OBJECT_STORAGE_ENDPOINT_URL || vars.YANDEX_OBJECT_STORAGE_ENDPOINT_URL || secrets.OBJECT_STORAGE_ENDPOINT_URL || vars.OBJECT_STORAGE_ENDPOINT_URL || 'https://storage.yandexcloud.net' }}
 
-      # Telegram. Если Telegram не нужен, можно запускать с send_telegram=false.
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || vars.TELEGRAM_BOT_TOKEN || secrets.TG_BOT_TOKEN || vars.TG_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || vars.TELEGRAM_CHAT_ID || secrets.TG_CHAT_ID || vars.TG_CHAT_ID }}
+      # Telegram aliases.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || vars.TELEGRAM_BOT_TOKEN || secrets.TG_BOT_TOKEN || vars.TG_BOT_TOKEN || secrets.BOT_TOKEN || vars.BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || vars.TELEGRAM_CHAT_ID || secrets.TG_CHAT_ID || vars.TG_CHAT_ID || secrets.CHAT_ID || vars.CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID || vars.TELEGRAM_MESSAGE_THREAD_ID || secrets.TG_MESSAGE_THREAD_ID || vars.TG_MESSAGE_THREAD_ID }}
 
-      # Старый time-guard отключен. Дату отчета выбирает сам report_runner.py.
+      # Старые time-guard отключены. Дату отчета выбирает report_runner.py FIX62.
       REPORT_RUN_SOURCE: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
       REPORT_ENFORCE_MSK_RUN_WINDOW: '0'
       REPORT_MANUAL_BYPASS_MSK_WINDOW: '1'
@@ -89,7 +93,7 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, sys
+          import os
           required = ['YC_ACCESS_KEY_ID', 'YC_SECRET_ACCESS_KEY', 'YC_BUCKET_NAME']
           optional = ['YC_ENDPOINT_URL']
           print('Object Storage env check:')
@@ -99,8 +103,9 @@ jobs:
           if missing:
               raise SystemExit(
                   'Missing Object Storage variables: ' + ', '.join(missing) + '\n'
-                  'Без них report_runner.py переключается на local root и получает rows=0. '
-                  'Проверь GitHub Secrets/Variables или добавь алиасы в этот workflow.'
+                  'report_runner.py без них будет читать local root и получит rows=0.\n'
+                  'Этот workflow уже ищет много старых aliases и подключает environment=production. '
+                  'Если раньше секреты лежали в другом GitHub Environment, поменяй одну строку environment: production на старое имя Environment.'
               )
           PY
 
@@ -126,8 +131,6 @@ jobs:
           echo "Run mode: ${RUN_MODE}"
           echo "Send Telegram: ${SEND_TELEGRAM_INPUT}"
 
-          # Для ручного запуска можно жестко задать дату. Для авто запуска даты НЕ задаем:
-          # report_runner.py сам выберет D-2 до 19:00 МСК и D-1 после 19:00 МСК.
           if [ -n "${MANUAL_TARGET_DATE}" ]; then
             echo "Manual target date: ${MANUAL_TARGET_DATE}"
             export REPORT_MANUAL_TARGET_DATE="${MANUAL_TARGET_DATE}"
