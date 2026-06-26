@@ -3289,9 +3289,19 @@ def build_campaign_base(ads: pd.DataFrame, campaigns: pd.DataFrame, orders: pd.D
         )
         if "subject_from_ads_daily" not in ads_subjects.columns:
             ads_subjects["subject_from_ads_daily"] = ""
+        # defensive: avoid merge suffix surprises if column already exists from previous joins
+        if "subject_from_ads_daily" in df.columns:
+            df = df.drop(columns=["subject_from_ads_daily"], errors="ignore")
         df = df.merge(ads_subjects[["campaign_id", "subject_from_ads_daily"]], on="campaign_id", how="left")
         if "subject_norm" not in df.columns:
             df["subject_norm"] = ""
+        # defensive: after merge the column may still get suffixed if an unexpected duplicate slipped in
+        if "subject_from_ads_daily" not in df.columns:
+            dup_cols = [c for c in df.columns if str(c).startswith("subject_from_ads_daily")]
+            if dup_cols:
+                df["subject_from_ads_daily"] = df[dup_cols[0]]
+            else:
+                df["subject_from_ads_daily"] = ""
         bad_subject = ~df["subject_norm"].map(is_managed_subject_value)
         fill_mask = bad_subject & df["subject_from_ads_daily"].map(is_managed_subject_value)
         df.loc[fill_mask, "subject_norm"] = df.loc[fill_mask, "subject_from_ads_daily"]
