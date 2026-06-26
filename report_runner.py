@@ -19,6 +19,7 @@
 # FIX59_WEEKLY_PDF_LOCALIZATION_DYNAMIC_20260624: PDF weekly windows ignore daily strict/current_week_only; localization uses weekly stock_day dynamics
 # FIX60_MSK_TARGET_WINDOW_NO_CANCEL_20260626: scheduled/manual daily runs never cancel by time; 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1
 # FIX62_STORAGE_ENV_RESTORE_20260626: restore GitHub Object Storage env aliases and apply MSK target to all report modes
+# FIX64_REPORT_ENV_LOADER_20260626: load credentials from multiline REPORT_ENV before storage init
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -941,7 +942,44 @@ class S3Storage(Storage):
             return False
 
 
+
+
+def _apply_report_env_blob_to_os_environ() -> None:
+    """Load multiline REPORT_ENV into os.environ when workflow passes it through.
+
+    The repository moved runtime credentials to one multiline REPORT_ENV variable/secret.
+    Older code still expects normal process env variables. This helper supports lines like:
+      KEY=value
+      export KEY=value
+    It never prints values.
+    """
+    blob = os.getenv("REPORT_ENV", "") or os.getenv("WB_REPORT_ENV", "") or os.getenv("REPORT_ENV_TOPFACE", "")
+    if not blob or not str(blob).strip():
+        return
+    loaded = 0
+    for raw in str(blob).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+    if loaded:
+        log(f"REPORT_ENV loader: loaded {loaded} variables into process environment")
+
 def make_storage(root: str) -> Storage:
+    _apply_report_env_blob_to_os_environ()
     """Create storage client.
 
     FIX62: GitHub workflows in the repo have existed in several variants, so do not
