@@ -3,8 +3,7 @@ name: WB TOPFACE Daily Report
 on:
   schedule:
     # GitHub cron is UTC. 22:05 UTC = 01:05 MSK next day.
-    # report_runner.py chooses report date by Moscow time:
-    # 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1.
+    # Rule: 00:00-18:59 MSK => report D-2; 19:00-23:59 MSK => report D-1.
     - cron: '5 22 * * *'
   workflow_dispatch:
     inputs:
@@ -48,161 +47,45 @@ jobs:
       PYTHONIOENCODING: 'utf-8'
       TZ: Europe/Moscow
 
-      # Runtime flags. Старые проверки времени отключены, дату выбирает report_runner.py.
+      # The repository moved credentials into REPORT_ENV. Keep it as the primary source.
+      REPORT_ENV_SECRET: ${{ secrets.REPORT_ENV }}
+      REPORT_ENV_VAR: ${{ vars.REPORT_ENV }}
+      REPORT_ENV_TOPFACE_SECRET: ${{ secrets.REPORT_ENV_TOPFACE }}
+      REPORT_ENV_TOPFACE_VAR: ${{ vars.REPORT_ENV_TOPFACE }}
+      WB_REPORT_ENV_SECRET: ${{ secrets.WB_REPORT_ENV }}
+      WB_REPORT_ENV_VAR: ${{ vars.WB_REPORT_ENV }}
+      WB_ENV_SECRET: ${{ secrets.WB_ENV }}
+      WB_ENV_VAR: ${{ vars.WB_ENV }}
+
+      # Fallbacks for individual variables, only if REPORT_ENV is not present.
+      FALLBACK_STORAGE_ACCESS_1: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      FALLBACK_STORAGE_ACCESS_2: ${{ secrets.S3_ACCESS_KEY_ID }}
+      FALLBACK_STORAGE_ACCESS_3: ${{ secrets.ACCESS_KEY_ID }}
+      FALLBACK_STORAGE_ACCESS_4: ${{ vars.AWS_ACCESS_KEY_ID }}
+      FALLBACK_STORAGE_ACCESS_5: ${{ vars.S3_ACCESS_KEY_ID }}
+      FALLBACK_STORAGE_SECRET_1: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      FALLBACK_STORAGE_SECRET_2: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+      FALLBACK_STORAGE_SECRET_3: ${{ secrets.SECRET_ACCESS_KEY }}
+      FALLBACK_STORAGE_SECRET_4: ${{ vars.AWS_SECRET_ACCESS_KEY }}
+      FALLBACK_STORAGE_SECRET_5: ${{ vars.S3_SECRET_ACCESS_KEY }}
+      FALLBACK_STORAGE_BUCKET_1: ${{ secrets.S3_BUCKET }}
+      FALLBACK_STORAGE_BUCKET_2: ${{ secrets.S3_BUCKET_NAME }}
+      FALLBACK_STORAGE_BUCKET_3: ${{ secrets.BUCKET_NAME }}
+      FALLBACK_STORAGE_BUCKET_4: ${{ vars.S3_BUCKET }}
+      FALLBACK_STORAGE_BUCKET_5: ${{ vars.S3_BUCKET_NAME }}
+      FALLBACK_STORAGE_ENDPOINT_1: ${{ secrets.S3_ENDPOINT_URL }}
+      FALLBACK_STORAGE_ENDPOINT_2: ${{ vars.S3_ENDPOINT_URL }}
+
+      # Runtime flags. No start-time cancellation; date is resolved below.
       REPORT_RUN_SOURCE: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
       REPORT_ENFORCE_MSK_RUN_WINDOW: '0'
       REPORT_MANUAL_BYPASS_MSK_WINDOW: '1'
       REPORT_AUTO_COMPLETE_DATE: '0'
       REPORT_REQUIRE_ABC_PERIOD: '0'
-      REPORT_KEEP_EXPLICIT_DATE: '0'
+      REPORT_KEEP_EXPLICIT_DATE: '1'
       WB_KEEP_ONLY_MONDAY_REPORTS: '1'
       WB_LOCALIZATION_MAX_STALE_DAYS: '2'
-
-      # Telegram: несколько старых вариантов имен, без длинных OR-выражений.
-      TG_1: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TG_2: ${{ secrets.TG_BOT_TOKEN }}
-      TG_3: ${{ secrets.BOT_TOKEN }}
-      TG_VAR_1: ${{ vars.TELEGRAM_BOT_TOKEN }}
-      TG_VAR_2: ${{ vars.TG_BOT_TOKEN }}
-      CHAT_1: ${{ secrets.TELEGRAM_CHAT_ID }}
-      CHAT_2: ${{ secrets.TG_CHAT_ID }}
-      CHAT_3: ${{ secrets.CHAT_ID }}
-      CHAT_VAR_1: ${{ vars.TELEGRAM_CHAT_ID }}
-      CHAT_VAR_2: ${{ vars.TG_CHAT_ID }}
-      THREAD_1: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-      THREAD_2: ${{ secrets.TG_MESSAGE_THREAD_ID }}
-      THREAD_VAR_1: ${{ vars.TELEGRAM_MESSAGE_THREAD_ID }}
-      THREAD_VAR_2: ${{ vars.TG_MESSAGE_THREAD_ID }}
-
-      # Object Storage candidates. Значения не печатаются; step ниже выбирает первый непустой.
-      OS_ACCESS_01: ${{ secrets.YC_ACCESS_KEY_ID }}
-      OS_ACCESS_02: ${{ secrets.YC_ACCESS_KEY }}
-      OS_ACCESS_03: ${{ secrets.YC_KEY_ID }}
-      OS_ACCESS_04: ${{ secrets.YC_KEY }}
-      OS_ACCESS_05: ${{ secrets.YC_S3_ACCESS_KEY_ID }}
-      OS_ACCESS_06: ${{ secrets.YC_S3_ACCESS_KEY }}
-      OS_ACCESS_07: ${{ secrets.YC_STORAGE_ACCESS_KEY_ID }}
-      OS_ACCESS_08: ${{ secrets.YC_STORAGE_ACCESS_KEY }}
-      OS_ACCESS_09: ${{ secrets.YC_OBJECT_STORAGE_ACCESS_KEY_ID }}
-      OS_ACCESS_10: ${{ secrets.YC_OBJECT_STORAGE_ACCESS_KEY }}
-      OS_ACCESS_11: ${{ secrets.YANDEX_ACCESS_KEY_ID }}
-      OS_ACCESS_12: ${{ secrets.YANDEX_ACCESS_KEY }}
-      OS_ACCESS_13: ${{ secrets.YANDEX_KEY_ID }}
-      OS_ACCESS_14: ${{ secrets.YANDEX_KEY }}
-      OS_ACCESS_15: ${{ secrets.YANDEX_S3_ACCESS_KEY_ID }}
-      OS_ACCESS_16: ${{ secrets.YANDEX_S3_ACCESS_KEY }}
-      OS_ACCESS_17: ${{ secrets.YANDEX_STORAGE_ACCESS_KEY_ID }}
-      OS_ACCESS_18: ${{ secrets.YANDEX_STORAGE_ACCESS_KEY }}
-      OS_ACCESS_19: ${{ secrets.YANDEX_CLOUD_ACCESS_KEY_ID }}
-      OS_ACCESS_20: ${{ secrets.YANDEX_CLOUD_ACCESS_KEY }}
-      OS_ACCESS_21: ${{ secrets.YANDEX_OBJECT_STORAGE_ACCESS_KEY_ID }}
-      OS_ACCESS_22: ${{ secrets.YANDEX_OBJECT_STORAGE_ACCESS_KEY }}
-      OS_ACCESS_23: ${{ secrets.OBJECT_STORAGE_ACCESS_KEY_ID }}
-      OS_ACCESS_24: ${{ secrets.OBJECT_STORAGE_ACCESS_KEY }}
-      OS_ACCESS_25: ${{ secrets.S3_ACCESS_KEY_ID }}
-      OS_ACCESS_26: ${{ secrets.S3_ACCESS_KEY }}
-      OS_ACCESS_27: ${{ secrets.S3_KEY_ID }}
-      OS_ACCESS_28: ${{ secrets.S3_KEY }}
-      OS_ACCESS_29: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      OS_ACCESS_30: ${{ secrets.AWS_ACCESS_KEY }}
-      OS_ACCESS_31: ${{ secrets.ACCESS_KEY_ID }}
-      OS_ACCESS_32: ${{ secrets.ACCESS_KEY }}
-      OS_ACCESS_33: ${{ secrets.AWS_ACCESS_KEY_ID_YC }}
-      OS_ACCESS_34: ${{ secrets.AWS_ACCESS_KEY_ID_S3 }}
-      OS_ACCESS_35: ${{ secrets.WB_YC_ACCESS_KEY_ID }}
-      OS_ACCESS_36: ${{ secrets.WB_S3_ACCESS_KEY_ID }}
-      OS_ACCESS_VAR_01: ${{ vars.YC_ACCESS_KEY_ID }}
-      OS_ACCESS_VAR_02: ${{ vars.YC_ACCESS_KEY }}
-      OS_ACCESS_VAR_03: ${{ vars.YC_KEY_ID }}
-      OS_ACCESS_VAR_04: ${{ vars.YANDEX_ACCESS_KEY_ID }}
-      OS_ACCESS_VAR_05: ${{ vars.YANDEX_ACCESS_KEY }}
-      OS_ACCESS_VAR_06: ${{ vars.S3_ACCESS_KEY_ID }}
-      OS_ACCESS_VAR_07: ${{ vars.S3_ACCESS_KEY }}
-      OS_ACCESS_VAR_08: ${{ vars.AWS_ACCESS_KEY_ID }}
-      OS_ACCESS_VAR_09: ${{ vars.ACCESS_KEY_ID }}
-
-      OS_SECRET_01: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      OS_SECRET_02: ${{ secrets.YC_SECRET_KEY }}
-      OS_SECRET_03: ${{ secrets.YC_SECRET }}
-      OS_SECRET_04: ${{ secrets.YC_S3_SECRET_ACCESS_KEY }}
-      OS_SECRET_05: ${{ secrets.YC_S3_SECRET_KEY }}
-      OS_SECRET_06: ${{ secrets.YC_STORAGE_SECRET_ACCESS_KEY }}
-      OS_SECRET_07: ${{ secrets.YC_STORAGE_SECRET_KEY }}
-      OS_SECRET_08: ${{ secrets.YC_OBJECT_STORAGE_SECRET_ACCESS_KEY }}
-      OS_SECRET_09: ${{ secrets.YC_OBJECT_STORAGE_SECRET_KEY }}
-      OS_SECRET_10: ${{ secrets.YANDEX_SECRET_ACCESS_KEY }}
-      OS_SECRET_11: ${{ secrets.YANDEX_SECRET_KEY }}
-      OS_SECRET_12: ${{ secrets.YANDEX_SECRET }}
-      OS_SECRET_13: ${{ secrets.YANDEX_S3_SECRET_ACCESS_KEY }}
-      OS_SECRET_14: ${{ secrets.YANDEX_S3_SECRET_KEY }}
-      OS_SECRET_15: ${{ secrets.YANDEX_STORAGE_SECRET_ACCESS_KEY }}
-      OS_SECRET_16: ${{ secrets.YANDEX_STORAGE_SECRET_KEY }}
-      OS_SECRET_17: ${{ secrets.YANDEX_CLOUD_SECRET_ACCESS_KEY }}
-      OS_SECRET_18: ${{ secrets.YANDEX_CLOUD_SECRET_KEY }}
-      OS_SECRET_19: ${{ secrets.YANDEX_OBJECT_STORAGE_SECRET_ACCESS_KEY }}
-      OS_SECRET_20: ${{ secrets.YANDEX_OBJECT_STORAGE_SECRET_KEY }}
-      OS_SECRET_21: ${{ secrets.OBJECT_STORAGE_SECRET_ACCESS_KEY }}
-      OS_SECRET_22: ${{ secrets.OBJECT_STORAGE_SECRET_KEY }}
-      OS_SECRET_23: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-      OS_SECRET_24: ${{ secrets.S3_SECRET_KEY }}
-      OS_SECRET_25: ${{ secrets.S3_SECRET }}
-      OS_SECRET_26: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      OS_SECRET_27: ${{ secrets.AWS_SECRET_KEY }}
-      OS_SECRET_28: ${{ secrets.SECRET_ACCESS_KEY }}
-      OS_SECRET_29: ${{ secrets.SECRET_KEY }}
-      OS_SECRET_30: ${{ secrets.SECRET }}
-      OS_SECRET_31: ${{ secrets.AWS_SECRET_ACCESS_KEY_YC }}
-      OS_SECRET_32: ${{ secrets.AWS_SECRET_ACCESS_KEY_S3 }}
-      OS_SECRET_33: ${{ secrets.WB_YC_SECRET_ACCESS_KEY }}
-      OS_SECRET_34: ${{ secrets.WB_S3_SECRET_ACCESS_KEY }}
-      OS_SECRET_VAR_01: ${{ vars.YC_SECRET_ACCESS_KEY }}
-      OS_SECRET_VAR_02: ${{ vars.YC_SECRET_KEY }}
-      OS_SECRET_VAR_03: ${{ vars.YANDEX_SECRET_ACCESS_KEY }}
-      OS_SECRET_VAR_04: ${{ vars.YANDEX_SECRET_KEY }}
-      OS_SECRET_VAR_05: ${{ vars.S3_SECRET_ACCESS_KEY }}
-      OS_SECRET_VAR_06: ${{ vars.S3_SECRET_KEY }}
-      OS_SECRET_VAR_07: ${{ vars.AWS_SECRET_ACCESS_KEY }}
-      OS_SECRET_VAR_08: ${{ vars.SECRET_ACCESS_KEY }}
-
-      OS_BUCKET_01: ${{ secrets.YC_BUCKET_NAME }}
-      OS_BUCKET_02: ${{ secrets.YC_BUCKET }}
-      OS_BUCKET_03: ${{ secrets.YC_S3_BUCKET }}
-      OS_BUCKET_04: ${{ secrets.YC_STORAGE_BUCKET }}
-      OS_BUCKET_05: ${{ secrets.YC_OBJECT_STORAGE_BUCKET }}
-      OS_BUCKET_06: ${{ secrets.YANDEX_BUCKET_NAME }}
-      OS_BUCKET_07: ${{ secrets.YANDEX_BUCKET }}
-      OS_BUCKET_08: ${{ secrets.YANDEX_S3_BUCKET }}
-      OS_BUCKET_09: ${{ secrets.YANDEX_STORAGE_BUCKET }}
-      OS_BUCKET_10: ${{ secrets.YANDEX_CLOUD_BUCKET }}
-      OS_BUCKET_11: ${{ secrets.YANDEX_OBJECT_STORAGE_BUCKET }}
-      OS_BUCKET_12: ${{ secrets.OBJECT_STORAGE_BUCKET }}
-      OS_BUCKET_13: ${{ secrets.S3_BUCKET_NAME }}
-      OS_BUCKET_14: ${{ secrets.S3_BUCKET }}
-      OS_BUCKET_15: ${{ secrets.AWS_BUCKET_NAME }}
-      OS_BUCKET_16: ${{ secrets.AWS_S3_BUCKET }}
-      OS_BUCKET_17: ${{ secrets.BUCKET_NAME }}
-      OS_BUCKET_18: ${{ secrets.BUCKET }}
-      OS_BUCKET_19: ${{ secrets.WB_BUCKET_NAME }}
-      OS_BUCKET_20: ${{ secrets.WB_S3_BUCKET }}
-      OS_BUCKET_VAR_01: ${{ vars.YC_BUCKET_NAME }}
-      OS_BUCKET_VAR_02: ${{ vars.YC_BUCKET }}
-      OS_BUCKET_VAR_03: ${{ vars.YANDEX_BUCKET_NAME }}
-      OS_BUCKET_VAR_04: ${{ vars.YANDEX_BUCKET }}
-      OS_BUCKET_VAR_05: ${{ vars.S3_BUCKET_NAME }}
-      OS_BUCKET_VAR_06: ${{ vars.S3_BUCKET }}
-      OS_BUCKET_VAR_07: ${{ vars.AWS_BUCKET_NAME }}
-      OS_BUCKET_VAR_08: ${{ vars.BUCKET_NAME }}
-      OS_BUCKET_VAR_09: ${{ vars.WB_BUCKET_NAME }}
-
-      OS_ENDPOINT_01: ${{ secrets.YC_ENDPOINT_URL }}
-      OS_ENDPOINT_02: ${{ secrets.S3_ENDPOINT_URL }}
-      OS_ENDPOINT_03: ${{ secrets.AWS_ENDPOINT_URL }}
-      OS_ENDPOINT_04: ${{ secrets.YANDEX_ENDPOINT_URL }}
-      OS_ENDPOINT_05: ${{ secrets.YANDEX_STORAGE_ENDPOINT_URL }}
-      OS_ENDPOINT_06: ${{ secrets.OBJECT_STORAGE_ENDPOINT_URL }}
-      OS_ENDPOINT_VAR_01: ${{ vars.YC_ENDPOINT_URL }}
-      OS_ENDPOINT_VAR_02: ${{ vars.S3_ENDPOINT_URL }}
-      OS_ENDPOINT_VAR_03: ${{ vars.YANDEX_ENDPOINT_URL }}
+      ALLOW_LOCAL_STORAGE: '0'
 
     steps:
       - name: Checkout repository
@@ -216,86 +99,177 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install pandas numpy openpyxl boto3 reportlab requests
 
-      - name: Resolve Object Storage and Telegram env
+      - name: Load REPORT_ENV and normalize runtime env
         shell: bash
         run: |
           set -euo pipefail
-          choose_first() {
-            local out_name="$1"; shift
-            local value=""
-            local matched=""
-            for candidate in "$@"; do
-              if [ -n "${!candidate:-}" ]; then
-                value="${!candidate}"
-                matched="$candidate"
-                break
-              fi
-            done
-            if [ -n "$value" ]; then
-              {
-                echo "$out_name<<__${out_name}__"
-                echo "$value"
-                echo "__${out_name}__"
-              } >> "$GITHUB_ENV"
-              echo "$out_name: OK from $matched"
-            else
-              echo "$out_name: MISSING"
-            fi
-          }
+          python - <<'PY'
+          import os, re
 
-          choose_first YC_ACCESS_KEY_ID \
-            OS_ACCESS_01 OS_ACCESS_02 OS_ACCESS_03 OS_ACCESS_04 OS_ACCESS_05 OS_ACCESS_06 OS_ACCESS_07 OS_ACCESS_08 OS_ACCESS_09 OS_ACCESS_10 \
-            OS_ACCESS_11 OS_ACCESS_12 OS_ACCESS_13 OS_ACCESS_14 OS_ACCESS_15 OS_ACCESS_16 OS_ACCESS_17 OS_ACCESS_18 OS_ACCESS_19 OS_ACCESS_20 \
-            OS_ACCESS_21 OS_ACCESS_22 OS_ACCESS_23 OS_ACCESS_24 OS_ACCESS_25 OS_ACCESS_26 OS_ACCESS_27 OS_ACCESS_28 OS_ACCESS_29 OS_ACCESS_30 \
-            OS_ACCESS_31 OS_ACCESS_32 OS_ACCESS_33 OS_ACCESS_34 OS_ACCESS_35 OS_ACCESS_36 \
-            OS_ACCESS_VAR_01 OS_ACCESS_VAR_02 OS_ACCESS_VAR_03 OS_ACCESS_VAR_04 OS_ACCESS_VAR_05 OS_ACCESS_VAR_06 OS_ACCESS_VAR_07 OS_ACCESS_VAR_08 OS_ACCESS_VAR_09
+          blob_candidates = [
+              'REPORT_ENV_SECRET', 'REPORT_ENV_VAR',
+              'REPORT_ENV_TOPFACE_SECRET', 'REPORT_ENV_TOPFACE_VAR',
+              'WB_REPORT_ENV_SECRET', 'WB_REPORT_ENV_VAR',
+              'WB_ENV_SECRET', 'WB_ENV_VAR',
+          ]
 
-          choose_first YC_SECRET_ACCESS_KEY \
-            OS_SECRET_01 OS_SECRET_02 OS_SECRET_03 OS_SECRET_04 OS_SECRET_05 OS_SECRET_06 OS_SECRET_07 OS_SECRET_08 OS_SECRET_09 OS_SECRET_10 \
-            OS_SECRET_11 OS_SECRET_12 OS_SECRET_13 OS_SECRET_14 OS_SECRET_15 OS_SECRET_16 OS_SECRET_17 OS_SECRET_18 OS_SECRET_19 OS_SECRET_20 \
-            OS_SECRET_21 OS_SECRET_22 OS_SECRET_23 OS_SECRET_24 OS_SECRET_25 OS_SECRET_26 OS_SECRET_27 OS_SECRET_28 OS_SECRET_29 OS_SECRET_30 \
-            OS_SECRET_31 OS_SECRET_32 OS_SECRET_33 OS_SECRET_34 \
-            OS_SECRET_VAR_01 OS_SECRET_VAR_02 OS_SECRET_VAR_03 OS_SECRET_VAR_04 OS_SECRET_VAR_05 OS_SECRET_VAR_06 OS_SECRET_VAR_07 OS_SECRET_VAR_08
+          def parse_env_blob(text):
+              result = {}
+              for raw in (text or '').splitlines():
+                  line = raw.strip()
+                  if not line or line.startswith('#'):
+                      continue
+                  if line.startswith('export '):
+                      line = line[len('export '):].strip()
+                  if '=' not in line:
+                      continue
+                  key, value = line.split('=', 1)
+                  key = key.strip()
+                  value = value.strip()
+                  if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
+                      continue
+                  if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                      value = value[1:-1]
+                  result[key] = value
+              return result
 
-          choose_first YC_BUCKET_NAME \
-            OS_BUCKET_01 OS_BUCKET_02 OS_BUCKET_03 OS_BUCKET_04 OS_BUCKET_05 OS_BUCKET_06 OS_BUCKET_07 OS_BUCKET_08 OS_BUCKET_09 OS_BUCKET_10 \
-            OS_BUCKET_11 OS_BUCKET_12 OS_BUCKET_13 OS_BUCKET_14 OS_BUCKET_15 OS_BUCKET_16 OS_BUCKET_17 OS_BUCKET_18 OS_BUCKET_19 OS_BUCKET_20 \
-            OS_BUCKET_VAR_01 OS_BUCKET_VAR_02 OS_BUCKET_VAR_03 OS_BUCKET_VAR_04 OS_BUCKET_VAR_05 OS_BUCKET_VAR_06 OS_BUCKET_VAR_07 OS_BUCKET_VAR_08 OS_BUCKET_VAR_09
+          source = ''
+          parsed = {}
+          for candidate in blob_candidates:
+              value = os.environ.get(candidate, '')
+              if value.strip():
+                  source = candidate
+                  parsed = parse_env_blob(value)
+                  break
 
-          if ! grep -q '^YC_BUCKET_NAME<<' "$GITHUB_ENV"; then
-            echo 'YC_BUCKET_NAME=wb-analis' >> "$GITHUB_ENV"
-            echo 'YC_BUCKET_NAME: OK from default wb-analis'
-          fi
+          if source:
+              print(f'REPORT_ENV source: {source}; loaded variables: {len(parsed)}')
+          else:
+              print('REPORT_ENV source: MISSING; using individual fallback variables if present')
 
-          choose_first YC_ENDPOINT_URL OS_ENDPOINT_01 OS_ENDPOINT_02 OS_ENDPOINT_03 OS_ENDPOINT_04 OS_ENDPOINT_05 OS_ENDPOINT_06 OS_ENDPOINT_VAR_01 OS_ENDPOINT_VAR_02 OS_ENDPOINT_VAR_03
-          if ! grep -q '^YC_ENDPOINT_URL<<' "$GITHUB_ENV"; then
-            echo 'YC_ENDPOINT_URL=https://storage.yandexcloud.net' >> "$GITHUB_ENV"
-            echo 'YC_ENDPOINT_URL: OK from default https://storage.yandexcloud.net'
-          fi
+          env = dict(os.environ)
+          env.update(parsed)
 
-          choose_first TELEGRAM_BOT_TOKEN TG_1 TG_2 TG_3 TG_VAR_1 TG_VAR_2
-          choose_first TELEGRAM_CHAT_ID CHAT_1 CHAT_2 CHAT_3 CHAT_VAR_1 CHAT_VAR_2
-          choose_first TELEGRAM_MESSAGE_THREAD_ID THREAD_1 THREAD_2 THREAD_VAR_1 THREAD_VAR_2 || true
+          def first(names, default=''):
+              for name in names:
+                  value = env.get(name, '')
+                  if str(value).strip():
+                      return str(value).strip(), name
+              return default, 'default' if default else ''
 
-      - name: Validate Object Storage settings
+          final = dict(parsed)
+
+          storage_access, storage_access_src = first([
+              'YC_ACCESS_KEY_ID', 'AWS_ACCESS_KEY_ID', 'S3_ACCESS_KEY_ID', 'ACCESS_KEY_ID',
+              'YANDEX_ACCESS_KEY_ID', 'YANDEX_STORAGE_ACCESS_KEY_ID', 'OBJECT_STORAGE_ACCESS_KEY_ID',
+              'FALLBACK_STORAGE_ACCESS_1', 'FALLBACK_STORAGE_ACCESS_2', 'FALLBACK_STORAGE_ACCESS_3',
+              'FALLBACK_STORAGE_ACCESS_4', 'FALLBACK_STORAGE_ACCESS_5',
+          ])
+          storage_secret, storage_secret_src = first([
+              'YC_SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY', 'S3_SECRET_ACCESS_KEY', 'SECRET_ACCESS_KEY',
+              'YANDEX_SECRET_ACCESS_KEY', 'YANDEX_STORAGE_SECRET_ACCESS_KEY', 'OBJECT_STORAGE_SECRET_ACCESS_KEY',
+              'FALLBACK_STORAGE_SECRET_1', 'FALLBACK_STORAGE_SECRET_2', 'FALLBACK_STORAGE_SECRET_3',
+              'FALLBACK_STORAGE_SECRET_4', 'FALLBACK_STORAGE_SECRET_5',
+          ])
+          storage_bucket, storage_bucket_src = first([
+              'YC_BUCKET_NAME', 'YC_BUCKET', 'S3_BUCKET', 'S3_BUCKET_NAME', 'BUCKET_NAME', 'BUCKET',
+              'YANDEX_BUCKET_NAME', 'YANDEX_STORAGE_BUCKET', 'OBJECT_STORAGE_BUCKET',
+              'FALLBACK_STORAGE_BUCKET_1', 'FALLBACK_STORAGE_BUCKET_2', 'FALLBACK_STORAGE_BUCKET_3',
+              'FALLBACK_STORAGE_BUCKET_4', 'FALLBACK_STORAGE_BUCKET_5',
+          ], default='wb-analis')
+          storage_endpoint, storage_endpoint_src = first([
+              'YC_ENDPOINT_URL', 'S3_ENDPOINT_URL', 'AWS_ENDPOINT_URL', 'YANDEX_ENDPOINT_URL',
+              'YANDEX_STORAGE_ENDPOINT_URL', 'OBJECT_STORAGE_ENDPOINT_URL',
+              'FALLBACK_STORAGE_ENDPOINT_1', 'FALLBACK_STORAGE_ENDPOINT_2',
+          ], default='https://storage.yandexcloud.net')
+
+          # Canonical names required by old report_runner.py.
+          final['YC_ACCESS_KEY_ID'] = storage_access
+          final['YC_SECRET_ACCESS_KEY'] = storage_secret
+          final['YC_BUCKET_NAME'] = storage_bucket
+          final['YC_ENDPOINT_URL'] = storage_endpoint
+
+          # Keep AWS/S3 aliases too for newer code variants.
+          if storage_access:
+              final.setdefault('AWS_ACCESS_KEY_ID', storage_access)
+              final.setdefault('S3_ACCESS_KEY_ID', storage_access)
+          if storage_secret:
+              final.setdefault('AWS_SECRET_ACCESS_KEY', storage_secret)
+              final.setdefault('S3_SECRET_ACCESS_KEY', storage_secret)
+          if storage_bucket:
+              final.setdefault('S3_BUCKET', storage_bucket)
+              final.setdefault('S3_BUCKET_NAME', storage_bucket)
+          if storage_endpoint:
+              final.setdefault('S3_ENDPOINT_URL', storage_endpoint)
+
+          github_env = os.environ['GITHUB_ENV']
+          sensitive_re = re.compile(r'(KEY|SECRET|TOKEN|PASSWORD|PASS|CHAT_ID|THREAD_ID)', re.I)
+          with open(github_env, 'a', encoding='utf-8') as f:
+              for key, value in final.items():
+                  if value is None:
+                      continue
+                  value = str(value)
+                  if value == '':
+                      continue
+                  if sensitive_re.search(key):
+                      print(f'::add-mask::{value}')
+                  f.write(f'{key}<<__{key}__\n{value}\n__{key}__\n')
+
+          print(f'Object Storage access: {"OK" if storage_access else "MISSING"} ({storage_access_src or "-"})')
+          print(f'Object Storage secret: {"OK" if storage_secret else "MISSING"} ({storage_secret_src or "-"})')
+          print(f'Object Storage bucket: OK ({storage_bucket_src})')
+          print(f'Object Storage endpoint: OK ({storage_endpoint_src})')
+
+          if not storage_access or not storage_secret:
+              raise SystemExit(
+                  'Object Storage credentials are not available. Expected them in REPORT_ENV first. '
+                  'No individual fallback variable provided either.'
+              )
+          PY
+
+      - name: Resolve report date by MSK rule
+        env:
+          MANUAL_TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
         run: |
           set -euo pipefail
           python - <<'PY'
           import os
-          required = ['YC_ACCESS_KEY_ID', 'YC_SECRET_ACCESS_KEY', 'YC_BUCKET_NAME']
-          print('Object Storage env check:')
-          for key in required + ['YC_ENDPOINT_URL']:
-              print(f'  {key}: {"OK" if os.getenv(key) else "MISSING"}')
-          missing = [key for key in required if not os.getenv(key)]
-          if missing:
-              raise SystemExit(
-                  'Missing Object Storage variables: ' + ', '.join(missing) + '\n'
-                  'В workflow добавлен широкий resolver старых имен secrets. Если всё равно MISSING, значит в этом репозитории/ветке secrets недоступны или называются совсем иначе. '
-                  'Нужен старый .github/workflows/*.yml или список названий secrets без значений.'
-              )
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+          import re
+
+          manual = os.environ.get('MANUAL_TARGET_DATE', '').strip()
+          if manual:
+              if not re.match(r'^\d{4}-\d{2}-\d{2}$', manual):
+                  raise SystemExit(f'target_date must be YYYY-MM-DD, got: {manual}')
+              target = manual
+              reason = 'manual target_date'
+              now_text = '-'
+          else:
+              now = datetime.now(ZoneInfo('Europe/Moscow'))
+              shift = 2 if now.hour < 19 else 1
+              target = (now.date() - timedelta(days=shift)).isoformat()
+              reason = 'MSK 00:00-18:59=>D-2, 19:00-23:59=>D-1'
+              now_text = now.strftime('%Y-%m-%d %H:%M:%S')
+
+          values = {
+              'REPORT_AS_OF_DATE': target,
+              'REPORT_REQUIRE_DATA_DATE': target,
+              'REPORT_REQUIRE_ADS_DATE': target,
+              'REPORT_REQUIRE_DAILY_ABC_DATE': target,
+              'WB_DAILY_TARGET_DATE': target,
+              'REPORT_MANUAL_TARGET_DATE': target,
+              'REPORT_KEEP_EXPLICIT_DATE': '1',
+              'REPORT_DATE_LOCKED_BY_MSK_WINDOW': '1',
+          }
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+              for key, value in values.items():
+                  f.write(f'{key}={value}\n')
+          print(f'Report date: {target}; now_msk={now_text}; reason={reason}')
           PY
 
       - name: Diagnostics
@@ -305,6 +279,7 @@ jobs:
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
           echo "REPORT_RUN_SOURCE=${REPORT_RUN_SOURCE}"
+          echo "REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE}"
           python --version
           test -f report_runner.py
           python -m py_compile report_runner.py
@@ -318,35 +293,24 @@ jobs:
           bucket = os.environ['YC_BUCKET_NAME']
           endpoint = os.environ.get('YC_ENDPOINT_URL') or 'https://storage.yandexcloud.net'
           s3 = boto3.client(
-              's3', endpoint_url=endpoint,
+              's3',
+              endpoint_url=endpoint,
               aws_access_key_id=os.environ['YC_ACCESS_KEY_ID'],
               aws_secret_access_key=os.environ['YC_SECRET_ACCESS_KEY'],
           )
           resp = s3.list_objects_v2(Bucket=bucket, Prefix='Отчёты/', MaxKeys=3)
-          print(f'S3 OK: bucket={bucket}, prefix=Отчёты/, objects_seen={len(resp.get("Contents", []))}')
+          print(f'Object Storage OK: bucket={bucket}, prefix=Отчёты/, objects_seen={len(resp.get("Contents", []))}')
           PY
 
       - name: Run report
         env:
           RUN_MODE: ${{ github.event.inputs.mode || 'current_week' }}
           SEND_TELEGRAM_INPUT: ${{ github.event.inputs.send_telegram || 'true' }}
-          MANUAL_TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
         run: |
           set -euo pipefail
 
           echo "Run mode: ${RUN_MODE}"
           echo "Send Telegram: ${SEND_TELEGRAM_INPUT}"
-
-          if [ -n "${MANUAL_TARGET_DATE}" ]; then
-            echo "Manual target date: ${MANUAL_TARGET_DATE}"
-            export REPORT_MANUAL_TARGET_DATE="${MANUAL_TARGET_DATE}"
-            export REPORT_KEEP_EXPLICIT_DATE="1"
-            export REPORT_AS_OF_DATE="${MANUAL_TARGET_DATE}"
-            export REPORT_REQUIRE_DATA_DATE="${MANUAL_TARGET_DATE}"
-            export REPORT_REQUIRE_ADS_DATE="${MANUAL_TARGET_DATE}"
-            export REPORT_REQUIRE_DAILY_ABC_DATE="${MANUAL_TARGET_DATE}"
-            export WB_DAILY_TARGET_DATE="${MANUAL_TARGET_DATE}"
-          fi
 
           ARGS=(--root "." --reports-root "Отчёты" --store "TOPFACE")
 
