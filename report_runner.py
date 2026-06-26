@@ -18,6 +18,7 @@
 # FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: localization pool coverage by snapshot date; stale stock snapshots are not carried indefinitely
 # FIX59_WEEKLY_PDF_LOCALIZATION_DYNAMIC_20260624: PDF weekly windows ignore daily strict/current_week_only; localization uses weekly stock_day dynamics
 # FIX60_MSK_TARGET_WINDOW_NO_CANCEL_20260626: scheduled/manual daily runs never cancel by time; 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1
+# FIX62_STORAGE_ENV_RESTORE_20260626: restore GitHub Object Storage env aliases and apply MSK target to all report modes
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -941,14 +942,102 @@ class S3Storage(Storage):
 
 
 def make_storage(root: str) -> Storage:
-    bucket = os.getenv("YC_BUCKET_NAME", "").strip()
-    access = os.getenv("YC_ACCESS_KEY_ID", "").strip()
-    secret = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
-    endpoint = os.getenv("YC_ENDPOINT_URL", "").strip() or "https://storage.yandexcloud.net"
-    # FIX_MARKER_20260525_ENDPOINT_FALLBACK: empty YC_ENDPOINT_URL must not break boto3.
+    """Create storage client.
+
+    FIX62: GitHub workflows in the repo have existed in several variants, so do not
+    depend on only one exact secret/env name. The canonical names for the script are
+    YC_ACCESS_KEY_ID / YC_SECRET_ACCESS_KEY / YC_BUCKET_NAME, but we also accept the
+    common legacy aliases used by S3/Yandex Object Storage workflows.
+
+    In GitHub Actions, silently falling back to local storage is dangerous: it produces
+    rows=0 and then an empty PDF failure. Therefore GitHub mode fails fast unless
+    ALLOW_LOCAL_STORAGE=1 is explicitly set.
+    """
+    def first_env(names: Sequence[str]) -> Tuple[str, str]:
+        for name in names:
+            value = os.getenv(name, "")
+            if value is not None and str(value).strip():
+                return str(value).strip(), name
+        return "", ""
+
+    access, access_name = first_env([
+        "YC_ACCESS_KEY_ID",
+        "ACCESS_KEY_ID",
+        "AWS_ACCESS_KEY_ID",
+        "S3_ACCESS_KEY_ID",
+        "S3_ACCESS_KEY",
+        "YANDEX_ACCESS_KEY_ID",
+        "YANDEX_STORAGE_ACCESS_KEY_ID",
+        "YANDEX_CLOUD_ACCESS_KEY_ID",
+        "OBJECT_STORAGE_ACCESS_KEY_ID",
+        "OBJECT_STORAGE_ACCESS_KEY",
+    ])
+    secret, secret_name = first_env([
+        "YC_SECRET_ACCESS_KEY",
+        "SECRET_ACCESS_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "S3_SECRET_ACCESS_KEY",
+        "S3_SECRET_KEY",
+        "YANDEX_SECRET_ACCESS_KEY",
+        "YANDEX_STORAGE_SECRET_ACCESS_KEY",
+        "YANDEX_CLOUD_SECRET_ACCESS_KEY",
+        "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+        "OBJECT_STORAGE_SECRET_KEY",
+    ])
+    bucket, bucket_name = first_env([
+        "YC_BUCKET_NAME",
+        "YC_BUCKET",
+        "BUCKET_NAME",
+        "BUCKET",
+        "S3_BUCKET_NAME",
+        "S3_BUCKET",
+        "AWS_BUCKET_NAME",
+        "AWS_S3_BUCKET",
+        "YANDEX_BUCKET_NAME",
+        "YANDEX_BUCKET",
+        "YANDEX_STORAGE_BUCKET",
+        "OBJECT_STORAGE_BUCKET",
+    ])
+    endpoint, endpoint_name = first_env([
+        "YC_ENDPOINT_URL",
+        "S3_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL",
+        "YANDEX_ENDPOINT_URL",
+        "YANDEX_STORAGE_ENDPOINT_URL",
+        "OBJECT_STORAGE_ENDPOINT_URL",
+    ])
+    endpoint = endpoint or "https://storage.yandexcloud.net"
+    endpoint_name = endpoint_name or "default"
+
     if bucket and access and secret:
-        log(f"Storage: Yandex Object Storage bucket={bucket}; endpoint={endpoint}")
+        # Normalize canonical env names for any downstream code / diagnostics.
+        os.environ["YC_ACCESS_KEY_ID"] = access
+        os.environ["YC_SECRET_ACCESS_KEY"] = secret
+        os.environ["YC_BUCKET_NAME"] = bucket
+        os.environ["YC_ENDPOINT_URL"] = endpoint
+        log(
+            f"Storage: Yandex Object Storage bucket={bucket}; endpoint={endpoint}; "
+            f"env_aliases access={access_name}, secret={secret_name}, bucket={bucket_name}, endpoint={endpoint_name}"
+        )
         return S3Storage(bucket, access, secret, endpoint)
+
+    missing = []
+    if not access:
+        missing.append("access key")
+    if not secret:
+        missing.append("secret key")
+    if not bucket:
+        missing.append("bucket")
+    is_github = os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
+    allow_local = os.getenv("ALLOW_LOCAL_STORAGE", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if is_github and not allow_local:
+        raise RuntimeError(
+            "Object Storage не подключен в GitHub Actions: отсутствует " + ", ".join(missing) + ". "
+            "Без этого report_runner.py переключался на local root и получал rows=0. "
+            "Проверь workflow: нужны env/secrets для YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME "
+            "или один из поддержанных алиасов ACCESS_KEY_ID/AWS_ACCESS_KEY_ID/S3_ACCESS_KEY_ID и т.п."
+        )
+
     log(f"Storage: local root={Path(root).resolve()}")
     return LocalStorage(root)
 
@@ -10339,8 +10428,10 @@ def main() -> None:
         run_smoke_test(args.root)
         return
     _enforce_msk_run_window_if_needed(allow_smoke=False)
+    # FIX62: apply the MSK target rule to every real mode, including --full-refresh and --pdf-only.
+    # 00:00-18:59 MSK => D-2; 19:00-23:59 MSK => D-1, unless an explicit date is locked.
+    _apply_msk_daily_target_window("main", force=not _env_flag("REPORT_KEEP_EXPLICIT_DATE", False))
     if args.preflight_date_check:
-        _apply_msk_daily_target_window("preflight_date_check", force=not _env_flag("REPORT_KEEP_EXPLICIT_DATE", False))
         run_preflight_date_check(args.root, args.reports_root, args.store)
         return
     diagnostics = Diagnostics()
