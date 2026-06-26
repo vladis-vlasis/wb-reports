@@ -1,4 +1,4 @@
-# version: v27_correct_manual_bypass_1504_retry10m_msk
+# version: v29_every10m_target_date_rule_manual_ok
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -16,14 +16,22 @@ on:
           - ALL
           - TOPFACE
           - MISSTAIS
+      target_date:
+        description: "Целевая дата выгрузки YYYY-MM-DD. Пусто = авто-правило: до 14:00 МСК позавчера, после 14:00 МСК вчера."
+        required: false
+        default: ""
+        type: string
   schedule:
-    # Автозапуск: с 15:04 до 23:54 МСК, попытка каждые 10 минут.
-    # GitHub cron работает в UTC: 12:04-20:54 UTC = 15:04-23:54 МСК.
-    # Временной запрет применяется ТОЛЬКО к schedule. Ручной запуск не блокируется временем.
-    - cron: "4-59/10 12-20 * * *"
+    # GitHub cron работает в UTC.
+    # Запускаем проверку каждые 10 минут круглосуточно.
+    # Сам Python не блокируется временем:
+    # - до 14:00 МСК выгружает предыдущий полный день = позавчера;
+    # - после 14:00 МСК выгружает вчера.
+    # Повторные schedule-запуски отсекаются marker-файлом по целевой дате.
+    - cron: "*/10 * * * *"
 
 concurrency:
-  # Scheduled и manual лежат в разных группах. Ручной запуск не блокируется scheduled-запуском.
+  # schedule и manual разделены. Ручной запуск не блокируется автозапуском.
   group: daily-update-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
@@ -32,9 +40,12 @@ jobs:
     name: Ежедневное обновление данных
     runs-on: ubuntu-latest
     timeout-minutes: 570
+
     env:
       TZ: Europe/Moscow
       STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
+      TARGET_DATE_INPUT: ${{ github.event.inputs.target_date || '' }}
+
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
@@ -47,257 +58,201 @@ jobs:
       TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
 
     steps:
-      - name: Проверка времени запуска schedule
-        id: time_guard
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          echo "YML_VERSION=v27_correct_manual_bypass_1504_retry10m_msk"
-          MSK_TIME=$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')
-          MSK_HOUR=$(TZ=Europe/Moscow date '+%H')
-          MSK_MIN=$(TZ=Europe/Moscow date '+%M')
-          MSK_HOUR_NUM=$((10#$MSK_HOUR))
-          MSK_MIN_NUM=$((10#$MSK_MIN))
-
-          echo "event_name=$EVENT_NAME"
-          echo "MSK now: $MSK_TIME"
-
-          if [ "$EVENT_NAME" != "schedule" ]; then
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            echo "is_schedule=false" >> "$GITHUB_OUTPUT"
-            echo "✅ Ручной запуск: временное ограничение не применяется."
-            exit 0
-          fi
-
-          echo "is_schedule=true" >> "$GITHUB_OUTPUT"
-
-          if [ "$MSK_HOUR_NUM" -lt 15 ] || { [ "$MSK_HOUR_NUM" -eq 15 ] && [ "$MSK_MIN_NUM" -lt 4 ]; }; then
-            echo "should_run=false" >> "$GITHUB_OUTPUT"
-            echo "⏭️ Schedule сработал раньше 15:04 МСК или после полуночи. Python не запускаем."
-            exit 0
-          fi
-
-          echo "should_run=true" >> "$GITHUB_OUTPUT"
-          echo "✅ Schedule попал в разрешённое окно: 15:04–23:59 МСК."
-
-      - name: Скачать репозиторий
-        if: steps.time_guard.outputs.should_run == 'true'
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Установить Python
-        if: steps.time_guard.outputs.should_run == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Установить зависимости
-        if: steps.time_guard.outputs.should_run == 'true'
+      - name: Resolve target date
+        id: target_date
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install pandas requests boto3 botocore openpyxl pytz
-          fi
-
-      - name: Подготовить переменные окружения
-        if: steps.time_guard.outputs.should_run == 'true'
-        run: |
-          # REPORT_ENV необязателен: поддерживаем и старую схему с отдельными secrets,
-          # и новую схему, где YC_* лежат внутри REPORT_ENV.
-          if [ -n "${REPORT_ENV:-}" ]; then
-            printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' >> "$GITHUB_ENV"
-            echo "REPORT_ENV загружен в GITHUB_ENV"
-          else
-            echo "REPORT_ENV пустой: используем отдельные secrets YC_*"
-          fi
-
-          if [ -n "${WB_PROMO_KEY_TOPFACE:-}" ]; then
-            echo "WB_PROMO_KEY_TOPFACE=$WB_PROMO_KEY_TOPFACE" >> "$GITHUB_ENV"
-          fi
-
-          if [ -n "${WB_KEY_MISSTAIS:-}" ]; then
-            echo "WB_KEY_MISSTAIS=$WB_KEY_MISSTAIS" >> "$GITHUB_ENV"
-          fi
-
-          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" >> "$GITHUB_ENV"
-          fi
-
-          if [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID" >> "$GITHUB_ENV"
-          fi
-
-          if [ -n "${TORGSTAT_ABC_URL:-}" ]; then
-            echo "TORGSTAT_ABC_URL=$TORGSTAT_ABC_URL" >> "$GITHUB_ENV"
-          fi
-
-      - name: Найти Python-скрипт
-        if: steps.time_guard.outputs.should_run == 'true'
-        run: |
-          if [ -f "ezhednevnoe_obnovlenie_dannyh.py" ]; then
-            echo "SCRIPT_PATH=ezhednevnoe_obnovlenie_dannyh.py" >> "$GITHUB_ENV"
-            echo "Использую скрипт: ezhednevnoe_obnovlenie_dannyh.py"
-          elif [ -f "scripts/ezhednevnoe_obnovlenie_dannyh.py" ]; then
-            echo "SCRIPT_PATH=scripts/ezhednevnoe_obnovlenie_dannyh.py" >> "$GITHUB_ENV"
-            echo "Использую скрипт: scripts/ezhednevnoe_obnovlenie_dannyh.py"
-          else
-            echo "::error::Не найден ezhednevnoe_obnovlenie_dannyh.py ни в корне, ни в scripts/"
-            exit 1
-          fi
-
-      - name: Проверить обязательные переменные
-        if: steps.time_guard.outputs.should_run == 'true'
-        run: |
-          missing=0
-
-          for var in YC_ACCESS_KEY_ID YC_SECRET_ACCESS_KEY YC_BUCKET_NAME; do
-            if [ -z "${!var:-}" ]; then
-              echo "::error::Не найдена переменная $var"
-              missing=1
-            else
-              echo "$var найден"
-            fi
-          done
-
-          if [ "$STORE_INPUT" = "ALL" ] || [ "$STORE_INPUT" = "TOPFACE" ]; then
-            if [ -z "${WB_PROMO_KEY_TOPFACE:-}" ]; then
-              echo "::error::Не найден WB_PROMO_KEY_TOPFACE для TOPFACE"
-              missing=1
-            else
-              echo "WB_PROMO_KEY_TOPFACE найден"
-            fi
-          fi
-
-          if [ "$STORE_INPUT" = "ALL" ] || [ "$STORE_INPUT" = "MISSTAIS" ]; then
-            if [ -z "${WB_KEY_MISSTAIS:-}" ]; then
-              echo "::error::Не найден WB_KEY_MISSTAIS для MISSTAIS"
-              missing=1
-            else
-              echo "WB_KEY_MISSTAIS найден"
-            fi
-          fi
-
-          if [ "$missing" -ne 0 ]; then
-            exit 1
-          fi
-
-      - name: Проверить маркер успешного автозапуска за сегодня
-        if: github.event_name == 'schedule' && steps.time_guard.outputs.should_run == 'true'
-        id: marker_guard
-        run: |
+          set -euo pipefail
+          echo "YML_VERSION=v29_every10m_target_date_rule_manual_ok"
           python - <<'PY'
           import os
-          from datetime import datetime
+          import re
+          from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          raw_target = (os.environ.get("TARGET_DATE_INPUT", "") or "").strip()
+          now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+
+          if raw_target:
+              if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_target):
+                  raise SystemExit(f"target_date должен быть в формате YYYY-MM-DD, получено: {raw_target}")
+              target_date = raw_target
+              rule = "manual_input_target_date"
+          else:
+              shift_days = 1 if now_msk.hour >= 14 else 2
+              target_date = (now_msk.date() - timedelta(days=shift_days)).strftime("%Y-%m-%d")
+              rule = "auto_after_14_yesterday_before_14_day_before_yesterday"
+
+          print("=== Target date resolution ===")
+          print(f"event_name={event_name}")
+          print(f"MSK now={now_msk:%Y-%m-%d %H:%M:%S}")
+          print(f"target_date={target_date}")
+          print(f"target_rule={rule}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"WB_TARGET_DATE={target_date}\n")
+              f.write(f"TARGET_DATE_RULE={rule}\n")
+              f.write(f"SCHEDULE_LOCK_KEY=Служебные файлы/Ежедневное обновление данных/locks/daily_update_{target_date}.json\n")
+          PY
+
+      - name: Check schedule marker
+        if: github.event_name == 'schedule'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
           import boto3
-          from botocore.client import Config
           from botocore.exceptions import ClientError
 
           bucket = os.environ["YC_BUCKET_NAME"]
-          endpoint = os.environ.get("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net"
-          today = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d")
-          key = f"Служебные файлы/GitHub Actions/01_ezhednevnoe_obnovlenie_dannyh/success/{today}.json"
+          key = os.environ["SCHEDULE_LOCK_KEY"]
 
           s3 = boto3.client(
               "s3",
-              endpoint_url=endpoint,
+              endpoint_url=os.getenv("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net",
               aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
               aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
-              region_name="ru-central1",
-              config=Config(signature_version="s3v4"),
           )
 
           already_done = False
           try:
               s3.head_object(Bucket=bucket, Key=key)
               already_done = True
-          except ClientError as e:
-              code = str(e.response.get("Error", {}).get("Code", ""))
+          except ClientError as exc:
+              code = str(exc.response.get("Error", {}).get("Code", ""))
               if code not in {"404", "NoSuchKey", "NotFound"}:
                   raise
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"already_done={'true' if already_done else 'false'}\n")
-              fh.write(f"marker_key={key}\n")
+          print("=== Schedule marker check ===")
+          print(f"target_date={os.environ['WB_TARGET_DATE']}")
+          print(f"lock_key={key}")
+          print(f"already_done={already_done}")
 
-          if already_done:
-              print(f"⏭️ Scheduled-запуск за сегодня уже успешно был. Маркер: {key}")
-          else:
-              print(f"✅ Scheduled-запуска за сегодня ещё не было. После успеха запишем маркер: {key}")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"SCHEDULE_ALREADY_DONE={'true' if already_done else 'false'}\n")
           PY
 
-      - name: Ручной запуск
-        if: github.event_name != 'schedule' && steps.time_guard.outputs.should_run == 'true'
+      - name: Stop if schedule already completed
+        if: github.event_name == 'schedule' && env.SCHEDULE_ALREADY_DONE == 'true'
+        shell: bash
         run: |
-          echo "✅ Ручной запуск без ограничения по времени."
-          python "$SCRIPT_PATH" --full --store "$STORE_INPUT"
+          echo "Schedule уже успешно отработал для WB_TARGET_DATE=${WB_TARGET_DATE}: ${SCHEDULE_LOCK_KEY}"
+          exit 0
 
-      - name: Автозапуск schedule
-        if: github.event_name == 'schedule' && steps.time_guard.outputs.should_run == 'true' && steps.marker_guard.outputs.already_done != 'true'
+      - name: Checkout diagnostics
+        shell: bash
         run: |
-          MSK_TIME=$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')
-          MSK_HOUR=$(TZ=Europe/Moscow date '+%H')
-          MSK_MIN=$(TZ=Europe/Moscow date '+%M')
-          MSK_HOUR_NUM=$((10#$MSK_HOUR))
-          MSK_MIN_NUM=$((10#$MSK_MIN))
-
-          echo "MSK before python: $MSK_TIME"
-
-          if [ "$MSK_HOUR_NUM" -lt 15 ] || { [ "$MSK_HOUR_NUM" -eq 15 ] && [ "$MSK_MIN_NUM" -lt 4 ]; }; then
-            echo "⏭️ Scheduled перед запуском Python попал в запрещённое окно. Python не запускаем."
-            exit 0
+          set -euo pipefail
+          echo "github.event_name=${{ github.event_name }}"
+          echo "github.event.schedule=${{ github.event.schedule }}"
+          echo "STORE_INPUT=${STORE_INPUT}"
+          echo "WB_TARGET_DATE=${WB_TARGET_DATE}"
+          echo "TARGET_DATE_RULE=${TARGET_DATE_RULE}"
+          echo "UTC now=$(date -u '+%Y-%m-%d %H:%M:%S')"
+          TZ=Europe/Moscow date '+MSK now=%Y-%m-%d %H:%M:%S'
+          ls -la
+          if [ ! -f "ezhednevnoe_obnovlenie_dannyh.py" ]; then
+            echo "ERROR: ezhednevnoe_obnovlenie_dannyh.py not found in repo root"
+            exit 2
           fi
 
-          SECONDS_TO_STOP=$(python - <<'PY'
-          from datetime import datetime, timedelta
-          from zoneinfo import ZoneInfo
-          now = datetime.now(ZoneInfo("Europe/Moscow"))
-          next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-          print(max(1, int((next_midnight - now).total_seconds()) - 30))
-          PY
-          )
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-          echo "Scheduled-запуск будет остановлен за 30 секунд до полуночи. Timeout: $SECONDS_TO_STOP сек."
-          timeout "$SECONDS_TO_STOP"s python "$SCRIPT_PATH" --full --store "$STORE_INPUT"
-
-      - name: Записать маркер успешного автозапуска за сегодня
-        if: github.event_name == 'schedule' && steps.time_guard.outputs.should_run == 'true' && steps.marker_guard.outputs.already_done != 'true' && success()
+      - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+
+      - name: Load REPORT_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${REPORT_ENV:-}" ]; then
+            echo "$REPORT_ENV" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify secrets
+        shell: bash
+        run: |
+          set -euo pipefail
           python - <<'PY'
-          import os, json
-          from datetime import datetime
+          import os
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+          ]
+          store = os.environ.get("STORE_INPUT", "ALL").upper()
+          if store in {"ALL", "TOPFACE"}:
+              required.append("WB_PROMO_KEY_TOPFACE")
+          if store in {"ALL", "MISSTAIS", "MT"}:
+              required.append("WB_KEY_MISSTAIS")
+          missing = [x for x in required if not os.getenv(x)]
+          if missing:
+              raise SystemExit("Missing env/secrets: " + ", ".join(missing))
+          print("All required secrets are present.")
+          PY
+
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile ezhednevnoe_obnovlenie_dannyh.py
+
+      - name: Run daily update
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Running daily update for STORE_INPUT=${STORE_INPUT}, WB_TARGET_DATE=${WB_TARGET_DATE}"
+          python ezhednevnoe_obnovlenie_dannyh.py --full --store "$STORE_INPUT"
+
+      - name: Write schedule marker after success
+        if: success() && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import json
+          from datetime import datetime, timezone
           from zoneinfo import ZoneInfo
           import boto3
-          from botocore.client import Config
 
           bucket = os.environ["YC_BUCKET_NAME"]
-          endpoint = os.environ.get("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net"
-          now = datetime.now(ZoneInfo("Europe/Moscow"))
-          today = now.strftime("%Y-%m-%d")
-          key = f"Служебные файлы/GitHub Actions/01_ezhednevnoe_obnovlenie_dannyh/success/{today}.json"
+          key = os.environ["SCHEDULE_LOCK_KEY"]
 
           payload = {
-              "workflow": os.environ.get("GITHUB_WORKFLOW"),
-              "run_id": os.environ.get("GITHUB_RUN_ID"),
-              "event": os.environ.get("GITHUB_EVENT_NAME"),
-              "msk_finished_at": now.isoformat(),
-              "version": "v27_correct_manual_bypass_1504_retry10m_msk",
+              "workflow_version": "v29_every10m_target_date_rule_manual_ok",
+              "target_date": os.environ.get("WB_TARGET_DATE"),
+              "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
+              "store_input": os.environ.get("STORE_INPUT"),
+              "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "github_run_number": os.environ.get("GITHUB_RUN_NUMBER"),
+              "utc_completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+              "msk_completed_at": datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"),
           }
 
           s3 = boto3.client(
               "s3",
-              endpoint_url=endpoint,
+              endpoint_url=os.getenv("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net",
               aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
               aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
-              region_name="ru-central1",
-              config=Config(signature_version="s3v4"),
           )
           s3.put_object(
               Bucket=bucket,
               Key=key,
               Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
-              ContentType="application/json; charset=utf-8",
+              ContentType="application/json",
           )
-          print(f"✅ Маркер successful scheduled-запуска записан: {key}")
+          print(f"Marker written: {key}")
           PY
