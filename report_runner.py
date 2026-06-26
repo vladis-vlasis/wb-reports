@@ -16,6 +16,8 @@
 # FIX55: 18:05 MSK hard run window, 10-min source retry, strict previous-day daily report
 # FIX57_AUTO_WINDOW_MANUAL_BYPASS_20260623: auto schedule window only; manual workflow_dispatch bypasses time guard
 # FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: localization pool coverage by snapshot date; stale stock snapshots are not carried indefinitely
+# FIX59_WEEKLY_PDF_LOCALIZATION_DYNAMIC_20260624: PDF weekly windows ignore daily strict/current_week_only; localization uses weekly stock_day dynamics
+# FIX60_MSK_TARGET_WINDOW_NO_CANCEL_20260626: scheduled/manual daily runs never cancel by time; 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -981,8 +983,10 @@ class Loader:
         if target_raw:
             self.daily_target_day = pd.Timestamp(target_raw).normalize()
         else:
-            # GitHub run at 12:00 MSK should take yesterday as the latest completed day.
-            self.daily_target_day = pd.Timestamp(datetime.now().date()).normalize() - pd.Timedelta(days=1)
+            # FIX60: дата ежедневного отчета зависит от московского времени.
+            # 00:00-18:59 MSK => берем D-2, потому что вчерашний контур WB/ABC/РК
+            # обычно еще не закрыт; с 19:00 MSK => берем D-1.
+            self.daily_target_day = _resolve_msk_operational_report_day()
 
     def _filter_current_week_files(self, files: List[str], keep_unparsed: bool = False, fallback_tail: int = 1) -> List[str]:
         if not self.current_week_only:
@@ -3088,7 +3092,15 @@ REPORT_MONTH_GENITIVE_RU = {
 }
 
 def _max_report_day_from_outputs(outputs: Dict[str, Any]) -> pd.Timestamp:
-    """Return the latest real date represented in report outputs for PDF naming/caption."""
+    """Return the report date represented in outputs for PDF naming/caption."""
+    # FIX60: when the daily target is locked by the MSK window, the file name and
+    # Telegram caption must use that target date, not a newer cached row.
+    try:
+        forced = _env_date("REPORT_AS_OF_DATE")
+    except Exception:
+        forced = None
+    if forced is not None:
+        return pd.Timestamp(forced).normalize()
     max_day = pd.NaT
     for name in ["article_day_fact", "ads_daily_source", "search_unique_demand", "ads_raw_source"]:
         df = outputs.get(name) if isinstance(outputs, dict) else None
@@ -3129,6 +3141,84 @@ def _env_date(name: str) -> Optional[pd.Timestamp]:
     if pd.isna(ts):
         raise ValueError(f"{name} должен быть датой YYYY-MM-DD, получено: {raw}")
     return pd.Timestamp(ts).normalize()
+
+def _now_msk_for_report() -> datetime:
+    """Current Moscow time for report scheduling, with optional test override.
+
+    REPORT_MSK_NOW_OVERRIDE accepts values like '2026-06-26 01:00' and is used
+    only for smoke/manual verification of the date rule.
+    """
+    override = os.getenv("REPORT_MSK_NOW_OVERRIDE", "").strip()
+    if override:
+        ts = pd.to_datetime(override, errors="coerce")
+        if pd.isna(ts):
+            raise ValueError(f"REPORT_MSK_NOW_OVERRIDE должен быть датой/временем, получено: {override}")
+        py_dt = ts.to_pydatetime()
+        try:
+            from zoneinfo import ZoneInfo
+            if py_dt.tzinfo is not None:
+                py_dt = py_dt.astimezone(ZoneInfo("Europe/Moscow"))
+        except Exception:
+            pass
+        return py_dt
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Moscow"))
+    except Exception:
+        return datetime.utcnow() + timedelta(hours=3)
+
+
+def _resolve_msk_operational_report_day(now_msk: Optional[datetime] = None) -> pd.Timestamp:
+    """Business rule for daily TOPFACE report date.
+
+    00:00-18:59 MSK -> D-2. Example: run on 26.06 before 19:00 => report for 24.06.
+    19:00-23:59 MSK -> D-1. Example: run on 26.06 after 19:00 => report for 25.06.
+    """
+    now_msk = now_msk or _now_msk_for_report()
+    shift_days = 2 if int(now_msk.hour) < 19 else 1
+    return pd.Timestamp(now_msk.date()).normalize() - pd.Timedelta(days=shift_days)
+
+
+def _apply_msk_daily_target_window(context: str = "", force: bool = False) -> pd.Timestamp:
+    """Set all daily report date environment variables from the MSK window rule.
+
+    By default daily/current-week runs are locked to the calculated date, so an old
+    GitHub schedule at 01:00 MSK no longer cancels and no longer tries to build D-1.
+    To run a specific historical date, set REPORT_KEEP_EXPLICIT_DATE=1 together
+    with REPORT_AS_OF_DATE/REPORT_REQUIRE_* or use REPORT_MANUAL_TARGET_DATE.
+    """
+    manual_target = _env_date("REPORT_MANUAL_TARGET_DATE")
+    keep_explicit = _env_flag("REPORT_KEEP_EXPLICIT_DATE", False)
+    now_msk = _now_msk_for_report()
+
+    if manual_target is not None:
+        target = manual_target
+        reason = "REPORT_MANUAL_TARGET_DATE"
+        should_set = True
+    elif keep_explicit and _env_date("REPORT_AS_OF_DATE") is not None:
+        target = _env_date("REPORT_AS_OF_DATE")
+        reason = "REPORT_KEEP_EXPLICIT_DATE"
+        should_set = True
+    else:
+        target = _resolve_msk_operational_report_day(now_msk)
+        reason = "MSK window 00:00-18:59=>D-2, 19:00-23:59=>D-1"
+        should_set = force or not os.getenv("REPORT_AS_OF_DATE", "").strip()
+
+    if should_set:
+        value = f"{target:%Y-%m-%d}"
+        os.environ["REPORT_AS_OF_DATE"] = value
+        os.environ["REPORT_REQUIRE_DATA_DATE"] = value
+        os.environ["REPORT_REQUIRE_ADS_DATE"] = value
+        os.environ["REPORT_REQUIRE_DAILY_ABC_DATE"] = value
+        os.environ["WB_DAILY_TARGET_DATE"] = value
+        os.environ["REPORT_DATE_LOCKED_BY_MSK_WINDOW"] = "1"
+
+    log(
+        f"msk_daily_target FIX60: now_msk={now_msk:%Y-%m-%d %H:%M:%S}; "
+        f"target={target:%Y-%m-%d}; reason={reason}; force={force}; context={context}"
+    )
+    return target
+
 
 
 def _daily_abc_dates_from_outputs(outputs: Dict[str, Any]) -> List[pd.Timestamp]:
@@ -3382,6 +3472,9 @@ def _apply_auto_complete_report_date(outputs: Dict[str, Any], context: str = "")
     This deliberately clears strict date checks: missing newer days are skipped, not treated
     as fatal. Weekly full_refresh still uses exact REPORT_REQUIRE_* checks.
     """
+    if _env_flag("REPORT_DATE_LOCKED_BY_MSK_WINDOW", False):
+        log(f"auto_complete_date: skip because report date is locked by FIX60 MSK window; context={context}")
+        return
     if not _env_flag("REPORT_AUTO_COMPLETE_DATE", False):
         return
     chosen = _latest_complete_operational_day(outputs)
@@ -3431,12 +3524,13 @@ def _enforce_msk_run_window_if_needed(allow_smoke: bool = False) -> None:
     # Later starts can finish after midnight, so the workflow should skip them.
     end_minutes = 23 * 60 + 5
     if current_minutes < start_minutes or current_minutes > end_minutes:
+        # FIX60: больше не отменяем запуск по времени. GitHub может стабильно стартовать
+        # около 01:00 MSK; дата отчета выбирается отдельным правилом D-2/D-1.
         log(
-            "msk_run_guard: skip scheduled auto run; current MSK time "
-            f"{now_msk:%Y-%m-%d %H:%M:%S}, allowed auto start window is 18:05-23:05. "
-            "Manual runs bypass this window."
+            "msk_run_guard FIX60: legacy window would skip this scheduled run, but skip is disabled; "
+            f"current MSK time {now_msk:%Y-%m-%d %H:%M:%S}. Continue run."
         )
-        raise SystemExit(0)
+        return
 
 
 def _preflight_abc_period_exists(storage: Storage, reports_root: str, required: pd.Timestamp) -> None:
@@ -6516,24 +6610,19 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             if _complete_latest < latest:
                 log(f"complete-day guard: latest_day {latest.date()} -> {_complete_latest.date()} because ads/demand are not complete")
                 latest = _complete_latest
-    # FIX53: daily/scheduled/current-week report is always a strict one-day report.
-    # Even if .env/REPORT_ENV accidentally contains REPORT_CLOSED_WEEK_AS_PREVIOUS=1,
-    # daily strict mode must not fall back to the closed Sunday/week.
-    daily_strict_mode = _env_flag("REPORT_DAILY_STRICT", False) or _env_flag("WB_CURRENT_WEEK_ONLY", False)
-    closed_week_mode = _env_flag("REPORT_CLOSED_WEEK_AS_PREVIOUS", False) and not daily_strict_mode
-    if daily_strict_mode:
-        cur_start = latest
-        cur_end = latest
-        cur_actual_end = latest
-        prev_start = latest - pd.Timedelta(days=1)
-        prev_end = latest - pd.Timedelta(days=1)
-        prev2_start = latest - pd.Timedelta(days=2)
-        prev2_end = latest - pd.Timedelta(days=2)
-        log(f"Daily strict mode: report day={latest:%d.%m.%Y}; comparison day={prev_start:%d.%m.%Y}")
-    else:
-        cur_start = latest - pd.Timedelta(days=int(latest.weekday()))
-        cur_end = cur_start + pd.Timedelta(days=6)
-        cur_actual_end = latest
+    # FIX59: управленческий PDF всегда строится как недельный отчет.
+    # REPORT_DAILY_STRICT и WB_CURRENT_WEEK_ONLY оставляем для загрузки источников/дейт-лока,
+    # но внутри PDF они больше НЕ имеют права сжимать периоды до одного дня.
+    cur_start = latest - pd.Timedelta(days=int(latest.weekday()))
+    cur_end = cur_start + pd.Timedelta(days=6)
+    cur_actual_end = min(latest, cur_end)
+
+    # Детальный недельный контур:
+    # - если latest = воскресенье, неделя уже закрыта, значит показываем ее как
+    #   «Прошлая полная неделя» и сравниваем с предыдущей Mon-Sun;
+    # - если latest не воскресенье, текущая неделя остается оперативным блоком,
+    #   а детализация идет по предыдущей полной неделе.
+    closed_week_mode = _env_flag("REPORT_CLOSED_WEEK_AS_PREVIOUS", False) or int(latest.weekday()) == 6
     if closed_week_mode:
         if int(latest.weekday()) != 6:
             raise RuntimeError(
@@ -6544,14 +6633,19 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         prev2_start = cur_start - pd.Timedelta(days=7)
         prev2_end = cur_start - pd.Timedelta(days=1)
         log(
-            f"Closed-week mode: previous full week={prev_start:%d.%m.%Y}-{prev_end:%d.%m.%Y}; "
+            f"PDF weekly mode FIX59: detailed closed week={prev_start:%d.%m.%Y}-{prev_end:%d.%m.%Y}; "
             f"comparison={prev2_start:%d.%m.%Y}-{prev2_end:%d.%m.%Y}"
         )
-    elif not daily_strict_mode:
+    else:
         prev_start = cur_start - pd.Timedelta(days=7)
         prev_end = cur_start - pd.Timedelta(days=1)
         prev2_start = cur_start - pd.Timedelta(days=14)
         prev2_end = cur_start - pd.Timedelta(days=8)
+        log(
+            f"PDF weekly mode FIX59: current week={cur_start:%d.%m.%Y}-{cur_actual_end:%d.%m.%Y}; "
+            f"previous full week={prev_start:%d.%m.%Y}-{prev_end:%d.%m.%Y}"
+        )
+
     # Last closed month. In a Monday full-refresh for a week that ended on the last day
     # of the month (example: report anchor 2026-05-31, run date 2026-06-02),
     # the closed month is that just-finished month, not April.
@@ -10246,30 +10340,23 @@ def main() -> None:
         return
     _enforce_msk_run_window_if_needed(allow_smoke=False)
     if args.preflight_date_check:
+        _apply_msk_daily_target_window("preflight_date_check", force=not _env_flag("REPORT_KEEP_EXPLICIT_DATE", False))
         run_preflight_date_check(args.root, args.reports_root, args.store)
         return
     diagnostics = Diagnostics()
     storage = make_storage(args.root)
     local_dir = Path(args.root) / OUT_DIR
     if args.current_week_only:
-        # FIX52: safety net. Even if workflow/env is not updated, current_week mode is always yesterday by MSK.
-        if not os.getenv("REPORT_AS_OF_DATE", "").strip():
-            try:
-                from zoneinfo import ZoneInfo
-                _yday = (datetime.now(ZoneInfo("Europe/Moscow")).date() - timedelta(days=1)).isoformat()
-            except Exception:
-                _yday = (datetime.utcnow().date() - timedelta(days=1)).isoformat()
-            os.environ["REPORT_AS_OF_DATE"] = _yday
-            os.environ["REPORT_REQUIRE_DATA_DATE"] = _yday
-            os.environ["REPORT_REQUIRE_ADS_DATE"] = _yday
-            os.environ["REPORT_REQUIRE_DAILY_ABC_DATE"] = _yday
-            os.environ["WB_DAILY_TARGET_DATE"] = _yday
+        # FIX60: daily/current-week report date is chosen by Moscow time, not by GitHub UTC start time.
+        # 00:00-18:59 MSK => D-2; 19:00-23:59 MSK => D-1.
+        _apply_msk_daily_target_window("current_week_only", force=not _env_flag("REPORT_KEEP_EXPLICIT_DATE", False))
         os.environ["REPORT_DAILY_STRICT"] = "1"
         # Lightweight daily mode: load cached full-report outputs, then refresh only current-week
         # operational rows from a limited set of current-week source files. It does NOT rebuild ABC/month/year details.
         local_dir.mkdir(parents=True, exist_ok=True)
         outputs = load_existing_outputs_for_pdf(storage, local_dir, args.reports_root, args.store, diagnostics)
         os.environ["WB_CURRENT_WEEK_ONLY"] = "1"
+        # FIX59_NOTE: current_week_only may set REPORT_DAILY_STRICT for source loading, but PDF period logic ignores it.
         try:
             loader = Loader(storage, args.reports_root, args.store, diagnostics)
             pack = loader.load_all()
