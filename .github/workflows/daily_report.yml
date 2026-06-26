@@ -1,712 +1,149 @@
-name: Daily TOPFACE sales report
-# FIX58_LOCALIZATION_SCHEDULE_20260623: active workflow. Upload as .github/workflows/daily_report.yml
+name: WB TOPFACE Daily Report
 
 on:
+  schedule:
+    # GitHub cron is UTC. 22:05 UTC = 01:05 MSK next day.
+    # FIX60 inside report_runner.py will choose report date by MSK:
+    # 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1.
+    - cron: '5 22 * * *'
   workflow_dispatch:
     inputs:
       mode:
-        description: "Режим запуска"
+        description: 'Режим запуска'
         required: true
-        default: "auto"
+        default: 'current_week'
         type: choice
         options:
-          - auto
-          - smoke
           - current_week
           - full_refresh
+          - pdf_only
+          - preflight
+          - smoke
       send_telegram:
-        description: "Отправлять в Telegram"
+        description: 'Отправить отчет в Telegram'
         required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
-      report_as_of_date:
-        description: "YYYY-MM-DD только для ручного full_refresh. Пусто = последнее закрытое воскресенье"
+        default: true
+        type: boolean
+      target_date:
+        description: 'Опционально: дата отчета YYYY-MM-DD для ручного запуска. Пусто = авто по МСК.'
         required: false
-        default: ""
-        type: string
-      require_data_date:
-        description: "YYYY-MM-DD только для ручного full_refresh. Пусто = report_as_of_date"
-        required: false
-        default: ""
+        default: ''
         type: string
 
-  schedule:
-    # FIX58: автозапуск каждые 10 минут с 18:05 до 23:55 МСК.
-    # UTC: 15:05..20:55 = MSK: 18:05..23:55.
-    # Если GitHub задержит scheduled-run и он начнётся после 00:00 МСК, time-guard в Python его пропустит.
-    # Ручной workflow_dispatch можно запускать в любое время: окно времени на него не действует.
-    - cron: "5-55/10 15-20 * * *"
+concurrency:
+  group: wb-topface-report-runner
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
-concurrency:
-  group: daily-topface-sales-report
-  cancel-in-progress: false
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: 'utf-8'
+  TZ: Europe/Moscow
+
+  # Yandex Object Storage
+  YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+  YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+  YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+  YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+
+  # Telegram
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+  # ВАЖНО: не включаем старые отмены/строгие недельные проверки.
+  REPORT_RUN_SOURCE: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
+  REPORT_ENFORCE_MSK_RUN_WINDOW: '0'
+  REPORT_MANUAL_BYPASS_MSK_WINDOW: '1'
+  REPORT_AUTO_COMPLETE_DATE: '0'
+  REPORT_REQUIRE_ABC_PERIOD: '0'
+  REPORT_KEEP_EXPLICIT_DATE: '0'
+  WB_CURRENT_WEEK_ONLY: '1'
+  WB_KEEP_ONLY_MONDAY_REPORTS: '1'
+  WB_LOCALIZATION_MAX_STALE_DAYS: '2'
 
 jobs:
-  report:
+  build-report:
+    name: Build TOPFACE report
     runs-on: ubuntu-latest
-    timeout-minutes: 420
-
-    env:
-      REPORT_SCRIPT: report_runner.py
-      EXPECTED_VERSION: FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623
-
-      # FIX58: schedule = previous day by MSK, 18:05-23:55 auto window; manual runs bypass time window.
-      # REPORT_ENV cannot override date/mode after decision step.
-      ABC_WAIT_MAX_ATTEMPTS: "1"
-      ABC_WAIT_SLEEP_SECONDS: "600"
-      SOURCE_WAIT_SLEEP_SECONDS: "600"
-
-      WB_STORE: TOPFACE
-      REPORT_STORE: TOPFACE
-      REPORT_DAILY_STRICT: "1"
-      REPORT_ENFORCE_MSK_RUN_WINDOW: "0"
-      PYTHONUNBUFFERED: "1"
-      PYTHONIOENCODING: "utf-8"
-
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
-
-      # Эти имена должны совпадать с тем, что читает report_runner.py.
-      # Ошибка FIX32 была в том, что workflow передавал TELEGRAM_*_SECRET,
-      # а Python искал TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-
-      # Дублируем старые имена только как fallback, если они уже были заведены в secrets.
-      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-
-      WB_MAX_SEARCH_QUERY_FILES: "12"
-      WB_MAX_ENTRY_POINT_FILES: "8"
-      WB_MAX_STOCK_FILES: "12"
-
-      PDF_FAIL_ON_MISSING_DEMAND: "0"
-      PDF_ALLOW_DEMAND_FALLBACK: "0"
-      PDF_PRODUCT_DETAIL_MIN_GP_SHARE: "10"
-      PDF_FORCE_DETAIL_PRODUCTS: "901,614,617,618,154,155,156,157,158"
-      PDF_FORCE_EXCLUDE_PRODUCTS: "206,207,209,210,211"
-      PDF_TRACE_SAMPLE_CATEGORY: "Кисти"
-      PDF_TRACE_SAMPLE_PRODUCT: "901"
-      PDF_TRACE_SAMPLE_ARTICLE: "901/2"
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show trigger time
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Event: ${{ github.event_name }}"
-          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-          echo "Planned cron: every 10 min from 18:05 to 23:55 MSK for schedule only"
-          echo "FIX58: schedule window 18:05-23:05 MSK; manual runs bypass time window; previous-day target only"
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install system packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y fonts-dejavu-core
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          pip install reportlab
+          python -m pip install pandas numpy openpyxl boto3 reportlab
 
-      - name: Validate report script
-        shell: bash
+      - name: Diagnostics
         run: |
-          set -euo pipefail
+          echo "GitHub event: $GITHUB_EVENT_NAME"
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+          echo "REPORT_RUN_SOURCE=${REPORT_RUN_SOURCE}"
+          python --version
+          test -f report_runner.py
+          python -m py_compile report_runner.py
 
-          test -f "$REPORT_SCRIPT" || { echo "ERROR: $REPORT_SCRIPT is missing in repository root"; exit 1; }
-
-          echo "Using report script: $REPORT_SCRIPT"
-          head -n 8 "$REPORT_SCRIPT"
-
-          if ! grep -q "$EXPECTED_VERSION" "$REPORT_SCRIPT"; then
-            echo "ERROR: wrong report script version. Expected $EXPECTED_VERSION"
-            exit 1
-          fi
-
-          if grep -nE "^(name:|on:|jobs:|steps:|set -euo pipefail)" "$REPORT_SCRIPT"; then
-            echo "ERROR: workflow/shell text was pasted into report_runner.py"
-            exit 1
-          fi
-
-          python -m py_compile "$REPORT_SCRIPT"
-          echo "report_runner.py compile OK"
-
-      - name: Write REPORT_ENV to .env
-        shell: bash
+      - name: Run report
         env:
-          REPORT_ENV: ${{ secrets.REPORT_ENV }}
+          RUN_MODE: ${{ github.event.inputs.mode || 'current_week' }}
+          SEND_TELEGRAM_INPUT: ${{ github.event.inputs.send_telegram || 'true' }}
+          MANUAL_TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
         run: |
           set -euo pipefail
 
-          umask 077
-          : > .env
+          echo "Run mode: ${RUN_MODE}"
+          echo "Send Telegram: ${SEND_TELEGRAM_INPUT}"
 
-          if [ -n "${REPORT_ENV:-}" ]; then
-            printf '%s\n' "$REPORT_ENV" | sed 's/\r$//' > .env
-            echo "REPORT_ENV written to .env"
-          else
-            echo "REPORT_ENV is empty; will use separate GitHub secrets if they exist"
+          if [ -n "${MANUAL_TARGET_DATE}" ]; then
+            echo "Manual target date: ${MANUAL_TARGET_DATE}"
+            export REPORT_MANUAL_TARGET_DATE="${MANUAL_TARGET_DATE}"
+            export REPORT_KEEP_EXPLICIT_DATE="1"
+            export REPORT_AS_OF_DATE="${MANUAL_TARGET_DATE}"
+            export REPORT_REQUIRE_DATA_DATE="${MANUAL_TARGET_DATE}"
+            export REPORT_REQUIRE_ADS_DATE="${MANUAL_TARGET_DATE}"
+            export REPORT_REQUIRE_DAILY_ABC_DATE="${MANUAL_TARGET_DATE}"
+            export WB_DAILY_TARGET_DATE="${MANUAL_TARGET_DATE}"
           fi
 
-      - name: Decide mode and dates
-        id: decide
-        shell: bash
-        env:
-          INPUT_MODE: ${{ github.event.inputs.mode }}
-          INPUT_SEND_TELEGRAM: ${{ github.event.inputs.send_telegram }}
-          INPUT_REPORT_AS_OF_DATE: ${{ github.event.inputs.report_as_of_date }}
-          INPUT_REQUIRE_DATA_DATE: ${{ github.event.inputs.require_data_date }}
-        run: |
-          set -euo pipefail
+          ARGS=(--root "." --reports-root "Отчёты" --store "TOPFACE")
 
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            SEND_TELEGRAM="true"
-            MODE="current_week"
-            REPORT_RUN_SOURCE="schedule"
-            ENFORCE_MSK_WINDOW="1"
-          else
-            MODE="${INPUT_MODE:-current_week}"
-            SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
-            REPORT_RUN_SOURCE="manual"
-            ENFORCE_MSK_WINDOW="0"
+          case "${RUN_MODE}" in
+            current_week)
+              ARGS+=(--current-week-only)
+              ;;
+            full_refresh)
+              ARGS+=(--full-refresh)
+              ;;
+            pdf_only)
+              ARGS+=(--pdf-only)
+              ;;
+            preflight)
+              ARGS+=(--preflight-date-check)
+              ;;
+            smoke)
+              ARGS+=(--smoke-test)
+              ;;
+            *)
+              echo "Unknown RUN_MODE=${RUN_MODE}"
+              exit 2
+              ;;
+          esac
 
-            if [ "$MODE" = "auto" ]; then
-              echo "FIX58: manual auto mode -> current_week, but without MSK time window"
-              MODE="current_week"
-            fi
+          if [ "${SEND_TELEGRAM_INPUT}" = "true" ] && [ "${RUN_MODE}" != "smoke" ] && [ "${RUN_MODE}" != "preflight" ]; then
+            ARGS+=(--send-telegram)
           fi
 
-          if [ "$MODE" = "full_refresh" ]; then
-            if [ -n "${INPUT_REPORT_AS_OF_DATE:-}" ]; then
-              AS_OF_DATE="$INPUT_REPORT_AS_OF_DATE"
-            else
-              AS_OF_DATE="$(python -c 'from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; today = datetime.now(ZoneInfo("Europe/Moscow")).date(); print((today - timedelta(days=today.isoweekday())).isoformat())')"
-            fi
-
-            if [ -n "${INPUT_REQUIRE_DATA_DATE:-}" ]; then
-              REQUIRE_DATE="$INPUT_REQUIRE_DATA_DATE"
-            else
-              REQUIRE_DATE="$AS_OF_DATE"
-            fi
-
-            REPORT_CLOSED_WEEK_AS_PREVIOUS="1"
-            REPORT_REQUIRE_ABC_PERIOD="1"
-            REPORT_REQUIRE_DAILY_ABC_DATE=""
-            REPORT_AUTO_COMPLETE_DATE="0"
-            REPORT_AS_OF_DATE="$AS_OF_DATE"
-            REPORT_REQUIRE_DATA_DATE="$REQUIRE_DATE"
-            REPORT_REQUIRE_ADS_DATE="$REQUIRE_DATE"
-            WB_DAILY_TARGET_DATE="$AS_OF_DATE"
-          elif [ "$MODE" = "current_week" ]; then
-            # FIX36: оперативный daily-отчёт должен быть строго за вчера по МСК.
-            # Если данных/рекламы за вчера нет, отчёт не должен тихо откатываться на позавчера.
-            WB_DAILY_TARGET_DATE="$(TZ=Europe/Moscow date -d 'yesterday' +%F)"
-            REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
-            REPORT_REQUIRE_ABC_PERIOD="0"
-            REPORT_REQUIRE_DAILY_ABC_DATE="$WB_DAILY_TARGET_DATE"
-            REPORT_AUTO_COMPLETE_DATE="0"
-            REPORT_AS_OF_DATE="$WB_DAILY_TARGET_DATE"
-            REPORT_REQUIRE_DATA_DATE="$WB_DAILY_TARGET_DATE"
-            REPORT_REQUIRE_ADS_DATE="$WB_DAILY_TARGET_DATE"
-          elif [ "$MODE" = "smoke" ]; then
-            REPORT_CLOSED_WEEK_AS_PREVIOUS="0"
-            REPORT_REQUIRE_ABC_PERIOD="0"
-            REPORT_REQUIRE_DAILY_ABC_DATE=""
-            REPORT_AUTO_COMPLETE_DATE="0"
-            REPORT_AS_OF_DATE=""
-            REPORT_REQUIRE_DATA_DATE=""
-            REPORT_REQUIRE_ADS_DATE=""
-            WB_DAILY_TARGET_DATE=""
-            SEND_TELEGRAM="false"
-          else
-            echo "ERROR: unknown mode=$MODE"
-            exit 1
-          fi
-
-          {
-            echo "MODE=$MODE"
-            echo "SEND_TELEGRAM=$SEND_TELEGRAM"
-            echo "REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
-            echo "REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
-            echo "REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
-            echo "REPORT_DAILY_STRICT=1"
-            echo "REPORT_ENFORCE_MSK_RUN_WINDOW=$ENFORCE_MSK_WINDOW"
-            echo "REPORT_RUN_SOURCE=$REPORT_RUN_SOURCE"
-            echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
-            echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
-            echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
-            echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
-            echo "WB_DAILY_TARGET_DATE=$WB_DAILY_TARGET_DATE"
-            # FIX58 locked values: after source .env, restore these values so REPORT_ENV cannot override date/mode.
-            echo "WF_LOCKED_MODE=$MODE"
-            echo "WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS=$REPORT_CLOSED_WEEK_AS_PREVIOUS"
-            echo "WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD=$REPORT_REQUIRE_ABC_PERIOD"
-            echo "WF_LOCKED_REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
-            echo "WF_LOCKED_REPORT_DAILY_STRICT=1"
-            echo "WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW=$ENFORCE_MSK_WINDOW"
-            echo "WF_LOCKED_REPORT_RUN_SOURCE=$REPORT_RUN_SOURCE"
-            echo "WF_LOCKED_REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
-            echo "WF_LOCKED_REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
-            echo "WF_LOCKED_REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
-            echo "WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
-            echo "WF_LOCKED_WB_DAILY_TARGET_DATE=$WB_DAILY_TARGET_DATE"
-          } >> "$GITHUB_ENV"
-
-          {
-            echo "mode=$MODE"
-            echo "send_telegram=$SEND_TELEGRAM"
-          } >> "$GITHUB_OUTPUT"
-
-          echo "MODE=$MODE"
-          echo "SEND_TELEGRAM=$SEND_TELEGRAM"
-          echo "REPORT_AS_OF_DATE=$REPORT_AS_OF_DATE"
-          echo "REPORT_REQUIRE_DATA_DATE=$REPORT_REQUIRE_DATA_DATE"
-          echo "REPORT_REQUIRE_ADS_DATE=$REPORT_REQUIRE_ADS_DATE"
-          echo "REPORT_REQUIRE_DAILY_ABC_DATE=$REPORT_REQUIRE_DAILY_ABC_DATE"
-          echo "REPORT_AUTO_COMPLETE_DATE=$REPORT_AUTO_COMPLETE_DATE"
-          echo "REPORT_DAILY_STRICT=1"
-          echo "REPORT_ENFORCE_MSK_RUN_WINDOW=$ENFORCE_MSK_WINDOW"
-          echo "REPORT_RUN_SOURCE=$REPORT_RUN_SOURCE"
-
-      - name: Check MSK run window
-        id: msk_window
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          MODE="${{ steps.decide.outputs.mode }}"
-          EVENT="${{ github.event_name }}"
-          NOW_HM="$(TZ=Europe/Moscow date +%H%M)"
-          NOW_TEXT="$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-
-          if [ "$EVENT" != "schedule" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-            echo "msk_window: manual run allowed at $NOW_TEXT; time window applies only to schedule"
-          elif [ "$MODE" = "smoke" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-            echo "msk_window: smoke mode allowed at $NOW_TEXT"
-          elif [[ "$NOW_HM" > "1804" && "$NOW_HM" < "2306" ]]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-            echo "msk_window: schedule allowed; now=$NOW_TEXT; window=18:05-23:05 MSK"
-          else
-            echo "allowed=false" >> "$GITHUB_OUTPUT"
-            echo "msk_window: schedule skip; now=$NOW_TEXT; auto reports are allowed only 18:05-23:05 MSK"
-          fi
-
-      - name: Validate storage env
-        if: steps.decide.outputs.mode == 'full_refresh' && steps.msk_window.outputs.allowed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set -a
-          source .env || true
-          set +a
-
-          # FIX58: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE/full_refresh flags.
-          # Restore workflow-decided values after sourcing .env.
-          export MODE="${WF_LOCKED_MODE:-current_week}"
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
-          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
-          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
-          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
-          export REPORT_ENFORCE_MSK_RUN_WINDOW="${WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW:-0}"
-          export REPORT_RUN_SOURCE="${WF_LOCKED_REPORT_RUN_SOURCE:-manual}"
-          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
-          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
-          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
-          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
-
-          test -n "${YC_ACCESS_KEY_ID:-}" || { echo "ERROR: YC_ACCESS_KEY_ID is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
-          test -n "${YC_SECRET_ACCESS_KEY:-}" || { echo "ERROR: YC_SECRET_ACCESS_KEY is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
-          test -n "${YC_BUCKET_NAME:-}" || { echo "ERROR: YC_BUCKET_NAME is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
-
-          echo "Storage env OK"
-          echo "YC_BUCKET_NAME=$YC_BUCKET_NAME"
-          echo "YC_ENDPOINT_URL=${YC_ENDPOINT_URL:-default}"
-
-      - name: Validate Telegram env
-        if: steps.decide.outputs.send_telegram == 'true' && steps.msk_window.outputs.allowed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set -a
-          source .env || true
-          set +a
-
-          # FIX58: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
-          # Restore workflow-decided values after sourcing .env.
-          export MODE="${WF_LOCKED_MODE:-current_week}"
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
-          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
-          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
-          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
-          export REPORT_ENFORCE_MSK_RUN_WINDOW="${WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW:-0}"
-          export REPORT_RUN_SOURCE="${WF_LOCKED_REPORT_RUN_SOURCE:-manual}"
-          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
-          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
-          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
-          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
-
-          # Fallback на старые временные имена, если вдруг они попали в окружение.
-          export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
-          export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
-          export TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}}"
-
-          test -n "${TELEGRAM_BOT_TOKEN:-}" || { echo "ERROR: TELEGRAM_BOT_TOKEN is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
-          test -n "${TELEGRAM_CHAT_ID:-}" || { echo "ERROR: TELEGRAM_CHAT_ID is missing. Add it to REPORT_ENV or GitHub Secrets"; exit 1; }
-
-          {
-            echo "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
-            echo "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID"
-            echo "TELEGRAM_MESSAGE_THREAD_ID=${TELEGRAM_MESSAGE_THREAD_ID:-}"
-          } >> "$GITHUB_ENV"
-
-          echo "Telegram env OK"
-
-
-      - name: Wait for required ABC report
-        if: steps.decide.outputs.mode != 'smoke' && steps.msk_window.outputs.allowed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set -a
-          source .env || true
-          set +a
-
-          # FIX58: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
-          # Restore workflow-decided values after sourcing .env.
-          export MODE="${WF_LOCKED_MODE:-current_week}"
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
-          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
-          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
-          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
-          export REPORT_ENFORCE_MSK_RUN_WINDOW="${WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW:-0}"
-          export REPORT_RUN_SOURCE="${WF_LOCKED_REPORT_RUN_SOURCE:-manual}"
-          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
-          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
-          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
-          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
-
-          # FIX47:
-          # - current_week должен ждать daily ABC за WB_DAILY_TARGET_DATE;
-          # - full_refresh / закрытая неделя должен ждать недельный ABC вида
-          #   wb_abc_report_goods__ПН.ММ.ГГГГ-ВС.ММ.ГГГГ__at_*.xlsx.
-          # Ошибка FIX45: full_refresh за воскресенье 14.06 ждал daily файл 14.06-14.06,
-          # хотя ABC-скачиватель уже положил корректный weekly файл 08.06-14.06.
-
-          ATTEMPT=1
-          MAX_ATTEMPTS="${ABC_WAIT_MAX_ATTEMPTS:-6}"
-          SLEEP_SECONDS="${ABC_WAIT_SLEEP_SECONDS:-600}"
-
-          echo "abc_wait: mode=${MODE:-}"
-          echo "abc_wait: REPORT_REQUIRE_ABC_PERIOD=${REPORT_REQUIRE_ABC_PERIOD:-}"
-          echo "abc_wait: REPORT_REQUIRE_DAILY_ABC_DATE=${REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          echo "abc_wait: REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE:-}"
-          echo "abc_wait: REPORT_REQUIRE_DATA_DATE=${REPORT_REQUIRE_DATA_DATE:-}"
-          echo "abc_wait: WB_DAILY_TARGET_DATE=${WB_DAILY_TARGET_DATE:-}"
-          echo "abc_wait: max_attempts=$MAX_ATTEMPTS sleep_seconds=$SLEEP_SECONDS"
-
-          while true; do
-            echo "abc_wait: attempt $ATTEMPT/$MAX_ATTEMPTS, UTC=$(date -u '+%Y-%m-%d %H:%M:%S'), MSK=$(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-
-            if python - <<'PYABCWAIT'
-          import os
-          import sys
-          from datetime import datetime, timedelta
-
-          import boto3
-          from botocore.config import Config
-
-          bucket = os.environ.get("YC_BUCKET_NAME") or ""
-          access_key = os.environ.get("YC_ACCESS_KEY_ID") or ""
-          secret_key = os.environ.get("YC_SECRET_ACCESS_KEY") or ""
-          endpoint = os.environ.get("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net"
-
-          if not bucket or not access_key or not secret_key:
-              print("abc_wait: ERROR missing YC storage env", file=sys.stderr)
-              sys.exit(2)
-
-          mode = os.environ.get("MODE") or ""
-          require_period = (os.environ.get("REPORT_REQUIRE_ABC_PERIOD") or "0") == "1"
-          report_as_of = os.environ.get("REPORT_AS_OF_DATE") or ""
-          require_date = os.environ.get("REPORT_REQUIRE_DATA_DATE") or ""
-          daily_target = os.environ.get("WB_DAILY_TARGET_DATE") or ""
-          daily_abc_date = os.environ.get("REPORT_REQUIRE_DAILY_ABC_DATE") or ""
-
-
-          def parse_iso(value: str):
-              return datetime.strptime(value, "%Y-%m-%d").date()
-
-          if require_period:
-              end_value = report_as_of or require_date or daily_target
-              if not end_value:
-                  print("abc_wait: skip because period end date is empty")
-                  sys.exit(0)
-              end_dt = parse_iso(end_value)
-              start_dt = end_dt - timedelta(days=6)
-              start_dmy = start_dt.strftime("%d.%m.%Y")
-              end_dmy = end_dt.strftime("%d.%m.%Y")
-              expected_label = f"weekly ABC period {start_dt.isoformat()}..{end_dt.isoformat()}"
-              exact_token = f"wb_abc_report_goods__{start_dmy}-{end_dmy}__at_"
-              related_tokens = [f"__{start_dmy}-", f"-{end_dmy}__", f"__{end_dmy}-{end_dmy}__at_"]
-          else:
-              target_value = daily_abc_date or daily_target or require_date or report_as_of
-              if not target_value:
-                  print("abc_wait: skip because required daily date is empty")
-                  sys.exit(0)
-              target_dt = parse_iso(target_value)
-              dmy = target_dt.strftime("%d.%m.%Y")
-              expected_label = f"daily ABC {target_dt.isoformat()}"
-              exact_token = f"wb_abc_report_goods__{dmy}-{dmy}__at_"
-              related_tokens = [f"__{dmy}-", f"-{dmy}__"]
-
-          s3 = boto3.client(
-              "s3",
-              aws_access_key_id=access_key,
-              aws_secret_access_key=secret_key,
-              endpoint_url=endpoint,
-              region_name="ru-central1",
-              config=Config(signature_version="s3v4"),
-          )
-
-          prefix = "Отчёты/ABC/"
-          matches = []
-          related = []
-          count = 0
-          paginator = s3.get_paginator("list_objects_v2")
-          for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-              for obj in page.get("Contents", []):
-                  count += 1
-                  key = obj.get("Key", "")
-                  name = key.rsplit("/", 1)[-1]
-                  if exact_token in name:
-                      matches.append((key, obj.get("LastModified")))
-                  elif any(token in name for token in related_tokens):
-                      related.append(key)
-
-          if matches:
-              matches.sort(key=lambda x: str(x[1]), reverse=True)
-              print(f"abc_wait: FOUND {expected_label}: {matches[0][0]}")
-              sys.exit(0)
-
-          print(f"abc_wait: NOT FOUND {expected_label}: expected file like {exact_token}*.xlsx")
-          print(f"abc_wait: scanned s3://{bucket}/{prefix}, objects={count}")
-          if related[:10]:
-              print("abc_wait: related ABC files:")
-              for key in related[:10]:
-                  print("  - " + key)
-          sys.exit(1)
-          PYABCWAIT
-            then
-              echo "abc_wait: OK, required ABC is ready"
-              break
-            fi
-
-            if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-              echo "abc_wait: ERROR required ABC was not found after $MAX_ATTEMPTS attempts"
-              exit 1
-            fi
-
-            echo "abc_wait: required ABC is not ready; sleep ${SLEEP_SECONDS}s and retry"
-            sleep "$SLEEP_SECONDS"
-            ATTEMPT=$((ATTEMPT + 1))
-          done
-
-
-      - name: Smoke test
-        if: steps.decide.outputs.mode == 'smoke'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python "$REPORT_SCRIPT" --root . --smoke-test
-
-      - name: Preflight before full refresh
-        if: steps.decide.outputs.mode == 'full_refresh' && steps.msk_window.outputs.allowed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set -a
-          source .env || true
-          set +a
-
-          # FIX58: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
-          # Restore workflow-decided values after sourcing .env.
-          export MODE="${WF_LOCKED_MODE:-current_week}"
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
-          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
-          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
-          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
-          export REPORT_ENFORCE_MSK_RUN_WINDOW="${WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW:-0}"
-          export REPORT_RUN_SOURCE="${WF_LOCKED_REPORT_RUN_SOURCE:-manual}"
-          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
-          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
-          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
-          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
-
-          echo "Preflight before long report run"
-          echo "MODE=$MODE"
-          echo "REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE:-}"
-          echo "REPORT_REQUIRE_DATA_DATE=${REPORT_REQUIRE_DATA_DATE:-}"
-          echo "REPORT_REQUIRE_ADS_DATE=${REPORT_REQUIRE_ADS_DATE:-}"
-
-          python "$REPORT_SCRIPT" --root . --store TOPFACE --preflight-date-check
-
-      - name: Run full refresh report
-        if: steps.decide.outputs.mode == 'full_refresh' && steps.msk_window.outputs.allowed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set -a
-          source .env || true
-          set +a
-
-          # FIX58: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
-          # Restore workflow-decided values after sourcing .env.
-          export MODE="${WF_LOCKED_MODE:-current_week}"
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
-          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
-          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
-          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
-          export REPORT_ENFORCE_MSK_RUN_WINDOW="${WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW:-0}"
-          export REPORT_RUN_SOURCE="${WF_LOCKED_REPORT_RUN_SOURCE:-manual}"
-          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
-          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
-          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
-          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
-
-          export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
-          export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
-          export TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}}"
-
-          ARGS="--root . --full-refresh --store TOPFACE"
-
-          if [ "$SEND_TELEGRAM" = "true" ]; then
-            ARGS="$ARGS --send-telegram"
-          fi
-
-          python "$REPORT_SCRIPT" $ARGS
-
-      - name: Check previous-day daily sources
-        id: source_check
-        if: steps.decide.outputs.mode == 'current_week' && steps.msk_window.outputs.allowed == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set -a
-          source .env || true
-          set +a
-
-          export MODE="${WF_LOCKED_MODE:-current_week}"
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
-          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
-          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
-          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
-          export REPORT_ENFORCE_MSK_RUN_WINDOW="${WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW:-0}"
-          export REPORT_RUN_SOURCE="${WF_LOCKED_REPORT_RUN_SOURCE:-manual}"
-          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
-          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
-          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
-          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
-
-          echo "source_check: target=$REPORT_REQUIRE_DATA_DATE; single attempt; next GitHub cron retries in 10 minutes"
-
-          if python "$REPORT_SCRIPT" --root . --store TOPFACE --preflight-date-check; then
-            echo "sources_ready=true" >> "$GITHUB_OUTPUT"
-            echo "source_check: all required daily sources are ready"
-          else
-            echo "sources_ready=false" >> "$GITHUB_OUTPUT"
-            if [ "${{ github.event_name }}" = "schedule" ]; then
-              echo "source_check: sources are not ready; scheduled run is skipped. Next cron will retry in 10 minutes."
-              exit 0
-            else
-              echo "source_check: sources are not ready for manual run; stop with error."
-              exit 1
-            fi
-          fi
-
-      - name: Run current week report
-        if: steps.decide.outputs.mode == 'current_week' && steps.msk_window.outputs.allowed == 'true' && steps.source_check.outputs.sources_ready == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set -a
-          source .env || true
-          set +a
-
-          # FIX58: REPORT_ENV/.env may contain old REPORT_AS_OF_DATE=2026-06-14 or full_refresh flags.
-          # Restore workflow-decided values after sourcing .env.
-          export MODE="${WF_LOCKED_MODE:-current_week}"
-          export REPORT_CLOSED_WEEK_AS_PREVIOUS="${WF_LOCKED_REPORT_CLOSED_WEEK_AS_PREVIOUS:-0}"
-          export REPORT_REQUIRE_ABC_PERIOD="${WF_LOCKED_REPORT_REQUIRE_ABC_PERIOD:-0}"
-          export REPORT_AUTO_COMPLETE_DATE="${WF_LOCKED_REPORT_AUTO_COMPLETE_DATE:-0}"
-          export REPORT_DAILY_STRICT="${WF_LOCKED_REPORT_DAILY_STRICT:-1}"
-          export REPORT_ENFORCE_MSK_RUN_WINDOW="${WF_LOCKED_REPORT_ENFORCE_MSK_RUN_WINDOW:-0}"
-          export REPORT_RUN_SOURCE="${WF_LOCKED_REPORT_RUN_SOURCE:-manual}"
-          export REPORT_AS_OF_DATE="${WF_LOCKED_REPORT_AS_OF_DATE:-}"
-          export REPORT_REQUIRE_DATA_DATE="${WF_LOCKED_REPORT_REQUIRE_DATA_DATE:-}"
-          export REPORT_REQUIRE_ADS_DATE="${WF_LOCKED_REPORT_REQUIRE_ADS_DATE:-}"
-          export REPORT_REQUIRE_DAILY_ABC_DATE="${WF_LOCKED_REPORT_REQUIRE_DAILY_ABC_DATE:-}"
-          export WB_DAILY_TARGET_DATE="${WF_LOCKED_WB_DAILY_TARGET_DATE:-}"
-
-          export TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN_SECRET:-}}"
-          export TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-${TELEGRAM_CHAT_ID_SECRET:-}}"
-          export TELEGRAM_MESSAGE_THREAD_ID="${TELEGRAM_MESSAGE_THREAD_ID:-${TELEGRAM_MESSAGE_THREAD_ID_SECRET:-}}"
-
-          ARGS="--root . --current-week-only --store TOPFACE"
-
-          if [ "$SEND_TELEGRAM" = "true" ]; then
-            ARGS="$ARGS --send-telegram"
-          fi
-
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            SECONDS_LEFT="$(python -c 'from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; now=datetime.now(ZoneInfo("Europe/Moscow")); midnight=(now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0); print(max(0, int((midnight-now).total_seconds()) - 60))')"
-            if [ "$SECONDS_LEFT" -le 0 ]; then
-              echo "auto_timeout: no time left before 00:00 MSK; skip report"
-              exit 0
-            fi
-            echo "auto_timeout: running report with timeout ${SECONDS_LEFT}s until midnight MSK"
-            timeout "${SECONDS_LEFT}s" python "$REPORT_SCRIPT" $ARGS
-          else
-            python "$REPORT_SCRIPT" $ARGS
-          fi
+          echo "Running: python report_runner.py ${ARGS[*]}"
+          python report_runner.py "${ARGS[@]}"
