@@ -57,6 +57,29 @@ jobs:
       WB_ENV_SECRET: ${{ secrets.WB_ENV }}
       WB_ENV_VAR: ${{ vars.WB_ENV }}
 
+      # Telegram credentials may also be in REPORT_ENV. These are only direct fallbacks
+      # for old working workflow names; values are masked by GitHub/Python before logging.
+      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TG_BOT_TOKEN_SECRET: ${{ secrets.TG_BOT_TOKEN }}
+      TELEGRAM_TOKEN_SECRET: ${{ secrets.TELEGRAM_TOKEN }}
+      TG_TOKEN_SECRET: ${{ secrets.TG_TOKEN }}
+      BOT_TOKEN_SECRET: ${{ secrets.BOT_TOKEN }}
+      WB_TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.WB_TELEGRAM_BOT_TOKEN }}
+      TOPFACE_TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TOPFACE_TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TG_CHAT_ID_SECRET: ${{ secrets.TG_CHAT_ID }}
+      TELEGRAM_CHAT_SECRET: ${{ secrets.TELEGRAM_CHAT }}
+      TG_CHAT_SECRET: ${{ secrets.TG_CHAT }}
+      CHAT_ID_SECRET: ${{ secrets.CHAT_ID }}
+      WB_TELEGRAM_CHAT_ID_SECRET: ${{ secrets.WB_TELEGRAM_CHAT_ID }}
+      TOPFACE_TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TOPFACE_TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+      TG_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TG_MESSAGE_THREAD_ID }}
+      TELEGRAM_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_THREAD_ID }}
+      TG_THREAD_ID_SECRET: ${{ secrets.TG_THREAD_ID }}
+      MESSAGE_THREAD_ID_SECRET: ${{ secrets.MESSAGE_THREAD_ID }}
+      THREAD_ID_SECRET: ${{ secrets.THREAD_ID }}
+
       # Fallbacks for individual variables, only if REPORT_ENV is not present.
       FALLBACK_STORAGE_ACCESS_1: ${{ secrets.AWS_ACCESS_KEY_ID }}
       FALLBACK_STORAGE_ACCESS_2: ${{ secrets.S3_ACCESS_KEY_ID }}
@@ -187,11 +210,41 @@ jobs:
               'FALLBACK_STORAGE_ENDPOINT_1', 'FALLBACK_STORAGE_ENDPOINT_2',
           ], default='https://storage.yandexcloud.net')
 
+          telegram_token, telegram_token_src = first([
+              'TELEGRAM_BOT_TOKEN', 'TG_BOT_TOKEN', 'TELEGRAM_TOKEN', 'TG_TOKEN', 'BOT_TOKEN',
+              'WB_TELEGRAM_BOT_TOKEN', 'TOPFACE_TELEGRAM_BOT_TOKEN',
+              'TELEGRAM_BOT_TOKEN_TOPFACE', 'TELEGRAM_TOPFACE_BOT_TOKEN', 'TG_TOPFACE_BOT_TOKEN',
+              'TELEGRAM_BOT_TOKEN_SECRET', 'TG_BOT_TOKEN_SECRET', 'TELEGRAM_TOKEN_SECRET',
+              'TG_TOKEN_SECRET', 'BOT_TOKEN_SECRET', 'WB_TELEGRAM_BOT_TOKEN_SECRET',
+              'TOPFACE_TELEGRAM_BOT_TOKEN_SECRET',
+          ])
+          telegram_chat, telegram_chat_src = first([
+              'TELEGRAM_CHAT_ID', 'TG_CHAT_ID', 'TELEGRAM_CHAT', 'TG_CHAT', 'CHAT_ID',
+              'WB_TELEGRAM_CHAT_ID', 'TOPFACE_TELEGRAM_CHAT_ID',
+              'TELEGRAM_CHAT_ID_TOPFACE', 'TELEGRAM_TOPFACE_CHAT_ID', 'TG_TOPFACE_CHAT_ID',
+              'TELEGRAM_CHAT_ID_SECRET', 'TG_CHAT_ID_SECRET', 'TELEGRAM_CHAT_SECRET',
+              'TG_CHAT_SECRET', 'CHAT_ID_SECRET', 'WB_TELEGRAM_CHAT_ID_SECRET',
+              'TOPFACE_TELEGRAM_CHAT_ID_SECRET',
+          ])
+          telegram_thread, telegram_thread_src = first([
+              'TELEGRAM_MESSAGE_THREAD_ID', 'TELEGRAM_THREAD_ID', 'TG_MESSAGE_THREAD_ID',
+              'TG_THREAD_ID', 'MESSAGE_THREAD_ID', 'THREAD_ID',
+              'TELEGRAM_MESSAGE_THREAD_ID_SECRET', 'TG_MESSAGE_THREAD_ID_SECRET',
+              'TELEGRAM_THREAD_ID_SECRET', 'TG_THREAD_ID_SECRET',
+              'MESSAGE_THREAD_ID_SECRET', 'THREAD_ID_SECRET',
+          ])
+
           # Canonical names required by old report_runner.py.
           final['YC_ACCESS_KEY_ID'] = storage_access
           final['YC_SECRET_ACCESS_KEY'] = storage_secret
           final['YC_BUCKET_NAME'] = storage_bucket
           final['YC_ENDPOINT_URL'] = storage_endpoint
+          if telegram_token:
+              final['TELEGRAM_BOT_TOKEN'] = telegram_token
+          if telegram_chat:
+              final['TELEGRAM_CHAT_ID'] = telegram_chat
+          if telegram_thread:
+              final['TELEGRAM_MESSAGE_THREAD_ID'] = telegram_thread
 
           # Keep AWS/S3 aliases too for newer code variants.
           if storage_access:
@@ -223,6 +276,9 @@ jobs:
           print(f'Object Storage secret: {"OK" if storage_secret else "MISSING"} ({storage_secret_src or "-"})')
           print(f'Object Storage bucket: OK ({storage_bucket_src})')
           print(f'Object Storage endpoint: OK ({storage_endpoint_src})')
+          print(f'Telegram token: {"OK" if telegram_token else "MISSING"} ({telegram_token_src or "-"})')
+          print(f'Telegram chat: {"OK" if telegram_chat else "MISSING"} ({telegram_chat_src or "-"})')
+          print(f'Telegram thread: {"OK" if telegram_thread else "not set"} ({telegram_thread_src or "-"})')
 
           if not storage_access or not storage_secret:
               raise SystemExit(
@@ -301,6 +357,35 @@ jobs:
           resp = s3.list_objects_v2(Bucket=bucket, Prefix='Отчёты/', MaxKeys=3)
           print(f'Object Storage OK: bucket={bucket}, prefix=Отчёты/, objects_seen={len(resp.get("Contents", []))}')
           PY
+
+      - name: Preflight Telegram variables
+        env:
+          RUN_MODE: ${{ github.event.inputs.mode || 'current_week' }}
+          SEND_TELEGRAM_INPUT: ${{ github.event.inputs.send_telegram || 'true' }}
+        run: |
+          set -euo pipefail
+          if [ "${SEND_TELEGRAM_INPUT}" != "true" ] || [ "${RUN_MODE}" = "smoke" ] || [ "${RUN_MODE}" = "preflight" ]; then
+            echo "Telegram preflight skipped: send_telegram=${SEND_TELEGRAM_INPUT}, mode=${RUN_MODE}"
+            exit 0
+          fi
+          missing=0
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "Telegram token: MISSING"
+            missing=1
+          else
+            echo "Telegram token: OK"
+          fi
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram chat: MISSING"
+            missing=1
+          else
+            echo "Telegram chat: OK"
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "Telegram delivery was requested, but credentials are not available after REPORT_ENV normalization."
+            echo "Failing now before heavy report calculations."
+            exit 1
+          fi
 
       - name: Run report
         env:
