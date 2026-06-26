@@ -2,8 +2,8 @@ name: WB TOPFACE Daily Report
 
 on:
   schedule:
-    # GitHub cron is UTC. 22:05 UTC = 01:05 MSK next day.
-    # FIX60 inside report_runner.py will choose report date by MSK:
+    # GitHub cron uses UTC. 22:05 UTC = 01:05 MSK next day.
+    # report_runner.py FIX60/FIX61 chooses report date by Moscow time:
     # 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1.
     - cron: '5 22 * * *'
   workflow_dispatch:
@@ -25,7 +25,7 @@ on:
         default: true
         type: boolean
       target_date:
-        description: 'Опционально: дата отчета YYYY-MM-DD для ручного запуска. Пусто = авто по МСК.'
+        description: 'Дата отчета YYYY-MM-DD для ручного запуска. Пусто = авто по МСК.'
         required: false
         default: ''
         type: string
@@ -37,38 +37,38 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  PYTHONUTF8: '1'
-  PYTHONIOENCODING: 'utf-8'
-  TZ: Europe/Moscow
-
-  # Yandex Object Storage
-  YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-  YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-  YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-  YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
-
-  # Telegram
-  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-  TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-
-  # ВАЖНО: не включаем старые отмены/строгие недельные проверки.
-  REPORT_RUN_SOURCE: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
-  REPORT_ENFORCE_MSK_RUN_WINDOW: '0'
-  REPORT_MANUAL_BYPASS_MSK_WINDOW: '1'
-  REPORT_AUTO_COMPLETE_DATE: '0'
-  REPORT_REQUIRE_ABC_PERIOD: '0'
-  REPORT_KEEP_EXPLICIT_DATE: '0'
-  WB_CURRENT_WEEK_ONLY: '1'
-  WB_KEEP_ONLY_MONDAY_REPORTS: '1'
-  WB_LOCALIZATION_MAX_STALE_DAYS: '2'
-
 jobs:
   build-report:
     name: Build TOPFACE report
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
+    env:
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
+      TZ: Europe/Moscow
+
+      # Yandex Object Storage. Поддержаны несколько возможных имен secrets/vars.
+      # Главные имена для report_runner.py: YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY, YC_BUCKET_NAME, YC_ENDPOINT_URL.
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID || vars.YC_ACCESS_KEY_ID || secrets.AWS_ACCESS_KEY_ID || vars.AWS_ACCESS_KEY_ID || secrets.YANDEX_ACCESS_KEY_ID || vars.YANDEX_ACCESS_KEY_ID || secrets.S3_ACCESS_KEY_ID || vars.S3_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY || vars.YC_SECRET_ACCESS_KEY || secrets.AWS_SECRET_ACCESS_KEY || vars.AWS_SECRET_ACCESS_KEY || secrets.YANDEX_SECRET_ACCESS_KEY || vars.YANDEX_SECRET_ACCESS_KEY || secrets.S3_SECRET_ACCESS_KEY || vars.S3_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME || vars.YC_BUCKET_NAME || secrets.S3_BUCKET_NAME || vars.S3_BUCKET_NAME || secrets.YANDEX_BUCKET_NAME || vars.YANDEX_BUCKET_NAME || secrets.BUCKET_NAME || vars.BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL || vars.YC_ENDPOINT_URL || secrets.S3_ENDPOINT_URL || vars.S3_ENDPOINT_URL || secrets.YANDEX_ENDPOINT_URL || vars.YANDEX_ENDPOINT_URL || 'https://storage.yandexcloud.net' }}
+
+      # Telegram. Если Telegram не нужен, можно запускать с send_telegram=false.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || vars.TELEGRAM_BOT_TOKEN || secrets.TG_BOT_TOKEN || vars.TG_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || vars.TELEGRAM_CHAT_ID || secrets.TG_CHAT_ID || vars.TG_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID || vars.TELEGRAM_MESSAGE_THREAD_ID || secrets.TG_MESSAGE_THREAD_ID || vars.TG_MESSAGE_THREAD_ID }}
+
+      # Старый time-guard отключен. Дату отчета выбирает сам report_runner.py.
+      REPORT_RUN_SOURCE: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
+      REPORT_ENFORCE_MSK_RUN_WINDOW: '0'
+      REPORT_MANUAL_BYPASS_MSK_WINDOW: '1'
+      REPORT_AUTO_COMPLETE_DATE: '0'
+      REPORT_REQUIRE_ABC_PERIOD: '0'
+      REPORT_KEEP_EXPLICIT_DATE: '0'
+      WB_KEEP_ONLY_MONDAY_REPORTS: '1'
+      WB_LOCALIZATION_MAX_STALE_DAYS: '2'
 
     steps:
       - name: Checkout repository
@@ -83,11 +83,31 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pandas numpy openpyxl boto3 reportlab
+          python -m pip install pandas numpy openpyxl boto3 reportlab requests
+
+      - name: Validate Object Storage settings
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, sys
+          required = ['YC_ACCESS_KEY_ID', 'YC_SECRET_ACCESS_KEY', 'YC_BUCKET_NAME']
+          optional = ['YC_ENDPOINT_URL']
+          print('Object Storage env check:')
+          for key in required + optional:
+              print(f'  {key}: {"OK" if os.getenv(key) else "MISSING"}')
+          missing = [key for key in required if not os.getenv(key)]
+          if missing:
+              raise SystemExit(
+                  'Missing Object Storage variables: ' + ', '.join(missing) + '\n'
+                  'Без них report_runner.py переключается на local root и получает rows=0. '
+                  'Проверь GitHub Secrets/Variables или добавь алиасы в этот workflow.'
+              )
+          PY
 
       - name: Diagnostics
         run: |
-          echo "GitHub event: $GITHUB_EVENT_NAME"
+          set -euo pipefail
+          echo "GitHub event: ${GITHUB_EVENT_NAME}"
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
           echo "REPORT_RUN_SOURCE=${REPORT_RUN_SOURCE}"
@@ -106,6 +126,8 @@ jobs:
           echo "Run mode: ${RUN_MODE}"
           echo "Send Telegram: ${SEND_TELEGRAM_INPUT}"
 
+          # Для ручного запуска можно жестко задать дату. Для авто запуска даты НЕ задаем:
+          # report_runner.py сам выберет D-2 до 19:00 МСК и D-1 после 19:00 МСК.
           if [ -n "${MANUAL_TARGET_DATE}" ]; then
             echo "Manual target date: ${MANUAL_TARGET_DATE}"
             export REPORT_MANUAL_TARGET_DATE="${MANUAL_TARGET_DATE}"
@@ -121,18 +143,23 @@ jobs:
 
           case "${RUN_MODE}" in
             current_week)
+              export WB_CURRENT_WEEK_ONLY="1"
               ARGS+=(--current-week-only)
               ;;
             full_refresh)
+              export WB_CURRENT_WEEK_ONLY="0"
               ARGS+=(--full-refresh)
               ;;
             pdf_only)
+              export WB_CURRENT_WEEK_ONLY="1"
               ARGS+=(--pdf-only)
               ;;
             preflight)
+              export WB_CURRENT_WEEK_ONLY="1"
               ARGS+=(--preflight-date-check)
               ;;
             smoke)
+              export WB_CURRENT_WEEK_ONLY="0"
               ARGS+=(--smoke-test)
               ;;
             *)
