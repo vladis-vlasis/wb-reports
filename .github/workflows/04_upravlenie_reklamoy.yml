@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v72_no_night_mode_subjectfix_2026-06-26"
+  WORKFLOW_VERSION: "v73_no_night_mode_subjectfix_productroot_2026-06-26"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
