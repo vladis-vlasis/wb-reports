@@ -739,6 +739,17 @@ def build_campaign_base(ads: pd.DataFrame, campaigns: pd.DataFrame, orders: pd.D
         df = df.drop(columns=["subject_from_ads_daily"], errors="ignore")
 
     df = filter_managed_subjects(df, "campaign_base")
+    if "supplier_article" not in df.columns:
+        df["supplier_article"] = ""
+    if "product_root" not in df.columns:
+        df["product_root"] = df["supplier_article"].map(product_root)
+    else:
+        df["product_root"] = df["product_root"].fillna("")
+        fill_mask = df["product_root"].astype(str).eq("")
+        if fill_mask.any():
+            df.loc[fill_mask, "product_root"] = df.loc[fill_mask, "supplier_article"].map(product_root)
+    if "placement" not in df.columns:
+        df["placement"] = ""
 
     if not bid_history.empty:
         last = bid_history.dropna(subset=["event_date"]).sort_values("event_date").groupby("campaign_id", as_index=False).tail(1)
@@ -976,6 +987,17 @@ def summarize_core_by_product(core: pd.DataFrame) -> pd.DataFrame:
 
 def rank_blocks(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    if "supplier_article" not in out.columns:
+        out["supplier_article"] = ""
+    if "product_root" not in out.columns:
+        out["product_root"] = out["supplier_article"].map(product_root)
+    else:
+        out["product_root"] = out["product_root"].fillna("")
+        fill_mask = out["product_root"].astype(str).eq("")
+        if fill_mask.any():
+            out.loc[fill_mask, "product_root"] = out.loc[fill_mask, "supplier_article"].map(product_root)
+    if "placement" not in out.columns:
+        out["placement"] = ""
     # A block is product_root + placement. For brushes product_root normally 901 but individual article can still be handled by supplier_article if needed.
     out["block_key"] = out["product_root"].fillna("") + "|" + out["placement"].fillna("")
     out["cpo_cur_safe"] = out["cpo_cur"].replace([np.inf, -np.inf], np.nan)
@@ -1002,6 +1024,17 @@ def decide_all(campaigns: pd.DataFrame, core: pd.DataFrame, pause_history: pd.Da
     df = filter_excluded_articles(df, "decide_all_excluded_articles")
     if df.empty:
         return pd.DataFrame(columns=["campaign_id", "action", "reason_code", "reason_text"])
+    if "supplier_article" not in df.columns:
+        df["supplier_article"] = ""
+    if "product_root" not in df.columns:
+        df["product_root"] = df["supplier_article"].map(product_root)
+    else:
+        df["product_root"] = df["product_root"].fillna("")
+        fill_mask = df["product_root"].astype(str).eq("")
+        if fill_mask.any():
+            df.loc[fill_mask, "product_root"] = df.loc[fill_mask, "supplier_article"].map(product_root)
+    if "placement" not in df.columns:
+        df["placement"] = ""
     core_summary = summarize_core_by_product(core[core["query_role"].eq("flagship")]) if not core.empty else pd.DataFrame()
     if not core_summary.empty:
         df = df.merge(core_summary, on="product_root", how="left")
