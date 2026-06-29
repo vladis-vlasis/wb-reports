@@ -26,7 +26,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "2026-06-10_v21_MISSTAIS_1C_EQUALS_SUPPLIER_ARTICLE"
+SCRIPT_VERSION = "2026-06-29_v22_MISSTAIS_SLIV_GRAY_ROWS"
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -127,6 +127,17 @@ class AppConfig:
     abc_prefix: str = os.getenv("WB_ABC_PREFIX", "Отчёты/ABC/")
     abc_target_month: str = os.getenv("WB_ABC_TARGET_MONTH", "2026-03")
     one_c_aux_prefix: str = os.getenv("WB_ONE_C_AUX_PREFIX", "Отчёты/Остатки/1С/")
+
+    # Список товаров под слив применяется только для MISS TAIS / МТ.
+    # Источник можно задать явно:
+    #   WB_SLIV_LIST_LOCAL_PATH=/path/to/АБС+слив.xlsx
+    #   или WB_SLIV_LIST_KEY=Служебные файлы/АБС+слив.xlsx
+    # Если явно не задано, код попробует найти xlsx с "слив"/"АБС" в служебных префиксах Object Storage.
+    sliv_list_key: str = os.getenv("WB_SLIV_LIST_KEY", "").strip()
+    sliv_list_local_path: str = os.getenv("WB_SLIV_LIST_LOCAL_PATH", "").strip()
+    sliv_list_sheet_name: str = os.getenv("WB_SLIV_LIST_SHEET_NAME", "слив").strip()
+    sliv_list_article_column: str = os.getenv("WB_SLIV_LIST_ARTICLE_COLUMN", "Артикул продавца").strip()
+    require_sliv_list: bool = env_bool("WB_REQUIRE_SLIV_LIST", False)
 
     ratings_key: str = os.getenv("WB_RATINGS_KEY", "").strip()
     ratings_prefix_candidates: Tuple[str, ...] = (
@@ -1938,6 +1949,144 @@ def pick_sheet_name(store_name: str) -> str:
     return "ТФ ВБ"
 
 
+def _read_sliv_workbook_bytes_from_local_path(path_value: str) -> Optional[Tuple[bytes, str]]:
+    path_text = normalize_text(path_value)
+    if not path_text:
+        return None
+
+    path = Path(path_text).expanduser()
+    if path.exists() and path.is_file():
+        return path.read_bytes(), str(path)
+
+    return None
+
+
+def _find_local_sliv_workbook() -> Optional[Tuple[bytes, str]]:
+    candidate_names = (
+        "АБС+слив.xlsx",
+        "АБС слив.xlsx",
+        "ABC+sliv.xlsx",
+        "ABC sliv.xlsx",
+    )
+    search_dirs = [Path.cwd()]
+    try:
+        script_dir = Path(__file__).resolve().parent
+        if script_dir not in search_dirs:
+            search_dirs.append(script_dir)
+    except NameError:
+        pass
+
+    for directory in search_dirs:
+        for name in candidate_names:
+            path = directory / name
+            if path.exists() and path.is_file():
+                return path.read_bytes(), str(path)
+
+    return None
+
+
+def _find_sliv_key_in_storage(storage: S3Storage, cfg: AppConfig) -> Optional[str]:
+    if cfg.sliv_list_key:
+        return cfg.sliv_list_key
+
+    prefixes = []
+    for prefix in ("Служебные файлы/", cfg.one_c_aux_prefix, cfg.abc_prefix):
+        if prefix and prefix not in prefixes:
+            prefixes.append(prefix)
+
+    candidates: List[str] = []
+    for prefix in prefixes:
+        try:
+            for key in storage.list_keys(prefix):
+                file_name = Path(key).name.lower().replace(" ", "")
+                if not file_name.endswith((".xlsx", ".xlsm")):
+                    continue
+                if "слив" in file_name and ("абс" in file_name or "abc" in file_name or "sliv" in file_name):
+                    candidates.append(key)
+        except Exception as exc:
+            log(f"⚠️ Не удалось просмотреть префикс для списка слив {prefix}: {exc}")
+
+    return sorted(candidates)[-1] if candidates else None
+
+
+def _select_sliv_sheet(excel_file: pd.ExcelFile, preferred_sheet_name: str) -> str:
+    preferred_norm = normalize_text(preferred_sheet_name).lower().replace("ё", "е")
+    sheet_map = {normalize_text(sheet).lower().replace("ё", "е"): sheet for sheet in excel_file.sheet_names}
+    if preferred_norm and preferred_norm in sheet_map:
+        return sheet_map[preferred_norm]
+
+    for sheet in excel_file.sheet_names:
+        sheet_norm = normalize_text(sheet).lower().replace("ё", "е")
+        if "слив" in sheet_norm or "sliv" in sheet_norm:
+            return sheet
+
+    if len(excel_file.sheet_names) >= 2:
+        return excel_file.sheet_names[1]
+
+    return excel_file.sheet_names[0]
+
+
+def load_sliv_articles(storage: S3Storage, cfg: AppConfig) -> Set[str]:
+    if not is_misstais_store(cfg.store_name):
+        log("Список слив не применяется: бренд не MISS TAIS / МТ")
+        return set()
+
+    source: Optional[Tuple[bytes, str]] = None
+
+    source = _read_sliv_workbook_bytes_from_local_path(cfg.sliv_list_local_path)
+    if source is None:
+        source = _find_local_sliv_workbook()
+
+    if source is None:
+        key = _find_sliv_key_in_storage(storage, cfg)
+        if key:
+            try:
+                source = (storage.read_bytes(key), key)
+            except Exception as exc:
+                message = f"Не удалось загрузить список слив из Object Storage: {key}: {exc}"
+                if cfg.require_sliv_list or cfg.sliv_list_key:
+                    raise RuntimeError(message) from exc
+                log(f"⚠️ {message}")
+
+    if source is None:
+        message = (
+            "Список слив для MISS TAIS не найден. "
+            "Задайте WB_SLIV_LIST_LOCAL_PATH или WB_SLIV_LIST_KEY, либо положите файл АБС+слив.xlsx рядом со скриптом."
+        )
+        if cfg.require_sliv_list:
+            raise FileNotFoundError(message)
+        log(f"⚠️ {message} Строки под слив не будут выделены серым.")
+        return set()
+
+    workbook_bytes, source_name = source
+    excel_file = pd.ExcelFile(io.BytesIO(workbook_bytes))
+    sheet_name = _select_sliv_sheet(excel_file, cfg.sliv_list_sheet_name)
+    df = pd.read_excel(io.BytesIO(workbook_bytes), sheet_name=sheet_name)
+
+    normalized_columns = {normalize_template_header(col).lower().replace("ё", "е"): col for col in df.columns}
+    configured_col = normalize_template_header(cfg.sliv_list_article_column).lower().replace("ё", "е")
+    article_col = normalized_columns.get(configured_col)
+    if article_col is None:
+        for candidate in ("артикул продавца", "supplierarticle", "артикул", "артикул 1с", "артикул 1c"):
+            article_col = normalized_columns.get(candidate)
+            if article_col is not None:
+                break
+
+    if article_col is None:
+        raise KeyError(
+            f"В списке слив не найдена колонка с артикулом продавца. "
+            f"Источник={source_name}, лист={sheet_name}, колонки={list(df.columns)}"
+        )
+
+    sliv_articles = {
+        normalize_supplier_article_key(value)
+        for value in df[article_col].dropna().tolist()
+        if normalize_supplier_article_key(value)
+    }
+    log(f"Загружен список слив для MISS TAIS: {len(sliv_articles):,} артикулов; источник={source_name}; лист={sheet_name}")
+    return sliv_articles
+
+
 def build_template_dataset(plan_df: pd.DataFrame, stocks_1c_map: pd.DataFrame) -> pd.DataFrame:
     work = plan_df.copy()
 
@@ -1988,7 +2137,7 @@ def build_template_dataset(plan_df: pd.DataFrame, stocks_1c_map: pd.DataFrame) -
     return out
 
 
-def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFrame, cfg: AppConfig) -> str:
+def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFrame, cfg: AppConfig, sliv_articles: Optional[Set[str]] = None) -> str:
     wb = load_workbook(template_path, keep_vba=True)
     ws = wb[pick_sheet_name(cfg.store_name)]
 
@@ -2106,6 +2255,9 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         )
 
     red_fill = PatternFill(fill_type="solid", fgColor="FFC7CE")
+    sliv_fill = PatternFill(fill_type="solid", fgColor="595959")
+    sliv_articles = sliv_articles or set()
+    sliv_marked_count = 0
 
     for i, (_, row) in enumerate(data_df.iterrows(), start=2):
         ws.cell(i, article_1c_col, row["Артикул 1С"])
@@ -2124,6 +2276,16 @@ def fill_template_file(template_path: str, output_path: str, data_df: pd.DataFra
         if bool(row.get("missing_1c_article", False)):
             for col_idx in range(1, ws.max_column + 1):
                 ws.cell(i, col_idx).fill = red_fill
+
+        supplier_article_key = normalize_supplier_article_key(row.get("supplierArticle", ""))
+        article_1c_key = normalize_supplier_article_key(row.get("Артикул 1С", ""))
+        if is_misstais_store(cfg.store_name) and (supplier_article_key in sliv_articles or article_1c_key in sliv_articles):
+            for col_idx in range(1, ws.max_column + 1):
+                ws.cell(i, col_idx).fill = sliv_fill
+            sliv_marked_count += 1
+
+    if is_misstais_store(cfg.store_name):
+        log(f"Строк под слив, выделенных тёмно-серым в шаблоне MISS TAIS: {sliv_marked_count:,}")
 
     wb.save(output_path)
     wb.close()
@@ -2278,10 +2440,12 @@ def main(cfg: AppConfig = CONFIG) -> str:
         missing_articles = int(plan_df["Артикул 1С"].map(normalize_text).eq("").sum()) if "Артикул 1С" in plan_df.columns else 0
         log(f"⚠️ Шаблон пустой: в плане строк={len(plan_df):,}, строк без 'Артикул 1С'={missing_articles:,}")
 
+    sliv_articles = load_sliv_articles(storage, cfg) if is_misstais_store(cfg.store_name) else set()
+
     with tempfile.TemporaryDirectory() as tmpdir:
         template_path = resolve_template(storage, cfg, tmpdir)
         output_path = str(Path(cfg.output_dir) / f"Согласование поставки WB_{cfg.store_name}_{cfg.run_date:%Y%m%d}.xlsm")
-        fill_template_file(template_path, output_path, template_data, cfg)
+        fill_template_file(template_path, output_path, template_data, cfg, sliv_articles=sliv_articles)
 
     save_debug_files(cfg.output_dir, sku_df, region_metrics, shares_df, plan_df, current_stock, output_path)
 
@@ -2312,6 +2476,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--supplier-coverage-days", type=int, default=None, help="Покрытие после приезда")
     parser.add_argument("--supplier-breakthrough-threshold", type=float, default=None, help="Порог для статуса Прорыв")
     parser.add_argument("--abc-target-month", default=None, help="Месяц ABC в формате YYYY-MM")
+    parser.add_argument("--sliv-list-key", default=None, help="Object Storage key файла АБС+слив.xlsx для MISS TAIS")
+    parser.add_argument("--sliv-list-local-path", default=None, help="Локальный путь к файлу АБС+слив.xlsx для MISS TAIS")
+    parser.add_argument("--sliv-list-sheet-name", default=None, help="Лист со списком слив; по умолчанию: слив")
     parser.add_argument("--strategy-mode", choices=["default", "economy"], default=None, help="Стратегия распределения для warehouse-режима")
     return parser
 
@@ -2334,6 +2501,12 @@ def build_cfg_from_args(args: argparse.Namespace) -> AppConfig:
         cfg.supplier_breakthrough_threshold = float(args.supplier_breakthrough_threshold)
     if args.abc_target_month:
         cfg.abc_target_month = args.abc_target_month
+    if args.sliv_list_key:
+        cfg.sliv_list_key = args.sliv_list_key
+    if args.sliv_list_local_path:
+        cfg.sliv_list_local_path = args.sliv_list_local_path
+    if args.sliv_list_sheet_name:
+        cfg.sliv_list_sheet_name = args.sliv_list_sheet_name
     if args.strategy_mode:
         cfg.strategy_mode = args.strategy_mode
     return cfg
