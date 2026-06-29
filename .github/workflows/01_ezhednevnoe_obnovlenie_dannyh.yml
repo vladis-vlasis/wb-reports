@@ -1,4 +1,4 @@
-# version: v29_every10m_target_date_rule_manual_ok
+# version: v30_report_env_before_marker
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -61,19 +61,107 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Workflow diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "YML_VERSION=v30_report_env_before_marker"
+          echo "github.event_name=${{ github.event_name }}"
+          echo "github.event.schedule=${{ github.event.schedule }}"
+          echo "STORE_INPUT=${STORE_INPUT}"
+          echo "UTC now=$(date -u '+%Y-%m-%d %H:%M:%S')"
+          TZ=Europe/Moscow date '+MSK now=%Y-%m-%d %H:%M:%S'
+          ls -la
+          if [ ! -f "ezhednevnoe_obnovlenie_dannyh.py" ]; then
+            echo "ERROR: ezhednevnoe_obnovlenie_dannyh.py not found in repo root"
+            exit 2
+          fi
+
+      - name: Load secrets from REPORT_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "YC_ENDPOINT_URL",
+              "WB_PROMO_KEY_TOPFACE",
+              "WB_KEY_MISSTAIS",
+              "TELEGRAM_BOT_TOKEN",
+              "TELEGRAM_CHAT_ID",
+              "TORGSTAT_ABC_URL",
+          ]
+
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+          for raw_line in report_env.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('"').strip("'")
+              if key in allowed and value:
+                  parsed[key] = value
+
+          github_env = os.environ["GITHUB_ENV"]
+          loaded = []
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in allowed:
+                  value = (os.getenv(key) or parsed.get(key) or "").strip()
+                  if value:
+                      f.write(f"{key}={value}\n")
+                      loaded.append(key)
+
+          print("Loaded env names: " + (", ".join(loaded) if loaded else "none"))
+          PY
+
+      - name: Verify required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+          ]
+
+          store = os.getenv("STORE_INPUT", "ALL").upper()
+          if store in {"ALL", "TOPFACE"}:
+              required.append("WB_PROMO_KEY_TOPFACE")
+          if store in {"ALL", "MISSTAIS", "MT"}:
+              required.append("WB_KEY_MISSTAIS")
+
+          missing = [x for x in required if not (os.getenv(x) or "").strip()]
+          if missing:
+              raise SystemExit("Missing env/secrets after REPORT_ENV load: " + ", ".join(missing))
+
+          print("All required secrets are present after REPORT_ENV load.")
+          print("YC_BUCKET_NAME length:", len(os.getenv("YC_BUCKET_NAME", "")))
+          PY
+
       - name: Resolve target date
         id: target_date
         shell: bash
         run: |
           set -euo pipefail
-          echo "YML_VERSION=v29_every10m_target_date_rule_manual_ok"
           python - <<'PY'
           import os
           import re
           from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
 
-          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
           raw_target = (os.environ.get("TARGET_DATE_INPUT", "") or "").strip()
           now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
 
@@ -88,7 +176,6 @@ jobs:
               rule = "auto_after_14_yesterday_before_14_day_before_yesterday"
 
           print("=== Target date resolution ===")
-          print(f"event_name={event_name}")
           print(f"MSK now={now_msk:%Y-%m-%d %H:%M:%S}")
           print(f"target_date={target_date}")
           print(f"target_rule={rule}")
@@ -109,9 +196,11 @@ jobs:
           import boto3
           from botocore.exceptions import ClientError
 
-          bucket = os.environ["YC_BUCKET_NAME"]
-          key = os.environ["SCHEDULE_LOCK_KEY"]
+          bucket = (os.environ.get("YC_BUCKET_NAME") or "").strip()
+          if not bucket:
+              raise SystemExit("YC_BUCKET_NAME is empty after REPORT_ENV load; marker check cannot continue.")
 
+          key = os.environ["SCHEDULE_LOCK_KEY"]
           s3 = boto3.client(
               "s3",
               endpoint_url=os.getenv("YC_ENDPOINT_URL") or "https://storage.yandexcloud.net",
@@ -144,23 +233,6 @@ jobs:
           echo "Schedule уже успешно отработал для WB_TARGET_DATE=${WB_TARGET_DATE}: ${SCHEDULE_LOCK_KEY}"
           exit 0
 
-      - name: Checkout diagnostics
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "github.event_name=${{ github.event_name }}"
-          echo "github.event.schedule=${{ github.event.schedule }}"
-          echo "STORE_INPUT=${STORE_INPUT}"
-          echo "WB_TARGET_DATE=${WB_TARGET_DATE}"
-          echo "TARGET_DATE_RULE=${TARGET_DATE_RULE}"
-          echo "UTC now=$(date -u '+%Y-%m-%d %H:%M:%S')"
-          TZ=Europe/Moscow date '+MSK now=%Y-%m-%d %H:%M:%S'
-          ls -la
-          if [ ! -f "ezhednevnoe_obnovlenie_dannyh.py" ]; then
-            echo "ERROR: ezhednevnoe_obnovlenie_dannyh.py not found in repo root"
-            exit 2
-          fi
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -172,36 +244,6 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
-
-      - name: Load REPORT_ENV
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${REPORT_ENV:-}" ]; then
-            echo "$REPORT_ENV" >> "$GITHUB_ENV"
-          fi
-
-      - name: Verify secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          required = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "YC_BUCKET_NAME",
-          ]
-          store = os.environ.get("STORE_INPUT", "ALL").upper()
-          if store in {"ALL", "TOPFACE"}:
-              required.append("WB_PROMO_KEY_TOPFACE")
-          if store in {"ALL", "MISSTAIS", "MT"}:
-              required.append("WB_KEY_MISSTAIS")
-          missing = [x for x in required if not os.getenv(x)]
-          if missing:
-              raise SystemExit("Missing env/secrets: " + ", ".join(missing))
-          print("All required secrets are present.")
-          PY
 
       - name: Validate Python syntax
         shell: bash
@@ -228,11 +270,13 @@ jobs:
           from zoneinfo import ZoneInfo
           import boto3
 
-          bucket = os.environ["YC_BUCKET_NAME"]
-          key = os.environ["SCHEDULE_LOCK_KEY"]
+          bucket = (os.environ.get("YC_BUCKET_NAME") or "").strip()
+          if not bucket:
+              raise SystemExit("YC_BUCKET_NAME is empty after run; cannot write marker.")
 
+          key = os.environ["SCHEDULE_LOCK_KEY"]
           payload = {
-              "workflow_version": "v29_every10m_target_date_rule_manual_ok",
+              "workflow_version": "v30_report_env_before_marker",
               "target_date": os.environ.get("WB_TARGET_DATE"),
               "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
               "store_input": os.environ.get("STORE_INPUT"),
