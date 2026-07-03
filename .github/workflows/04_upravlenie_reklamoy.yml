@@ -7,8 +7,6 @@ on:
     # Основной контур: каждые 10 минут с 18:00 до 23:50 МСК.
     # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
     - cron: "*/10 15-20 * * *"
-    # Telegram по проблемным кистям: понедельник 19:05, затем каждые 10 минут до 23:55 МСК.
-    - cron: "5,15,25,35,45,55 16-20 * * 1"
 
 permissions:
   contents: read
@@ -19,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v73_no_night_mode_subjectfix_productroot_2026-06-26"
+  WORKFLOW_VERSION: "v75_core90_collect_only_2026-07-03"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -66,7 +64,7 @@ jobs:
           echo "=== Workflow file hash and markers ==="
           if [[ -f "${WORKFLOW_FILE}" ]]; then
             sha256sum "${WORKFLOW_FILE}"
-            grep -nE "WORKFLOW_VERSION|cron:|18:|19:05|МСК|RUN_SLOT|brush_tg|REPORT_ENV" "${WORKFLOW_FILE}" || true
+            grep -nE "WORKFLOW_VERSION|cron:|18:|МСК|RUN_SLOT|REPORT_ENV" "${WORKFLOW_FILE}" || true
           else
             echo "WARNING: ${WORKFLOW_FILE} not found after checkout"
             find .github/workflows -maxdepth 1 -type f -print || true
@@ -82,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz reportlab
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
 
       - name: Load secrets from REPORT_ENV
         shell: bash
@@ -147,8 +145,6 @@ jobs:
           if missing:
               raise SystemExit("Missing secrets after REPORT_ENV load: " + ", ".join(missing))
           print("All required secrets are present after REPORT_ENV load.")
-          if not os.getenv("TELEGRAM_BOT_TOKEN") or not os.getenv("TELEGRAM_CHAT_ID"):
-              print("WARNING: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not fully set; TG send may be skipped by code.")
           PY
 
       - name: Resolve slot and guard time
@@ -172,16 +168,10 @@ jobs:
           reason = "manual_dispatch_single_mode"
           lock_name = f"manual_main_{now_msk:%Y-%m-%d_%H%M%S}"
           if event_name == "schedule":
-              if schedule == "5,15,25,35,45,55 16-20 * * 1":
-                  run_slot = "brush_tg"
-                  allowed = (weekday == 0) and ((19 * 60 + 5) <= minutes <= (23 * 60 + 59))
-                  reason = "brush_tg_monday_1905_2359_msk_window" if allowed else "BLOCKED_BRUSH_TG_TIME_GUARD"
-                  lock_name = f"brush_tg_{now_msk:%Y-%m-%d}"
-              else:
-                  run_slot = "main_run"
-                  allowed = 18 <= now_msk.hour <= 23
-                  reason = "main_18_00_23_59_msk_window" if allowed else "BLOCKED_MAIN_TIME_GUARD"
-                  lock_name = f"main_run_{now_msk:%Y-%m-%d}"
+              run_slot = "main_run"
+              allowed = 18 <= now_msk.hour <= 23
+              reason = "main_18_00_23_59_msk_window" if allowed else "BLOCKED_MAIN_TIME_GUARD"
+              lock_name = f"main_run_{now_msk:%Y-%m-%d}"
 
           print("=== Slot resolution ===")
           print(f"event_name={event_name}")
@@ -267,13 +257,10 @@ jobs:
 
           case "${RUN_SLOT}" in
             manual_main)
-              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start --send-brush-tg --force-brush-tg"
+              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start"
               ;;
             main_run)
-              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start --send-brush-tg --brush-tg-schedule-only"
-              ;;
-            brush_tg)
-              CMD="python upravlenie_reklamoy.py preview --skip-price --send-brush-tg --brush-tg-schedule-only"
+              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start"
               ;;
             *)
               echo "Unknown RUN_SLOT=${RUN_SLOT}"
@@ -334,5 +321,3 @@ jobs:
             Лог_API.xlsx
             История_ставок.xlsx
             История_пауз.xlsx
-            Проблемные_кисти_TG.xlsx
-            Проблемные_кисти_WB_Ads.pdf
