@@ -91,15 +91,13 @@ TARGET_SUBJECTS = {
     "косметические карандаши": "Косметические карандаши",
 }
 
-# Жёсткий контур управления: любые решения/API только по этим 4 предметам.
+# Жёсткий контур управления: любые решения/API только по кистям и карандашам.
 MANAGED_SUBJECTS_CANON = {
     "Кисти косметические",
-    "Помады",
-    "Блески",
     "Косметические карандаши",
 }
-# Кисти не паузим автоматически: пауза разрешена только этим предметам.
-PAUSE_ALLOWED_SUBJECTS_CANON = {"Помады", "Блески", "Косметические карандаши"}
+# Кисти не паузим автоматически: пауза разрешена только карандашам.
+PAUSE_ALLOWED_SUBJECTS_CANON = {"Косметические карандаши"}
 
 # Артикулы, которые полностью исключены из автоматического управления ставками/паузами.
 # Они не участвуют в расчёте решений, очереди разгона и API payload.
@@ -115,7 +113,7 @@ def is_pause_allowed_subject_value(value: Any) -> bool:
 
 
 def filter_managed_subjects(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
-    """Оставляет только 4 управляемые категории перед расчётом решений/API.
+    """Оставляет только 2 управляемые категории перед расчётом решений/API.
 
     Это hard guard: если предмет пустой или не входит в контур, строка не должна
     попасть ни в решения, ни тем более в API.
@@ -2378,27 +2376,16 @@ def maybe_send_brush_tg_alert(
     pdf_path: Optional[Path] = None,
     period_label: str = "",
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    alerts = build_brush_problem_alerts(decisions)
-    now = _now_msk()
-    lock_key = f"{BRUSH_TG_LOCK_PREFIX}/brush_tg_{now.date().isoformat()}.json"
-    result = {
+    """Отключено по ТЗ: расчёт и отправка проблемных кистей не используются."""
+    return pd.DataFrame(), {
         "tg_attempted": False,
         "tg_sent": False,
-        "tg_status": "not_requested",
-        "tg_lock_key": lock_key,
-        "tg_rows": int(len(alerts)),
-        "tg_pdf_path": str(pdf_path) if pdf_path else "",
+        "tg_status": "disabled_by_config",
+        "tg_rows": 0,
+        "tg_pdf_path": "",
+        "tg_pdf_created": False,
     }
 
-    if pdf_path is not None:
-        try:
-            build_brush_problem_pdf(alerts, Path(pdf_path), period_label=period_label)
-            result["tg_pdf_created"] = True
-        except Exception as exc:
-            result["tg_status"] = "pdf_build_exception"
-            result["tg_response"] = repr(exc)[:500]
-            result["tg_pdf_created"] = False
-            return alerts, result
 
     if schedule_only:
         # Monday 19:05 MSK or later. After midnight it becomes Tuesday and is blocked by weekday guard.
@@ -2644,44 +2631,29 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
         full_api_log = append_excel(api_log_path, api_log)
         summary = make_summary_json(mode, decisions, successful, full_api_log, windows, args)
 
+        # Расчёт проблемных кистей и отправка в TG отключены по ТЗ.
         brush_tg_alerts = pd.DataFrame()
-        brush_tg_result: Dict[str, Any] = {"tg_status": "not_requested"}
-        brush_tg_pdf_out = workdir / "Проблемные_кисти_WB_Ads.pdf"
-        if bool(getattr(args, "send_brush_tg", False)):
-            period_label = f"{windows['current_start'].date().strftime('%d.%m')}-{windows['current_end'].date().strftime('%d.%m.%Y')} / сначала ПОИСК, затем ПОЛКИ"
-            brush_tg_alerts, brush_tg_result = maybe_send_brush_tg_alert(
-                s3,
-                bucket,
-                decisions,
-                force=bool(getattr(args, "force_brush_tg", False)),
-                schedule_only=bool(getattr(args, "brush_tg_schedule_only", False)),
-                pdf_path=brush_tg_pdf_out,
-                period_label=period_label,
-            )
-            summary["TG кисти: статус"] = brush_tg_result.get("tg_status", "")
-            summary["TG кисти: строк"] = int(brush_tg_result.get("tg_rows", 0) or 0)
-            summary["TG кисти: PDF"] = "да" if brush_tg_result.get("tg_pdf_created") else "нет"
-            summary["TG кисти: отправлено"] = "да" if brush_tg_result.get("tg_sent") else "нет"
+        brush_tg_result: Dict[str, Any] = {
+            "tg_status": "disabled_by_config",
+            "tg_rows": 0,
+            "tg_pdf_created": False,
+            "tg_sent": False,
+        }
 
         summary_path = workdir / "Сводка_последнего_запуска.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         bid_history_out = workdir / "История_ставок.xlsx"
         pause_history_out = workdir / "История_пауз.xlsx"
         api_log_out = workdir / "Лог_API.xlsx"
-        brush_tg_out = workdir / "Проблемные_кисти_TG.xlsx"
         bid_history.to_excel(bid_history_out, index=False)
         pause_history.to_excel(pause_history_out, index=False)
         full_api_log.to_excel(api_log_out, index=False)
-        brush_tg_alerts.to_excel(brush_tg_out, index=False)
 
         upload_s3_bytes(s3, bucket, PREVIEW_OUTPUT_KEY if mode == "preview" else RUN_OUTPUT_KEY, local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, SUMMARY_JSON_KEY, summary_path.read_bytes(), "application/json")
         upload_s3_bytes(s3, bucket, API_LOG_KEY, api_log_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, BID_HISTORY_KEY, bid_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, PAUSE_HISTORY_KEY, pause_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        upload_s3_bytes(s3, bucket, BRUSH_TG_ALERT_KEY, brush_tg_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        if brush_tg_pdf_out.exists():
-            upload_s3_bytes(s3, bucket, BRUSH_TG_PDF_KEY, brush_tg_pdf_out.read_bytes(), "application/pdf")
 
         # Copy to repository workspace for GitHub artifacts.
         Path(local_out.name).write_bytes(local_out.read_bytes())
@@ -2689,9 +2661,6 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
         Path(api_log_out.name).write_bytes(api_log_out.read_bytes())
         Path(bid_history_out.name).write_bytes(bid_history_out.read_bytes())
         Path(pause_history_out.name).write_bytes(pause_history_out.read_bytes())
-        Path(brush_tg_out.name).write_bytes(brush_tg_out.read_bytes())
-        if brush_tg_pdf_out.exists():
-            Path(brush_tg_pdf_out.name).write_bytes(brush_tg_pdf_out.read_bytes())
 
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     return 0
@@ -2720,9 +2689,9 @@ def build_legacy_runner_parser() -> argparse.ArgumentParser:
     p.add_argument("--night-experiment-only", action="store_true")
     p.add_argument("--night-experiment-slot", choices=["start", "end", ""], default="")
     p.add_argument("--rollback-wrong-pauses-only", action="store_true", help="Разово запустить обратно кампании, ошибочно поставленные на паузу FIX46 v47")
-    p.add_argument("--send-brush-tg", action="store_true", help="Сформировать и отправить TG по проблемным кистям")
-    p.add_argument("--force-brush-tg", action="store_true", help="Отправить TG по кистям без дневного lock, для ручного запуска")
-    p.add_argument("--brush-tg-schedule-only", action="store_true", help="TG по кистям только если понедельник >=19:05 МСК")
+    p.add_argument("--send-brush-tg", action="store_true", help="Игнорируется: TG/проблемные кисти удалены из контура")
+    p.add_argument("--force-brush-tg", action="store_true", help="Игнорируется: TG/проблемные кисти удалены из контура")
+    p.add_argument("--brush-tg-schedule-only", action="store_true", help="Игнорируется: TG/проблемные кисти удалены из контура")
     return p
 
 
@@ -2742,8 +2711,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 # V69 OVERRIDES: GP + CORE + POSTCHECK
 # =========================
 
-SCRIPT_VERSION = "v70-gp-core-postcheck-night-guard-fix-2026-06-25"
-VERSION = "FIX46_CORE_RAMP_PAUSE_20260611_V70_GP_CORE_POSTCHECK"
+SCRIPT_VERSION = "v75-core90-collect-only-2026-07-03"
+VERSION = "FIX48_BRUSHES_PENCILS_CORE90_COLLECT_ONLY"
 
 DRR_FORECAST_CAP_PCT = 15.0
 BRUSH_BID_CAP_DRR_PCT = 15.0
@@ -2752,6 +2721,9 @@ CORE_FLAGSHIP_TARGET_POSITION = 5
 CORE_CLICK_LIFT_GOOD_PCT = 10.0
 CORE_CLICK_LIFT_WEAK_PCT = 5.0
 STORAGE_PCT_OF_SUM = 0.5
+CORE_LOOKBACK_DAYS = 90
+KEYWORD_WEEKLY_DOWNLOAD_LIMIT = 16
+CORE_90D_DECISION_INFLUENCE = False
 
 SEARCH_WEEKLY_PREFIX_CANDIDATES = [
     "Отчёты/Позиции по Ключам/TOPFACE/Недельные/",
@@ -3903,7 +3875,7 @@ def _download_candidate_keys(s3_client, bucket: str, candidates: Sequence[str], 
             if s3_key_exists(s3_client, bucket, candidate):
                 out.append(download_key_to_dir(s3_client, bucket, candidate, workdir))
         else:
-            for key in latest_excel_keys(s3_client, bucket, candidate, limit=6):
+            for key in latest_excel_keys(s3_client, bucket, candidate, limit=KEYWORD_WEEKLY_DOWNLOAD_LIMIT):
                 out.append(download_key_to_dir(s3_client, bucket, key, workdir))
     # dedupe
     seen = set()
@@ -3984,53 +3956,35 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
         full_api_log = append_excel(api_log_path, api_log)
         summary = make_summary_json(mode, decisions, successful, full_api_log, windows, args)
 
+        # Расчёт проблемных кистей и отправка в TG отключены по ТЗ.
         brush_tg_alerts = pd.DataFrame()
-        brush_tg_result: Dict[str, Any] = {"tg_status": "not_requested"}
-        brush_tg_pdf_out = workdir / "Проблемные_кисти_WB_Ads.pdf"
-        if bool(getattr(args, "send_brush_tg", False)):
-            period_label = f"{windows['current_start'].date().strftime('%d.%m')}-{windows['current_end'].date().strftime('%d.%m.%Y')} / сначала ПОИСК, затем ПОЛКИ"
-            brush_tg_alerts, brush_tg_result = maybe_send_brush_tg_alert(
-                s3,
-                bucket,
-                decisions,
-                force=bool(getattr(args, "force_brush_tg", False)),
-                schedule_only=bool(getattr(args, "brush_tg_schedule_only", False)),
-                pdf_path=brush_tg_pdf_out,
-                period_label=period_label,
-            )
-            summary["TG кисти: статус"] = brush_tg_result.get("tg_status", "")
-            summary["TG кисти: строк"] = int(brush_tg_result.get("tg_rows", 0) or 0)
-            summary["TG кисти: PDF"] = "да" if brush_tg_result.get("tg_pdf_created") else "нет"
-            summary["TG кисти: отправлено"] = "да" if brush_tg_result.get("tg_sent") else "нет"
+        brush_tg_result: Dict[str, Any] = {
+            "tg_status": "disabled_by_config",
+            "tg_rows": 0,
+            "tg_pdf_created": False,
+            "tg_sent": False,
+        }
 
         summary_path = workdir / "Сводка_последнего_запуска.json"
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         bid_history_out = workdir / "История_ставок.xlsx"
         pause_history_out = workdir / "История_пауз.xlsx"
         api_log_out = workdir / "Лог_API.xlsx"
-        brush_tg_out = workdir / "Проблемные_кисти_TG.xlsx"
         bid_history.to_excel(bid_history_out, index=False)
         pause_history.to_excel(pause_history_out, index=False)
         full_api_log.to_excel(api_log_out, index=False)
-        brush_tg_alerts.to_excel(brush_tg_out, index=False)
 
         upload_s3_bytes(s3, bucket, PREVIEW_OUTPUT_KEY if mode == "preview" else RUN_OUTPUT_KEY, local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, SUMMARY_JSON_KEY, summary_path.read_bytes(), "application/json")
         upload_s3_bytes(s3, bucket, API_LOG_KEY, api_log_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, BID_HISTORY_KEY, bid_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_s3_bytes(s3, bucket, PAUSE_HISTORY_KEY, pause_history_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        upload_s3_bytes(s3, bucket, BRUSH_TG_ALERT_KEY, brush_tg_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        if brush_tg_pdf_out.exists():
-            upload_s3_bytes(s3, bucket, BRUSH_TG_PDF_KEY, brush_tg_pdf_out.read_bytes(), "application/pdf")
 
         Path(local_out.name).write_bytes(local_out.read_bytes())
         Path(summary_path.name).write_bytes(summary_path.read_bytes())
         Path(api_log_out.name).write_bytes(api_log_out.read_bytes())
         Path(bid_history_out.name).write_bytes(bid_history_out.read_bytes())
         Path(pause_history_out.name).write_bytes(pause_history_out.read_bytes())
-        Path(brush_tg_out.name).write_bytes(brush_tg_out.read_bytes())
-        if brush_tg_pdf_out.exists():
-            Path(brush_tg_pdf_out.name).write_bytes(brush_tg_pdf_out.read_bytes())
 
         print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     return 0
@@ -4061,9 +4015,9 @@ def build_legacy_runner_parser() -> argparse.ArgumentParser:
     p.add_argument("--night-experiment-only", action="store_true")
     p.add_argument("--night-experiment-slot", choices=["start", "end", ""], default="")
     p.add_argument("--rollback-wrong-pauses-only", action="store_true", help="Разово запустить обратно кампании, ошибочно поставленные на паузу FIX46 v47")
-    p.add_argument("--send-brush-tg", action="store_true", help="Сформировать и отправить TG по проблемным кистям")
-    p.add_argument("--force-brush-tg", action="store_true", help="Отправить TG по кистям без дневного lock, для ручного запуска")
-    p.add_argument("--brush-tg-schedule-only", action="store_true", help="TG по кистям только если понедельник >=19:05 МСК")
+    p.add_argument("--send-brush-tg", action="store_true", help="Игнорируется: TG/проблемные кисти удалены из контура")
+    p.add_argument("--force-brush-tg", action="store_true", help="Игнорируется: TG/проблемные кисти удалены из контура")
+    p.add_argument("--brush-tg-schedule-only", action="store_true", help="Игнорируется: TG/проблемные кисти удалены из контура")
     return p
 
 
@@ -4077,6 +4031,210 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     return run_local(args)
 
+
+
+
+# =========================
+# V75 OVERRIDES: CORE 90D DIAGNOSTICS ONLY
+# =========================
+LAST_CORE_90D_DIAGNOSTICS = pd.DataFrame()
+_WRITE_OUTPUTS_BASE_V75 = write_outputs
+
+
+def _kw_idx(header_map: Dict[str, int], names: Sequence[str]) -> Optional[int]:
+    for name in names:
+        if name in header_map:
+            return header_map[name]
+    return None
+
+
+def load_keywords_daily_90d(path: Optional[str], windows: Optional[Dict[str, pd.Timestamp]] = None) -> pd.DataFrame:
+    from openpyxl import load_workbook
+    if not path:
+        return pd.DataFrame()
+    as_of = pd.Timestamp(windows.get("as_of") if windows else pd.Timestamp(datetime.now().date())).normalize()
+    end_day = as_of - pd.Timedelta(days=1)
+    start_day = end_day - pd.Timedelta(days=CORE_LOOKBACK_DAYS - 1)
+    frames: List[pd.DataFrame] = []
+    for pth in expand_input_paths(path):
+        try:
+            wb = load_workbook(pth, read_only=True, data_only=True)
+            sh = next((s for s in wb.sheetnames if "ключ" in s.lower() or "пози" in s.lower()), wb.sheetnames[0])
+            ws = wb[sh]
+            rows = ws.iter_rows(values_only=True)
+            header = next(rows)
+            hm = {str(v).strip(): i for i, v in enumerate(header) if v is not None}
+            ix_day = _kw_idx(hm, ["Дата", "date", "day"])
+            ix_query = _kw_idx(hm, ["Поисковый запрос", "Запрос", "query_text", "search_query"])
+            ix_article = _kw_idx(hm, ["Артикул продавца", "supplierArticle", "supplier_article"])
+            ix_nm = _kw_idx(hm, ["Артикул WB", "nmId", "nm_id"])
+            ix_subject = _kw_idx(hm, ["Предмет", "Название предмета", "subject"])
+            ix_freq = _kw_idx(hm, ["Частота запросов", "Частота за неделю", "Частотность", "frequency"])
+            ix_pos = _kw_idx(hm, ["Медианная позиция", "Позиция", "median_position"])
+            ix_vis = _kw_idx(hm, ["Видимость %", "Видимость", "visibility_pct"])
+            ix_clicks = _kw_idx(hm, ["Переходы в карточку", "Клики", "clicks"])
+            ix_impr = _kw_idx(hm, ["Показы", "impressions"])
+            ix_orders = _kw_idx(hm, ["Заказы", "orders"])
+            recs = []
+            for row in rows:
+                article = clean_article(row[ix_article] if ix_article is not None else "")
+                query = str(row[ix_query]).strip() if ix_query is not None and row[ix_query] is not None else ""
+                if not article or not query:
+                    continue
+                recs.append({
+                    "day": row[ix_day] if ix_day is not None else None,
+                    "supplier_article": article,
+                    "nm_id": row[ix_nm] if ix_nm is not None else None,
+                    "subject_norm": canon_subject(row[ix_subject] if ix_subject is not None else ""),
+                    "query_text": query,
+                    "frequency": row[ix_freq] if ix_freq is not None else None,
+                    "median_position": row[ix_pos] if ix_pos is not None else None,
+                    "visibility_pct": row[ix_vis] if ix_vis is not None else None,
+                    "clicks": row[ix_clicks] if ix_clicks is not None else None,
+                    "impressions": row[ix_impr] if ix_impr is not None else None,
+                    "orders": row[ix_orders] if ix_orders is not None else None,
+                    "source_file": Path(pth).name,
+                    "source_sheet": sh,
+                })
+            raw = pd.DataFrame(recs)
+        except Exception as exc:
+            print(f"WARNING: не удалось прочитать 90д поисковые запросы {pth}: {exc}", flush=True)
+            raw = pd.DataFrame()
+        if raw.empty:
+            continue
+        raw["day"] = to_date(raw["day"])
+        raw = raw[raw["day"].notna()].copy()
+        raw = raw[(raw["day"] >= start_day) & (raw["day"] <= end_day)].copy()
+        if raw.empty:
+            continue
+        for c in ["frequency", "median_position", "visibility_pct", "clicks", "impressions", "orders"]:
+            raw[c] = to_num(raw[c])
+        raw["frequency"] = raw["frequency"].fillna(0.0)
+        raw["clicks"] = raw["clicks"].fillna(0.0)
+        raw["orders"] = raw["orders"].fillna(0.0)
+        raw["product_root"] = raw["supplier_article"].map(product_root)
+        raw["query_text_norm"] = raw["query_text"].astype(str).str.strip().str.lower()
+        raw = raw.drop_duplicates(["supplier_article", "query_text_norm", "day"], keep="last")
+        frames.append(raw)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def build_core_90d_diagnostics(keyword_daily: pd.DataFrame, campaign_metrics: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
+    if keyword_daily is None or keyword_daily.empty:
+        return pd.DataFrame()
+    work = keyword_daily.copy()
+    if "subject_norm" in work.columns:
+        work = work[work["subject_norm"].map(is_managed_subject_value)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    if campaign_metrics is not None and not campaign_metrics.empty and "placement" in campaign_metrics.columns:
+        s = campaign_metrics[campaign_metrics["placement"].astype(str).eq("search")].copy()
+    else:
+        s = pd.DataFrame()
+    if not s.empty:
+        cpc_tbl = s.groupby("supplier_article", as_index=False).agg(clicks_cur=("clicks_cur", "sum"), spend_cur=("spend_cur", "sum"))
+        cpc_tbl["proxy_cpc"] = np.where(cpc_tbl["clicks_cur"] > 0, cpc_tbl["spend_cur"] / cpc_tbl["clicks_cur"], np.nan)
+        cpc_map = cpc_tbl.set_index("supplier_article")["proxy_cpc"].to_dict()
+    else:
+        cpc_map = {}
+    rows = []
+    for key, part in work.groupby(["supplier_article", "product_root", "subject_norm", "query_text_norm"], dropna=False):
+        part = part.sort_values("day")
+        latest = part.iloc[-1]
+        mean_orders = float(part["orders"].mean())
+        high = part[part["orders"] > mean_orders].copy()
+        cpc = cpc_map.get(key[0], np.nan)
+        clicks_90 = float(part["clicks"].sum())
+        orders_90 = float(part["orders"].sum())
+        if orders_90 <= 0:
+            continue
+        def avg(col): return float(part[col].mean()) if col in part else np.nan
+        def havg(col): return float(high[col].mean()) if (not high.empty and col in high) else np.nan
+        latest_freq = float(latest.get("frequency", np.nan)) if pd.notna(latest.get("frequency", np.nan)) else np.nan
+        latest_vis = float(latest.get("visibility_pct", np.nan)) if pd.notna(latest.get("visibility_pct", np.nan)) else np.nan
+        latest_clicks = float(latest.get("clicks", np.nan)) if pd.notna(latest.get("clicks", np.nan)) else np.nan
+        latest_orders = float(latest.get("orders", np.nan)) if pd.notna(latest.get("orders", np.nan)) else np.nan
+        target_clicks = havg("clicks")
+        target_orders = havg("orders")
+        target_freq = havg("frequency")
+        target_pos = havg("median_position")
+        target_vis = havg("visibility_pct")
+        target_impr = havg("impressions")
+        latest_pos = float(latest.get("median_position", np.nan)) if pd.notna(latest.get("median_position", np.nan)) else np.nan
+        latest_impr = float(latest.get("impressions", np.nan)) if pd.notna(latest.get("impressions", np.nan)) else np.nan
+        rows.append({
+            "supplier_article": key[0], "product_root": key[1], "subject_norm": key[2],
+            "query_text": str(latest.get("query_text", "") or ""), "query_text_norm": key[3],
+            "period_start": part["day"].min(), "period_end": part["day"].max(),
+            "days_seen_90d": int(part["day"].nunique()), "days_with_orders_90d": int((part["orders"] > 0).sum()),
+            "days_above_avg_orders_90d": int(len(high)),
+            "orders_sum_90d": orders_90, "orders_avg_day_90d": mean_orders, "orders_target_day_high_90d": target_orders, "orders_latest_day": latest_orders,
+            "clicks_sum_90d": clicks_90, "clicks_avg_day_90d": avg("clicks"), "clicks_target_day_high_90d": target_clicks, "clicks_latest_day": latest_clicks,
+            "frequency_avg_day_90d": avg("frequency"), "frequency_target_day_high_90d": target_freq, "frequency_latest_day": latest_freq,
+            "impressions_sum_90d": float(part["impressions"].sum()) if part["impressions"].notna().any() else np.nan,
+            "impressions_proxy_sum_90d": float((part["frequency"].fillna(0) * part["visibility_pct"].fillna(0) / 100).sum()),
+            "impressions_target_day_high_90d": target_impr,
+            "impressions_proxy_target_day_high_90d": float((high["frequency"].fillna(0) * high["visibility_pct"].fillna(0) / 100).mean()) if not high.empty else np.nan,
+            "impressions_latest_day": latest_impr,
+            "impressions_proxy_latest_day": safe_div(latest_freq * latest_vis, 100.0, np.nan) if pd.notna(latest_freq) and pd.notna(latest_vis) else np.nan,
+            "median_position_avg_90d": avg("median_position"), "median_position_target_high_90d": target_pos, "median_position_latest_day": latest_pos,
+            "visibility_avg_90d": avg("visibility_pct"), "visibility_target_high_90d": target_vis, "visibility_latest_day": latest_vis,
+            "proxy_search_cpc_cur": cpc,
+            "query_spend_est_90d": clicks_90 * cpc if pd.notna(cpc) else np.nan,
+            "query_cpo_est_90d": safe_div(clicks_90 * cpc, orders_90, np.nan) if pd.notna(cpc) else np.nan,
+            "query_cpo_target_high_90d": safe_div(target_clicks * cpc, target_orders, np.nan) if pd.notna(cpc) and pd.notna(target_clicks) and pd.notna(target_orders) else np.nan,
+            "latest_clicks_vs_target_pct": ((latest_clicks - target_clicks) / abs(target_clicks) * 100) if pd.notna(latest_clicks) and pd.notna(target_clicks) and target_clicks else np.nan,
+            "latest_orders_vs_target_pct": ((latest_orders - target_orders) / abs(target_orders) * 100) if pd.notna(latest_orders) and pd.notna(target_orders) and target_orders else np.nan,
+            "latest_frequency_vs_target_pct": ((latest_freq - target_freq) / abs(target_freq) * 100) if pd.notna(latest_freq) and pd.notna(target_freq) and target_freq else np.nan,
+            "latest_position_vs_target_delta": latest_pos - target_pos if pd.notna(latest_pos) and pd.notna(target_pos) else np.nan,
+            "latest_visibility_vs_target_delta": latest_vis - target_vis if pd.notna(latest_vis) and pd.notna(target_vis) else np.nan,
+            "cpo_calc_method": "оценка: клики × средний CPC поисковой РК / заказы",
+            "diagnostic_note": "CORE 90 дней; в решение не влияет",
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    total_orders = out.groupby("supplier_article")["orders_sum_90d"].transform("sum")
+    out["query_orders_share_article_90d_pct"] = np.where(total_orders > 0, out["orders_sum_90d"] / total_orders * 100, np.nan)
+    out["query_rank_by_orders_article_90d"] = out.groupby("supplier_article")["orders_sum_90d"].rank(method="first", ascending=False)
+    return out.sort_values(["supplier_article", "query_rank_by_orders_article_90d", "orders_sum_90d"], ascending=[True, True, False])
+
+
+def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.Timestamp], pd.DataFrame]:
+    global LAST_CORE_90D_DIAGNOSTICS
+    as_of = pd.Timestamp(args.as_of).normalize() if getattr(args, "as_of", None) else pd.Timestamp(datetime.now().date())
+    windows = date_windows(as_of)
+    ads, campaigns = load_ads_daily(args.ads)
+    orders = load_orders(getattr(args, "orders", None))
+    bid_history = load_bid_history(getattr(args, "bid_history", None))
+    pause_history = load_pause_history(getattr(args, "pause_history", None))
+    weekly_spec = getattr(args, "keywords_weekly", None)
+    keywords = load_keywords_weekly(weekly_spec) if weekly_spec else pd.DataFrame()
+    keywords_daily_90d = load_keywords_daily_90d(weekly_spec, windows) if weekly_spec else pd.DataFrame()
+    if keywords.empty:
+        keywords = load_keywords_from_previous(getattr(args, "previous_output", None))
+    econ = load_economics(getattr(args, "economics", None)) if getattr(args, "economics", None) else pd.DataFrame()
+    campaign_base = build_campaign_base(ads, campaigns, orders, bid_history, windows)
+    campaign_base = filter_excluded_articles(campaign_base, "campaign_base_excluded_articles")
+    campaign_base = apply_profitability_metrics(campaign_base, econ, windows)
+    campaign_base = compute_bid_caps(campaign_base)
+    core = build_core_efficiency(keywords, campaigns, campaign_base, windows)
+    LAST_CORE_90D_DIAGNOSTICS = build_core_90d_diagnostics(keywords_daily_90d, campaign_base, windows)
+    decisions = decide_all(campaign_base, pd.DataFrame(), pause_history, windows)
+    payload = build_payload_preview(decisions)
+    postcheck = build_postcheck_report(decisions, bid_history, windows)
+    return decisions, core, payload, windows, postcheck
+
+
+def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payload: pd.DataFrame, windows: Dict[str, pd.Timestamp], postcheck: Optional[pd.DataFrame] = None) -> None:
+    _WRITE_OUTPUTS_BASE_V75(path, decisions, core, payload, windows, postcheck)
+    core90 = LAST_CORE_90D_DIAGNOSTICS
+    mode = "a" if Path(path).exists() else "w"
+    with pd.ExcelWriter(path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
+        if core90 is not None and not core90.empty:
+            core90.to_excel(writer, sheet_name="CORE_90д_диагностика", index=False)
+        else:
+            pd.DataFrame({"note": ["Нет данных CORE за последние 90 дней или weekly query files не найдены. На решения не влияет."]}).to_excel(writer, sheet_name="CORE_90д_диагностика", index=False)
 
 if __name__ == "__main__":
     raise SystemExit(main())
