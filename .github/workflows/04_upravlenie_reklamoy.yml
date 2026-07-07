@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # GitHub cron работает в UTC. Москва = UTC+3.
-    # Основной контур: каждые 10 минут с 18:00 до 23:50 МСК.
+    # Основной контур schedule: каждые 10 минут с 18:00 до 23:50 МСК; manual запускается сразу.
     # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
     - cron: "*/10 15-20 * * *"
 
@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v75_core90_collect_only_2026-07-03"
+  WORKFLOW_VERSION: "v76_economics_core_mapping_fix_2026-07-03"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
