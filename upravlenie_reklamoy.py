@@ -4236,5 +4236,393 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
         else:
             pd.DataFrame({"note": ["Нет данных CORE за последние 90 дней или weekly query files не найдены. На решения не влияет."]}).to_excel(writer, sheet_name="CORE_90д_диагностика", index=False)
 
+# V76 keeps references to v75 implementations before overriding them.
+_BUILD_CAMPAIGN_BASE_V75 = build_campaign_base
+_BUILD_CORE_EFFICIENCY_V75 = build_core_efficiency
+
+
+
+# =========================
+# V76 OVERRIDES: economics + mapping + clean summary
+# =========================
+
+SCRIPT_VERSION = "v76-economics-core-mapping-fix-2026-07-03"
+VERSION = "FIX49_BRUSHES_PENCILS_ECONOMICS_CORE_MAPPING_FIX"
+
+# Known campaign_id -> supplier_article safety net. Normal path still tries campaign name / reports first.
+CAMPAIGN_ARTICLE_FALLBACK_V76 = {
+    29651217: "901/6",
+    29656882: "901/20",
+    33303545: "901/16",
+    33303562: "901/6",
+    33303580: "901/10",
+    33303619: "901/7",
+    33303650: "901/20",
+    33303804: "901/19",
+    33937828: "901/3",
+}
+
+LAST_ECONOMICS_DIAGNOSTICS = pd.DataFrame()
+
+
+def _normalize_header_v76(v: Any) -> str:
+    return re.sub(r"[^a-zа-я0-9]+", "", str(v or "").strip().lower().replace("ё", "е"))
+
+
+def _first_matching_column_v76(columns: Sequence[Any], aliases: Sequence[str]) -> Optional[Any]:
+    norm = {_normalize_header_v76(c): c for c in columns}
+    for a in aliases:
+        key = _normalize_header_v76(a)
+        if key in norm:
+            return norm[key]
+    # relaxed contains pass for common economics columns
+    for c in columns:
+        nc = _normalize_header_v76(c)
+        for a in aliases:
+            na = _normalize_header_v76(a)
+            if na and na in nc:
+                return c
+    return None
+
+
+def _detect_header_row_v76(raw: pd.DataFrame) -> int:
+    article_keys = {_normalize_header_v76(x) for x in ["Артикул продавца", "Артикул", "supplierArticle", "Seller item No."]}
+    metric_needles = ["комис", "эквайр", "спп", "себест", "логист"]
+    best_i = 0
+    best_score = -1
+    for i in range(min(len(raw), 40)):
+        vals = [_normalize_header_v76(x) for x in raw.iloc[i].tolist()]
+        score = 0
+        if any(v in article_keys for v in vals):
+            score += 5
+        score += sum(1 for v in vals for m in metric_needles if m in v)
+        if score > best_score:
+            best_score = score
+            best_i = i
+    return best_i
+
+
+def _pct_normalize_v76(series: pd.Series) -> pd.Series:
+    s_num = to_num(series)
+    vals = s_num.dropna().abs()
+    if len(vals) and vals.quantile(0.75) <= 1.5:
+        s_num = s_num * 100.0
+    return s_num
+
+
+def _coalesce_cols_v76(df: pd.DataFrame, candidates: Sequence[Optional[Any]], default: Any = np.nan) -> pd.Series:
+    out = pd.Series([default] * len(df), index=df.index)
+    for c in candidates:
+        if c is not None and c in df.columns:
+            cur = df[c]
+            out = out.where(out.notna() & out.astype(str).str.strip().ne(""), cur)
+    return out
+
+
+def load_economics(path: Optional[str]) -> pd.DataFrame:
+    """Robust Экономика.xlsx reader.
+
+    The previous implementation required an exact week and exact header names. In real files this can vary:
+    sheet names, header row position, percentage format and week labels are not stable. This version reads all
+    sheets, detects the header row, normalizes percentages and later falls back to nearest/latest week.
+    """
+    global LAST_ECONOMICS_DIAGNOSTICS
+    paths = expand_input_paths(path)
+    frames: List[pd.DataFrame] = []
+    diag: List[Dict[str, Any]] = []
+    aliases = {
+        "week_label": ["Неделя", "Год-неделя", "week", "Период", "Дата", "Дата сбора"],
+        "nm_id": ["Артикул WB", "nmId", "nm_id", "WB item No.", "Номенклатура WB"],
+        "supplier_article": ["Артикул продавца", "supplierArticle", "Seller item No.", "Артикул", "Артикул 1С"],
+        "subject_norm": ["Предмет", "Название предмета", "Категория", "subject"],
+        "avg_sale_price": ["Средняя цена продажи", "Цена продажи", "Средняя продажная цена", "Цена продажная"],
+        "avg_buyer_price": ["Средняя цена покупателя", "Цена покупателя", "Цена с СПП", "Цена покупателя, руб"],
+        "spp_pct": ["СПП, %", "Среднее СПП", "СПП", "СПП %", "Средний СПП"],
+        "commission_pct": ["Комиссия WB, %", "Комиссия, %", "Комиссия", "Комиссия %"],
+        "acquiring_pct": ["Эквайринг, %", "Эквайринг", "Эквайринг %"],
+        "logistics_direct_unit": ["Логистика прямая, руб/ед", "Логистика/шт", "Логистика, руб/ед", "Логистика", "Логистика прям., руб/ед"],
+        "logistics_reverse_unit": ["Логистика обратная, руб/ед", "Обратная логистика, руб/ед", "Обратная логистика"],
+        "storage_unit": ["Хранение, руб/ед", "Хранение/шт", "Хранение"],
+        "cogs_unit": ["Себестоимость, руб", "Себестоимость/шт", "Себест./шт", "Себестоимость", "Себестоимость, руб/ед"],
+        "gross_profit_unit": ["Валовая прибыль, руб/ед", "ВП, руб/ед", "ВП ABC", "Валовая прибыль"],
+        "net_sales_qty": ["Чистые продажи, шт", "Продажи, шт", "Заказы, шт", "Количество", "Шт"],
+    }
+    for pth in paths:
+        try:
+            xl = pd.ExcelFile(pth)
+        except Exception as exc:
+            diag.append({"file": str(pth), "sheet": "", "status": "excel_open_error", "detail": repr(exc), "rows": 0})
+            continue
+        for sh in xl.sheet_names:
+            try:
+                raw = pd.read_excel(pth, sheet_name=sh, header=None, dtype=object)
+                if raw.empty:
+                    diag.append({"file": Path(pth).name, "sheet": sh, "status": "empty", "detail": "", "rows": 0})
+                    continue
+                header_i = _detect_header_row_v76(raw)
+                header = raw.iloc[header_i].fillna("").astype(str).str.strip().tolist()
+                df = raw.iloc[header_i + 1:].copy()
+                df.columns = header
+                df = df.dropna(how="all")
+                if df.empty:
+                    diag.append({"file": Path(pth).name, "sheet": sh, "status": "no_data_after_header", "detail": f"header_row={header_i+1}", "rows": 0})
+                    continue
+                col = {k: _first_matching_column_v76(df.columns, v) for k, v in aliases.items()}
+                if col["supplier_article"] is None:
+                    diag.append({"file": Path(pth).name, "sheet": sh, "status": "skip_no_article_col", "detail": f"header_row={header_i+1}", "rows": 0})
+                    continue
+                rec = pd.DataFrame(index=df.index)
+                rec["week_label"] = df[col["week_label"]].astype(str).str.strip() if col["week_label"] is not None else ""
+                rec["nm_id"] = to_num(df[col["nm_id"]]) if col["nm_id"] is not None else np.nan
+                rec["supplier_article"] = df[col["supplier_article"]].map(clean_article)
+                rec["subject_norm"] = df[col["subject_norm"]].map(canon_subject) if col["subject_norm"] is not None else ""
+                rec["avg_sale_price"] = to_num(df[col["avg_sale_price"]]) if col["avg_sale_price"] is not None else np.nan
+                rec["avg_buyer_price"] = to_num(df[col["avg_buyer_price"]]) if col["avg_buyer_price"] is not None else np.nan
+                rec["spp_pct"] = _pct_normalize_v76(df[col["spp_pct"]]) if col["spp_pct"] is not None else np.nan
+                rec["commission_pct"] = _pct_normalize_v76(df[col["commission_pct"]]) if col["commission_pct"] is not None else np.nan
+                rec["acquiring_pct"] = _pct_normalize_v76(df[col["acquiring_pct"]]) if col["acquiring_pct"] is not None else np.nan
+                rec["logistics_direct_unit"] = to_num(df[col["logistics_direct_unit"]]) if col["logistics_direct_unit"] is not None else np.nan
+                rec["logistics_reverse_unit"] = to_num(df[col["logistics_reverse_unit"]]) if col["logistics_reverse_unit"] is not None else 0.0
+                rec["storage_unit"] = to_num(df[col["storage_unit"]]) if col["storage_unit"] is not None else np.nan
+                rec["cogs_unit"] = to_num(df[col["cogs_unit"]]) if col["cogs_unit"] is not None else np.nan
+                rec["gross_profit_unit"] = to_num(df[col["gross_profit_unit"]]) if col["gross_profit_unit"] is not None else np.nan
+                rec["net_sales_qty"] = to_num(df[col["net_sales_qty"]]) if col["net_sales_qty"] is not None else np.nan
+                rec = rec[rec["supplier_article"].astype(str).str.strip().ne("")].copy()
+                rec = rec[~rec["supplier_article"].astype(str).str.lower().isin(["nan", "none", "итого", "total"])].copy()
+                if rec.empty:
+                    diag.append({"file": Path(pth).name, "sheet": sh, "status": "no_article_rows", "detail": f"header_row={header_i+1}", "rows": 0})
+                    continue
+                rec["nm_id"] = rec["nm_id"].astype("Int64")
+                rec["product_root"] = rec["supplier_article"].map(product_root)
+                rec["logistics_unit"] = rec[["logistics_direct_unit", "logistics_reverse_unit"]].fillna(0).sum(axis=1)
+                rec["source_file"] = Path(pth).name
+                rec["source_sheet"] = sh
+                frames.append(rec)
+                diag.append({"file": Path(pth).name, "sheet": sh, "status": "loaded", "detail": f"header_row={header_i+1}", "rows": int(len(rec))})
+            except Exception as exc:
+                diag.append({"file": Path(pth).name, "sheet": sh, "status": "sheet_error", "detail": repr(exc), "rows": 0})
+    LAST_ECONOMICS_DIAGNOSTICS = pd.DataFrame(diag)
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+    for c in ["avg_sale_price", "avg_buyer_price", "spp_pct", "commission_pct", "acquiring_pct", "logistics_direct_unit", "logistics_reverse_unit", "storage_unit", "cogs_unit", "gross_profit_unit", "net_sales_qty", "logistics_unit"]:
+        if c not in out.columns:
+            out[c] = np.nan
+    # If week is absent, still keep rows: nearest-week lookup will use latest/all fallback.
+    out["week_label"] = out["week_label"].replace({"nan": "", "NaT": "", "None": ""}).fillna("").astype(str).str.strip()
+    # prefer last occurrence from latest file/sheet for article-week duplicates
+    out = out.sort_values(["week_label", "supplier_article", "source_file", "source_sheet"]).drop_duplicates(["week_label", "supplier_article"], keep="last")
+    return out
+
+
+def _week_rank_v76(label: Any) -> float:
+    text = str(label or "").strip()
+    m = re.search(r"(20\d{2})\s*[-_ ]?W\s*(\d{1,2})", text, flags=re.I)
+    if m:
+        return int(m.group(1)) * 100 + int(m.group(2))
+    # Russian week formats like 2026-27 or 27.2026
+    m = re.search(r"(20\d{2})\D+(\d{1,2})", text)
+    if m and 1 <= int(m.group(2)) <= 53:
+        return int(m.group(1)) * 100 + int(m.group(2))
+    m = re.search(r"(\d{1,2})\D+(20\d{2})", text)
+    if m and 1 <= int(m.group(1)) <= 53:
+        return int(m.group(2)) * 100 + int(m.group(1))
+    dt = pd.to_datetime(text, errors="coerce", dayfirst=True)
+    if pd.notna(dt):
+        iso = pd.Timestamp(dt).isocalendar()
+        return int(iso.year) * 100 + int(iso.week)
+    return -1.0
+
+
+def _pick_econ_slice_v76(econ: pd.DataFrame, week_label: str) -> pd.DataFrame:
+    if econ is None or econ.empty:
+        return pd.DataFrame()
+    e = econ.copy()
+    e["_week_rank"] = e["week_label"].map(_week_rank_v76) if "week_label" in e.columns else -1.0
+    target = _week_rank_v76(week_label)
+    if target >= 0 and (e["_week_rank"] == target).any():
+        return e[e["_week_rank"].eq(target)].copy()
+    valid = e[e["_week_rank"].ge(0)].copy()
+    if not valid.empty and target >= 0:
+        before = valid[valid["_week_rank"].le(target)]
+        if not before.empty:
+            rank = before["_week_rank"].max()
+            return before[before["_week_rank"].eq(rank)].copy()
+    if not valid.empty:
+        rank = valid["_week_rank"].max()
+        return valid[valid["_week_rank"].eq(rank)].copy()
+    return e.copy()
+
+
+def _weighted_group_agg_v76(part: pd.DataFrame) -> Dict[str, float]:
+    cols = ["spp_pct", "commission_pct", "acquiring_pct", "logistics_unit", "cogs_unit", "avg_sale_price", "avg_buyer_price"]
+    weights = pd.to_numeric(part.get("net_sales_qty", pd.Series(index=part.index, dtype=float)), errors="coerce").fillna(0)
+    out: Dict[str, float] = {}
+    for c in cols:
+        vals = pd.to_numeric(part.get(c, pd.Series(index=part.index, dtype=float)), errors="coerce")
+        m = vals.notna()
+        if m.any() and weights.loc[m].sum() > 0:
+            out[c] = float((vals.loc[m] * weights.loc[m]).sum() / weights.loc[m].sum())
+        elif m.any():
+            out[c] = float(vals.loc[m].mean())
+        else:
+            out[c] = np.nan
+    return out
+
+
+def _build_econ_lookups(econ: pd.DataFrame, week_label: str) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+    e = _pick_econ_slice_v76(econ, week_label)
+    if e is None or e.empty:
+        return {}, {}
+    article_map: Dict[str, Dict[str, float]] = {}
+    for _, r in e.iterrows():
+        art = clean_article(r.get("supplier_article", ""))
+        if art:
+            article_map[art] = r.to_dict()
+    group_map: Dict[str, Dict[str, float]] = {}
+    if "product_root" in e.columns:
+        for root, part in e.groupby("product_root", dropna=False):
+            root = str(root or "")
+            if root:
+                group_map[root] = _weighted_group_agg_v76(part)
+                group_map[root]["product_root"] = root
+    return article_map, group_map
+
+
+def _restore_missing_article_v76(row: pd.Series) -> str:
+    article = clean_article(row.get("supplier_article", ""))
+    if article and article.lower() not in {"nan", "none", "без артикула"}:
+        return article
+    for field in ["campaign_name", "name", "campaignName"]:
+        if field in row.index:
+            article = extract_article_from_campaign_name(row.get(field))
+            if article:
+                return clean_article(article)
+    try:
+        cid = int(float(row.get("campaign_id")))
+    except Exception:
+        return ""
+    return CAMPAIGN_ARTICLE_FALLBACK_V76.get(cid, "")
+
+
+def _apply_article_mapping_v76(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "supplier_article" not in out.columns:
+        out["supplier_article"] = ""
+    out["supplier_article"] = out.apply(_restore_missing_article_v76, axis=1)
+    out["product_root"] = out["supplier_article"].map(product_root)
+    return out
+
+
+def build_campaign_base(ads: pd.DataFrame, campaigns: pd.DataFrame, orders: pd.DataFrame, bid_history: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
+    # Use previous v75 implementation, then patch article mapping at the final base level.
+    df = _BUILD_CAMPAIGN_BASE_V75(ads, campaigns, orders, bid_history, windows)
+    df = _apply_article_mapping_v76(df, "campaign_base_after_build")
+    return df
+
+
+def build_core_efficiency(keywords: pd.DataFrame, campaigns: pd.DataFrame, campaign_base: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
+    core = _BUILD_CORE_EFFICIENCY_V75(keywords, campaigns, campaign_base, windows)
+    if core is not None and not core.empty and "subject_norm" in core.columns:
+        core = core[core["subject_norm"].map(is_managed_subject_value)].copy()
+    if core is not None and not core.empty:
+        core = _apply_article_mapping_v76(core, "core_efficiency")
+        core = core[core["supplier_article"].astype(str).str.strip().ne("")].copy()
+    return core
+
+
+def _is_main_api_window() -> bool:
+    # Manual workflow dispatch is an intentional run; schedule is already protected in YAML.
+    if os.getenv("RUN_SLOT", "").strip() == "manual_main" or os.getenv("GITHUB_EVENT_NAME", "").strip() == "workflow_dispatch":
+        return True
+    now = _now_msk()
+    return 18 <= now.hour <= 23
+
+
+def _bid_api_allowed(night_experiment_only: bool = False, night_experiment_slot: str = "") -> Tuple[bool, str]:
+    if os.getenv("RUN_SLOT", "").strip() == "manual_main" or os.getenv("GITHUB_EVENT_NAME", "").strip() == "workflow_dispatch":
+        return True, "BID_API_ALLOWED_MANUAL_DISPATCH"
+    if _is_main_api_window():
+        return True, "BID_API_ALLOWED_MAIN_18_00_23_59_MSK"
+    return False, f"BID_API_BLOCKED_OUTSIDE_MAIN_WINDOW_{_now_msk().strftime('%H:%M:%S')}"
+
+
+def _write_api_allowed(night_experiment_only: bool = False, night_experiment_slot: str = "") -> Tuple[bool, str]:
+    return _bid_api_allowed(False, "")
+
+
+def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
+    actions = decisions.get("action", pd.Series(dtype=str)).astype(str).value_counts() if decisions is not None and not decisions.empty else pd.Series(dtype=int)
+    return {
+        "Режим": mode,
+        "Версия": SCRIPT_VERSION,
+        "Дата формирования": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+        "Всего рекомендаций": int(len(decisions)) if decisions is not None else 0,
+        "Изменённых ставок": int((successful.get("action", pd.Series(dtype=str)).astype(str).str.lower().isin(["raise", "lower"])).sum()) if successful is not None and not successful.empty else 0,
+        "Кандидатов на паузу": int((decisions.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "pause").sum()) if decisions is not None and not decisions.empty else 0,
+        "Поставлено на паузу": int((successful.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "pause").sum()) if successful is not None and not successful.empty else 0,
+        "Кандидатов на запуск": int((decisions.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "start").sum()) if decisions is not None and not decisions.empty else 0,
+        "Запущено обратно": int((successful.get("action", pd.Series(dtype=str)).astype(str).str.lower() == "start").sum()) if successful is not None and not successful.empty else 0,
+        "Действия": {str(k): int(v) for k, v in actions.items()},
+        "Текущее окно с": windows["current_start"].date().isoformat(),
+        "Текущее окно по": windows["current_end"].date().isoformat(),
+        "База с": windows["base_start"].date().isoformat(),
+        "База по": windows["base_end"].date().isoformat(),
+        "Окно паузы с": windows["pause_start"].date().isoformat(),
+        "Окно паузы по": windows["pause_end"].date().isoformat(),
+        "Контур управления": "Кисти косметические; Косметические карандаши",
+        "Валовая прибыль": "считается по Экономика.xlsx; для кистей себестоимость 50% артикул + 50% средняя 901",
+        "CORE 90 дней": "собирается в отдельный лист, на решения не влияет",
+        "API ставок: разрешённое окно": "schedule 18:00-23:59 МСК; manual без временного ограничения",
+        "Текущее время МСК для API guard": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+        "Разовый откат ошибочных пауз": "да" if getattr(args, "rollback_wrong_pauses_only", False) else "нет",
+        "Разовый откат: кандидатов на start": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == ROLLBACK_WRONG_FIX46_PAUSE_REASON_CODE).sum()) if decisions is not None and not decisions.empty else 0,
+        "Hard cap: принудительных снижений": int((decisions.get("reason_code", pd.Series(dtype=str)).astype(str) == "CAP_OVERSHOOT_GT_ONE_STEP_FORCE_LOWER").sum()) if decisions is not None and not decisions.empty else 0,
+        "Исключённые артикулы": ", ".join(sorted(EXCLUDED_ARTICLES_FROM_AUTOMATION)),
+        "Ошибок API": count_api_errors(api_log) if api_log is not None and not api_log.empty else 0,
+    }
+
+
+def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payload: pd.DataFrame, windows: Dict[str, pd.Timestamp], postcheck: Optional[pd.DataFrame] = None) -> None:
+    core_filtered = core.copy() if core is not None else pd.DataFrame()
+    if not core_filtered.empty and "subject_norm" in core_filtered.columns:
+        core_filtered = core_filtered[core_filtered["subject_norm"].map(is_managed_subject_value)].copy()
+    if not core_filtered.empty:
+        core_filtered = _apply_article_mapping_v76(core_filtered, "write_core")
+        core_filtered = core_filtered[core_filtered["supplier_article"].astype(str).str.strip().ne("")].copy()
+        if "product_root" not in core_filtered.columns:
+            core_filtered["product_root"] = core_filtered["supplier_article"].map(product_root)
+        if "is_query_flagship_article" not in core_filtered.columns:
+            core_filtered["is_query_flagship_article"] = False
+    decisions_mapped = _apply_article_mapping_v76(decisions, "write_decisions") if decisions is not None and not decisions.empty else decisions
+    payload_mapped = payload.copy() if payload is not None else pd.DataFrame()
+    _WRITE_OUTPUTS_BASE_V75(path, decisions_mapped, core_filtered, payload_mapped, windows, postcheck)
+    core90 = LAST_CORE_90D_DIAGNOSTICS
+    if core90 is not None and not core90.empty:
+        core90 = _apply_article_mapping_v76(core90, "write_core90")
+        if "subject_norm" in core90.columns:
+            core90 = core90[core90["subject_norm"].map(is_managed_subject_value)].copy()
+        core90 = core90[core90["supplier_article"].astype(str).str.strip().ne("")].copy()
+    mode = "a" if Path(path).exists() else "w"
+    with pd.ExcelWriter(path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
+        if core90 is not None and not core90.empty:
+            core90.to_excel(writer, sheet_name="CORE_90д_диагностика", index=False)
+        else:
+            pd.DataFrame({"note": ["Нет данных CORE за последние 90 дней или weekly query files не найдены. На решения не влияет."]}).to_excel(writer, sheet_name="CORE_90д_диагностика", index=False)
+        if LAST_ECONOMICS_DIAGNOSTICS is not None and not LAST_ECONOMICS_DIAGNOSTICS.empty:
+            LAST_ECONOMICS_DIAGNOSTICS.to_excel(writer, sheet_name="Диагностика_экономики", index=False)
+        else:
+            pd.DataFrame({"note": ["Экономика.xlsx не найдена или не загружена."]}).to_excel(writer, sheet_name="Диагностика_экономики", index=False)
+        if decisions_mapped is not None and not decisions_mapped.empty:
+            miss = decisions_mapped[decisions_mapped.get("supplier_article", pd.Series([""] * len(decisions_mapped), index=decisions_mapped.index)).astype(str).str.strip().eq("")].copy()
+            if not miss.empty:
+                cols = [c for c in ["campaign_id", "subject_norm", "placement", "campaign_status", "action", "reason_code"] if c in miss.columns]
+                miss[cols].drop_duplicates().to_excel(writer, sheet_name="Маппинг_без_артикула", index=False)
+            else:
+                pd.DataFrame({"status": ["ok"], "note": ["Все campaign_id в решениях имеют supplier_article."]}).to_excel(writer, sheet_name="Маппинг_без_артикула", index=False)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
