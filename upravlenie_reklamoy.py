@@ -4624,5 +4624,325 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
                 pd.DataFrame({"status": ["ok"], "note": ["Все campaign_id в решениях имеют supplier_article."]}).to_excel(writer, sheet_name="Маппинг_без_артикула", index=False)
 
 
+# =========================
+# V77 OVERRIDES: CORE traffic flagships by query
+# =========================
+
+SCRIPT_VERSION = "v77-core-flagship-pairs-traffic-2026-07-13"
+VERSION = "FIX50_CORE_FLAGSHIP_PAIRS_TRAFFIC_DIAGNOSTICS"
+
+CORE_FLAGSHIP_MIN_IMPRESSIONS_30D = 5000
+CORE_FLAGSHIP_TARGET_POSITION_MIN = 1
+CORE_FLAGSHIP_TARGET_POSITION_MAX = 8
+CORE_FLAGSHIP_TARGET_VISIBILITY_PCT = 95.0
+CORE_FLAGSHIP_PAIR_LOOKBACK_DAYS = 30
+
+LAST_CORE_TRAFFIC_QUERY_ARTICLE_V77 = pd.DataFrame()
+LAST_CORE_FLAGSHIP_PAIRS_V77 = pd.DataFrame()
+
+_BUILD_CORE_90D_DIAGNOSTICS_V76 = build_core_90d_diagnostics
+_COMPUTE_ENGINE_V76 = compute_engine
+_WRITE_OUTPUTS_V76 = write_outputs
+_MAKE_SUMMARY_JSON_V76 = make_summary_json
+
+
+def _safe_pct_delta_v77(cur_v: Any, base_v: Any) -> float:
+    try:
+        cur_f = float(cur_v) if pd.notna(cur_v) else np.nan
+        base_f = float(base_v) if pd.notna(base_v) else np.nan
+    except Exception:
+        return np.nan
+    if not pd.notna(base_f) or abs(base_f) <= 0:
+        return np.nan
+    return (cur_f - base_f) / abs(base_f) * 100.0
+
+
+def _traffic_impressions_series_v77(df: pd.DataFrame) -> pd.Series:
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    impr = to_num(df.get("impressions", pd.Series([np.nan] * len(df), index=df.index)))
+    freq = to_num(df.get("frequency", pd.Series([0] * len(df), index=df.index))).fillna(0.0)
+    vis = to_num(df.get("visibility_pct", pd.Series([0] * len(df), index=df.index))).fillna(0.0)
+    proxy = freq * vis / 100.0
+    return np.where(impr.fillna(0) > 0, impr, proxy)
+
+
+def _agg_query_article_period_v77(work: pd.DataFrame, start_day: pd.Timestamp, end_day: pd.Timestamp, suffix: str) -> pd.DataFrame:
+    cols = ["supplier_article", "product_root", "subject_norm", "query_text_norm"]
+    if work is None or work.empty:
+        return pd.DataFrame(columns=cols)
+    part = work[(work["day"] >= start_day) & (work["day"] <= end_day)].copy()
+    if part.empty:
+        return pd.DataFrame(columns=cols)
+    part["traffic_impressions"] = _traffic_impressions_series_v77(part)
+    g = part.groupby(cols, dropna=False).agg(
+        query_text=("query_text", "last"),
+        days=("day", "nunique"),
+        frequency=("frequency", "mean"),
+        impressions=("traffic_impressions", "sum"),
+        clicks=("clicks", "sum"),
+        orders=("orders", "sum"),
+        median_position=("median_position", "median"),
+        visibility=("visibility_pct", "mean"),
+    ).reset_index()
+    g = g.rename(columns={
+        "query_text": f"query_text_{suffix}",
+        "days": f"days_{suffix}",
+        "frequency": f"frequency_{suffix}",
+        "impressions": f"impressions_{suffix}",
+        "clicks": f"clicks_{suffix}",
+        "orders": f"orders_{suffix}",
+        "median_position": f"median_position_{suffix}",
+        "visibility": f"visibility_{suffix}",
+    })
+    totals = g.groupby("query_text_norm", as_index=False)[f"impressions_{suffix}"].sum().rename(columns={f"impressions_{suffix}": f"query_total_impressions_{suffix}"})
+    g = g.merge(totals, on="query_text_norm", how="left")
+    g[f"impression_share_{suffix}_pct"] = np.where(
+        g[f"query_total_impressions_{suffix}"].fillna(0) > 0,
+        g[f"impressions_{suffix}"] / g[f"query_total_impressions_{suffix}"] * 100.0,
+        np.nan,
+    )
+    g[f"ctr_{suffix}_pct"] = np.where(g[f"impressions_{suffix}"].fillna(0) > 0, g[f"clicks_{suffix}"] / g[f"impressions_{suffix}"] * 100.0, np.nan)
+    g[f"clicks_per_order_{suffix}"] = np.where(g[f"orders_{suffix}"].fillna(0) > 0, g[f"clicks_{suffix}"] / g[f"orders_{suffix}"], np.nan)
+    return g
+
+
+def _period_for_last_days_v77(windows: Dict[str, pd.Timestamp], days: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    as_of = pd.Timestamp(windows.get("as_of") if windows else pd.Timestamp(datetime.now().date())).normalize()
+    end_day = as_of - pd.Timedelta(days=1)
+    start_day = end_day - pd.Timedelta(days=days - 1)
+    return start_day, end_day
+
+
+def build_core_90d_diagnostics(keyword_daily: pd.DataFrame, campaign_metrics: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
+    out = _BUILD_CORE_90D_DIAGNOSTICS_V76(keyword_daily, campaign_metrics, windows)
+    if out is None or out.empty:
+        return out
+    out = out.copy()
+    out["clicks_per_order_90d"] = np.where(out["orders_sum_90d"].fillna(0) > 0, out["clicks_sum_90d"] / out["orders_sum_90d"], np.nan)
+    out["clicks_per_order_target_high_90d"] = np.where(out["orders_target_day_high_90d"].fillna(0) > 0, out["clicks_target_day_high_90d"] / out["orders_target_day_high_90d"], np.nan)
+    out["traffic_priority_note"] = "CORE-клики являются ведущим трафиковым индикатором для будущей ВП"
+    return out
+
+
+def build_core_query_article_traffic_v77(keyword_daily: pd.DataFrame, campaign_metrics: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
+    if keyword_daily is None or keyword_daily.empty:
+        return pd.DataFrame()
+    work = keyword_daily.copy()
+    if "subject_norm" in work.columns:
+        work = work[work["subject_norm"].map(is_managed_subject_value)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["day"] = to_date(work["day"])
+    work = work[work["day"].notna()].copy()
+    for c in ["frequency", "median_position", "visibility_pct", "clicks", "impressions", "orders"]:
+        if c not in work.columns:
+            work[c] = np.nan
+        work[c] = to_num(work[c])
+    work["frequency"] = work["frequency"].fillna(0.0)
+    work["clicks"] = work["clicks"].fillna(0.0)
+    work["orders"] = work["orders"].fillna(0.0)
+    work["traffic_impressions"] = _traffic_impressions_series_v77(work)
+    work["query_text_norm"] = work.get("query_text_norm", work["query_text"].astype(str).str.strip().str.lower())
+    work["product_root"] = work.get("product_root", work["supplier_article"].map(product_root))
+
+    start30, end30 = _period_for_last_days_v77(windows, CORE_FLAGSHIP_PAIR_LOOKBACK_DAYS)
+    cur_start, cur_end = pd.Timestamp(windows["current_start"]).normalize(), pd.Timestamp(windows["current_end"]).normalize()
+    base_start, base_end = pd.Timestamp(windows["base_start"]).normalize(), pd.Timestamp(windows["base_end"]).normalize()
+
+    key_cols = ["supplier_article", "product_root", "subject_norm", "query_text_norm"]
+    g90 = work.groupby(key_cols, dropna=False).agg(
+        query_text=("query_text", "last"),
+        period_start_90d=("day", "min"),
+        period_end_90d=("day", "max"),
+        days_seen_90d=("day", "nunique"),
+        frequency_avg_90d=("frequency", "mean"),
+        impressions_sum_90d=("traffic_impressions", "sum"),
+        clicks_sum_90d=("clicks", "sum"),
+        orders_sum_90d=("orders", "sum"),
+        median_position_avg_90d=("median_position", "median"),
+        visibility_avg_90d=("visibility_pct", "mean"),
+    ).reset_index()
+    g90 = g90[g90["orders_sum_90d"].fillna(0) > 0].copy()
+    if g90.empty:
+        return pd.DataFrame()
+
+    g30 = _agg_query_article_period_v77(work, start30, end30, "30d")
+    gcur = _agg_query_article_period_v77(work, cur_start, cur_end, "cur")
+    gbase = _agg_query_article_period_v77(work, base_start, base_end, "base")
+
+    out = g90.merge(g30.drop(columns=[c for c in ["query_text_30d"] if c in g30.columns]), on=key_cols, how="left")
+    out = out.merge(gcur.drop(columns=[c for c in ["query_text_cur"] if c in gcur.columns]), on=key_cols, how="left")
+    out = out.merge(gbase.drop(columns=[c for c in ["query_text_base"] if c in gbase.columns]), on=key_cols, how="left")
+
+    if campaign_metrics is not None and not campaign_metrics.empty and "placement" in campaign_metrics.columns:
+        search = campaign_metrics[campaign_metrics["placement"].astype(str).eq("search")].copy()
+    else:
+        search = pd.DataFrame()
+    if not search.empty:
+        cpc_tbl = search.groupby("supplier_article", as_index=False).agg(clicks_cur=("clicks_cur", "sum"), spend_cur=("spend_cur", "sum"))
+        cpc_tbl["proxy_search_cpc_cur"] = np.where(cpc_tbl["clicks_cur"] > 0, cpc_tbl["spend_cur"] / cpc_tbl["clicks_cur"], np.nan)
+        cpc_map = cpc_tbl.set_index("supplier_article")["proxy_search_cpc_cur"].to_dict()
+    else:
+        cpc_map = {}
+    out["proxy_search_cpc_cur"] = out["supplier_article"].map(cpc_map)
+    for suffix in ["90d", "30d", "cur", "base"]:
+        clicks_col = f"clicks_sum_{suffix}" if suffix in ["90d"] else f"clicks_{suffix}"
+        orders_col = f"orders_sum_{suffix}" if suffix in ["90d"] else f"orders_{suffix}"
+        if clicks_col in out.columns and orders_col in out.columns:
+            out[f"query_cpo_{suffix}"] = np.where(out[orders_col].fillna(0) > 0, out[clicks_col].fillna(0) * out["proxy_search_cpc_cur"] / out[orders_col], np.nan)
+            out[f"clicks_per_order_{suffix}"] = np.where(out[orders_col].fillna(0) > 0, out[clicks_col].fillna(0) / out[orders_col], np.nan)
+
+    # Query-level share and deltas: helps distinguish market traffic drop vs loss of our position/share.
+    for suffix in ["cur", "base"]:
+        if f"impressions_{suffix}" not in out.columns:
+            out[f"impressions_{suffix}"] = np.nan
+        if f"query_total_impressions_{suffix}" not in out.columns:
+            out[f"query_total_impressions_{suffix}"] = np.nan
+        if f"impression_share_{suffix}_pct" not in out.columns:
+            out[f"impression_share_{suffix}_pct"] = np.where(out[f"query_total_impressions_{suffix}"].fillna(0) > 0, out[f"impressions_{suffix}"] / out[f"query_total_impressions_{suffix}"] * 100.0, np.nan)
+    out["query_total_impressions_delta_pct"] = out.apply(lambda r: _safe_pct_delta_v77(r.get("query_total_impressions_cur"), r.get("query_total_impressions_base")), axis=1)
+    out["article_impressions_delta_pct"] = out.apply(lambda r: _safe_pct_delta_v77(r.get("impressions_cur"), r.get("impressions_base")), axis=1)
+    out["clicks_delta_pct"] = out.apply(lambda r: _safe_pct_delta_v77(r.get("clicks_cur"), r.get("clicks_base")), axis=1)
+    out["orders_delta_pct"] = out.apply(lambda r: _safe_pct_delta_v77(r.get("orders_cur"), r.get("orders_base")), axis=1)
+    out["impression_share_delta_pp"] = out["impression_share_cur_pct"] - out["impression_share_base_pct"]
+    out["position_delta_cur_vs_base"] = out["median_position_cur"] - out["median_position_base"]
+    out["visibility_delta_cur_vs_base_pp"] = out["visibility_cur"] - out["visibility_base"]
+
+    out["rank_by_orders_query_90d"] = out.groupby("query_text_norm")["orders_sum_90d"].rank(method="first", ascending=False)
+    out["rank_by_ctr_query_30d"] = out.groupby("query_text_norm")["ctr_30d_pct"].rank(method="first", ascending=False)
+    out["ctr_eligible_30d"] = out["impressions_30d"].fillna(0) >= CORE_FLAGSHIP_MIN_IMPRESSIONS_30D
+
+    def diagnose(r: pd.Series) -> str:
+        qd = r.get("query_total_impressions_delta_pct", np.nan)
+        ad = r.get("article_impressions_delta_pct", np.nan)
+        sd = r.get("impression_share_delta_pp", np.nan)
+        pdlt = r.get("position_delta_cur_vs_base", np.nan)
+        vdlt = r.get("visibility_delta_cur_vs_base_pp", np.nan)
+        cd = r.get("clicks_delta_pct", np.nan)
+        od = r.get("orders_delta_pct", np.nan)
+        if pd.notna(qd) and qd <= -20 and (pd.isna(sd) or sd > -5):
+            return "По запросу в целом стало меньше показов; падение похоже на снижение общего трафика, а не только на позицию товара"
+        if (pd.notna(sd) and sd <= -10) or (pd.notna(pdlt) and pdlt >= 5) or (pd.notna(vdlt) and vdlt <= -10):
+            return "Товар потерял долю показов/позицию/видимость по CORE-запросу; это может снижать клики и будущую ВП"
+        if pd.notna(cd) and cd <= -20 and (pd.isna(ad) or ad > -10):
+            return "Показы сохранились, но клики просели; вероятна проблема CTR/карточки/цены на выдаче"
+        if pd.notna(od) and od <= -20 and (pd.isna(cd) or cd > -10):
+            return "Клики есть, но заказы просели; вероятна проблема конверсии, цены или предложения, а не ставки"
+        return "Критичного трафикового провала по сравнению с базовым окном не видно"
+
+    out["traffic_diagnosis"] = out.apply(diagnose, axis=1)
+    out["target_position_rule"] = "Флагман должен держаться на 1-8 месте"
+    out["target_visibility_rule"] = "Флагман должен иметь видимость не ниже 95%"
+    return out.sort_values(["query_text_norm", "rank_by_orders_query_90d", "orders_sum_90d"], ascending=[True, True, False])
+
+
+def select_core_flagship_pairs_v77(query_article: pd.DataFrame) -> pd.DataFrame:
+    if query_article is None or query_article.empty:
+        return pd.DataFrame()
+    rows: List[Dict[str, Any]] = []
+    for q, part in query_article.groupby("query_text_norm", dropna=False):
+        part = part.copy()
+        part_sales = part.sort_values(["orders_sum_90d", "clicks_sum_90d", "impressions_sum_90d"], ascending=[False, False, False], na_position="last")
+        if part_sales.empty:
+            continue
+        sales_row = part_sales.iloc[0]
+        selected_articles = set()
+
+        def make_row(src: pd.Series, role: str, reason: str) -> Dict[str, Any]:
+            pos = src.get("median_position_cur", np.nan)
+            vis = src.get("visibility_cur", np.nan)
+            if pd.notna(pos) and pd.notna(vis) and CORE_FLAGSHIP_TARGET_POSITION_MIN <= float(pos) <= CORE_FLAGSHIP_TARGET_POSITION_MAX and float(vis) >= CORE_FLAGSHIP_TARGET_VISIBILITY_PCT:
+                status = "Цель выполнена: позиция 1-8 и видимость не ниже 95%"
+            elif pd.notna(pos) and float(pos) > CORE_FLAGSHIP_TARGET_POSITION_MAX and pd.notna(vis) and float(vis) < CORE_FLAGSHIP_TARGET_VISIBILITY_PCT:
+                status = "Нужно улучшить позицию и видимость флагмана"
+            elif pd.notna(pos) and float(pos) > CORE_FLAGSHIP_TARGET_POSITION_MAX:
+                status = "Нужно улучшить позицию флагмана до 1-8 места"
+            elif pd.notna(vis) and float(vis) < CORE_FLAGSHIP_TARGET_VISIBILITY_PCT:
+                status = "Нужно поднять видимость флагмана до 95%+"
+            else:
+                status = "Недостаточно данных для проверки цели флагмана"
+            d = src.to_dict()
+            d.update({
+                "flagship_role": role,
+                "flagship_selection_reason": reason,
+                "flagship_target_status": status,
+                "target_position_min": CORE_FLAGSHIP_TARGET_POSITION_MIN,
+                "target_position_max": CORE_FLAGSHIP_TARGET_POSITION_MAX,
+                "target_visibility_pct": CORE_FLAGSHIP_TARGET_VISIBILITY_PCT,
+            })
+            return d
+
+        selected_articles.add(str(sales_row.get("supplier_article", "")))
+        rows.append(make_row(sales_row, "Флагман по заказам", "Больше всего заказов по этому CORE-запросу за последние 90 дней"))
+
+        ctr_candidates = part[part["ctr_eligible_30d"].fillna(False)].copy()
+        ctr_candidates = ctr_candidates.sort_values(["ctr_30d_pct", "orders_30d", "orders_sum_90d", "impressions_30d"], ascending=[False, False, False, False], na_position="last")
+        second_row = None
+        second_role = "Флагман по CTR"
+        second_reason = "Лучший CTR за последние 30 дней среди товаров с 5000+ показов по этому запросу"
+        if not ctr_candidates.empty:
+            cand = ctr_candidates.iloc[0]
+            if str(cand.get("supplier_article", "")) not in selected_articles:
+                second_row = cand
+            else:
+                rest_sales = part_sales[~part_sales["supplier_article"].astype(str).isin(selected_articles)]
+                if not rest_sales.empty:
+                    second_row = rest_sales.iloc[0]
+                    second_role = "Второй флагман по заказам"
+                    second_reason = "Лидер по CTR совпал с лидером по заказам; выбран второй товар по заказам за 90 дней"
+        else:
+            rest_sales = part_sales[~part_sales["supplier_article"].astype(str).isin(selected_articles)]
+            if not rest_sales.empty:
+                second_row = rest_sales.iloc[0]
+                second_role = "Второй флагман по заказам"
+                second_reason = "Нет товара с 5000+ показов за 30 дней для честного выбора по CTR; выбран второй товар по заказам"
+        if second_row is not None:
+            rows.append(make_row(second_row, second_role, second_reason))
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    sort_cols = [c for c in ["query_text_norm", "flagship_role", "orders_sum_90d"] if c in out.columns]
+    return out.sort_values(sort_cols, ascending=[True, True, False][:len(sort_cols)])
+
+
+def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.Timestamp], pd.DataFrame]:
+    global LAST_CORE_TRAFFIC_QUERY_ARTICLE_V77, LAST_CORE_FLAGSHIP_PAIRS_V77
+    decisions, core, payload, windows, postcheck = _COMPUTE_ENGINE_V76(args)
+    weekly_spec = getattr(args, "keywords_weekly", None)
+    if weekly_spec:
+        keyword_daily_90d = load_keywords_daily_90d(weekly_spec, windows)
+    else:
+        keyword_daily_90d = pd.DataFrame()
+    LAST_CORE_TRAFFIC_QUERY_ARTICLE_V77 = build_core_query_article_traffic_v77(keyword_daily_90d, decisions, windows)
+    LAST_CORE_FLAGSHIP_PAIRS_V77 = select_core_flagship_pairs_v77(LAST_CORE_TRAFFIC_QUERY_ARTICLE_V77)
+    return decisions, core, payload, windows, postcheck
+
+
+def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
+    summary = _MAKE_SUMMARY_JSON_V76(mode, decisions, successful, api_log, windows, args)
+    summary["Версия"] = SCRIPT_VERSION
+    summary["CORE 90 дней"] = "собирается; дополнительно выбираются 2 флагмана на каждый CORE-запрос"
+    summary["CORE флагманы"] = "1-й по заказам за 90 дней; 2-й по CTR за 30 дней при 5000+ показов, иначе 2-й по заказам"
+    summary["Цель флагмана"] = "позиция 1-8 и видимость не ниже 95%; пока логируется, на ставки не влияет"
+    summary["CORE трафик"] = "сравниваются показы, доля показов, клики, заказы, позиция и видимость; причины выводятся по-русски"
+    return summary
+
+
+def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payload: pd.DataFrame, windows: Dict[str, pd.Timestamp], postcheck: Optional[pd.DataFrame] = None) -> None:
+    _WRITE_OUTPUTS_V76(path, decisions, core, payload, windows, postcheck)
+    mode = "a" if Path(path).exists() else "w"
+    with pd.ExcelWriter(path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
+        if LAST_CORE_FLAGSHIP_PAIRS_V77 is not None and not LAST_CORE_FLAGSHIP_PAIRS_V77.empty:
+            LAST_CORE_FLAGSHIP_PAIRS_V77.to_excel(writer, sheet_name="CORE_флагманы_запросов", index=False)
+        else:
+            pd.DataFrame({"note": ["Флагманы CORE-запросов не выбраны: нет данных за 90 дней или нет заказов по запросам."]}).to_excel(writer, sheet_name="CORE_флагманы_запросов", index=False)
+        if LAST_CORE_TRAFFIC_QUERY_ARTICLE_V77 is not None and not LAST_CORE_TRAFFIC_QUERY_ARTICLE_V77.empty:
+            LAST_CORE_TRAFFIC_QUERY_ARTICLE_V77.to_excel(writer, sheet_name="CORE_трафик_запросы", index=False)
+        else:
+            pd.DataFrame({"note": ["CORE-трафик по запросам не собран: нет дневных данных поисковых запросов."]}).to_excel(writer, sheet_name="CORE_трафик_запросы", index=False)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
