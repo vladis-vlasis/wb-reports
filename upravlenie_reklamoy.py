@@ -4944,5 +4944,423 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
             pd.DataFrame({"note": ["CORE-трафик по запросам не собран: нет дневных данных поисковых запросов."]}).to_excel(writer, sheet_name="CORE_трафик_запросы", index=False)
 
 
+# =========================
+# V78 OVERRIDES: daily CORE traffic post-check and rollback after ineffective raise
+# =========================
+
+SCRIPT_VERSION = "v78-core-daily-traffic-postcheck-2026-07-13"
+VERSION = "FIX51_CORE_DAILY_TRAFFIC_POSTCHECK_ROLLBACK"
+
+_COMPUTE_ENGINE_V77 = compute_engine
+_WRITE_OUTPUTS_V77 = write_outputs
+_MAKE_SUMMARY_JSON_V77 = make_summary_json
+
+LAST_CORE_DAILY_TRAFFIC_POSTCHECK_V78 = pd.DataFrame()
+LAST_CORE_DAILY_TRAFFIC_POSTCHECK_SUMMARY_V78 = pd.DataFrame()
+LAST_CORE_DAILY_ROLLBACKS_V78: Dict[int, Dict[str, Any]] = {}
+
+CORE_TRAFFIC_POSTCHECK_MAX_DAYS = 3
+CORE_TRAFFIC_POSTCHECK_MIN_DAY = 1
+CORE_TRAFFIC_GOOD_CLICK_GROWTH_PCT = 10.0
+CORE_TRAFFIC_GOOD_SHARE_GROWTH_PP = 3.0
+CORE_TRAFFIC_GOOD_POSITION_DELTA = 1.0
+CORE_TRAFFIC_GOOD_VISIBILITY_DELTA_PP = 3.0
+CORE_TRAFFIC_GOOD_IMPRESSIONS_VS_MARKET_PCT = 5.0
+
+
+def _latest_available_day_before_v78(days: Sequence[pd.Timestamp], boundary: pd.Timestamp) -> Optional[pd.Timestamp]:
+    boundary = pd.Timestamp(boundary).normalize()
+    vals = [pd.Timestamp(d).normalize() for d in days if pd.notna(d) and pd.Timestamp(d).normalize() <= boundary]
+    return max(vals) if vals else None
+
+
+def _first_available_day_after_v78(days: Sequence[pd.Timestamp], boundary: pd.Timestamp) -> Optional[pd.Timestamp]:
+    boundary = pd.Timestamp(boundary).normalize()
+    vals = [pd.Timestamp(d).normalize() for d in days if pd.notna(d) and pd.Timestamp(d).normalize() >= boundary]
+    return min(vals) if vals else None
+
+
+def _daily_query_article_table_v78(keyword_daily: pd.DataFrame) -> pd.DataFrame:
+    if keyword_daily is None or keyword_daily.empty:
+        return pd.DataFrame()
+    work = keyword_daily.copy()
+    if "subject_norm" in work.columns:
+        work = work[work["subject_norm"].map(is_managed_subject_value)].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["day"] = to_date(work.get("day"))
+    work = work[work["day"].notna()].copy()
+    for c in ["frequency", "median_position", "visibility_pct", "clicks", "impressions", "orders"]:
+        if c not in work.columns:
+            work[c] = np.nan
+        work[c] = to_num(work[c])
+    work["clicks"] = work["clicks"].fillna(0.0)
+    work["orders"] = work["orders"].fillna(0.0)
+    work["frequency"] = work["frequency"].fillna(0.0)
+    work["query_text_norm"] = work.get("query_text_norm", work["query_text"].astype(str).str.strip().str.lower())
+    work["product_root"] = work.get("product_root", work["supplier_article"].map(product_root))
+    work["traffic_impressions"] = _traffic_impressions_series_v77(work)
+    key = ["day", "supplier_article", "product_root", "subject_norm", "query_text_norm"]
+    g = work.groupby(key, dropna=False).agg(
+        query_text=("query_text", "last"),
+        impressions=("traffic_impressions", "sum"),
+        clicks=("clicks", "sum"),
+        orders=("orders", "sum"),
+        frequency=("frequency", "mean"),
+        median_position=("median_position", "median"),
+        visibility_pct=("visibility_pct", "mean"),
+    ).reset_index()
+    qtot = g.groupby(["day", "query_text_norm"], as_index=False).agg(query_total_impressions=("impressions", "sum"))
+    g = g.merge(qtot, on=["day", "query_text_norm"], how="left")
+    g["impression_share_pct"] = np.where(g["query_total_impressions"].fillna(0) > 0, g["impressions"] / g["query_total_impressions"] * 100.0, np.nan)
+    g["ctr_pct"] = np.where(g["impressions"].fillna(0) > 0, g["clicks"] / g["impressions"] * 100.0, np.nan)
+    g["clicks_per_order"] = np.where(g["orders"].fillna(0) > 0, g["clicks"] / g["orders"], np.nan)
+    return g
+
+
+def _traffic_pct_delta_v78(cur_v: Any, base_v: Any) -> float:
+    cur_n = pd.to_numeric(cur_v, errors="coerce")
+    base_n = pd.to_numeric(base_v, errors="coerce")
+    if pd.isna(base_n) or abs(float(base_n)) <= 1e-9:
+        return np.nan
+    return (float(cur_n if pd.notna(cur_n) else 0.0) - float(base_n)) / abs(float(base_n)) * 100.0
+
+
+def _aggregate_daily_metrics_v78(rows: pd.DataFrame, queries: Sequence[str]) -> Dict[str, Any]:
+    if rows is None or rows.empty:
+        return {
+            "impressions": 0.0,
+            "query_total_impressions": 0.0,
+            "impression_share_pct": np.nan,
+            "clicks": 0.0,
+            "orders": 0.0,
+            "ctr_pct": np.nan,
+            "median_position": np.nan,
+            "visibility_pct": np.nan,
+        }
+    part = rows[rows["query_text_norm"].astype(str).isin(set(map(str, queries)))].copy()
+    if part.empty:
+        return {
+            "impressions": 0.0,
+            "query_total_impressions": 0.0,
+            "impression_share_pct": np.nan,
+            "clicks": 0.0,
+            "orders": 0.0,
+            "ctr_pct": np.nan,
+            "median_position": np.nan,
+            "visibility_pct": np.nan,
+        }
+    impressions = float(part["impressions"].fillna(0).sum())
+    qtotal = float(part["query_total_impressions"].fillna(0).sum())
+    clicks = float(part["clicks"].fillna(0).sum())
+    orders = float(part["orders"].fillna(0).sum())
+    return {
+        "impressions": impressions,
+        "query_total_impressions": qtotal,
+        "impression_share_pct": (impressions / qtotal * 100.0) if qtotal > 0 else np.nan,
+        "clicks": clicks,
+        "orders": orders,
+        "ctr_pct": (clicks / impressions * 100.0) if impressions > 0 else np.nan,
+        "median_position": float(part["median_position"].median()) if part["median_position"].notna().any() else np.nan,
+        "visibility_pct": float(part["visibility_pct"].mean()) if part["visibility_pct"].notna().any() else np.nan,
+    }
+
+
+def _traffic_effect_status_v78(base: Dict[str, Any], check: Dict[str, Any]) -> Tuple[bool, str, Dict[str, float]]:
+    query_total_delta_pct = _traffic_pct_delta_v78(check.get("query_total_impressions"), base.get("query_total_impressions"))
+    impressions_delta_pct = _traffic_pct_delta_v78(check.get("impressions"), base.get("impressions"))
+    clicks_delta_pct = _traffic_pct_delta_v78(check.get("clicks"), base.get("clicks"))
+    share_delta_pp = (check.get("impression_share_pct") if pd.notna(check.get("impression_share_pct")) else np.nan) - (base.get("impression_share_pct") if pd.notna(base.get("impression_share_pct")) else np.nan)
+    position_delta = (base.get("median_position") if pd.notna(base.get("median_position")) else np.nan) - (check.get("median_position") if pd.notna(check.get("median_position")) else np.nan)
+    visibility_delta_pp = (check.get("visibility_pct") if pd.notna(check.get("visibility_pct")) else np.nan) - (base.get("visibility_pct") if pd.notna(base.get("visibility_pct")) else np.nan)
+    impressions_vs_market_pct = (impressions_delta_pct if pd.notna(impressions_delta_pct) else 0.0) - (query_total_delta_pct if pd.notna(query_total_delta_pct) and query_total_delta_pct > 0 else 0.0)
+    clicks_vs_market_pct = (clicks_delta_pct if pd.notna(clicks_delta_pct) else 0.0) - (query_total_delta_pct if pd.notna(query_total_delta_pct) and query_total_delta_pct > 0 else 0.0)
+
+    has_growth = any([
+        pd.notna(clicks_delta_pct) and clicks_vs_market_pct >= CORE_TRAFFIC_GOOD_CLICK_GROWTH_PCT,
+        pd.notna(share_delta_pp) and share_delta_pp >= CORE_TRAFFIC_GOOD_SHARE_GROWTH_PP,
+        pd.notna(position_delta) and position_delta >= CORE_TRAFFIC_GOOD_POSITION_DELTA,
+        pd.notna(visibility_delta_pp) and visibility_delta_pp >= CORE_TRAFFIC_GOOD_VISIBILITY_DELTA_PP,
+        pd.notna(impressions_delta_pct) and impressions_vs_market_pct >= CORE_TRAFFIC_GOOD_IMPRESSIONS_VS_MARKET_PCT,
+    ])
+    metrics = {
+        "query_total_impressions_delta_pct": query_total_delta_pct,
+        "impressions_delta_pct": impressions_delta_pct,
+        "impressions_vs_market_pct": impressions_vs_market_pct,
+        "clicks_delta_pct": clicks_delta_pct,
+        "clicks_vs_market_pct": clicks_vs_market_pct,
+        "impression_share_delta_pp": share_delta_pp,
+        "position_delta": position_delta,
+        "visibility_delta_pp": visibility_delta_pp,
+    }
+    if has_growth:
+        return True, "После повышения ставки есть положительный трафиковый эффект по CORE: улучшились клики, доля показов, позиция или видимость", metrics
+    if pd.notna(query_total_delta_pct) and query_total_delta_pct <= -20 and (pd.isna(share_delta_pp) or share_delta_pp > -3) and (pd.isna(position_delta) or position_delta >= 0):
+        return False, "Общий объём показов по CORE-запросам снизился; роста трафика от повышения ставки не видно, доля/позиция не улучшились достаточно", metrics
+    return False, "После повышения ставки CORE-трафик не вырос: нет улучшения кликов, доли показов, позиции и видимости", metrics
+
+
+def build_core_daily_traffic_postcheck_v78(keyword_daily: pd.DataFrame, decisions: pd.DataFrame, bid_history: pd.DataFrame, flagship_pairs: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[int, Dict[str, Any]]]:
+    if keyword_daily is None or keyword_daily.empty or decisions is None or decisions.empty or bid_history is None or bid_history.empty or flagship_pairs is None or flagship_pairs.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    daily = _daily_query_article_table_v78(keyword_daily)
+    if daily.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+    all_days = sorted(pd.to_datetime(daily["day"].dropna()).dt.normalize().unique())
+    if not all_days:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    dmap = decisions.drop_duplicates("campaign_id").set_index("campaign_id").to_dict("index")
+    margin_by_article = decisions.groupby("supplier_article", dropna=False)["gross_profit_before_ads_per_order_rub_cur"].median().to_dict() if "gross_profit_before_ads_per_order_rub_cur" in decisions.columns else {}
+
+    fp = flagship_pairs.copy()
+    fp["supplier_article"] = fp["supplier_article"].map(clean_article)
+    fp["query_text_norm"] = fp["query_text_norm"].astype(str).str.strip().str.lower()
+    fp["query_cpo_90d"] = to_num(fp.get("query_cpo_90d", pd.Series([np.nan] * len(fp))))
+    fp["orders_sum_90d"] = to_num(fp.get("orders_sum_90d", pd.Series([0] * len(fp))))
+    fp_by_article = {a: part.copy() for a, part in fp.groupby("supplier_article", dropna=False)}
+
+    bh = bid_history.copy()
+    bh["campaign_id"] = to_num(bh.get("campaign_id", pd.Series(dtype=float))).astype("Int64")
+    bh["event_date"] = to_date(bh.get("event_date", pd.Series(dtype=object)))
+    bh["direction"] = bh.get("direction", "").astype(str).str.lower().str.strip()
+    bh["old_bid_rub"] = to_num(bh.get("old_bid_rub", pd.Series([np.nan] * len(bh))))
+    bh["new_bid_rub"] = to_num(bh.get("new_bid_rub", pd.Series([np.nan] * len(bh))))
+    as_of = pd.Timestamp(windows.get("as_of", pd.Timestamp(datetime.now().date()))).normalize()
+    bh["days_since_event"] = (as_of - bh["event_date"]).dt.days
+    bh = bh[(bh["direction"] == "raise") & bh["days_since_event"].between(CORE_TRAFFIC_POSTCHECK_MIN_DAY, CORE_TRAFFIC_POSTCHECK_MAX_DAYS, inclusive="both")].copy()
+    if bh.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+    bh = bh.sort_values(["campaign_id", "event_date", "run_datetime"]).drop_duplicates("campaign_id", keep="last")
+
+    detail_rows: List[Dict[str, Any]] = []
+    summary_rows: List[Dict[str, Any]] = []
+    rollbacks: Dict[int, Dict[str, Any]] = {}
+
+    for _, h in bh.iterrows():
+        cid = int(h.get("campaign_id")) if pd.notna(h.get("campaign_id")) else None
+        if cid is None or cid not in dmap:
+            continue
+        dec = dmap[cid]
+        placement = str(dec.get("placement", "") or "").lower()
+        # CORE keyword traffic is used for search-bid post-check. Shelves/combined have no direct query position target here.
+        if placement != "search":
+            continue
+        article = clean_article(dec.get("supplier_article", h.get("supplier_article", "")))
+        if not article:
+            continue
+        event_day = pd.Timestamp(h.get("event_date")).normalize()
+        baseline_day = _latest_available_day_before_v78(all_days, event_day - pd.Timedelta(days=1))
+        check_day = _first_available_day_after_v78(all_days, event_day + pd.Timedelta(days=1))
+        if baseline_day is None or check_day is None:
+            summary_rows.append({
+                "campaign_id": cid,
+                "supplier_article": article,
+                "placement": placement,
+                "event_date": event_day.date().isoformat(),
+                "old_bid_rub": h.get("old_bid_rub"),
+                "new_bid_rub": h.get("new_bid_rub"),
+                "traffic_decision": "ждать",
+                "traffic_reason": "Недостаточно дневных данных поисковых запросов для post-check трафика",
+            })
+            continue
+
+        article_fp = fp_by_article.get(article, pd.DataFrame()).copy()
+        if article_fp.empty:
+            summary_rows.append({
+                "campaign_id": cid,
+                "supplier_article": article,
+                "placement": placement,
+                "event_date": event_day.date().isoformat(),
+                "baseline_day": baseline_day.date().isoformat(),
+                "check_day": check_day.date().isoformat(),
+                "old_bid_rub": h.get("old_bid_rub"),
+                "new_bid_rub": h.get("new_bid_rub"),
+                "traffic_decision": "ждать",
+                "traffic_reason": "Для артикула нет закреплённых CORE-флагманских запросов",
+            })
+            continue
+        margin = pd.to_numeric(margin_by_article.get(article, np.nan), errors="coerce")
+        article_fp["cpo_is_adequate"] = False
+        if pd.notna(margin) and float(margin) > 0:
+            article_fp["cpo_is_adequate"] = article_fp["query_cpo_90d"].notna() & (article_fp["query_cpo_90d"] <= float(margin))
+        adequate = article_fp[article_fp["cpo_is_adequate"] & article_fp["orders_sum_90d"].fillna(0).gt(0)].copy()
+        if adequate.empty:
+            # We do not roll back by CORE traffic if all flagship queries are too expensive or margin is unknown.
+            summary_rows.append({
+                "campaign_id": cid,
+                "supplier_article": article,
+                "placement": placement,
+                "event_date": event_day.date().isoformat(),
+                "baseline_day": baseline_day.date().isoformat(),
+                "check_day": check_day.date().isoformat(),
+                "old_bid_rub": h.get("old_bid_rub"),
+                "new_bid_rub": h.get("new_bid_rub"),
+                "gp_before_ads_per_order_rub": margin,
+                "traffic_decision": "ждать",
+                "traffic_reason": "Нет CORE-запросов с адекватным CPO относительно маржи до рекламы; откат по трафику не применяем",
+            })
+            continue
+
+        queries = adequate["query_text_norm"].astype(str).tolist()
+        base_rows = daily[(daily["day"].eq(baseline_day)) & (daily["supplier_article"].astype(str).eq(article)) & (daily["query_text_norm"].astype(str).isin(set(queries)))].copy()
+        check_rows = daily[(daily["day"].eq(check_day)) & (daily["supplier_article"].astype(str).eq(article)) & (daily["query_text_norm"].astype(str).isin(set(queries)))].copy()
+        base_ag = _aggregate_daily_metrics_v78(base_rows, queries)
+        check_ag = _aggregate_daily_metrics_v78(check_rows, queries)
+        has_growth, traffic_reason, effect_metrics = _traffic_effect_status_v78(base_ag, check_ag)
+
+        for _, qrow in adequate.iterrows():
+            q = str(qrow.get("query_text_norm", ""))
+            br = base_rows[base_rows["query_text_norm"].astype(str).eq(q)]
+            cr = check_rows[check_rows["query_text_norm"].astype(str).eq(q)]
+            b = br.iloc[0].to_dict() if not br.empty else {}
+            c = cr.iloc[0].to_dict() if not cr.empty else {}
+            detail_rows.append({
+                "campaign_id": cid,
+                "supplier_article": article,
+                "placement": placement,
+                "event_date": event_day.date().isoformat(),
+                "baseline_day": baseline_day.date().isoformat(),
+                "check_day": check_day.date().isoformat(),
+                "old_bid_rub": h.get("old_bid_rub"),
+                "new_bid_rub": h.get("new_bid_rub"),
+                "query_text": qrow.get("query_text", q),
+                "flagship_role": qrow.get("flagship_role", ""),
+                "query_cpo_90d": qrow.get("query_cpo_90d", np.nan),
+                "clicks_per_order_90d": qrow.get("clicks_per_order_90d", np.nan),
+                "gp_before_ads_per_order_rub": margin,
+                "baseline_impressions": b.get("impressions", 0.0),
+                "check_impressions": c.get("impressions", 0.0),
+                "baseline_query_total_impressions": b.get("query_total_impressions", 0.0),
+                "check_query_total_impressions": c.get("query_total_impressions", 0.0),
+                "baseline_impression_share_pct": b.get("impression_share_pct", np.nan),
+                "check_impression_share_pct": c.get("impression_share_pct", np.nan),
+                "baseline_clicks": b.get("clicks", 0.0),
+                "check_clicks": c.get("clicks", 0.0),
+                "baseline_orders": b.get("orders", 0.0),
+                "check_orders": c.get("orders", 0.0),
+                "baseline_position": b.get("median_position", np.nan),
+                "check_position": c.get("median_position", np.nan),
+                "baseline_visibility_pct": b.get("visibility_pct", np.nan),
+                "check_visibility_pct": c.get("visibility_pct", np.nan),
+                "traffic_effect": "есть рост" if has_growth else "роста нет",
+                "traffic_reason": traffic_reason,
+            })
+
+        traffic_decision = "держать" if has_growth else "откатить"
+        summary = {
+            "campaign_id": cid,
+            "supplier_article": article,
+            "placement": placement,
+            "event_date": event_day.date().isoformat(),
+            "baseline_day": baseline_day.date().isoformat(),
+            "check_day": check_day.date().isoformat(),
+            "postcheck_day": int((check_day - event_day).days),
+            "old_bid_rub": h.get("old_bid_rub"),
+            "new_bid_rub": h.get("new_bid_rub"),
+            "gp_before_ads_per_order_rub": margin,
+            "adequate_core_queries_count": int(len(adequate)),
+            "baseline_impressions": base_ag.get("impressions"),
+            "check_impressions": check_ag.get("impressions"),
+            "baseline_query_total_impressions": base_ag.get("query_total_impressions"),
+            "check_query_total_impressions": check_ag.get("query_total_impressions"),
+            "baseline_impression_share_pct": base_ag.get("impression_share_pct"),
+            "check_impression_share_pct": check_ag.get("impression_share_pct"),
+            "baseline_clicks": base_ag.get("clicks"),
+            "check_clicks": check_ag.get("clicks"),
+            "baseline_orders": base_ag.get("orders"),
+            "check_orders": check_ag.get("orders"),
+            "baseline_position": base_ag.get("median_position"),
+            "check_position": check_ag.get("median_position"),
+            "baseline_visibility_pct": base_ag.get("visibility_pct"),
+            "check_visibility_pct": check_ag.get("visibility_pct"),
+            **effect_metrics,
+            "traffic_decision": traffic_decision,
+            "traffic_reason": traffic_reason,
+        }
+        summary_rows.append(summary)
+        current_bid = pd.to_numeric(dec.get("real_bid_rub", np.nan), errors="coerce")
+        old_bid = pd.to_numeric(h.get("old_bid_rub", np.nan), errors="coerce")
+        if (not has_growth) and pd.notna(old_bid) and pd.notna(current_bid) and float(old_bid) < float(current_bid):
+            rollbacks[cid] = {
+                "new_bid_rub": int(round(float(old_bid))),
+                "reason_code": "CORE_TRAFFIC_RAISE_NO_EFFECT_ROLLBACK",
+                "reason_text": f"После повышения ставки CORE-трафик не вырос за 1 день: нет улучшения кликов, доли показов, позиции и видимости. Возвращаем ставку {current_bid:g}→{old_bid:g}.",
+                "traffic_summary": summary,
+            }
+
+    return pd.DataFrame(detail_rows), pd.DataFrame(summary_rows), rollbacks
+
+
+def apply_core_daily_traffic_rollbacks_v78(decisions: pd.DataFrame, rollbacks: Dict[int, Dict[str, Any]]) -> pd.DataFrame:
+    if decisions is None or decisions.empty or not rollbacks:
+        return decisions
+    out = decisions.copy()
+    if "traffic_postcheck_action" not in out.columns:
+        out["traffic_postcheck_action"] = ""
+    if "traffic_postcheck_reason" not in out.columns:
+        out["traffic_postcheck_reason"] = ""
+    for cid, rb in rollbacks.items():
+        mask = out["campaign_id"].astype("Int64").eq(int(cid))
+        if not mask.any():
+            continue
+        # Do not override pause/start. For bid rows rollback has priority over ordinary hold/raise.
+        cur_action = str(out.loc[mask, "action"].iloc[0]).lower() if "action" in out.columns else ""
+        if cur_action in {"pause", "start"}:
+            continue
+        out.loc[mask, "action"] = "lower"
+        out.loc[mask, "new_bid_rub"] = rb["new_bid_rub"]
+        out.loc[mask, "reason_code"] = rb["reason_code"]
+        out.loc[mask, "reason_text"] = rb["reason_text"]
+        out.loc[mask, "traffic_postcheck_action"] = "откатить повышение"
+        out.loc[mask, "traffic_postcheck_reason"] = rb["reason_text"]
+    return out
+
+
+def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.Timestamp], pd.DataFrame]:
+    global LAST_CORE_DAILY_TRAFFIC_POSTCHECK_V78, LAST_CORE_DAILY_TRAFFIC_POSTCHECK_SUMMARY_V78, LAST_CORE_DAILY_ROLLBACKS_V78
+    decisions, core, payload, windows, postcheck = _COMPUTE_ENGINE_V77(args)
+    weekly_spec = getattr(args, "keywords_weekly", None)
+    keyword_daily_90d = load_keywords_daily_90d(weekly_spec, windows) if weekly_spec else pd.DataFrame()
+    bid_history = load_bid_history(getattr(args, "bid_history", None))
+    detail, summary, rollbacks = build_core_daily_traffic_postcheck_v78(
+        keyword_daily_90d,
+        decisions,
+        bid_history,
+        LAST_CORE_FLAGSHIP_PAIRS_V77,
+        windows,
+    )
+    LAST_CORE_DAILY_TRAFFIC_POSTCHECK_V78 = detail
+    LAST_CORE_DAILY_TRAFFIC_POSTCHECK_SUMMARY_V78 = summary
+    LAST_CORE_DAILY_ROLLBACKS_V78 = rollbacks
+    decisions = apply_core_daily_traffic_rollbacks_v78(decisions, rollbacks)
+    payload = build_payload_preview(decisions)
+    return decisions, core, payload, windows, postcheck
+
+
+def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
+    summary = _MAKE_SUMMARY_JSON_V77(mode, decisions, successful, api_log, windows, args)
+    summary["Версия"] = SCRIPT_VERSION
+    summary["CORE daily traffic post-check"] = "после повышения ставки ежедневно проверяем CORE-запросы с адекватным CPO; если за 1 день нет роста кликов/доли показов/позиции/видимости — откат ставки"
+    summary["Откатов по CORE-трафику"] = int(len(LAST_CORE_DAILY_ROLLBACKS_V78 or {}))
+    summary["Причины"] = "пользовательские причины выводятся на русском; reason_code оставлен как техническое поле"
+    return summary
+
+
+def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payload: pd.DataFrame, windows: Dict[str, pd.Timestamp], postcheck: Optional[pd.DataFrame] = None) -> None:
+    _WRITE_OUTPUTS_V77(path, decisions, core, payload, windows, postcheck)
+    mode = "a" if Path(path).exists() else "w"
+    with pd.ExcelWriter(path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
+        if LAST_CORE_DAILY_TRAFFIC_POSTCHECK_SUMMARY_V78 is not None and not LAST_CORE_DAILY_TRAFFIC_POSTCHECK_SUMMARY_V78.empty:
+            LAST_CORE_DAILY_TRAFFIC_POSTCHECK_SUMMARY_V78.to_excel(writer, sheet_name="CORE_postcheck_кампании", index=False)
+        else:
+            pd.DataFrame({"note": ["Нет кампаний для ежедневного CORE traffic post-check после повышения ставки."]}).to_excel(writer, sheet_name="CORE_postcheck_кампании", index=False)
+        if LAST_CORE_DAILY_TRAFFIC_POSTCHECK_V78 is not None and not LAST_CORE_DAILY_TRAFFIC_POSTCHECK_V78.empty:
+            LAST_CORE_DAILY_TRAFFIC_POSTCHECK_V78.to_excel(writer, sheet_name="CORE_postcheck_трафика", index=False)
+        else:
+            pd.DataFrame({"note": ["Нет детализации по CORE-запросам для daily traffic post-check."]}).to_excel(writer, sheet_name="CORE_postcheck_трафика", index=False)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
