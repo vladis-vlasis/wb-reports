@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v76_economics_core_mapping_fix_2026-07-03"
+  WORKFLOW_VERSION: "v77_core_flagship_pairs_traffic_2026-07-13"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
