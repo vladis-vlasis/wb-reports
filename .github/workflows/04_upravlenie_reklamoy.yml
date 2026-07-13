@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v77_core_flagship_pairs_traffic_2026-07-13"
+  WORKFLOW_VERSION: "v78_core_daily_traffic_postcheck_2026-07-13"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -64,7 +64,7 @@ jobs:
           echo "=== Workflow file hash and markers ==="
           if [[ -f "${WORKFLOW_FILE}" ]]; then
             sha256sum "${WORKFLOW_FILE}"
-            grep -nE "WORKFLOW_VERSION|cron:|18:|МСК|RUN_SLOT|REPORT_ENV" "${WORKFLOW_FILE}" || true
+            grep -nE "WORKFLOW_VERSION|cron:|18:|МСК|RUN_SLOT|REPORT_ENV|CORE" "${WORKFLOW_FILE}" || true
           else
             echo "WARNING: ${WORKFLOW_FILE} not found after checkout"
             find .github/workflows -maxdepth 1 -type f -print || true
