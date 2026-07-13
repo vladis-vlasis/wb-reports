@@ -6,7 +6,7 @@
 Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
 Автоматическое получение всех артикулов из заказов для отчёта по ключам.
 Формат для keywords: Неделя ГГГГ-WНН.xlsx
-Финансовые показатели: в ежедневном режиме загружается только целевую дату; историческая догрузка включается только через env.
+Финансовые показатели: в ежедневном режиме загружается только целевая дата; историческая догрузка включается только через env.
 Всегда читается первый лист в файле.
 Поисковые запросы: загружается целевая дата по правилу времени запуска.
 Реклама: в ежедневном режиме получает статистику только за целевую дату и объединяет её с существующей историей.
@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-06-26_v29_TARGET_DATE_RULE_MANUAL_OK"
+SCRIPT_VERSION = "2026-07-13_v30_STOCKS_WAREHOUSE_REMAINS_NO_429_LOOP"
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -443,6 +443,22 @@ class WildberriesDailyUpdater:
         return articles
 
     # ====================== МЕТОДЫ ДЛЯ КАЖДОГО ОТЧЁТА ======================
+    def _rate_limit_wait_seconds(self, resp, default_seconds: int = 65, max_seconds: int = 900) -> int:
+        """Время ожидания при 429 по заголовкам WB."""
+        candidates = []
+        for header in ("X-Ratelimit-Retry", "X-RateLimit-Retry", "X-Ratelimit-Reset", "X-RateLimit-Reset", "Retry-After"):
+            raw = resp.headers.get(header)
+            if raw is None:
+                continue
+            try:
+                value = int(float(str(raw).strip()))
+                if value > 0:
+                    candidates.append(value)
+            except Exception:
+                continue
+        wait = max(candidates) if candidates else default_seconds
+        return max(5, min(wait, max_seconds))
+
     def _make_request(self, config: dict, headers: dict, date_str: str, **kwargs) -> Optional[Any]:
         url = config['api_url']
         method = config['api_method']
@@ -597,21 +613,222 @@ class WildberriesDailyUpdater:
                 self.log(f"ℹ️ Нет новых данных за неделю")
         return True
 
-    # ---------- Остатки (исправленная версия с пагинацией) ----------
+    # ---------- Остатки ----------
+    def _create_warehouse_remains_task(self, headers: dict) -> Optional[str]:
+        """Создать задачу нового отчёта warehouse_remains вместо deprecated /supplier/stocks."""
+        url = "https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains"
+        params = {
+            "locale": "ru",
+            "groupByBrand": "true",
+            "groupBySubject": "true",
+            "groupBySa": "true",
+            "groupByNm": "true",
+            "groupByBarcode": "true",
+            "groupBySize": "true",
+        }
+
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=120)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    task_id = (data.get("data") or {}).get("taskId")
+                    if not task_id:
+                        self.log(f"❌ warehouse_remains не вернул taskId: {str(data)[:1000]}")
+                        return None
+                    self.log(f"✅ Задача warehouse_remains создана: {task_id}")
+                    return task_id
+
+                if resp.status_code == 429:
+                    wait = self._rate_limit_wait_seconds(resp, default_seconds=90, max_seconds=900)
+                    self.log(
+                        f"⚠️ warehouse_remains create: 429, попытка {attempt}/3, "
+                        f"ждём {wait} сек. headers={dict(resp.headers)}"
+                    )
+                    time.sleep(wait)
+                    continue
+
+                self.log(f"❌ warehouse_remains create HTTP {resp.status_code}: {resp.text[:1000]}")
+                return None
+            except Exception as e:
+                self.log(f"❌ Ошибка warehouse_remains create: {e}")
+                if attempt < 3:
+                    time.sleep(30)
+                else:
+                    return None
+
+        self.log("❌ warehouse_remains create: лимит 429 не снялся после 3 попыток, остатки пропущены")
+        return None
+
+    def _wait_warehouse_remains_task(self, task_id: str, headers: dict) -> bool:
+        """Дождаться готовности отчёта warehouse_remains."""
+        url = f"https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains/tasks/{task_id}/status"
+
+        for attempt in range(1, 31):
+            try:
+                resp = requests.get(url, headers=headers, timeout=60)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    status = ((data.get("data") or {}).get("status") or "").lower()
+                    self.log(f"⏳ warehouse_remains status: {status or 'unknown'} ({attempt}/30)")
+                    if status == "done":
+                        return True
+                    if status in {"canceled", "cancelled", "failed", "error"}:
+                        self.log(f"❌ warehouse_remains завершился статусом {status}: {str(data)[:1000]}")
+                        return False
+                    time.sleep(10)
+                    continue
+
+                if resp.status_code == 429:
+                    wait = self._rate_limit_wait_seconds(resp, default_seconds=15, max_seconds=300)
+                    self.log(
+                        f"⚠️ warehouse_remains status: 429, попытка {attempt}/30, "
+                        f"ждём {wait} сек. headers={dict(resp.headers)}"
+                    )
+                    time.sleep(wait)
+                    continue
+
+                self.log(f"❌ warehouse_remains status HTTP {resp.status_code}: {resp.text[:1000]}")
+                return False
+            except Exception as e:
+                self.log(f"❌ Ошибка warehouse_remains status: {e}")
+                time.sleep(10)
+
+        self.log("❌ warehouse_remains не подготовился за 30 попыток")
+        return False
+
+    def _download_warehouse_remains_task(self, task_id: str, headers: dict) -> Optional[List[dict]]:
+        """Скачать готовый отчёт warehouse_remains."""
+        url = f"https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains/tasks/{task_id}/download"
+
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(url, headers=headers, timeout=180)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        self.log(f"✅ warehouse_remains скачан, строк верхнего уровня: {len(data)}")
+                        return data
+                    self.log(f"❌ warehouse_remains download вернул не список: {str(data)[:1000]}")
+                    return None
+
+                if resp.status_code == 204:
+                    self.log("ℹ️ warehouse_remains download: нет данных")
+                    return []
+
+                if resp.status_code == 429:
+                    wait = self._rate_limit_wait_seconds(resp, default_seconds=90, max_seconds=900)
+                    self.log(
+                        f"⚠️ warehouse_remains download: 429, попытка {attempt}/3, "
+                        f"ждём {wait} сек. headers={dict(resp.headers)}"
+                    )
+                    time.sleep(wait)
+                    continue
+
+                self.log(f"❌ warehouse_remains download HTTP {resp.status_code}: {resp.text[:1000]}")
+                return None
+            except Exception as e:
+                self.log(f"❌ Ошибка warehouse_remains download: {e}")
+                if attempt < 3:
+                    time.sleep(30)
+                else:
+                    return None
+
+        self.log("❌ warehouse_remains download: лимит 429 не снялся после 3 попыток, остатки пропущены")
+        return None
+
+    def _warehouse_remains_to_stocks_df(self, data: List[dict], store_name: str, target_date_str: str) -> pd.DataFrame:
+        """Преобразовать новый warehouse_remains в старую структуру листа Остатки."""
+        rows = []
+        now_str = datetime.now(pytz.timezone('Europe/Moscow')).strftime('%Y-%m-%d %H:%M:%S')
+
+        inway_to_names = {"в пути до получателей", "в пути к клиенту", "в пути до клиента"}
+        inway_from_names = {"в пути возвраты на склад wb", "в пути от клиента", "в пути возвраты"}
+        total_names = {"всего находится на складах", "итого", "всего"}
+
+        for item in data or []:
+            warehouses = item.get("warehouses") or []
+
+            for wh in warehouses:
+                wh_name = str(wh.get("warehouseName", "") or "").strip()
+                q = int(wh.get("quantity") or 0)
+                wh_name_l = wh_name.lower()
+
+                if wh_name_l in total_names:
+                    continue
+
+                if wh_name_l in inway_to_names:
+                    row_qty, row_in_to, row_in_from = 0, q, 0
+                elif wh_name_l in inway_from_names:
+                    row_qty, row_in_to, row_in_from = 0, 0, q
+                else:
+                    row_qty, row_in_to, row_in_from = q, 0, 0
+
+                rows.append({
+                    'Дата последнего изменения': now_str,
+                    'Склад': wh_name,
+                    'Артикул продавца': item.get('vendorCode', ''),
+                    'Артикул WB': item.get('nmId', ''),
+                    'Баркод': item.get('barcode', ''),
+                    'Доступно для продажи': row_qty,
+                    'В пути к клиенту': row_in_to,
+                    'В пути от клиента': row_in_from,
+                    'Полное количество': row_qty + row_in_to + row_in_from,
+                    'Категория': '',
+                    'Предмет': item.get('subjectName', ''),
+                    'Бренд': item.get('brand', ''),
+                    'Размер': item.get('techSize', ''),
+                    'Цена': 0,
+                    'Скидка': 0,
+                    'Договор поставки': '',
+                    'Договор реализации': '',
+                    'Код контракта': '',
+                    'Дата запроса': target_date_str,
+                    'Магазин': store_name,
+                    'Дата сбора': now_str,
+                })
+
+            if not warehouses:
+                rows.append({
+                    'Дата последнего изменения': now_str,
+                    'Склад': '',
+                    'Артикул продавца': item.get('vendorCode', ''),
+                    'Артикул WB': item.get('nmId', ''),
+                    'Баркод': item.get('barcode', ''),
+                    'Доступно для продажи': 0,
+                    'В пути к клиенту': 0,
+                    'В пути от клиента': 0,
+                    'Полное количество': 0,
+                    'Категория': '',
+                    'Предмет': item.get('subjectName', ''),
+                    'Бренд': item.get('brand', ''),
+                    'Размер': item.get('techSize', ''),
+                    'Цена': 0,
+                    'Скидка': 0,
+                    'Договор поставки': '',
+                    'Договор реализации': '',
+                    'Код контракта': '',
+                    'Дата запроса': target_date_str,
+                    'Магазин': store_name,
+                    'Дата сбора': now_str,
+                })
+
+        return pd.DataFrame(rows)
+
     def update_stocks(self, store_name: str) -> bool:
-        """Обновление остатков (ежедневный срез) с поддержкой пагинации."""
-        self.log(f"\n📌 ОБНОВЛЕНИЕ: Остатки для магазина {store_name}")
-        config = self.reports_config['stocks']
+        """Обновление остатков через новый warehouse_remains.
 
-        # Целевая дата по правилу времени запуска
+        Старый endpoint /api/v1/supplier/stocks deprecated и даёт постоянные 429/недоступность.
+        Новый метод асинхронный: create task -> wait status -> download.
+        """
+        self.log(f"\\n📌 ОБНОВЛЕНИЕ: Остатки для магазина {store_name}")
         target_date = self.target_date
-        week_start = self._get_week_start(datetime.combine(target_date, datetime.min.time()))
         target_date_str = target_date.strftime('%Y-%m-%d')
+        week_start = self._get_week_start(datetime.combine(target_date, datetime.min.time()))
 
-        # Загружаем существующий недельный файл
         weekly_df = self._load_weekly_data(store_name, 'stocks', week_start)
         if not weekly_df.empty and 'Дата запроса' in weekly_df.columns:
-            existing_dates = set(pd.to_datetime(weekly_df['Дата запроса']).dt.date.unique())
+            existing_dates = set(pd.to_datetime(weekly_df['Дата запроса'], errors='coerce').dt.date.dropna().unique())
         else:
             existing_dates = set()
 
@@ -619,114 +836,52 @@ class WildberriesDailyUpdater:
             self.log(f"✅ Данные за {target_date_str} уже есть в недельном файле, пропускаем")
             return True
 
-        self.log(f"📅 Загрузка остатков за {target_date_str}...")
+        self.log(f"📅 Загрузка остатков за {target_date_str} через warehouse_remains...")
 
-        api_key = self.api_keys[store_name][config['key_type']]
+        api_key = self.api_keys[store_name][self.reports_config['stocks']['key_type']]
         headers = {"Authorization": api_key.strip()}
 
-        # Параметры для пагинации: начинаем с очень ранней даты
-        date_from = "2000-01-01T00:00:00"
-        all_data = []
-        page = 1
-        max_pages = 50  # предохранитель
+        task_id = self._create_warehouse_remains_task(headers)
+        if not task_id:
+            self.log("⚠️ Остатки пропущены: не удалось создать задачу warehouse_remains")
+            return False
 
-        while page <= max_pages:
-            params = {"dateFrom": date_from}
-            self.log(f"  Страница {page}, dateFrom={date_from}")
+        if not self._wait_warehouse_remains_task(task_id, headers):
+            self.log("⚠️ Остатки пропущены: задача warehouse_remains не готова")
+            return False
 
-            try:
-                resp = requests.get(config['api_url'], headers=headers, params=params, timeout=60)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if not data:  # пустой массив – все данные получены
-                        self.log(f"  ✅ Завершено: получено пустых данных")
-                        break
+        raw_data = self._download_warehouse_remains_task(task_id, headers)
+        if raw_data is None:
+            self.log("⚠️ Остатки пропущены: не удалось скачать warehouse_remains")
+            return False
 
-                    all_data.extend(data)
-                    self.log(f"  ➕ Добавлено {len(data)} записей, всего {len(all_data)}")
-
-                    # Берём lastChangeDate последней записи для следующего запроса
-                    last_item = data[-1]
-                    date_from = last_item.get("lastChangeDate")
-                    if not date_from:
-                        self.log("  ⚠️ В последней записи нет lastChangeDate, прерываем пагинацию")
-                        break
-
-                    # Лимит 1 запрос в минуту, ждём 65 сек перед следующим
-                    time.sleep(self.delays['stocks'])
-                    page += 1
-
-                elif resp.status_code == 429:
-                    self.log(f"  ⚠️ Лимит запросов (429), ждём 65 сек...")
-                    time.sleep(65)
-                    # повторяем запрос с теми же параметрами
-                    continue
-                else:
-                    self.log(f"  ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
-                    return False
-            except Exception as e:
-                self.log(f"  ❌ Исключение при запросе: {e}")
-                return False
-
-        if not all_data:
-            self.log(f"ℹ️ Нет данных за {target_date_str}")
+        df_day = self._warehouse_remains_to_stocks_df(raw_data, store_name, target_date_str)
+        if df_day.empty:
+            self.log(f"ℹ️ Нет данных остатков за {target_date_str}")
             return True
 
-        # Создаём DataFrame и добавляем служебные колонки
-        df_day = pd.DataFrame(all_data)
-        df_day['Дата запроса'] = target_date_str
-        df_day['Магазин'] = store_name
-        df_day['Дата сбора'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        # Переименование колонок
-        rename_map = {
-            'lastChangeDate': 'Дата последнего изменения',
-            'warehouseName': 'Склад',
-            'supplierArticle': 'Артикул продавца',
-            'nmId': 'Артикул WB',
-            'barcode': 'Баркод',
-            'quantity': 'Доступно для продажи',
-            'inWayToClient': 'В пути к клиенту',
-            'inWayFromClient': 'В пути от клиента',
-            'quantityFull': 'Полное количество',
-            'category': 'Категория',
-            'subject': 'Предмет',
-            'brand': 'Бренд',
-            'techSize': 'Размер',
-            'Price': 'Цена',
-            'Discount': 'Скидка',
-            'isSupply': 'Договор поставки',
-            'isRealization': 'Договор реализации',
-            'SCCode': 'Код контракта'
-        }
-        df_day.rename(columns={k: v for k, v in rename_map.items() if k in df_day.columns}, inplace=True)
-
-        # Дедупликация по уникальному набору полей (дата + артикул WB + склад)
-        dedup_cols = ['Дата запроса', 'Артикул WB', 'Склад']
+        dedup_cols = ['Дата запроса', 'Артикул WB', 'Баркод', 'Склад']
         existing_cols = [c for c in dedup_cols if c in df_day.columns]
         if existing_cols:
             before = len(df_day)
             df_day = df_day.drop_duplicates(subset=existing_cols, keep='last')
-            after = len(df_day)
-            if before > after:
-                self.log(f"🔍 Удалено дубликатов в дневных данных: {before - after}")
+            removed = before - len(df_day)
+            if removed:
+                self.log(f"🔍 Удалено дубликатов в дневных остатках: {removed}")
 
-        # Объединяем с недельным файлом
         if weekly_df.empty:
             weekly_df = df_day
         else:
             weekly_df = pd.concat([weekly_df, df_day], ignore_index=True)
-            # Дедупликация во всём недельном файле
             if existing_cols:
-                before_week = len(weekly_df)
+                before = len(weekly_df)
                 weekly_df = weekly_df.drop_duplicates(subset=existing_cols, keep='last')
-                after_week = len(weekly_df)
-                if before_week > after_week:
-                    self.log(f"🔍 Удалено дубликатов в недельном файле: {before_week - after_week}")
+                removed = before - len(weekly_df)
+                if removed:
+                    self.log(f"🔍 Удалено дубликатов в недельном файле остатков: {removed}")
 
-        # Сохраняем
         self._save_weekly_data(weekly_df, store_name, 'stocks', week_start)
-        self.log(f"✅ Данные за {target_date_str} добавлены в недельный файл")
+        self.log(f"✅ Остатки за {target_date_str} добавлены в недельный файл через warehouse_remains")
         return True
 
     # ---------- Финансовые показатели ----------
@@ -1128,7 +1283,7 @@ class WildberriesDailyUpdater:
         end_date = self.target_date
 
         # v24:
-        # Ежедневный запуск должен собирать только целевую датушний день.
+        # Ежедневный запуск должен собирать только целевую дату.
         # Историческую догрузку с 2026-06-01 включаем только явно через env:
         # WB_KEYWORDS_BACKFILL_FROM=YYYY-MM-DD
         backfill_from = _parse_optional_date_env("WB_KEYWORDS_BACKFILL_FROM")
