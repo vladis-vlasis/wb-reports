@@ -16,6 +16,7 @@
 # FIX55: 18:05 MSK hard run window, 10-min source retry, strict previous-day daily report
 # FIX57_AUTO_WINDOW_MANUAL_BYPASS_20260623: auto schedule window only; manual workflow_dispatch bypasses time guard
 # FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: localization pool coverage by snapshot date; stale stock snapshots are not carried indefinitely
+# FIX66_REPORT_QUALITY_CORE_PRODUCTS_MANAGERS_20260713: CORE demand=orders80 last90, fixed conversions, all products in category lists, 620/622 included, manager overrides
 # FIX59_WEEKLY_PDF_LOCALIZATION_DYNAMIC_20260624: PDF weekly windows ignore daily strict/current_week_only; localization uses weekly stock_day dynamics
 # FIX60_MSK_TARGET_WINDOW_NO_CANCEL_20260626: scheduled/manual daily runs never cancel by time; 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1
 # FIX62_STORAGE_ENV_RESTORE_20260626: restore GitHub Object Storage env aliases and apply MSK target to all report modes
@@ -95,6 +96,8 @@ VALID_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = {
     "614": "Косметические карандаши",
     "617": "Косметические карандаши",
     "618": "Косметические карандаши",
+    "620": "Косметические карандаши",
+    "622": "Косметические карандаши",
     "154": "Помады",
     "155": "Помады",
     "156": "Помады",
@@ -2280,14 +2283,40 @@ class AnalyticsBuilder:
         if f.empty:
             return pd.DataFrame()
         f = f[(f["day"] >= self.cutoff_90) & (f["day"] <= self.latest_day)].copy()
+        # FIX66: do not recompute all funnel conversions from WB Orders later.
+        # WB funnel already has its own addToCartConversion/cartToOrderConversion;
+        # aggregate those rates with relevant denominators so PDF never shows impossible
+        # cart->order values like 140% caused by mixing Orders rows with funnel carts.
+        for _c in ["open_cards", "add_to_cart", "orders", "order_sum", "cart_conv_pct", "order_conv_pct"]:
+            if _c not in f.columns:
+                f[_c] = np.nan if _c in {"cart_conv_pct", "order_conv_pct"} else 0.0
+            f[_c] = pd.to_numeric(f[_c], errors="coerce")
+        f["open_cards"] = f["open_cards"].fillna(0.0)
+        f["add_to_cart"] = f["add_to_cart"].fillna(0.0)
+        f["orders"] = f["orders"].fillna(0.0)
+        f["order_sum"] = f["order_sum"].fillna(0.0)
+        f["_cart_conv_num"] = f["cart_conv_pct"] * f["open_cards"]
+        f["_cart_conv_den"] = np.where(f["cart_conv_pct"].notna() & (f["open_cards"] > 0), f["open_cards"], 0.0)
+        f["_order_conv_num"] = f["order_conv_pct"] * f["add_to_cart"]
+        f["_order_conv_den"] = np.where(f["order_conv_pct"].notna() & (f["add_to_cart"] > 0), f["add_to_cart"], 0.0)
+        f["card_to_order_pct"] = np.where(f["open_cards"] > 0, f["orders"] / f["open_cards"] * 100, np.nan)
+        f["_card_to_order_num"] = f["card_to_order_pct"] * f["open_cards"]
+        f["_card_to_order_den"] = np.where(f["card_to_order_pct"].notna() & (f["open_cards"] > 0), f["open_cards"], 0.0)
         g = f.groupby(["day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
             orders=("orders", "sum"), order_sum=("order_sum", "sum"), open_cards=("open_cards", "sum"),
             add_to_cart=("add_to_cart", "sum"), buyouts_count=("buyouts_count", "sum"), cancels_count=("cancels_count", "sum"),
             finished_price_funnel=("finished_price", "mean"), spp_funnel=("spp", "mean"),
+            _cart_conv_num=("_cart_conv_num", "sum"), _cart_conv_den=("_cart_conv_den", "sum"),
+            _order_conv_num=("_order_conv_num", "sum"), _order_conv_den=("_order_conv_den", "sum"),
+            _card_to_order_num=("_card_to_order_num", "sum"), _card_to_order_den=("_card_to_order_den", "sum"),
         )
-        g["cart_conv_pct"] = np.where(g["open_cards"] > 0, g["add_to_cart"] / g["open_cards"] * 100, np.nan)
-        g["order_conv_pct"] = np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan)
-        return g
+        g["cart_conv_pct"] = np.where(g["_cart_conv_den"] > 0, g["_cart_conv_num"] / g["_cart_conv_den"], np.where(g["open_cards"] > 0, g["add_to_cart"] / g["open_cards"] * 100, np.nan))
+        g["order_conv_pct"] = np.where(g["_order_conv_den"] > 0, g["_order_conv_num"] / g["_order_conv_den"], np.where(g["add_to_cart"] > 0, g["orders"] / g["add_to_cart"] * 100, np.nan))
+        g["card_to_order_pct"] = np.where(g["_card_to_order_den"] > 0, g["_card_to_order_num"] / g["_card_to_order_den"], np.where(g["open_cards"] > 0, g["orders"] / g["open_cards"] * 100, np.nan))
+        # Conversion rates are percentages; WB data glitches must not leak into the management PDF.
+        for _c in ["cart_conv_pct", "order_conv_pct", "card_to_order_pct"]:
+            g[_c] = pd.to_numeric(g[_c], errors="coerce").clip(lower=0, upper=100)
+        return g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
 
     def ads_daily_pivot(self) -> pd.DataFrame:
         ads = self.enrich(self.pack.ads_daily, "ads")
@@ -2332,9 +2361,9 @@ class AnalyticsBuilder:
             rating_card=("rating_card", "mean"), rating_reviews=("rating_reviews", "mean"), visibility_pct=("visibility_pct", "mean"),
         )
         summary["search_traffic_capture_pct"] = np.where(summary["search_frequency"] > 0, summary["search_transitions"] / summary["search_frequency"] * 100, np.nan)
-        # Core queries that give 80%+ orders over the last 60 days.
+        # FIX66: CORE queries = queries that generate 80% of orders over the last 90 days.
         # If available history is shorter, take everything present.
-        core_start = max(pd.to_datetime(q["day"], errors="coerce").min(), self.latest_day - pd.Timedelta(days=59))
+        core_start = max(pd.to_datetime(q["day"], errors="coerce").min(), self.latest_day - pd.Timedelta(days=89))
         q_core = q[(q["day"] >= core_start) & (q["day"] <= self.latest_day)].copy()
         core_rows = []
         for keys, part in q_core.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False):
@@ -2363,12 +2392,14 @@ class AnalyticsBuilder:
         return summary, core
 
     def search_unique_demand(self) -> pd.DataFrame:
-        """Unique WB demand by level from raw search queries.
+        """Unique WB demand by CORE queries only.
 
-        Важно: спрос на уровне категории/товара нельзя считать суммой спроса по артикулам,
-        потому что один и тот же поисковый запрос встречается у нескольких карточек.
-        Поэтому считаем частотность один раз на уровне: день + уровень + нормализованный запрос.
-        Для частотности берём max по дублям. Переходы/заказы уже очищены от фильтр-дублей в loader.
+        FIX66 business rule:
+        - CORE = queries that generate 80% of all query orders for the entity over
+          the last 90 days (or all available history if shorter);
+        - demand is counted only for these CORE queries;
+        - at category/product levels the same query is counted once per day/entity
+          via MAX(frequency), not summed across articles.
         """
         q = self.enrich(self.pack.search_queries, "search_queries")
         if q.empty:
@@ -2386,14 +2417,56 @@ class AnalyticsBuilder:
                 q[col] = 0
             q[col] = pd.to_numeric(q[col], errors="coerce").fillna(0)
 
+        def _select_core_query_names(x: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+            rows = []
+            if x.empty:
+                return pd.DataFrame(columns=keys + ["query_norm", "core_orders", "core_orders_share_pct", "core_cum_orders_share_pct"])
+            for keyvals, part in x.groupby(keys, dropna=False):
+                if not isinstance(keyvals, tuple):
+                    keyvals = (keyvals,)
+                p = part.groupby("query_norm", dropna=False, as_index=False).agg(
+                    core_orders=("orders", "sum"),
+                    core_frequency=("frequency", "sum"),
+                    core_transitions=("transitions", "sum"),
+                )
+                p = p[p["query_norm"].astype(str).ne("")].copy()
+                if p.empty:
+                    continue
+                p = p.sort_values(["core_orders", "core_frequency", "core_transitions"], ascending=[False, False, False]).copy()
+                total_orders = float(pd.to_numeric(p["core_orders"], errors="coerce").fillna(0).sum())
+                if total_orders > 0:
+                    p["core_orders_share_pct"] = p["core_orders"] / total_orders * 100.0
+                    p["core_cum_orders_share_pct"] = p["core_orders_share_pct"].cumsum()
+                    core = p[(p["core_cum_orders_share_pct"] <= 80.0) | (p["core_orders"] == p["core_orders"].max())].copy()
+                    crossing = p[p["core_cum_orders_share_pct"] > 80.0].head(1)
+                    core = pd.concat([core, crossing], ignore_index=True).drop_duplicates("query_norm")
+                    core["core_rule"] = "orders80_last90"
+                else:
+                    # No query orders in history: keep the strongest demand queries instead of hiding demand completely.
+                    core = p.head(int(os.getenv("WB_CORE_FALLBACK_TOP_N", "10"))).copy()
+                    core["core_orders_share_pct"] = 0.0
+                    core["core_cum_orders_share_pct"] = 0.0
+                    core["core_rule"] = "fallback_top_frequency_no_orders"
+                for _, rr in core.iterrows():
+                    rec = dict(zip(keys, keyvals))
+                    rec.update(rr.to_dict())
+                    rows.append(rec)
+            return pd.DataFrame(rows)
+
         def build(level: str, keys: List[str]) -> pd.DataFrame:
+            core_names = _select_core_query_names(q, keys)
+            if core_names.empty:
+                return pd.DataFrame()
+            core_cols = keys + ["query_norm"]
+            x = q.merge(core_names[core_cols + ["core_rule"]].drop_duplicates(core_cols), on=core_cols, how="inner")
             cols = ["day"] + keys + ["query_norm"]
-            x = q.groupby(cols, dropna=False, as_index=False).agg(
+            x = x.groupby(cols, dropna=False, as_index=False).agg(
                 unique_frequency=("frequency", "max"),
                 query_rows=("frequency", "size"),
                 transitions=("transitions", "sum"),
                 add_to_cart=("add_to_cart", "sum"),
                 orders=("orders", "sum"),
+                core_rule=("core_rule", "first"),
             )
             g = x.groupby(["day"] + keys, dropna=False, as_index=False).agg(
                 unique_search_frequency=("unique_frequency", "sum"),
@@ -2402,9 +2475,11 @@ class AnalyticsBuilder:
                 transitions=("transitions", "sum"),
                 add_to_cart=("add_to_cart", "sum"),
                 orders=("orders", "sum"),
+                core_rule=("core_rule", "first"),
             )
             g["duplicate_query_rows_removed"] = g["raw_query_rows"] - g["unique_search_queries"]
             g["level"] = level
+            g["core_window_days"] = 90
             return g
 
         frames = [
@@ -2412,6 +2487,7 @@ class AnalyticsBuilder:
             build("product", ["subject", "product"]),
             build("article", ["subject", "product", "supplier_article", "nm_id"]),
         ]
+        frames = [f for f in frames if f is not None and not f.empty]
         out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         return out
 
@@ -2427,7 +2503,7 @@ class AnalyticsBuilder:
         q = self.enrich(self.pack.search_queries, "search_queries")
         if q.empty or daily is None or daily.empty:
             return pd.DataFrame()
-        core_start = max(pd.to_datetime(q["day"], errors="coerce").min(), self.latest_day - pd.Timedelta(days=59))
+        core_start = max(pd.to_datetime(q["day"], errors="coerce").min(), self.latest_day - pd.Timedelta(days=89))
         q = q[(q["day"] >= core_start) & (q["day"] <= self.latest_day)].copy()
         if q.empty:
             return pd.DataFrame()
@@ -4053,9 +4129,31 @@ def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Time
     if x.empty:
         return pd.DataFrame(columns=empty_cols)
 
+    # FIX66: keep WB funnel conversion rates weighted by their denominators.
+    for _c in ["cart_conv_pct", "order_conv_pct", "card_to_order_pct", "open_cards", "add_to_cart"]:
+        if _c not in x.columns:
+            x[_c] = np.nan
+        x[_c] = pd.to_numeric(x[_c], errors="coerce")
+    _open_w = x["open_cards"].fillna(0.0).clip(lower=0)
+    _cart_w = x["add_to_cart"].fillna(0.0).clip(lower=0)
+    x["_cart_conv_num"] = x["cart_conv_pct"] * _open_w
+    x["_cart_conv_den"] = np.where(x["cart_conv_pct"].notna(), _open_w, 0.0)
+    x["_order_conv_num"] = x["order_conv_pct"] * _cart_w
+    x["_order_conv_den"] = np.where(x["order_conv_pct"].notna(), _cart_w, 0.0)
+    x["_card_to_order_num"] = x["card_to_order_pct"] * _open_w
+    x["_card_to_order_den"] = np.where(x["card_to_order_pct"].notna(), _open_w, 0.0)
+
     agg = {c: (c, "sum") for c in sum_cols}
     for c in mean_cols:
         agg[c] = (c, "mean")
+    agg.update({
+        "_cart_conv_num": ("_cart_conv_num", "sum"),
+        "_cart_conv_den": ("_cart_conv_den", "sum"),
+        "_order_conv_num": ("_order_conv_num", "sum"),
+        "_order_conv_den": ("_order_conv_den", "sum"),
+        "_card_to_order_num": ("_card_to_order_num", "sum"),
+        "_card_to_order_den": ("_card_to_order_den", "sum"),
+    })
     g = x.groupby(group_cols, dropna=False, as_index=False).agg(**agg)
     g["ad_spend_total"] = sum((g[c] if c in g.columns else 0) for c in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"])
     # Avoid double-count if ad_spend_model already includes manual+unified and channels exist.
@@ -4079,11 +4177,14 @@ def _agg_daily_for_bridge(daily: pd.DataFrame, start: pd.Timestamp, end: pd.Time
     g["drr_pct"] = np.where(order_sum > 0, g["ad_spend_total"] / order_sum * 100, np.nan)
     g["cpc"] = np.where(g["ad_clicks_total"] > 0, g["ad_spend_total"] / g["ad_clicks_total"], np.nan)
     g["ctr_pct"] = np.where(g["ad_impressions_total"] > 0, g["ad_clicks_total"] / g["ad_impressions_total"] * 100, np.nan)
-    g["cart_conv_pct"] = np.where(open_cards > 0, add_to_cart / open_cards * 100, np.nan)
-    g["order_conv_pct"] = np.where(add_to_cart > 0, orders / add_to_cart * 100, np.nan)
-    g["card_to_order_pct"] = np.where(open_cards > 0, orders / open_cards * 100, np.nan)
+    g["cart_conv_pct"] = np.where(g["_cart_conv_den"] > 0, g["_cart_conv_num"] / g["_cart_conv_den"], np.where(open_cards > 0, add_to_cart / open_cards * 100, np.nan))
+    g["order_conv_pct"] = np.where(g["_order_conv_den"] > 0, g["_order_conv_num"] / g["_order_conv_den"], np.where(add_to_cart > 0, orders / add_to_cart * 100, np.nan))
+    g["card_to_order_pct"] = np.where(g["_card_to_order_den"] > 0, g["_card_to_order_num"] / g["_card_to_order_den"], np.where(open_cards > 0, orders / open_cards * 100, np.nan))
+    for _cc in ["cart_conv_pct", "order_conv_pct", "card_to_order_pct"]:
+        g[_cc] = pd.to_numeric(g[_cc], errors="coerce").clip(lower=0, upper=100)
     g["search_traffic_capture_pct"] = np.where(search_frequency > 0, search_transitions / search_frequency * 100, np.nan)
     g["avg_order_price"] = np.where(orders > 0, order_sum / orders, np.nan)
+    g = g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
     return g
 
 
@@ -6524,7 +6625,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     CATEGORY_ORDER = ["Кисти", "Карандаши", "Помады", "Блески"]
     PRODUCT_ORDER = {
         "Кисти": ["901"],
-        "Карандаши": ["605", "611", "613", "614", "617", "618"],
+        "Карандаши": ["605", "611", "613", "614", "617", "618", "620", "622"],
         "Помады": ["154", "155", "156", "157", "206"],
         "Блески": ["207", "209", "210", "211"],
     }
@@ -7041,11 +7142,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         level = _level_for_keys(keys)
         if not level:
             return pd.DataFrame()
-        # FIX52: CORE is not a one-week snapshot. For each period end, take last 60 days
-        # of available query history (or fewer when history is shorter).
+        # FIX66: CORE position = average position for queries that generate 80%
+        # of query orders over the last 90 days before the period end.
         _end = pd.Timestamp(end).normalize()
         _hist_min = pd.to_datetime(search_query_gp_position["day"], errors="coerce").min()
-        _start = max(_hist_min, _end - pd.Timedelta(days=59)) if pd.notna(_hist_min) else _end - pd.Timedelta(days=59)
+        _start = max(_hist_min, _end - pd.Timedelta(days=89)) if pd.notna(_hist_min) else _end - pd.Timedelta(days=89)
         x = search_query_gp_position[(search_query_gp_position["day"] >= _start) & (search_query_gp_position["day"] <= _end)].copy()
         if x.empty:
             return pd.DataFrame()
@@ -7062,28 +7163,30 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 orders=("orders", "sum"),
                 frequency=("frequency", "sum"),
                 transitions=("transitions", "sum"),
-                avg_position=("avg_position", lambda s: weighted_mean(s, part.loc[s.index, "query_gp_est"].clip(lower=0).fillna(0) + part.loc[s.index, "orders"].fillna(0) + part.loc[s.index, "frequency"].fillna(0) / 1000)),
+                avg_position=("avg_position", lambda s: weighted_mean(s, part.loc[s.index, "orders"].fillna(0) + part.loc[s.index, "frequency"].fillna(0) / 1000)),
             )
-            q["query_gp_est"] = pd.to_numeric(q["query_gp_est"], errors="coerce").fillna(0.0)
-            q["_rank_gp"] = q["query_gp_est"].clip(lower=0)
-            q = q.sort_values(["_rank_gp", "orders", "frequency"], ascending=[False, False, False]).copy()
-            total_gp = float(q["_rank_gp"].sum())
-            if total_gp > 0:
-                q["cum_gp_share"] = q["_rank_gp"].cumsum() / total_gp
-                top = q[(q["cum_gp_share"] <= 0.80) | (q["_rank_gp"] == q["_rank_gp"].max())].copy()
-                crossing = q[q["cum_gp_share"] > 0.80].head(1)
+            for _c in ["orders", "frequency", "transitions", "query_gp_est"]:
+                q[_c] = pd.to_numeric(q[_c], errors="coerce").fillna(0.0)
+            q = q.sort_values(["orders", "frequency", "transitions"], ascending=[False, False, False]).copy()
+            total_orders = float(q["orders"].sum())
+            if total_orders > 0:
+                q["cum_orders_share"] = q["orders"].cumsum() / total_orders
+                top = q[(q["cum_orders_share"] <= 0.80) | (q["orders"] == q["orders"].max())].copy()
+                crossing = q[q["cum_orders_share"] > 0.80].head(1)
                 top = pd.concat([top, crossing], ignore_index=True).drop_duplicates("search_query")
-                weight = top["_rank_gp"].replace(0, np.nan)
-                gp_share = float(top["_rank_gp"].sum() / total_gp * 100.0) if total_gp else np.nan
+                weight = top["orders"].replace(0, np.nan)
+                order_share = float(top["orders"].sum() / total_orders * 100.0)
             else:
-                top = q.head(10).copy()
-                weight = (top["orders"].fillna(0) + top["frequency"].fillna(0) / 1000).replace(0, np.nan)
-                gp_share = np.nan
+                top = q.head(int(os.getenv("WB_CORE_FALLBACK_TOP_N", "10"))).copy()
+                weight = (top["frequency"].fillna(0) + top["transitions"].fillna(0)).replace(0, np.nan)
+                order_share = np.nan
             rec = dict(zip(keys, keyvals))
             rec["search_gp80_avg_position"] = weighted_mean(top["avg_position"], weight) if not top.empty else np.nan
             rec["search_gp80_queries"] = int(top["search_query"].astype(str).replace("", np.nan).dropna().nunique()) if not top.empty else 0
-            rec["search_gp80_gp_share"] = gp_share
-            rec["search_gp80_gp_est"] = float(top["_rank_gp"].sum()) if "_rank_gp" in top.columns else 0.0
+            rec["search_gp80_gp_share"] = order_share
+            rec["search_gp80_gp_est"] = float(top["query_gp_est"].sum()) if "query_gp_est" in top.columns else 0.0
+            rec["search_gp80_core_orders"] = float(top["orders"].sum()) if "orders" in top.columns else 0.0
+            rec["search_gp80_rule"] = "orders80_last90" if total_orders > 0 else "fallback_top_frequency_no_orders"
             rows.append(rec)
         return pd.DataFrame(rows)
 
@@ -7130,6 +7233,18 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         x["_finished_price_den"] = np.where(x["finished_price"].notna(), _orders_w, 0.0)
         x["_spp_num"] = x["spp"] * _money_w
         x["_spp_den"] = np.where(x["spp"].notna(), _money_w, 0.0)
+        # FIX66: preserve WB funnel conversion rates. These columns are already built
+        # from the funnel source and must not be recomputed from WB Orders + funnel carts.
+        for _c in ["cart_conv_pct", "order_conv_pct", "card_to_order_pct"]:
+            if _c not in x.columns:
+                x[_c] = np.nan
+            x[_c] = pd.to_numeric(x[_c], errors="coerce")
+        x["_cart_conv_num"] = x["cart_conv_pct"] * pd.to_numeric(x.get("open_cards", 0), errors="coerce").fillna(0.0)
+        x["_cart_conv_den"] = np.where(x["cart_conv_pct"].notna(), pd.to_numeric(x.get("open_cards", 0), errors="coerce").fillna(0.0), 0.0)
+        x["_order_conv_num"] = x["order_conv_pct"] * pd.to_numeric(x.get("add_to_cart", 0), errors="coerce").fillna(0.0)
+        x["_order_conv_den"] = np.where(x["order_conv_pct"].notna(), pd.to_numeric(x.get("add_to_cart", 0), errors="coerce").fillna(0.0), 0.0)
+        x["_card_to_order_num"] = x["card_to_order_pct"] * pd.to_numeric(x.get("open_cards", 0), errors="coerce").fillna(0.0)
+        x["_card_to_order_den"] = np.where(x["card_to_order_pct"].notna(), pd.to_numeric(x.get("open_cards", 0), errors="coerce").fillna(0.0), 0.0)
         g = x.groupby(keys, dropna=False, as_index=False).agg(
             daily_rows=("order_sum", "size"),
             active_days=("day", "nunique"),
@@ -7152,6 +7267,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             _finished_price_den=("_finished_price_den", "sum"),
             _spp_num=("_spp_num", "sum"),
             _spp_den=("_spp_den", "sum"),
+            _cart_conv_num=("_cart_conv_num", "sum"),
+            _cart_conv_den=("_cart_conv_den", "sum"),
+            _order_conv_num=("_order_conv_num", "sum"),
+            _order_conv_den=("_order_conv_den", "sum"),
+            _card_to_order_num=("_card_to_order_num", "sum"),
+            _card_to_order_den=("_card_to_order_den", "sum"),
             commission_pct_model=("commission_%", _safe_mean),
             acquiring_pct_model=("acquiring_%", _safe_mean),
             logistics_per_unit=("logistics_direct", _safe_mean),
@@ -7162,6 +7283,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         g["buyer_price"] = np.where(g["_finished_price_den"] > 0, g["_finished_price_num"] / g["_finished_price_den"], np.nan)
         g["price_with_disc_avg"] = np.where(g["_price_with_disc_den"] > 0, g["_price_with_disc_num"] / g["_price_with_disc_den"], np.nan)
         g["spp"] = np.where(g["_spp_den"] > 0, g["_spp_num"] / g["_spp_den"], np.nan)
+        # FIX66: conversions come from WB funnel rates, weighted by their real denominators.
+        # They are clipped to 0..100 to prevent impossible values from mixed WB Orders/funnel rows.
+        g["cart_conv"] = np.where(g["_cart_conv_den"] > 0, g["_cart_conv_num"] / g["_cart_conv_den"], np.nan)
+        g["order_conv"] = np.where(g["_order_conv_den"] > 0, g["_order_conv_num"] / g["_order_conv_den"], np.nan)
+        g["order_from_open_conv"] = np.where(g["_card_to_order_den"] > 0, g["_card_to_order_num"] / g["_card_to_order_den"], np.nan)
+        for _cc in ["cart_conv", "order_conv", "order_from_open_conv"]:
+            g[_cc] = pd.to_numeric(g[_cc], errors="coerce").clip(lower=0, upper=100)
         g = g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
         at = _ads_truth_period(start, end, keys)
         if at is not None and not at.empty:
@@ -7210,10 +7338,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         g["ad_ctr"] = np.where(g["impressions"] > 0, g["clicks"] / g["impressions"] * 100, np.nan)
         # CPC is kept as calculated from the available ad spend/click source.
         # Do not hide low CPC values: shelf-type ads can legitimately produce CPC below bid floor.
-        g["cart_conv"] = np.where(g["opens"] > 0, g["carts"] / g["opens"] * 100, 0.0)
-        g["order_conv"] = np.where(g["carts"] > 0, g["orders"] / g["carts"] * 100, 0.0)
-        # Управленческая конверсия в заказ: заказы / все открытия карточки.
-        g["order_from_open_conv"] = np.where(g["opens"] > 0, g["orders"] / g["opens"] * 100, 0.0)
+        # FIX66: do not recompute funnel conversions from WB Orders after aggregation.
+        # Use source funnel conversions when present; only fallback when the funnel sheet has no rates.
+        if "cart_conv" not in g.columns or pd.to_numeric(g["cart_conv"], errors="coerce").notna().sum() == 0:
+            g["cart_conv"] = np.where(g["opens"] > 0, g["carts"] / g["opens"] * 100, np.nan)
+        if "order_conv" not in g.columns or pd.to_numeric(g["order_conv"], errors="coerce").notna().sum() == 0:
+            g["order_conv"] = np.where(g["carts"] > 0, g["orders"] / g["carts"] * 100, np.nan)
+        # Управленческая конверсия в заказ: источник WB funnel, fallback только при отсутствии ставки в воронке.
+        if "order_from_open_conv" not in g.columns or pd.to_numeric(g["order_from_open_conv"], errors="coerce").notna().sum() == 0:
+            g["order_from_open_conv"] = np.where(g["opens"] > 0, g["orders"] / g["opens"] * 100, np.nan)
+        for _cc in ["cart_conv", "order_conv", "order_from_open_conv"]:
+            g[_cc] = pd.to_numeric(g[_cc], errors="coerce").clip(lower=0, upper=100).fillna(0.0)
         return g
 
     def _metrics_period(start: pd.Timestamp, end: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
@@ -7545,8 +7680,42 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
         return x.sort_values(["_cat_order", "gp_use", "sum_use"], ascending=[True, False, False])
 
-    prev_prod_detail = _filter_detail_products(prev_prod)
-    closed_prod_detail = _filter_detail_products(closed_prod)
+
+    def _filter_visible_products(df: pd.DataFrame) -> pd.DataFrame:
+        """Products shown in category summary lists.
+
+        FIX66: product-level category lists must include every product with current/base
+        sales or GP, even when the product is too small for separate product/article pages.
+        DETAIL_EXCLUDE and GP-share threshold apply only to deeper drill-down pages.
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+        x = df.copy()
+        x["product_code"] = x.get("product_code", "").astype(str)
+        x = x[x["product_code"].ne("")].copy()
+        for c0 in ["sum_use", "gp_use", "sum_prev_use", "gp_prev_use", "ad_spend", "ad_spend_prev", "orders", "orders_prev"]:
+            if c0 not in x.columns:
+                x[c0] = 0.0
+            x[c0] = pd.to_numeric(x[c0], errors="coerce").fillna(0.0)
+        keep = (
+            x["sum_use"].abs().gt(0)
+            | x["gp_use"].abs().gt(0)
+            | x["sum_prev_use"].abs().gt(0)
+            | x["gp_prev_use"].abs().gt(0)
+            | x["orders"].abs().gt(0)
+            | x["orders_prev"].abs().gt(0)
+        )
+        x = x[keep].copy()
+        if x.empty:
+            return x
+        x["_cat_order"] = x["subject_disp"].map({c:i for i,c in enumerate(CATEGORY_ORDER)}).fillna(99)
+        x["_prod_order"] = x["product_code"].map({p:i for cat, vals in PRODUCT_ORDER.items() for i,p in enumerate(vals)}).fillna(999)
+        return x.sort_values(["_cat_order", "_prod_order", "gp_use", "sum_use"], ascending=[True, True, False, False])
+
+    prev_prod_visible = _filter_visible_products(prev_prod)
+    closed_prod_visible = _filter_visible_products(closed_prod)
+    prev_prod_detail = _filter_detail_products(prev_prod_visible)
+    closed_prod_detail = _filter_detail_products(closed_prod_visible)
 
     def _select_articles(df: pd.DataFrame, prod_row: pd.Series) -> pd.DataFrame:
         if df is None or df.empty: return pd.DataFrame()
@@ -7569,14 +7738,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             "label": "Прошлая неделя",
             "period": f"{prev_start:%d.%m}-{prev_end:%d.%m.%Y}",
             "start": prev_start, "end": prev_end, "prev_start": prev2_start, "prev_end": prev2_end,
-            "summary_key": "prev_summary", "cat_df": prev_cat, "prod_df": prev_prod_detail, "art_df": prev_art,
+            "summary_key": "prev_summary", "cat_df": prev_cat, "prod_df": prev_prod_visible, "prod_detail_df": prev_prod_detail, "art_df": prev_art,
             "back_label": "← прошлая неделя",
         },
         "closed": {
             "label": "Закрытый месяц",
             "period": f"{closed_start:%d.%m}-{closed_end:%d.%m.%Y}",
             "start": closed_start, "end": closed_end, "prev_start": closed_prev_start, "prev_end": closed_prev_end,
-            "summary_key": "closed_summary", "cat_df": closed_cat, "prod_df": closed_prod_detail, "art_df": closed_art,
+            "summary_key": "closed_summary", "cat_df": closed_cat, "prod_df": closed_prod_visible, "prod_detail_df": closed_prod_detail, "art_df": closed_art,
             "back_label": "← закр. месяц",
         },
     }
@@ -8303,12 +8472,24 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         prod = info["prod_df"]
         if prod is None or prod.empty: return pd.DataFrame()
         q = prod[prod["subject_disp"].astype(str).eq(cat)].copy()
+        sort_cols = [c for c in ["_prod_order", "gp_use", "sum_use"] if c in q.columns]
+        if sort_cols:
+            return q.sort_values(sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1))
+        return q.sort_values(["gp_use", "sum_use"], ascending=[False, False])
+
+    def _detail_products_for_category(contour: str, cat: str) -> pd.DataFrame:
+        info = contours[contour]
+        prod = info.get("prod_detail_df", pd.DataFrame())
+        if prod is None or prod.empty:
+            return pd.DataFrame()
+        q = prod[prod["subject_disp"].astype(str).eq(cat)].copy()
         return q.sort_values(["gp_use", "sum_use"], ascending=[False, False])
 
     def _articles_for_product(contour: str, cat: str, prod_code: str) -> pd.DataFrame:
         info = contours[contour]
-        prod_df = info["prod_df"]
-        prod_row = prod_df[(prod_df["subject_disp"].astype(str).eq(cat)) & (prod_df["product_code"].astype(str).eq(str(prod_code)))]
+        # Deep article pages are created only for products selected into prod_detail_df.
+        prod_df = info.get("prod_detail_df", info.get("prod_df", pd.DataFrame()))
+        prod_row = prod_df[(prod_df["subject_disp"].astype(str).eq(cat)) & (prod_df["product_code"].astype(str).eq(str(prod_code)))] if prod_df is not None and not prod_df.empty else pd.DataFrame()
         if prod_row.empty: return pd.DataFrame()
         return _select_articles(info["art_df"], prod_row.iloc[0])
 
@@ -8362,7 +8543,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         cards2 = [
             (_fmt_num(row.get("demand")), "Спрос WB", _delta(row.get("demand"), row.get("demand_prev")), "Спрос", ""),
             (_fmt_pct(row.get("search_share")), "% поиска", _delta(row.get("search_share"), row.get("search_share_prev")), "% поиска", ""),
-            (_fmt_num(row.get("search_gp80_avg_position")), "CORE запросы", _delta(row.get("search_gp80_avg_position"), row.get("search_gp80_avg_position_prev")), "Позиция", ""),
+            (_fmt_num(row.get("search_gp80_avg_position")), "Ср. поз. CORE", _delta(row.get("search_gp80_avg_position"), row.get("search_gp80_avg_position_prev")), "Позиция", ""),
             (_fmt_pct(row.get("ad_ctr")), "CTR РК", _delta(row.get("ad_ctr"), row.get("ad_ctr_prev")), "CTR РК", ""),
             (_fmt_num(row.get("opens")), "Открытия", _delta(row.get("opens"), row.get("opens_prev")), "Открытия", ""),
             (_fmt_pct(row.get("order_from_open_conv")), "Конв. в заказ", _delta(row.get("order_from_open_conv"), row.get("order_from_open_conv_prev")), "Конверсия", ""),
@@ -8422,9 +8603,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             widths=[240,250,250,250,210,210]
         else:
             prods = _children_for_category(contour, cat)
+            detail_codes = set(_detail_products_for_category(contour, cat).get("product_code", pd.Series(dtype=str)).astype(str))
             for _, r in prods.iterrows():
                 prod = str(r.get("product_code"))
-                rows.append({"_target": _prod_key(contour, cat, prod), "cells": [
+                target_key = _prod_key(contour, cat, prod) if prod in detail_codes else ""
+                rows.append({"_target": target_key, "cells": [
                     prod,
                     (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev_use")), "Сумма"),
                     (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev_use")), "ВП"),
@@ -8616,6 +8799,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             "transitions": ["transitions", "search_transitions", "clicks", "open_cards"],
             "frequency": ["frequency", "search_frequency", "unique_search_frequency"],
             "visibility_pct": ["visibility_pct", "visibility", "Видимость, %", "Видимость"],
+            "avg_position": ["avg_position", "averagePosition", "Средняя позиция", "avg_position_calc"],
+            "median_position": ["median_position", "medianPosition", "Медианная позиция"],
             "orders": ["orders", "search_orders"],
             "order_sum": ["order_sum", "search_order_sum"],
         }
@@ -8623,7 +8808,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             if target_col not in x.columns:
                 found = next((cnd for cnd in candidates if cnd in x.columns), None)
                 x[target_col] = x[found] if found else 0.0
-        for col_name in ["frequency", "transitions", "orders", "order_sum", "visibility_pct"]:
+        for col_name in ["frequency", "transitions", "orders", "order_sum", "visibility_pct", "avg_position", "median_position"]:
             x[col_name] = pd.to_numeric(x[col_name], errors="coerce").fillna(0.0)
         x = x[x["day"].notna() & x["search_query"].ne("")].copy()
         _article_ads_keys_cache["search_detail"] = x
@@ -8714,12 +8899,21 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
 
     def _search_query_agg_for_article(row: pd.Series, start_dt: pd.Timestamp, end_dt: pd.Timestamp, aov: float = 0.0) -> pd.DataFrame:
         src = _article_source_filter(_pdf_search_detail_source(), row)
+        cols = ["search_query", "frequency", "transitions", "orders", "order_sum_calc", "click_to_order_conv", "avg_position_calc", "visibility_pct_calc", "traffic_taken_pct"]
         if src.empty:
-            return pd.DataFrame(columns=["search_query", "frequency", "transitions", "orders", "order_sum_calc", "click_to_order_conv", "visibility_pct_calc", "traffic_taken_pct"])
+            return pd.DataFrame(columns=cols)
         x = src[(src["day"] >= pd.Timestamp(start_dt).normalize()) & (src["day"] <= pd.Timestamp(end_dt).normalize())].copy()
         if x.empty:
-            return pd.DataFrame(columns=["search_query", "frequency", "transitions", "orders", "order_sum_calc", "click_to_order_conv", "visibility_pct_calc", "traffic_taken_pct"])
+            return pd.DataFrame(columns=cols)
+        for _c in ["frequency", "transitions", "orders", "order_sum", "visibility_pct", "avg_position", "median_position"]:
+            if _c not in x.columns:
+                x[_c] = np.nan
+            x[_c] = pd.to_numeric(x[_c], errors="coerce").fillna(0.0)
         x["_vis_weight"] = x["frequency"].where(x["frequency"] > 0, x["transitions"]).fillna(0.0)
+        x["_pos_source"] = x["avg_position"].where(x["avg_position"].gt(0), x["median_position"])
+        x["_pos_weight"] = np.where(x["orders"] > 0, x["orders"], np.where(x["frequency"] > 0, x["frequency"], np.where(x["transitions"] > 0, x["transitions"], 1.0)))
+        x["_pos_num"] = np.where(x["_pos_source"] > 0, x["_pos_source"] * x["_pos_weight"], 0.0)
+        x["_pos_den"] = np.where(x["_pos_source"] > 0, x["_pos_weight"], 0.0)
         q = x.groupby("search_query", dropna=False, as_index=False).agg(
             frequency=("frequency", "sum"),
             transitions=("transitions", "sum"),
@@ -8727,14 +8921,50 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             order_sum=("order_sum", "sum"),
             visibility_num=("visibility_pct", lambda s: float((s * x.loc[s.index, "_vis_weight"]).sum())),
             visibility_den=("_vis_weight", "sum"),
+            avg_position_num=("_pos_num", "sum"),
+            avg_position_den=("_pos_den", "sum"),
         )
         if q.empty:
             return q
         q["order_sum_calc"] = np.where(pd.to_numeric(q["order_sum"], errors="coerce").fillna(0) > 0, q["order_sum"], q["orders"] * aov)
         q["click_to_order_conv"] = np.where(q["transitions"] > 0, q["orders"] / q["transitions"] * 100.0, np.nan)
+        q["avg_position_calc"] = np.where(q["avg_position_den"] > 0, q["avg_position_num"] / q["avg_position_den"], np.nan)
         q["visibility_pct_calc"] = np.where(q["visibility_den"] > 0, q["visibility_num"] / q["visibility_den"], np.nan)
         q["traffic_taken_pct"] = np.where(q["frequency"] > 0, q["transitions"] / q["frequency"] * 100.0, np.nan)
         return q
+
+    def _core_query_names_for_article(row: pd.Series, end_dt: pd.Timestamp) -> set:
+        """CORE = queries responsible for 80% of orders over the last 90 days."""
+        src = _article_source_filter(_pdf_search_detail_source(), row)
+        if src.empty:
+            return set()
+        end_n = pd.Timestamp(end_dt).normalize()
+        start_n = end_n - pd.Timedelta(days=89)
+        x = src[(src["day"] >= start_n) & (src["day"] <= end_n)].copy()
+        if x.empty:
+            return set()
+        for _c in ["orders", "frequency", "transitions"]:
+            if _c not in x.columns:
+                x[_c] = 0.0
+            x[_c] = pd.to_numeric(x[_c], errors="coerce").fillna(0.0)
+        q = x.groupby("search_query", dropna=False, as_index=False).agg(
+            orders=("orders", "sum"),
+            frequency=("frequency", "sum"),
+            transitions=("transitions", "sum"),
+        )
+        q = q[q["search_query"].map(normalize_text).ne("")].copy()
+        if q.empty:
+            return set()
+        total_orders = float(q["orders"].sum())
+        if total_orders > 0:
+            q = q.sort_values(["orders", "frequency", "transitions"], ascending=[False, False, False]).copy()
+            q["_cum_before"] = q["orders"].cumsum() - q["orders"]
+            q["_cum_share_before"] = q["_cum_before"] / total_orders * 100.0
+            core = q[q["_cum_share_before"] < 80.0].copy()
+        else:
+            top_n = int(os.getenv("WB_CORE_FALLBACK_TOP_N", "10") or "10")
+            core = q.sort_values(["frequency", "transitions"], ascending=[False, False]).head(top_n).copy()
+        return set(core["search_query"].map(normalize_text))
 
     def _search_query_rows_for_article(row: pd.Series, start_dt: pd.Timestamp, end_dt: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, max_items: int = 12) -> List[Dict[str, Any]]:
         article_orders = _num(row.get("orders"), 0.0)
@@ -8745,13 +8975,19 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         prev_aov = prev_sum / prev_orders if prev_orders > 0 else aov
         cur = _search_query_agg_for_article(row, start_dt, end_dt, aov=aov)
         prev = _search_query_agg_for_article(row, prev_s, prev_e, aov=prev_aov)
-        empty_cells = ["Нет данных по поисковым запросам за период", "—", "—", "—", "—", "—", "—", "—"]
+        core_names = _core_query_names_for_article(row, end_dt)
+        if core_names:
+            if not cur.empty:
+                cur = cur[cur["search_query"].map(normalize_text).isin(core_names)].copy()
+            if not prev.empty:
+                prev = prev[prev["search_query"].map(normalize_text).isin(core_names)].copy()
+        empty_cells = ["Нет данных по CORE-запросам за период", "—", "—", "—", "—", "—", "—", "—", "—"]
         if cur.empty and prev.empty:
             return [{"cells": empty_cells}]
         q = cur.merge(prev, on="search_query", how="left", suffixes=("", "_prev")) if not cur.empty else pd.DataFrame()
         if q.empty:
-            return [{"cells": ["Нет запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—"]}]
-        for col_name in ["frequency", "transitions", "orders", "order_sum_calc", "click_to_order_conv", "visibility_pct_calc", "traffic_taken_pct"]:
+            return [{"cells": ["Нет CORE-запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—", "—"]}]
+        for col_name in ["frequency", "transitions", "orders", "order_sum_calc", "click_to_order_conv", "avg_position_calc", "visibility_pct_calc", "traffic_taken_pct"]:
             if col_name not in q.columns:
                 q[col_name] = np.nan
             if col_name + "_prev" not in q.columns:
@@ -8762,7 +8998,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # so falling important queries do not disappear and the page does not show only winners.
         q = q[pd.to_numeric(q["orders"], errors="coerce").fillna(0) > 0].copy()
         if q.empty:
-            return [{"cells": ["Нет запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—"]}]
+            return [{"cells": ["Нет CORE-запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—", "—"]}]
         q["_orders_union"] = pd.to_numeric(q["orders"], errors="coerce").fillna(0) + pd.to_numeric(q.get("orders_prev", 0), errors="coerce").fillna(0)
         q["_sum_union"] = pd.to_numeric(q["order_sum_calc"], errors="coerce").fillna(0) + pd.to_numeric(q.get("order_sum_calc_prev", 0), errors="coerce").fillna(0)
         q["_clicks_union"] = pd.to_numeric(q["transitions"], errors="coerce").fillna(0) + pd.to_numeric(q.get("transitions_prev", 0), errors="coerce").fillna(0)
@@ -8776,10 +9012,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 (_fmt_num(r.get("orders")), _delta(r.get("orders"), r.get("orders_prev")), "Заказы"),
                 (_fmt_money(r.get("order_sum_calc")), _delta_abs(r.get("order_sum_calc"), r.get("order_sum_calc_prev")), "Сумма"),
                 (_fmt_pct(r.get("click_to_order_conv")), _delta(r.get("click_to_order_conv"), r.get("click_to_order_conv_prev")), "CR клик→заказ"),
+                (_fmt_num(r.get("avg_position_calc")), _delta(r.get("avg_position_calc"), r.get("avg_position_calc_prev")), "Ср. поз."),
                 (_fmt_pct(r.get("visibility_pct_calc")), _delta(r.get("visibility_pct_calc"), r.get("visibility_pct_calc_prev")), "Видим."),
                 (_fmt_pct(r.get("traffic_taken_pct")), _delta(r.get("traffic_taken_pct"), r.get("traffic_taken_pct_prev")), "% трафика"),
             ]})
-        return rows or [{"cells": ["Нет запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—"]}]
+        return rows or [{"cells": ["Нет CORE-запросов с заказами за период", "—", "—", "—", "—", "—", "—", "—", "—"]}]
 
     def _draw_article_ads_keys_page(contour: str, key: str, row: pd.Series, back_buttons: List[Tuple[int, int, int, str, str]]):
         info = contours[contour]
@@ -8809,15 +9046,15 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             max_rows=6,
         )
         query_bar_y = max(330, ad_y - 54)
-        _section_bar(query_bar_y, "Блок 5. Поисковые запросы, которые дали заказы")
+        _section_bar(query_bar_y, "Блок 5. CORE-запросы: 80% заказов за последние 90 дней")
         query_row_h = 20
         query_y = 58
         max_query_rows = max(12, min(20, int((query_bar_y - query_y - 48) / query_row_h)))
         query_rows = _search_query_rows_for_article(row, info["start"], info["end"], info["prev_start"], info["prev_end"], max_items=max_query_rows)
         _draw_table(
             75, query_y, W-150,
-            ["Поисковый запрос", "Част.", "Клики", "Заказы", "Сумма", "CR клик→заказ", "Видим.", "% трафика"],
-            [390,110,95,95,130,145,105,115],
+            ["Поисковый запрос", "Част.", "Клики", "Заказы", "Сумма", "CR клик→заказ", "Ср. поз.", "Видим.", "% трафика"],
+            [330,95,85,85,120,125,95,95,95],
             query_rows,
             row_h=query_row_h,
             font_size=8.8,
@@ -8881,7 +9118,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 for _, ar in arts.iterrows():
                     _draw_article_pages(contour, ar)
             else:
-                prods = _children_for_category(contour, cat)
+                prods = _detail_products_for_category(contour, cat)
                 for _, prow in prods.iterrows():
                     _draw_product_detail(contour, prow)
                     arts = _articles_for_product(contour, str(prow["subject_disp"]), str(prow["product_code"]))
@@ -9636,6 +9873,45 @@ def _tg_daily_abc_gross_profit(outputs: Dict[str, Any], day: pd.Timestamp) -> fl
 
 TELEGRAM_MANAGER_ORDER = ["Влад", "Игорь", "Эмиль", "Юля"]
 
+# FIX66: operational manager ownership overrides. ABC files may still contain old values;
+# Telegram/report manager allocation must use the current business ownership.
+TELEGRAM_MANAGER_OVERRIDE_BY_SUBJECT = {
+    "блески": "Эмиль",
+    "помады": "Юля",
+}
+TELEGRAM_MANAGER_OVERRIDE_BY_PRODUCT = {
+    "207": "Эмиль", "209": "Эмиль", "210": "Эмиль", "211": "Эмиль",
+    "154": "Юля", "155": "Юля", "156": "Юля", "157": "Юля", "158": "Юля", "206": "Юля",
+}
+
+def _tg_apply_manager_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply current manager ownership after any ABC/reference mapping.
+
+    This deliberately overrides stale ABC ``Ваша категория`` for Блески and Помады.
+    It is used for manager_reference and every Telegram manager source after attachment.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    out = df.copy()
+    if "manager" not in out.columns:
+        out["manager"] = ""
+    if "manager_raw" not in out.columns:
+        out["manager_raw"] = out["manager"]
+    if "subject" in out.columns:
+        subj_key = out["subject"].map(norm_key)
+        for subj, mgr in TELEGRAM_MANAGER_OVERRIDE_BY_SUBJECT.items():
+            mask = subj_key.eq(norm_key(subj))
+            out.loc[mask, "manager"] = mgr
+            out.loc[mask, "manager_raw"] = mgr
+    if "product" in out.columns:
+        prod_key = out["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        for prod, mgr in TELEGRAM_MANAGER_OVERRIDE_BY_PRODUCT.items():
+            mask = prod_key.eq(str(prod))
+            out.loc[mask, "manager"] = mgr
+            out.loc[mask, "manager_raw"] = mgr
+    out["manager"] = out["manager"].map(_tg_normalize_manager) if "_tg_normalize_manager" in globals() else out["manager"]
+    return out
+
 
 def _tg_normalize_manager(value: Any) -> str:
     text = normalize_text(value)
@@ -9688,13 +9964,16 @@ def build_manager_reference_from_abc(*frames: pd.DataFrame) -> pd.DataFrame:
             if col not in x.columns:
                 x[col] = np.nan if col in {"nm_id", "gross_revenue", "gross_profit", "orders"} else ""
         x["manager"] = x["manager"].map(_tg_normalize_manager)
-        x = x[x["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
-        if x.empty:
-            continue
         x["nm_id"] = pd.to_numeric(x["nm_id"], errors="coerce")
         x["supplier_article"] = x["supplier_article"].map(clean_article)
         x["subject"] = x["subject"].map(_tg_clean_subject_full)
         x["product"] = x["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        # FIX66: override current ownership before filtering. This keeps rows even if the
+        # old ABC manager was stale/blank for Помады or Блески.
+        x = _tg_apply_manager_overrides(x)
+        x = x[x["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
+        if x.empty:
+            continue
         for col in ["gross_revenue", "gross_profit", "orders"]:
             x[col] = pd.to_numeric(x[col], errors="coerce").fillna(0.0)
         if "period_end" not in x.columns:
@@ -9705,6 +9984,7 @@ def build_manager_reference_from_abc(*frames: pd.DataFrame) -> pd.DataFrame:
     if not parts:
         return pd.DataFrame(columns=["manager", "manager_raw", "subject", "product", "supplier_article", "nm_id", "gross_revenue", "gross_profit", "orders", "period_start", "period_end", "source_file"])
     ref = pd.concat(parts, ignore_index=True, sort=False)
+    ref = _tg_apply_manager_overrides(ref)
     ref = ref[ref["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
     ref = ref[(ref["nm_id"].notna()) | ref["supplier_article"].ne("") | ref["subject"].ne("")].copy()
     # Latest rows win for exact article mapping; all rows remain available for subject weights.
@@ -9791,7 +10071,7 @@ def _tg_attach_manager_exact(df: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFram
     out["supplier_article"] = out["supplier_article"].map(clean_article)
     out["subject"] = out["subject"].map(_tg_clean_subject_full)
     if ref is None or ref.empty:
-        return out
+        return _tg_apply_manager_overrides(out)
     r = ref.copy()
     r["manager"] = r.get("manager", "").map(_tg_normalize_manager)
     r = r[r["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
@@ -9820,7 +10100,7 @@ def _tg_attach_manager_exact(df: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFram
         out = out.merge(map_subj, on="subject", how="left")
         out["manager"] = out["manager"].where(out["manager"].ne(""), out["_manager_subj"].fillna(""))
         out = out.drop(columns=["_manager_subj"], errors="ignore")
-    return out
+    return _tg_apply_manager_overrides(out)
 
 
 def _tg_allocate_subject_rows(df: pd.DataFrame, ref: pd.DataFrame, value_cols: Sequence[str]) -> pd.DataFrame:
