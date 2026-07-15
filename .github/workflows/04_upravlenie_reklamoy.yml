@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v78_core_daily_traffic_postcheck_2026-07-13"
+  WORKFLOW_VERSION: "v80_flagship_traffic_rollback_2026-07-15"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
