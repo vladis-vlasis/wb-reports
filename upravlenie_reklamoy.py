@@ -5362,5 +5362,274 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
             pd.DataFrame({"note": ["Нет детализации по CORE-запросам для daily traffic post-check."]}).to_excel(writer, sheet_name="CORE_postcheck_трафика", index=False)
 
 
+# =========================
+# V80 OVERRIDES: flagship CORE priority with allowed rollback after failed traffic response
+# =========================
+# Правило пользователя:
+# флагманский товар должен держать позицию 1-8, видимость >=95% и максимум кликов по CORE.
+# Но снижение ставки разрешено, если это именно откат последнего повышения, которое за 1 день
+# не дало роста CORE-кликов / доли показов / видимости / медианной позиции.
+# Экономические снижения, hard cap и паузы не должны перебивать режим флагмана, пока цель CORE не выполнена.
+
+SCRIPT_VERSION = "v80-flagship-core-traffic-rollback-2026-07-15"
+VERSION = "FIX53_FLAGSHIP_CORE_PRIORITY_ALLOW_FAILED_RAISE_ROLLBACK"
+
+_COMPUTE_ENGINE_V78 = compute_engine
+_WRITE_OUTPUTS_V78 = write_outputs
+_MAKE_SUMMARY_JSON_V78 = make_summary_json
+
+LAST_FLAGSHIP_CONTROL_V79 = pd.DataFrame()
+
+
+def _build_flagship_control_v79(flagship_pairs: pd.DataFrame) -> pd.DataFrame:
+    """Агрегирует флагманские CORE-запросы до уровня товара."""
+    if flagship_pairs is None or flagship_pairs.empty:
+        return pd.DataFrame()
+    fp = flagship_pairs.copy()
+    if "supplier_article" not in fp.columns:
+        return pd.DataFrame()
+    fp["supplier_article"] = fp["supplier_article"].astype(str).str.strip()
+    fp = fp[fp["supplier_article"].ne("")].copy()
+    if fp.empty:
+        return pd.DataFrame()
+
+    pos = pd.to_numeric(fp.get("median_position_cur", np.nan), errors="coerce")
+    vis = pd.to_numeric(fp.get("visibility_cur", np.nan), errors="coerce")
+    fp["_position_bad_v79"] = pos.isna() | (pos > CORE_FLAGSHIP_TARGET_POSITION_MAX)
+    fp["_visibility_bad_v79"] = vis.isna() | (vis < CORE_FLAGSHIP_TARGET_VISIBILITY_PCT)
+    fp["_target_missed_v79"] = fp["_position_bad_v79"] | fp["_visibility_bad_v79"]
+
+    # Для объяснения берём самые значимые проблемные запросы по заказам за 90 дней.
+    fp["_orders90"] = pd.to_numeric(fp.get("orders_sum_90d", 0), errors="coerce").fillna(0)
+    fp["_clicks90"] = pd.to_numeric(fp.get("clicks_sum_90d", 0), errors="coerce").fillna(0)
+
+    def _bad_queries_text(part: pd.DataFrame) -> str:
+        bad = part[part["_target_missed_v79"]].copy()
+        if bad.empty:
+            return ""
+        bad = bad.sort_values("_orders90", ascending=False).head(5)
+        vals = []
+        for _, rr in bad.iterrows():
+            q = str(rr.get("query_text", rr.get("query_text_norm", "")) or "").strip()
+            p = pd.to_numeric(rr.get("median_position_cur", np.nan), errors="coerce")
+            v = pd.to_numeric(rr.get("visibility_cur", np.nan), errors="coerce")
+            txt = q
+            if pd.notna(p):
+                txt += f" позиция {float(p):.1f}"
+            else:
+                txt += " позиция н/д"
+            if pd.notna(v):
+                txt += f", видимость {float(v):.1f}%"
+            else:
+                txt += ", видимость н/д"
+            vals.append(txt)
+        return "; ".join(vals)
+
+    grouped = []
+    for article, part in fp.groupby("supplier_article", dropna=False):
+        pos_vals = pd.to_numeric(part.get("median_position_cur", np.nan), errors="coerce")
+        vis_vals = pd.to_numeric(part.get("visibility_cur", np.nan), errors="coerce")
+        target_missed = bool(part["_target_missed_v79"].fillna(False).any())
+        grouped.append({
+            "supplier_article": article,
+            "core_flagship_query_count_v79": int(len(part)),
+            "core_flagship_bad_query_count_v79": int(part["_target_missed_v79"].fillna(False).sum()),
+            "core_flagship_target_missed_v79": target_missed,
+            "core_flagship_worst_position_v79": float(pos_vals.max()) if pos_vals.notna().any() else np.nan,
+            "core_flagship_min_visibility_v79": float(vis_vals.min()) if vis_vals.notna().any() else np.nan,
+            "core_flagship_orders_90d_v79": float(part["_orders90"].sum()),
+            "core_flagship_clicks_90d_v79": float(part["_clicks90"].sum()),
+            "core_flagship_problem_queries_v79": _bad_queries_text(part),
+            "core_flagship_control_reason_v79": (
+                "Флагманский товар не держит цель по CORE: нужна позиция 1-8 и видимость от 95%"
+                if target_missed else
+                "Флагманский товар держит целевую позицию и видимость по CORE"
+            ),
+        })
+    return pd.DataFrame(grouped)
+
+
+def _flagship_priority_reason_v79(row: pd.Series, action: str, new_bid: Any) -> str:
+    q = str(row.get("core_flagship_problem_queries_v79", "") or "").strip()
+    if q:
+        return (
+            f"Флагманский товар: приоритет — восстановить позицию 1-8, видимость 95%+ и CORE-клики. "
+            f"Проблемные запросы: {q}. Решение: {action}, ставка {row.get('real_bid_rub')}→{new_bid}."
+        )
+    return (
+        f"Флагманский товар: приоритет — удерживать CORE-позиции 1-8, видимость 95%+ и максимум кликов. "
+        f"Решение: {action}, ставка {row.get('real_bid_rub')}→{new_bid}."
+    )
+
+
+def _is_allowed_flagship_traffic_rollback_v80(reason_code: Any, row: Optional[pd.Series] = None) -> bool:
+    """True только для отката последнего повышения, если CORE-трафик не вырос."""
+    rc = str(reason_code or "").upper().strip()
+    allowed = {
+        "CORE_TRAFFIC_RAISE_NO_EFFECT_ROLLBACK",
+        "POSTCHECK_RAISE_NO_CLICK_LIFT_ROLLBACK",
+    }
+    if rc in allowed:
+        return True
+    # Страховка на случай будущих русских/технических формулировок в reason_text.
+    if row is not None:
+        txt = (str(row.get("reason_text", "") or "") + " " + str(row.get("traffic_postcheck_reason", "") or "")).lower()
+        if ("после повышения" in txt) and ("core" in txt or "кор" in txt) and ("не вырос" in txt or "роста нет" in txt) and ("откат" in txt or "возвращ" in txt):
+            return True
+    return False
+
+
+def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd.DataFrame) -> pd.DataFrame:
+    """Флагманам даёт приоритет CORE-трафика, но разрешает откат неэффективного повышения."""
+    global LAST_FLAGSHIP_CONTROL_V79
+    if decisions is None or decisions.empty:
+        LAST_FLAGSHIP_CONTROL_V79 = pd.DataFrame()
+        return decisions
+
+    out = decisions.copy()
+    control = _build_flagship_control_v79(flagship_pairs)
+    LAST_FLAGSHIP_CONTROL_V79 = control.copy()
+
+    # Базовые диагностические поля, чтобы лист Решения сразу показывал, что произошло.
+    for col, default in [
+        ("is_core_flagship_article_v79", False),
+        ("core_flagship_query_count_v79", 0),
+        ("core_flagship_bad_query_count_v79", 0),
+        ("core_flagship_target_missed_v79", False),
+        ("core_flagship_worst_position_v79", np.nan),
+        ("core_flagship_min_visibility_v79", np.nan),
+        ("core_flagship_problem_queries_v79", ""),
+        ("flagship_priority_applied_v79", ""),
+    ]:
+        if col not in out.columns:
+            out[col] = default
+
+    if control.empty:
+        return out
+
+    keep_cols = [
+        "supplier_article",
+        "core_flagship_query_count_v79",
+        "core_flagship_bad_query_count_v79",
+        "core_flagship_target_missed_v79",
+        "core_flagship_worst_position_v79",
+        "core_flagship_min_visibility_v79",
+        "core_flagship_orders_90d_v79",
+        "core_flagship_clicks_90d_v79",
+        "core_flagship_problem_queries_v79",
+        "core_flagship_control_reason_v79",
+    ]
+    control = control[[c for c in keep_cols if c in control.columns]].copy()
+    control["supplier_article"] = control["supplier_article"].astype(str).str.strip()
+    out["supplier_article"] = out["supplier_article"].astype(str).str.strip()
+    out = out.drop(columns=[c for c in control.columns if c != "supplier_article" and c in out.columns], errors="ignore")
+    out = out.merge(control, on="supplier_article", how="left")
+    out["is_core_flagship_article_v79"] = out["core_flagship_query_count_v79"].fillna(0).astype(float) > 0
+    out["core_flagship_target_missed_v79"] = out["core_flagship_target_missed_v79"].fillna(False).astype(bool)
+    out["core_flagship_bad_query_count_v79"] = pd.to_numeric(out.get("core_flagship_bad_query_count_v79", 0), errors="coerce").fillna(0).astype(int)
+    out["core_flagship_query_count_v79"] = pd.to_numeric(out.get("core_flagship_query_count_v79", 0), errors="coerce").fillna(0).astype(int)
+
+    for idx, row in out.iterrows():
+        if not bool(row.get("is_core_flagship_article_v79", False)):
+            continue
+
+        placement = str(row.get("placement", "") or "").lower()
+        active = str(row.get("campaign_status", "") or "").lower() != "пауза"
+        current_action = str(row.get("action", "") or "").lower()
+        current_bid = row.get("real_bid_rub", np.nan)
+        step, min_bid, bid_effective, next_up, next_down, new_abs_max = _bid_grid_values(placement, current_bid)
+        target_missed = bool(row.get("core_flagship_target_missed_v79", False))
+
+        # Для флагманов снижение разрешено только как откат неэффективного повышения по CORE-трафику.
+        if current_action in {"lower", "pause"}:
+            reason_code_now = row.get("reason_code", "")
+            allowed_traffic_rollback = (current_action == "lower") and _is_allowed_flagship_traffic_rollback_v80(reason_code_now, row)
+
+            if allowed_traffic_rollback:
+                # Это правильный кейс: ставку подняли, но CORE-клики/доля показов/позиция/видимость не выросли.
+                # Такой откат не блокируем даже для флагмана.
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_FAILED_RAISE_ROLLBACK_ALLOWED"
+                old_reason = str(row.get("reason_text", "") or "").strip()
+                out.at[idx, "reason_text"] = (
+                    "Флагманский товар: разрешён откат последнего повышения, потому что после роста ставки "
+                    "не выросли CORE-клики, доля показов, видимость или медианная позиция. "
+                    + (old_reason if old_reason else "Ставку возвращаем на предыдущий уровень.")
+                )
+                out.at[idx, "flagship_priority_applied_v79"] = "разрешён откат неэффективного повышения флагмана"
+                continue
+
+            if target_missed and active and placement == "search" and pd.notna(next_up):
+                new_bid = next_up
+                out.at[idx, "action"] = "raise"
+                out.at[idx, "new_bid_rub"] = new_bid
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_PRIORITY_RAISE"
+                out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "повышаем ставку", new_bid)
+                out.at[idx, "flagship_priority_applied_v79"] = "экономическое снижение/пауза заменены на повышение флагмана"
+            else:
+                new_bid = bid_effective
+                out.at[idx, "action"] = "hold"
+                out.at[idx, "new_bid_rub"] = new_bid
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_PRIORITY_NO_ECONOMIC_LOWER"
+                out.at[idx, "reason_text"] = (
+                    "Флагманский товар: обычное экономическое снижение или пауза запрещены, пока не выполнена цель CORE. "
+                    "Снижать можно только как откат повышения, которое не дало роста CORE-кликов, видимости или позиции."
+                )
+                out.at[idx, "flagship_priority_applied_v79"] = "экономическое снижение/пауза запрещены для флагмана"
+
+        # Если цель флагмана не выполнена, поисковую РК нужно тянуть вверх, если не было доказанного неэффективного повышения.
+        elif target_missed and active and placement == "search":
+            if pd.notna(next_up) and float(next_up) > float(bid_effective):
+                out.at[idx, "action"] = "raise"
+                out.at[idx, "new_bid_rub"] = next_up
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_TARGET_MISSED_RAISE"
+                out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "повышаем ставку", next_up)
+                out.at[idx, "flagship_priority_applied_v79"] = "флагман ниже цели CORE: приоритет повышения"
+            else:
+                out.at[idx, "action"] = "hold"
+                out.at[idx, "new_bid_rub"] = bid_effective
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_TARGET_MISSED_HOLD_NO_STEP"
+                out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "держим ставку, нет доступного шага повышения", bid_effective)
+                out.at[idx, "flagship_priority_applied_v79"] = "флагман ниже цели CORE, но шаг повышения недоступен"
+
+        # Если флагман уже в цели, не даём обычным правилам случайно уронить ставку.
+        elif active and current_action == "hold":
+            # Без изменения, но причина должна быть понятная.
+            if str(row.get("reason_code", "")).startswith("NO_STRONG_SIGNAL"):
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_TARGET_OK_HOLD"
+                out.at[idx, "reason_text"] = "Флагманский товар держит целевую позицию/видимость по CORE; ставку не снижаем и не разгоняем без необходимости"
+                out.at[idx, "flagship_priority_applied_v79"] = "флагман защищён от обычного снижения"
+
+    return out
+
+
+def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, pd.Timestamp], pd.DataFrame]:
+    decisions, core, payload, windows, postcheck = _COMPUTE_ENGINE_V78(args)
+    decisions = apply_flagship_core_priority_v79(decisions, LAST_CORE_FLAGSHIP_PAIRS_V77)
+    payload = build_payload_preview(decisions)
+    return decisions, core, payload, windows, postcheck
+
+
+def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
+    summary = _MAKE_SUMMARY_JSON_V78(mode, decisions, successful, api_log, windows, args)
+    summary["Версия"] = SCRIPT_VERSION
+    summary["Режим флагмана CORE"] = "приоритет трафика: позиция 1-8, видимость 95%+, максимум кликов; экономические снижения/паузы запрещены, но откат повышения разрешён, если за 1 день CORE-трафик не вырос"
+    summary["Флагманов CORE в контроле"] = int(len(LAST_FLAGSHIP_CONTROL_V79)) if LAST_FLAGSHIP_CONTROL_V79 is not None else 0
+    if decisions is not None and not decisions.empty and "reason_code" in decisions.columns:
+        summary["Флагманских повышений"] = int(decisions["reason_code"].astype(str).isin(["FLAGSHIP_CORE_PRIORITY_RAISE", "FLAGSHIP_CORE_TARGET_MISSED_RAISE"]).sum())
+        summary["Флагманских запретов экономического снижения"] = int(decisions["reason_code"].astype(str).eq("FLAGSHIP_CORE_PRIORITY_NO_ECONOMIC_LOWER").sum())
+        summary["Флагманских откатов неэффективного повышения"] = int(decisions["reason_code"].astype(str).eq("FLAGSHIP_CORE_FAILED_RAISE_ROLLBACK_ALLOWED").sum())
+    return summary
+
+
+def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payload: pd.DataFrame, windows: Dict[str, pd.Timestamp], postcheck: Optional[pd.DataFrame] = None) -> None:
+    _WRITE_OUTPUTS_V78(path, decisions, core, payload, windows, postcheck)
+    mode = "a" if Path(path).exists() else "w"
+    with pd.ExcelWriter(path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
+        if LAST_FLAGSHIP_CONTROL_V79 is not None and not LAST_FLAGSHIP_CONTROL_V79.empty:
+            LAST_FLAGSHIP_CONTROL_V79.to_excel(writer, sheet_name="Флагманы_CORE_контроль", index=False)
+        else:
+            pd.DataFrame({"note": ["Нет флагманских товаров CORE для контроля."]}).to_excel(writer, sheet_name="Флагманы_CORE_контроль", index=False)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
