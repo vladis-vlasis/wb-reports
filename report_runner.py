@@ -17,6 +17,7 @@
 # FIX57_AUTO_WINDOW_MANUAL_BYPASS_20260623: auto schedule window only; manual workflow_dispatch bypasses time guard
 # FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: localization pool coverage by snapshot date; stale stock snapshots are not carried indefinitely
 # FIX66_REPORT_QUALITY_CORE_PRODUCTS_MANAGERS_20260713: CORE demand=orders80 last90, fixed conversions, all products in category lists, 620/622 included, manager overrides
+# FIX67_VLAD_TARGET_MANAGER_REALLOCATION_20260713: Vlad PDF excludes Помады/Блески; Telegram forces Pomades->Юля and Glosses->Эмиль by subject/product/article before aggregation
 # FIX59_WEEKLY_PDF_LOCALIZATION_DYNAMIC_20260624: PDF weekly windows ignore daily strict/current_week_only; localization uses weekly stock_day dynamics
 # FIX60_MSK_TARGET_WINDOW_NO_CANCEL_20260626: scheduled/manual daily runs never cancel by time; 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1
 # FIX62_STORAGE_ENV_RESTORE_20260626: restore GitHub Object Storage env aliases and apply MSK target to all report modes
@@ -77,10 +78,12 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+# FIX67: this PDF/report file is Влад's operational contour.
+# Помады now belong to Юля, Блески to Эмиль, so they must not be included
+# in Влад's PDF totals, category pages, plan/fact, or product drill-downs.
+# They remain in VALID_PRODUCT_CATEGORY_REFERENCE for all-manager Telegram allocation.
 TARGET_SUBJECTS = [
     "Кисти косметические",
-    "Помады",
-    "Блески",
     "Косметические карандаши",
 ]
 
@@ -785,7 +788,7 @@ def is_valid_product_code(value: Any) -> bool:
     if any(t.startswith(prefix) for prefix in EXCLUDE_PRODUCT_PREFIXES):
         return False
     # For management reports we keep only product families approved in the global mapping.
-    # This removes 405/406/552/620/622 from target reports unless explicitly added above.
+    # This removes 405/406/552 and other non-approved families from target reports.
     return t in VALID_PRODUCT_CODES
 
 
@@ -9602,7 +9605,8 @@ def _tg_prepare_daily(outputs: Dict[str, Any]) -> pd.DataFrame:
     daily = daily.copy()
     daily["day"] = pd.to_datetime(daily.get("day"), errors="coerce").dt.normalize()
     daily["subject_disp"] = daily.get("subject", "").map(_tg_subject_disp) if "subject" in daily.columns else daily.get("subject_disp", "").map(_tg_subject_disp)
-    daily = daily[daily["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+    target_disp = [_tg_subject_disp(s) for s in TARGET_SUBJECTS]
+    daily = daily[daily["subject_disp"].isin(target_disp)].copy()
     for col in ["order_sum", "orders", "open_cards", "search_frequency", "ad_spend_total", "ad_clicks_total", "ad_impressions_total", "manual_spend", "unified_spend", "unknown_spend", "manual_clicks", "unified_clicks", "unknown_clicks", "manual_impressions", "unified_impressions", "unknown_impressions"]:
         if col not in daily.columns:
             daily[col] = 0.0
@@ -9628,7 +9632,7 @@ def _tg_prepare_ads_truth(outputs: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
     if not isinstance(outputs, dict):
         return pd.DataFrame(), ""
 
-    TARGET_DISP = ["Кисти", "Карандаши", "Помады", "Блески"]
+    TARGET_DISP = [_tg_subject_disp(s) for s in TARGET_SUBJECTS]
 
     def _ensure_numeric(ads: pd.DataFrame) -> pd.DataFrame:
         rename_candidates = {
@@ -9878,11 +9882,31 @@ TELEGRAM_MANAGER_ORDER = ["Влад", "Игорь", "Эмиль", "Юля"]
 TELEGRAM_MANAGER_OVERRIDE_BY_SUBJECT = {
     "блески": "Эмиль",
     "помады": "Юля",
+    "Блески": "Эмиль",
+    "Помады": "Юля",
 }
 TELEGRAM_MANAGER_OVERRIDE_BY_PRODUCT = {
     "207": "Эмиль", "209": "Эмиль", "210": "Эмиль", "211": "Эмиль",
     "154": "Юля", "155": "Юля", "156": "Юля", "157": "Юля", "158": "Юля", "206": "Юля",
 }
+
+def _tg_product_from_row_columns(frame: pd.DataFrame) -> pd.Series:
+    """Derive product family for manager override from product or seller article.
+
+    Some Telegram sources have only subject, some have only supplier_article, and
+    ABC/reference may still contain stale manager. Current ownership must override
+    stale manager before aggregation in every case.
+    """
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.Series(dtype="object")
+    if "product" in frame.columns:
+        prod = frame["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+    else:
+        prod = pd.Series("", index=frame.index, dtype="object")
+    if "supplier_article" in frame.columns:
+        art_prod = frame["supplier_article"].map(product_code).map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        prod = prod.where(prod.ne(""), art_prod)
+    return prod
 
 def _tg_apply_manager_overrides(df: pd.DataFrame) -> pd.DataFrame:
     """Apply current manager ownership after any ABC/reference mapping.
@@ -9897,18 +9921,28 @@ def _tg_apply_manager_overrides(df: pd.DataFrame) -> pd.DataFrame:
         out["manager"] = ""
     if "manager_raw" not in out.columns:
         out["manager_raw"] = out["manager"]
+
+    forced = pd.Series("", index=out.index, dtype="object")
+
     if "subject" in out.columns:
         subj_key = out["subject"].map(norm_key)
-        for subj, mgr in TELEGRAM_MANAGER_OVERRIDE_BY_SUBJECT.items():
-            mask = subj_key.eq(norm_key(subj))
-            out.loc[mask, "manager"] = mgr
-            out.loc[mask, "manager_raw"] = mgr
-    if "product" in out.columns:
-        prod_key = out["product"].map(lambda v: normalize_text(v).upper().replace(" ", ""))
+        # Exact and substring protection: source may contain canonical subject, lower-case
+        # subject, or already-short display value.
+        gloss_mask = subj_key.eq("блески") | subj_key.str.contains(r"\bблеск", na=False)
+        lipstick_mask = subj_key.eq("помады") | subj_key.str.contains(r"\bпомад", na=False)
+        forced.loc[gloss_mask] = "Эмиль"
+        forced.loc[lipstick_mask] = "Юля"
+
+    prod_key = _tg_product_from_row_columns(out)
+    if not prod_key.empty:
         for prod, mgr in TELEGRAM_MANAGER_OVERRIDE_BY_PRODUCT.items():
-            mask = prod_key.eq(str(prod))
-            out.loc[mask, "manager"] = mgr
-            out.loc[mask, "manager_raw"] = mgr
+            forced.loc[prod_key.eq(str(prod))] = mgr
+
+    mask = forced.ne("")
+    if mask.any():
+        out.loc[mask, "manager"] = forced.loc[mask]
+        out.loc[mask, "manager_raw"] = forced.loc[mask]
+
     out["manager"] = out["manager"].map(_tg_normalize_manager) if "_tg_normalize_manager" in globals() else out["manager"]
     return out
 
@@ -10070,6 +10104,9 @@ def _tg_attach_manager_exact(df: pd.DataFrame, ref: pd.DataFrame) -> pd.DataFram
     out["nm_id"] = pd.to_numeric(out["nm_id"], errors="coerce")
     out["supplier_article"] = out["supplier_article"].map(clean_article)
     out["subject"] = out["subject"].map(_tg_clean_subject_full)
+    # Force current ownership before and after reference joins. This prevents stale
+    # raw ABC manager from keeping Помады/Блески inside Влад.
+    out = _tg_apply_manager_overrides(out)
     if ref is None or ref.empty:
         return _tg_apply_manager_overrides(out)
     r = ref.copy()
@@ -10126,6 +10163,7 @@ def _tg_allocate_subject_rows(df: pd.DataFrame, ref: pd.DataFrame, value_cols: S
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True, sort=False)
+    out = _tg_apply_manager_overrides(out)
     out["manager"] = out["manager"].map(_tg_normalize_manager)
     out = out[out["manager"].isin(TELEGRAM_MANAGER_ORDER)].copy()
     return out
