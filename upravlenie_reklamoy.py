@@ -5363,7 +5363,7 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
 
 
 # =========================
-# V80 OVERRIDES: flagship CORE priority with allowed rollback after failed traffic response
+# V81 OVERRIDES: flagship one-time raise to 10 with max+3 cap and rollback control
 # =========================
 # Правило пользователя:
 # флагманский товар должен держать позицию 1-8, видимость >=95% и максимум кликов по CORE.
@@ -5371,8 +5371,11 @@ def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payloa
 # не дало роста CORE-кликов / доли показов / видимости / медианной позиции.
 # Экономические снижения, hard cap и паузы не должны перебивать режим флагмана, пока цель CORE не выполнена.
 
-SCRIPT_VERSION = "v80-flagship-core-traffic-rollback-2026-07-15"
-VERSION = "FIX53_FLAGSHIP_CORE_PRIORITY_ALLOW_FAILED_RAISE_ROLLBACK"
+SCRIPT_VERSION = "v81-flagship-raise-to-10-cap3-2026-07-15"
+VERSION = "FIX54_FLAGSHIP_RAISE_TO_10_CAP3"
+
+CORE_FLAGSHIP_SEARCH_TARGET_BID_RUB_V81 = 10
+CORE_FLAGSHIP_SEARCH_CAP_EXTRA_RUB_V81 = 3
 
 _COMPUTE_ENGINE_V78 = compute_engine
 _WRITE_OUTPUTS_V78 = write_outputs
@@ -5468,6 +5471,7 @@ def _is_allowed_flagship_traffic_rollback_v80(reason_code: Any, row: Optional[pd
     allowed = {
         "CORE_TRAFFIC_RAISE_NO_EFFECT_ROLLBACK",
         "POSTCHECK_RAISE_NO_CLICK_LIFT_ROLLBACK",
+        "FLAGSHIP_CORE_FAILED_RAISE_ROLLBACK_ALLOWED",
     }
     if rc in allowed:
         return True
@@ -5477,6 +5481,50 @@ def _is_allowed_flagship_traffic_rollback_v80(reason_code: Any, row: Optional[pd
         if ("после повышения" in txt) and ("core" in txt or "кор" in txt) and ("не вырос" in txt or "роста нет" in txt) and ("откат" in txt or "возвращ" in txt):
             return True
     return False
+
+
+def _flagship_search_ceiling_v81(row: pd.Series) -> float:
+    """Для поискового флагмана потолок = рассчитанная max-ставка + 3 ₽."""
+    max_bid = pd.to_numeric(row.get("max_allowed_bid_rub", np.nan), errors="coerce")
+    if pd.isna(max_bid):
+        return np.nan
+    return float(max_bid) + float(CORE_FLAGSHIP_SEARCH_CAP_EXTRA_RUB_V81)
+
+
+def _flagship_search_target_bid_v81(row: pd.Series, bid_effective: Any) -> float:
+    """Разовый целевой подъём флагмана: до 10 ₽, но не выше max+3 ₽."""
+    ceiling = _flagship_search_ceiling_v81(row)
+    if pd.isna(ceiling):
+        return np.nan
+    target = min(float(CORE_FLAGSHIP_SEARCH_TARGET_BID_RUB_V81), float(ceiling))
+    if pd.isna(bid_effective):
+        return target
+    # Не снижаем до 10, если текущая ставка уже выше 10, но в пределах max+3.
+    return max(float(bid_effective), float(target))
+
+
+def _flagship_raise_to_10_reason_v81(row: pd.Series, new_bid: Any) -> str:
+    q = str(row.get("core_flagship_problem_queries_v79", "") or "").strip()
+    max_bid = row.get("max_allowed_bid_rub", np.nan)
+    ceiling = _flagship_search_ceiling_v81(row)
+    parts = [
+        "Флагманский товар ниже цели CORE: нужно быстрее восстановить позицию 1-8, видимость 95%+ и клики по главным запросам.",
+        f"Разово поднимаем поисковую ставку до {new_bid} ₽: цель 10 ₽, но не выше рассчитанной max-ставки +3 ₽.",
+    ]
+    if pd.notna(max_bid) and pd.notna(ceiling):
+        parts.append(f"Рассчитанная max-ставка {float(max_bid):.0f} ₽, допустимый потолок флагмана {float(ceiling):.0f} ₽.")
+    if q:
+        parts.append(f"Проблемные CORE-запросы: {q}.")
+    return " ".join(parts)
+
+
+def _flagship_cap3_lower_reason_v81(row: pd.Series, forced_bid: Any) -> str:
+    max_bid = row.get("max_allowed_bid_rub", np.nan)
+    ceiling = _flagship_search_ceiling_v81(row)
+    return (
+        "Флагманский товар может удерживаться агрессивнее обычных РК, но ставка не должна быть выше рассчитанной max-ставки +3 ₽. "
+        f"Рассчитанная max-ставка {float(max_bid):.0f} ₽, потолок {float(ceiling):.0f} ₽, поэтому снижаем до {forced_bid} ₽."
+    )
 
 
 def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd.DataFrame) -> pd.DataFrame:
@@ -5540,14 +5588,17 @@ def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd
         step, min_bid, bid_effective, next_up, next_down, new_abs_max = _bid_grid_values(placement, current_bid)
         target_missed = bool(row.get("core_flagship_target_missed_v79", False))
 
-        # Для флагманов снижение разрешено только как откат неэффективного повышения по CORE-трафику.
+        # V81: для поискового флагмана при провале позиции/видимости поднимаем быстрее — сразу до 10 ₽,
+        # но строго не выше рассчитанной max-ставки +3 ₽. Снижение разрешено в двух случаях:
+        # 1) это откат неэффективного повышения по CORE-трафику; 2) текущая ставка выше max+3 ₽.
+        flagship_ceiling = _flagship_search_ceiling_v81(row) if placement == "search" else np.nan
+        over_flagship_cap = bool(placement == "search" and pd.notna(flagship_ceiling) and pd.notna(bid_effective) and float(bid_effective) > float(flagship_ceiling))
+
         if current_action in {"lower", "pause"}:
             reason_code_now = row.get("reason_code", "")
             allowed_traffic_rollback = (current_action == "lower") and _is_allowed_flagship_traffic_rollback_v80(reason_code_now, row)
 
             if allowed_traffic_rollback:
-                # Это правильный кейс: ставку подняли, но CORE-клики/доля показов/позиция/видимость не выросли.
-                # Такой откат не блокируем даже для флагмана.
                 out.at[idx, "reason_code"] = "FLAGSHIP_CORE_FAILED_RAISE_ROLLBACK_ALLOWED"
                 old_reason = str(row.get("reason_text", "") or "").strip()
                 out.at[idx, "reason_text"] = (
@@ -5558,13 +5609,31 @@ def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd
                 out.at[idx, "flagship_priority_applied_v79"] = "разрешён откат неэффективного повышения флагмана"
                 continue
 
-            if target_missed and active and placement == "search" and pd.notna(next_up):
-                new_bid = next_up
-                out.at[idx, "action"] = "raise"
-                out.at[idx, "new_bid_rub"] = new_bid
-                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_PRIORITY_RAISE"
-                out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "повышаем ставку", new_bid)
-                out.at[idx, "flagship_priority_applied_v79"] = "экономическое снижение/пауза заменены на повышение флагмана"
+            if over_flagship_cap:
+                forced_bid = int(math.floor(float(flagship_ceiling)))
+                forced_bid = max(int(min_bid), forced_bid)
+                out.at[idx, "action"] = "lower"
+                out.at[idx, "new_bid_rub"] = forced_bid
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_CAP_PLUS3_FORCE_LOWER"
+                out.at[idx, "reason_text"] = _flagship_cap3_lower_reason_v81(row, forced_bid)
+                out.at[idx, "flagship_priority_applied_v79"] = "снижение флагмана до max+3"
+                continue
+
+            if target_missed and active and placement == "search":
+                target_bid = _flagship_search_target_bid_v81(row, bid_effective)
+                if pd.notna(target_bid) and float(target_bid) > float(bid_effective):
+                    new_bid = int(round(float(target_bid)))
+                    out.at[idx, "action"] = "raise"
+                    out.at[idx, "new_bid_rub"] = new_bid
+                    out.at[idx, "reason_code"] = "FLAGSHIP_CORE_RAISE_TO_10_CAP3"
+                    out.at[idx, "reason_text"] = _flagship_raise_to_10_reason_v81(row, new_bid)
+                    out.at[idx, "flagship_priority_applied_v79"] = "экономическое снижение/пауза заменены на разовый подъём флагмана до 10/max+3"
+                else:
+                    out.at[idx, "action"] = "hold"
+                    out.at[idx, "new_bid_rub"] = bid_effective
+                    out.at[idx, "reason_code"] = "FLAGSHIP_CORE_TARGET_MISSED_HOLD_AT_TARGET_OR_CAP"
+                    out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "держим ставку: уже достигнут целевой уровень/потолок max+3", bid_effective)
+                    out.at[idx, "flagship_priority_applied_v79"] = "флагман ниже цели CORE, но ставка уже на целевом уровне или потолке"
             else:
                 new_bid = bid_effective
                 out.at[idx, "action"] = "hold"
@@ -5572,24 +5641,35 @@ def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd
                 out.at[idx, "reason_code"] = "FLAGSHIP_CORE_PRIORITY_NO_ECONOMIC_LOWER"
                 out.at[idx, "reason_text"] = (
                     "Флагманский товар: обычное экономическое снижение или пауза запрещены, пока не выполнена цель CORE. "
-                    "Снижать можно только как откат повышения, которое не дало роста CORE-кликов, видимости или позиции."
+                    "Снижать можно только как откат повышения без роста CORE-трафика или если ставка выше max+3 ₽."
                 )
                 out.at[idx, "flagship_priority_applied_v79"] = "экономическое снижение/пауза запрещены для флагмана"
 
-        # Если цель флагмана не выполнена, поисковую РК нужно тянуть вверх, если не было доказанного неэффективного повышения.
+        elif over_flagship_cap:
+            forced_bid = int(math.floor(float(flagship_ceiling)))
+            forced_bid = max(int(min_bid), forced_bid)
+            out.at[idx, "action"] = "lower"
+            out.at[idx, "new_bid_rub"] = forced_bid
+            out.at[idx, "reason_code"] = "FLAGSHIP_CORE_CAP_PLUS3_FORCE_LOWER"
+            out.at[idx, "reason_text"] = _flagship_cap3_lower_reason_v81(row, forced_bid)
+            out.at[idx, "flagship_priority_applied_v79"] = "снижение флагмана до max+3"
+
+        # Если цель флагмана не выполнена, поисковую РК тянем быстрее: сразу до 10 ₽, но не выше max+3 ₽.
         elif target_missed and active and placement == "search":
-            if pd.notna(next_up) and float(next_up) > float(bid_effective):
+            target_bid = _flagship_search_target_bid_v81(row, bid_effective)
+            if pd.notna(target_bid) and float(target_bid) > float(bid_effective):
+                new_bid = int(round(float(target_bid)))
                 out.at[idx, "action"] = "raise"
-                out.at[idx, "new_bid_rub"] = next_up
-                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_TARGET_MISSED_RAISE"
-                out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "повышаем ставку", next_up)
-                out.at[idx, "flagship_priority_applied_v79"] = "флагман ниже цели CORE: приоритет повышения"
+                out.at[idx, "new_bid_rub"] = new_bid
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_RAISE_TO_10_CAP3"
+                out.at[idx, "reason_text"] = _flagship_raise_to_10_reason_v81(row, new_bid)
+                out.at[idx, "flagship_priority_applied_v79"] = "флагман ниже цели CORE: разовый подъём до 10/max+3"
             else:
                 out.at[idx, "action"] = "hold"
                 out.at[idx, "new_bid_rub"] = bid_effective
-                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_TARGET_MISSED_HOLD_NO_STEP"
-                out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "держим ставку, нет доступного шага повышения", bid_effective)
-                out.at[idx, "flagship_priority_applied_v79"] = "флагман ниже цели CORE, но шаг повышения недоступен"
+                out.at[idx, "reason_code"] = "FLAGSHIP_CORE_TARGET_MISSED_HOLD_AT_TARGET_OR_CAP"
+                out.at[idx, "reason_text"] = _flagship_priority_reason_v79(row, "держим ставку: уже достигнут целевой уровень/потолок max+3", bid_effective)
+                out.at[idx, "flagship_priority_applied_v79"] = "флагман ниже цели CORE, но ставка уже на целевом уровне или потолке"
 
         # Если флагман уже в цели, не даём обычным правилам случайно уронить ставку.
         elif active and current_action == "hold":
@@ -5612,12 +5692,13 @@ def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame
 def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
     summary = _MAKE_SUMMARY_JSON_V78(mode, decisions, successful, api_log, windows, args)
     summary["Версия"] = SCRIPT_VERSION
-    summary["Режим флагмана CORE"] = "приоритет трафика: позиция 1-8, видимость 95%+, максимум кликов; экономические снижения/паузы запрещены, но откат повышения разрешён, если за 1 день CORE-трафик не вырос"
+    summary["Режим флагмана CORE"] = "позиция 1-8, видимость 95%+, максимум кликов; если цель не выполнена, поискового флагмана разово поднимаем до 10 ₽, но не выше рассчитанной max-ставки +3 ₽; откат разрешён, если рост ставки не дал CORE-трафик"
     summary["Флагманов CORE в контроле"] = int(len(LAST_FLAGSHIP_CONTROL_V79)) if LAST_FLAGSHIP_CONTROL_V79 is not None else 0
     if decisions is not None and not decisions.empty and "reason_code" in decisions.columns:
-        summary["Флагманских повышений"] = int(decisions["reason_code"].astype(str).isin(["FLAGSHIP_CORE_PRIORITY_RAISE", "FLAGSHIP_CORE_TARGET_MISSED_RAISE"]).sum())
+        summary["Флагманских повышений"] = int(decisions["reason_code"].astype(str).isin(["FLAGSHIP_CORE_PRIORITY_RAISE", "FLAGSHIP_CORE_TARGET_MISSED_RAISE", "FLAGSHIP_CORE_RAISE_TO_10_CAP3"]).sum())
         summary["Флагманских запретов экономического снижения"] = int(decisions["reason_code"].astype(str).eq("FLAGSHIP_CORE_PRIORITY_NO_ECONOMIC_LOWER").sum())
         summary["Флагманских откатов неэффективного повышения"] = int(decisions["reason_code"].astype(str).eq("FLAGSHIP_CORE_FAILED_RAISE_ROLLBACK_ALLOWED").sum())
+        summary["Флагманских снижений до max+3"] = int(decisions["reason_code"].astype(str).eq("FLAGSHIP_CORE_CAP_PLUS3_FORCE_LOWER").sum())
     return summary
 
 
