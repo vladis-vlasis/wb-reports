@@ -6,12 +6,12 @@
 Данные хранятся только в недельных файлах (кроме воронки продаж и 1С).
 Автоматическое получение всех артикулов из заказов для отчёта по ключам.
 Формат для keywords: Неделя ГГГГ-WНН.xlsx
-Финансовые показатели: в ежедневном режиме загружается только целевая дата; историческая догрузка включается только через env.
+Финансовые показатели: новый метод POST /api/finance/v1/sales-reports/detailed, в ежедневном режиме только целевая дата.
 Всегда читается первый лист в файле.
 Поисковые запросы: загружается целевая дата по правилу времени запуска.
 Реклама: в ежедневном режиме получает статистику только за целевую дату и объединяет её с существующей историей.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
-Для TOPFACE используется WB_PROMO_KEY_TOPFACE, для MISSTAIS используется WB_KEY_MISSTAIS.
+Для TOPFACE/MISSTAIS используются основные WB-токены, для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS.
 """
 
 import os
@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-07-13_v30_STOCKS_WAREHOUSE_REMAINS_NO_429_LOOP"
+SCRIPT_VERSION = "2026-07-27_v35_RETRY_AFTER_15_MARKER_TARGET_DATE"
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -51,8 +51,8 @@ def resolve_target_data_date(now_msk: Optional[datetime] = None) -> datetime.dat
 
     Правило:
     - если явно задан WB_TARGET_DATE=YYYY-MM-DD, используем его;
-    - если запуск по МСК после 14:00 включительно, выгружаем вчера;
-    - если запуск по МСК до 14:00, выгружаем предыдущий полный день, то есть позавчера.
+    - если запуск по МСК после 15:00 включительно, выгружаем вчера;
+    - если запуск по МСК до 15:00, выгружаем предыдущий полный день, то есть позавчера.
 
     Пример: запуск 26 числа в 02:00 МСК -> данные за 24 число.
     Пример: запуск 26 числа в 15:00 МСК -> данные за 25 число.
@@ -64,7 +64,7 @@ def resolve_target_data_date(now_msk: Optional[datetime] = None) -> datetime.dat
     if now_msk is None:
         now_msk = datetime.now(pytz.timezone("Europe/Moscow"))
 
-    base_shift_days = 1 if now_msk.hour >= 14 else 2
+    base_shift_days = 1 if now_msk.hour >= 15 else 2
     return now_msk.date() - timedelta(days=base_shift_days)
 
 
@@ -183,7 +183,7 @@ class WildberriesDailyUpdater:
                 'folder': 'Остатки',
                 'date_column': 'Дата запроса',
                 'id_columns': ['Дата запроса', 'Артикул WB', 'Склад'],
-                'api_url': 'https://statistics-api.wildberries.ru/api/v1/supplier/stocks',
+                'api_url': 'https://seller-analytics-api.wildberries.ru/api/v1/warehouse_remains',
                 'api_method': 'GET',
                 'key_type': 'promo',
             },
@@ -192,9 +192,9 @@ class WildberriesDailyUpdater:
                 'folder': 'Финансовые показатели',
                 'date_column': 'rr_dt',
                 'id_columns': ['rr_dt', 'rrd_id', 'nm_id'],
-                'api_url': 'https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod',
-                'api_method': 'GET',
-                'key_type': 'promo',
+                'api_url': 'https://finance-api.wildberries.ru/api/finance/v1/sales-reports/detailed',
+                'api_method': 'POST',
+                'key_type': 'finance',
             },
             'keywords': {
                 'name': 'Позиции по Ключам',
@@ -506,50 +506,201 @@ class WildberriesDailyUpdater:
                     return None
         return None
 
+    def _map_finance_v1_row_to_old_format(self, row: dict) -> dict:
+        """Привести camelCase из нового finance-api к старым snake_case колонкам.
+
+        Это нужно, чтобы недельные файлы оставались совместимыми со старой структурой:
+        rr_dt, rrd_id, nm_id, supplier_oper_name, ppvz_for_pay и т.д.
+        """
+        mapping = {
+            "reportId": "realizationreport_id",
+            "dateFrom": "date_from",
+            "dateTo": "date_to",
+            "createDate": "create_dt",
+            "currency": "currency_name",
+            "rrdId": "rrd_id",
+            "giId": "gi_id",
+            "dlvPrc": "dlv_prc",
+            "fixTariffDateFrom": "fix_tariff_date_from",
+            "fixTariffDateTo": "fix_tariff_date_to",
+            "subjectName": "subject_name",
+            "nmId": "nm_id",
+            "brandName": "brand_name",
+            "vendorCode": "sa_name",
+            "techSize": "ts_name",
+            "sku": "barcode",
+            "docTypeName": "doc_type_name",
+            "retailPrice": "retail_price",
+            "retailAmount": "retail_amount",
+            "salePercent": "sale_percent",
+            "commissionPercent": "commission_percent",
+            "officeName": "office_name",
+            "sellerOperName": "supplier_oper_name",
+            "orderDt": "order_dt",
+            "saleDt": "sale_dt",
+            "rrDate": "rr_dt",
+            "shkId": "shk_id",
+            "retailPriceWithDisc": "retail_price_withdisc_rub",
+            "deliveryAmount": "delivery_amount",
+            "returnAmount": "return_amount",
+            "deliveryService": "delivery_rub",
+            "giBoxTypeName": "gi_box_type_name",
+            "productDiscountForReport": "product_discount_for_report",
+            "sellerPromo": "supplier_promo",
+            "spp": "ppvz_spp_prc",
+            "kvwBase": "ppvz_kvw_prc_base",
+            "kvw": "ppvz_kvw_prc",
+            "supRatingUp": "sup_rating_prc_up",
+            "isKgvpV2": "is_kgvp_v2",
+            "ppvzSalesCommission": "ppvz_sales_commission",
+            "forPay": "ppvz_for_pay",
+            "ppvzReward": "ppvz_reward",
+            "acquiringFee": "acquiring_fee",
+            "acquiringPercent": "acquiring_percent",
+            "paymentProcessing": "payment_processing",
+            "acquiringBank": "acquiring_bank",
+            "vw": "ppvz_vw",
+            "vwNds": "ppvz_vw_nds",
+            "ppvzOfficeName": "ppvz_office_name",
+            "ppvzOfficeId": "ppvz_office_id",
+            "ppvzSupplierName": "ppvz_supplier_name",
+            "ppvzSupplierInn": "ppvz_inn",
+            "declarationNumber": "declaration_number",
+            "bonusTypeName": "bonus_type_name",
+            "stickerId": "sticker_id",
+            "penalty": "penalty",
+            "additionalPayment": "additional_payment",
+            "rebillLogisticCost": "rebill_logistic_cost",
+            "rebillLogisticOrg": "rebill_logistic_org",
+            "paidStorage": "storage_fee",
+            "deduction": "deduction",
+            "paidAcceptance": "acceptance",
+            "orderId": "order_id",
+            "srid": "srid",
+            "articleSubstitution": "article_substitution",
+            "salePriceAffiliatedDiscountPrc": "sale_price_affiliated_discount_prc",
+            "salePriceWholesaleDiscountPrc": "sale_price_wholesale_discount_prc",
+            "cashbackAmount": "cashback_amount",
+            "cashbackDiscount": "cashback_discount",
+            "cashbackCommissionChange": "cashback_commission_change",
+            "paymentSchedule": "payment_schedule",
+            "deliveryMethod": "delivery_method",
+            "sellerPromoId": "seller_promo_id",
+            "sellerPromoDiscount": "seller_promo_discount",
+            "loyaltyId": "loyalty_id",
+            "loyaltyDiscount": "loyalty_discount",
+            "uuidPromocode": "uuid_promocode",
+            "salePricePromocodeDiscountPrc": "sale_price_promocode_discount_prc",
+            "agencyVat": "agency_vat",
+            "orderUid": "order_uid",
+        }
+
+        out = {}
+        for key, value in row.items():
+            out[mapping.get(key, key)] = value
+
+        # В новом методе title есть, в старом его не было. Оставляем как полезное новое поле.
+        if "title" in row:
+            out["title"] = row.get("title")
+
+        return out
+
+    def _finance_wait_429(self, resp, attempt: int, default_seconds: int = 65) -> None:
+        wait = default_seconds * attempt
+        for header in ("X-Ratelimit-Retry", "X-RateLimit-Retry", "X-Ratelimit-Reset", "X-RateLimit-Reset", "Retry-After"):
+            raw = resp.headers.get(header)
+            if not raw:
+                continue
+            try:
+                wait = max(wait, int(float(str(raw).strip())))
+            except Exception:
+                pass
+        wait = min(max(wait, 30), 900)
+        self.log(f"    ⚠ Finance API 429, попытка {attempt}, ждём {wait} сек. headers={dict(resp.headers)}")
+        time.sleep(wait)
+
     def _fetch_finance_day(self, config: dict, headers: dict, date_str: str) -> List[dict]:
+        """Новый финансовый метод WB с 15.07: POST /api/finance/v1/sales-reports/detailed."""
         url = config['api_url']
         all_items = []
-        rrdid = 0
+        rrd_id = 0
         limit = 100000
-        max_attempts = 3
+
         while True:
-            params = {
+            payload = {
                 "dateFrom": date_str,
                 "dateTo": date_str,
                 "limit": limit,
-                "rrdid": rrdid,
+                "rrdId": rrd_id,
                 "period": "daily"
             }
-            for attempt in range(max_attempts):
+
+            max_attempts = 5
+            page_loaded = False
+
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    resp = requests.get(url, headers=headers, params=params, timeout=120)
+                    resp = requests.post(url, headers=headers, json=payload, timeout=180)
+
                     if resp.status_code == 200:
                         data = resp.json()
                         if not data:
                             return all_items
-                        all_items.extend(data)
-                        last_rrdid = data[-1].get("rrd_id", 0)
-                        if len(data) < limit or last_rrdid <= rrdid:
+
+                        if not isinstance(data, list):
+                            self.log(f"    ❌ Finance API вернул не список: {str(data)[:1000]}")
                             return all_items
-                        rrdid = last_rrdid
+
+                        mapped = [self._map_finance_v1_row_to_old_format(item) for item in data]
+                        all_items.extend(mapped)
+
+                        last_rrd_id = 0
+                        for item in data[::-1]:
+                            try:
+                                last_rrd_id = int(item.get("rrdId") or item.get("rrd_id") or 0)
+                            except Exception:
+                                last_rrd_id = 0
+                            if last_rrd_id:
+                                break
+
+                        self.log(f"    ✅ Finance API: получено {len(data)} строк, rrdId={last_rrd_id}")
+
+                        if len(data) < limit or last_rrd_id <= rrd_id:
+                            return all_items
+
+                        rrd_id = last_rrd_id
+                        page_loaded = True
                         break
-                    elif resp.status_code == 204:
+
+                    if resp.status_code == 204:
                         return all_items
-                    elif resp.status_code == 429:
-                        wait = 60 * (attempt + 1)
-                        self.log(f"    ⚠ Лимит, попытка {attempt+1}/{max_attempts}, ждём {wait} сек...")
-                        time.sleep(wait)
+
+                    if resp.status_code == 429:
+                        self._finance_wait_429(resp, attempt, default_seconds=65)
+                        continue
+
+                    if resp.status_code in (401, 403):
+                        self.log(
+                            f"    ❌ Finance API {resp.status_code}: проверь токен. "
+                            f"Новый метод требует токен категории Finance. Ответ: {resp.text[:1000]}"
+                        )
+                        return all_items
+
+                    self.log(f"    ❌ Finance API HTTP {resp.status_code}: {resp.text[:1000]}")
+                    if attempt < max_attempts:
+                        time.sleep(15 * attempt)
                     else:
-                        self.log(f"    ❌ Ошибка {resp.status_code}: {resp.text[:200]}")
-                        if attempt == max_attempts - 1:
-                            return all_items
-                        time.sleep(10)
-                except Exception as e:
-                    self.log(f"    ❌ Исключение: {e}")
-                    if attempt == max_attempts - 1:
                         return all_items
-                    time.sleep(10)
-        return all_items
+
+                except Exception as e:
+                    self.log(f"    ❌ Исключение Finance API: {e}")
+                    if attempt < max_attempts:
+                        time.sleep(15 * attempt)
+                    else:
+                        return all_items
+
+            if not page_loaded:
+                return all_items
 
     # ---------- Заказы ----------
     def update_orders(self, store_name: str) -> bool:
@@ -898,7 +1049,7 @@ class WildberriesDailyUpdater:
             weeks[week_start].append(d)
 
         api_key = self.api_keys[store_name][config['key_type']]
-        headers = {"Authorization": f"Bearer {api_key.strip()}"}
+        headers = {"Authorization": api_key.strip(), "Content-Type": "application/json"}
         total_loaded_rows = 0
         total_loaded_days = 0
 
@@ -2029,6 +2180,13 @@ STORE_SECRET_ENV = {
     'MISSTAIS': 'WB_KEY_MISSTAIS',
 }
 
+# Новый финансовый API с 15 июля требует токен категории Finance.
+# Если отдельного finance-токена нет, берём прежний токен магазина как fallback.
+STORE_FINANCE_SECRET_ENV = {
+    'TOPFACE': 'WB_FINANCE_KEY_TOPFACE',
+    'MISSTAIS': 'WB_FINANCE_KEY_MISSTAIS',
+}
+
 STORE_ALIASES = {
     'TOPFACE': 'TOPFACE',
     'TF': 'TOPFACE',
@@ -2074,7 +2232,21 @@ def build_api_keys_for_stores(stores: List[str]) -> Dict[str, Dict[str, str]]:
         key_value = os.environ.get(secret_env, '').strip()
         if not key_value:
             raise ValueError(f"Для магазина {store} не задан secret/env {secret_env}")
-        api_keys[store] = {'promo': key_value, 'stats': key_value}
+
+        finance_secret_env = STORE_FINANCE_SECRET_ENV.get(store)
+        finance_key_value = os.environ.get(finance_secret_env or '', '').strip() if finance_secret_env else ''
+        if finance_key_value:
+            print(f"✅ Для {store} используется отдельный finance-token: {finance_secret_env}")
+        else:
+            finance_key_value = key_value
+            print(f"⚠️ Для {store} отдельный finance-token не задан, используем основной токен {secret_env}. "
+                  f"Если новый финансовый метод вернёт 401/403, нужен токен категории Finance.")
+
+        api_keys[store] = {
+            'promo': key_value,
+            'stats': key_value,
+            'finance': finance_key_value,
+        }
     return api_keys
 
 # ========================== МЕНЮ ДЛЯ РУЧНОГО ЗАПУСКА ==========================
