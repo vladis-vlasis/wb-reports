@@ -1,4 +1,4 @@
-# version: v30_report_env_before_marker
+# version: v35_retry_after_15_marker_target_date
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -17,18 +17,25 @@ on:
           - TOPFACE
           - MISSTAIS
       target_date:
-        description: "Целевая дата выгрузки YYYY-MM-DD. Пусто = авто-правило: до 14:00 МСК позавчера, после 14:00 МСК вчера."
+        description: "Целевая дата выгрузки YYYY-MM-DD. Пусто = авто-правило: 00:00-14:59 МСК позавчера, 15:00-23:59 МСК вчера."
         required: false
         default: ""
         type: string
+
   schedule:
-    # GitHub cron работает в UTC.
-    # Запускаем проверку каждые 10 минут круглосуточно.
-    # Сам Python не блокируется временем:
-    # - до 14:00 МСК выгружает предыдущий полный день = позавчера;
-    # - после 14:00 МСК выгружает вчера.
-    # Повторные schedule-запуски отсекаются marker-файлом по целевой дате.
-    - cron: "*/10 * * * *"
+    # GitHub cron работает в UTC. Москва = UTC+3.
+    # Частые попытки после обновления данных WB:
+    # 15:04, 15:14, ..., 23:54 МСК = 12:04, 12:14, ..., 20:54 UTC.
+    #
+    # Почему не один cron:
+    # GitHub Schedule может запускать workflow с задержкой/хаотично.
+    # Код сам выбирает целевую дату:
+    # - 00:00-14:59 МСК -> позавчера;
+    # - 15:00-23:59 МСК -> вчера.
+    #
+    # Marker-файл в S3 делает так, что полноценная выгрузка проходит только один раз
+    # на конкретную WB_TARGET_DATE. Остальные scheduled-попытки быстро завершаются.
+    - cron: "4-59/10 12-20 * * *"
 
 concurrency:
   # schedule и manual разделены. Ручной запуск не блокируется автозапуском.
@@ -53,6 +60,8 @@ jobs:
       YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       WB_KEY_MISSTAIS: ${{ secrets.WB_KEY_MISSTAIS }}
+      WB_FINANCE_KEY_TOPFACE: ${{ secrets.WB_FINANCE_KEY_TOPFACE }}
+      WB_FINANCE_KEY_MISSTAIS: ${{ secrets.WB_FINANCE_KEY_MISSTAIS }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
@@ -65,15 +74,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "YML_VERSION=v30_report_env_before_marker"
+          echo "YML_VERSION=v35_retry_after_15_marker_target_date"
           echo "github.event_name=${{ github.event_name }}"
           echo "github.event.schedule=${{ github.event.schedule }}"
           echo "STORE_INPUT=${STORE_INPUT}"
           echo "UTC now=$(date -u '+%Y-%m-%d %H:%M:%S')"
           TZ=Europe/Moscow date '+MSK now=%Y-%m-%d %H:%M:%S'
-          ls -la
           if [ ! -f "ezhednevnoe_obnovlenie_dannyh.py" ]; then
             echo "ERROR: ezhednevnoe_obnovlenie_dannyh.py not found in repo root"
+            ls -la
             exit 2
           fi
 
@@ -91,6 +100,8 @@ jobs:
               "YC_ENDPOINT_URL",
               "WB_PROMO_KEY_TOPFACE",
               "WB_KEY_MISSTAIS",
+              "WB_FINANCE_KEY_TOPFACE",
+              "WB_FINANCE_KEY_MISSTAIS",
               "TELEGRAM_BOT_TOKEN",
               "TELEGRAM_CHAT_ID",
               "TORGSTAT_ABC_URL",
@@ -98,6 +109,7 @@ jobs:
 
           report_env = os.getenv("REPORT_ENV", "") or ""
           parsed = {}
+
           for raw_line in report_env.splitlines():
               line = raw_line.strip()
               if not line or line.startswith("#"):
@@ -112,9 +124,8 @@ jobs:
               if key in allowed and value:
                   parsed[key] = value
 
-          github_env = os.environ["GITHUB_ENV"]
           loaded = []
-          with open(github_env, "a", encoding="utf-8") as f:
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               for key in allowed:
                   value = (os.getenv(key) or parsed.get(key) or "").strip()
                   if value:
@@ -171,9 +182,9 @@ jobs:
               target_date = raw_target
               rule = "manual_input_target_date"
           else:
-              shift_days = 1 if now_msk.hour >= 14 else 2
+              shift_days = 1 if now_msk.hour >= 15 else 2
               target_date = (now_msk.date() - timedelta(days=shift_days)).strftime("%Y-%m-%d")
-              rule = "auto_after_14_yesterday_before_14_day_before_yesterday"
+              rule = "auto_after_15_yesterday_before_15_day_before_yesterday"
 
           print("=== Target date resolution ===")
           print(f"MSK now={now_msk:%Y-%m-%d %H:%M:%S}")
@@ -276,7 +287,7 @@ jobs:
 
           key = os.environ["SCHEDULE_LOCK_KEY"]
           payload = {
-              "workflow_version": "v30_report_env_before_marker",
+              "workflow_version": "v35_retry_after_15_marker_target_date",
               "target_date": os.environ.get("WB_TARGET_DATE"),
               "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
               "store_input": os.environ.get("STORE_INPUT"),
