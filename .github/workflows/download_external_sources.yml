@@ -89,7 +89,7 @@ jobs:
           echo "Workflow: Загрузка Внешних источников"
           echo "Sources: Торгстат АБС-анализ и Точки входа ВБ"
 
-      - name: Verify Python v9
+      - name: Verify Python v10
         shell: bash
         run: |
           set -euo pipefail
@@ -108,8 +108,8 @@ jobs:
           echo "Selected script: $SCRIPT_PATH"
           echo "Detected: $ACTUAL_VERSION"
 
-          if ! grep -q 'EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V9_20260730' "$SCRIPT_PATH"; then
-            echo "::error::В download_external_sources.py лежит не версия V9. Замените содержимое файла на актуальную версию."
+          if ! grep -q 'EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V10_20260730' "$SCRIPT_PATH"; then
+            echo "::error::В download_external_sources.py лежит не версия V10. Замените содержимое файла на актуальную версию."
             exit 1
           fi
 
