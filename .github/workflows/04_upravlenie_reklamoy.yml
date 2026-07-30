@@ -8,7 +8,7 @@ on:
     # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
     - cron: "*/10 15-20 * * *"
     # CPM-чистка и управление ставками поисковых кластеров: каждые 2 часа, без ограничения 18:00-23:59.
-    # v87: CPM stats-days=1; основной run управляет только активными кистями; paused РК не запускаем, остальные РК логируются.
+    # v88: fix import shutil для cpm-manager; CPM stats-days=1; основной run управляет только активными кистями; paused РК не запускаем, остальные РК логируются.
     - cron: "0 */2 * * *"
 
 permissions:
@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v87_active_only_manual_pauses_respected_2026-07-30"
+  WORKFLOW_VERSION: "v88_import_shutil_cpm_manager_fix_2026-07-30"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
