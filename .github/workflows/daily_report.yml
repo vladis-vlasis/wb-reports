@@ -3,18 +3,19 @@ name: WB TOPFACE Daily Report
 on:
   schedule:
     # GitHub cron is UTC. 22:05 UTC = 01:05 MSK next day.
-    # Rule: 00:00-18:59 MSK => report D-2; 19:00-23:59 MSK => report D-1.
+    # report_runner.py itself applies the MSK rule:
+    # 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1.
     - cron: '5 22 * * *'
   workflow_dispatch:
     inputs:
       mode:
         description: 'Режим запуска'
         required: true
-        default: 'current_week'
+        default: 'full_refresh'
         type: choice
         options:
-          - current_week
           - full_refresh
+          - current_week
           - pdf_only
           - preflight
           - smoke
@@ -24,7 +25,7 @@ on:
         default: true
         type: boolean
       target_date:
-        description: 'Дата отчета YYYY-MM-DD. Пусто = авто по МСК.'
+        description: 'Дата отчета YYYY-MM-DD. Пусто = авто по московскому правилу.'
         required: false
         default: ''
         type: string
@@ -47,65 +48,27 @@ jobs:
       PYTHONIOENCODING: 'utf-8'
       TZ: Europe/Moscow
 
-      # The repository moved credentials into REPORT_ENV. Keep it as the primary source.
-      REPORT_ENV_SECRET: ${{ secrets.REPORT_ENV }}
-      REPORT_ENV_VAR: ${{ vars.REPORT_ENV }}
-      REPORT_ENV_TOPFACE_SECRET: ${{ secrets.REPORT_ENV_TOPFACE }}
-      REPORT_ENV_TOPFACE_VAR: ${{ vars.REPORT_ENV_TOPFACE }}
-      WB_REPORT_ENV_SECRET: ${{ secrets.WB_REPORT_ENV }}
-      WB_REPORT_ENV_VAR: ${{ vars.WB_REPORT_ENV }}
-      WB_ENV_SECRET: ${{ secrets.WB_ENV }}
-      WB_ENV_VAR: ${{ vars.WB_ENV }}
+      # Основной источник секретов. Никакие новые имена не требуются.
+      REPORT_ENV: ${{ secrets.REPORT_ENV || vars.REPORT_ENV }}
 
-      # Telegram credentials may also be in REPORT_ENV. These are only direct fallbacks
-      # for old working workflow names; values are masked by GitHub/Python before logging.
-      TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TG_BOT_TOKEN_SECRET: ${{ secrets.TG_BOT_TOKEN }}
-      TELEGRAM_TOKEN_SECRET: ${{ secrets.TELEGRAM_TOKEN }}
-      TG_TOKEN_SECRET: ${{ secrets.TG_TOKEN }}
-      BOT_TOKEN_SECRET: ${{ secrets.BOT_TOKEN }}
-      WB_TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.WB_TELEGRAM_BOT_TOKEN }}
-      TOPFACE_TELEGRAM_BOT_TOKEN_SECRET: ${{ secrets.TOPFACE_TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TG_CHAT_ID_SECRET: ${{ secrets.TG_CHAT_ID }}
-      TELEGRAM_CHAT_SECRET: ${{ secrets.TELEGRAM_CHAT }}
-      TG_CHAT_SECRET: ${{ secrets.TG_CHAT }}
-      CHAT_ID_SECRET: ${{ secrets.CHAT_ID }}
-      WB_TELEGRAM_CHAT_ID_SECRET: ${{ secrets.WB_TELEGRAM_CHAT_ID }}
-      TOPFACE_TELEGRAM_CHAT_ID_SECRET: ${{ secrets.TOPFACE_TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-      TG_MESSAGE_THREAD_ID_SECRET: ${{ secrets.TG_MESSAGE_THREAD_ID }}
-      TELEGRAM_THREAD_ID_SECRET: ${{ secrets.TELEGRAM_THREAD_ID }}
-      TG_THREAD_ID_SECRET: ${{ secrets.TG_THREAD_ID }}
-      MESSAGE_THREAD_ID_SECRET: ${{ secrets.MESSAGE_THREAD_ID }}
-      THREAD_ID_SECRET: ${{ secrets.THREAD_ID }}
+      # Прямые старые секреты оставлены только как fallback, если они уже есть в репозитории.
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID || vars.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY || vars.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME || vars.YC_BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL || vars.YC_ENDPOINT_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || vars.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || vars.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID || vars.TELEGRAM_MESSAGE_THREAD_ID }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN || vars.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID || vars.TG_CHAT_ID }}
+      TG_THREAD_ID: ${{ secrets.TG_THREAD_ID || vars.TG_THREAD_ID }}
 
-      # Fallbacks for individual variables, only if REPORT_ENV is not present.
-      FALLBACK_STORAGE_ACCESS_1: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      FALLBACK_STORAGE_ACCESS_2: ${{ secrets.S3_ACCESS_KEY_ID }}
-      FALLBACK_STORAGE_ACCESS_3: ${{ secrets.ACCESS_KEY_ID }}
-      FALLBACK_STORAGE_ACCESS_4: ${{ vars.AWS_ACCESS_KEY_ID }}
-      FALLBACK_STORAGE_ACCESS_5: ${{ vars.S3_ACCESS_KEY_ID }}
-      FALLBACK_STORAGE_SECRET_1: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      FALLBACK_STORAGE_SECRET_2: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-      FALLBACK_STORAGE_SECRET_3: ${{ secrets.SECRET_ACCESS_KEY }}
-      FALLBACK_STORAGE_SECRET_4: ${{ vars.AWS_SECRET_ACCESS_KEY }}
-      FALLBACK_STORAGE_SECRET_5: ${{ vars.S3_SECRET_ACCESS_KEY }}
-      FALLBACK_STORAGE_BUCKET_1: ${{ secrets.S3_BUCKET }}
-      FALLBACK_STORAGE_BUCKET_2: ${{ secrets.S3_BUCKET_NAME }}
-      FALLBACK_STORAGE_BUCKET_3: ${{ secrets.BUCKET_NAME }}
-      FALLBACK_STORAGE_BUCKET_4: ${{ vars.S3_BUCKET }}
-      FALLBACK_STORAGE_BUCKET_5: ${{ vars.S3_BUCKET_NAME }}
-      FALLBACK_STORAGE_ENDPOINT_1: ${{ secrets.S3_ENDPOINT_URL }}
-      FALLBACK_STORAGE_ENDPOINT_2: ${{ vars.S3_ENDPOINT_URL }}
-
-      # Runtime flags. No start-time cancellation; date is resolved below.
+      # Не отменяем запуск по времени. Дату выбирает сам report_runner.py.
       REPORT_RUN_SOURCE: ${{ github.event_name == 'schedule' && 'schedule' || 'manual' }}
       REPORT_ENFORCE_MSK_RUN_WINDOW: '0'
       REPORT_MANUAL_BYPASS_MSK_WINDOW: '1'
       REPORT_AUTO_COMPLETE_DATE: '0'
       REPORT_REQUIRE_ABC_PERIOD: '0'
-      REPORT_KEEP_EXPLICIT_DATE: '1'
       WB_KEEP_ONLY_MONDAY_REPORTS: '1'
       WB_LOCALIZATION_MAX_STALE_DAYS: '2'
       ALLOW_LOCAL_STORAGE: '0'
@@ -126,19 +89,61 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pandas numpy openpyxl boto3 reportlab requests
 
-      - name: Load REPORT_ENV and normalize runtime env
-        shell: bash
+      - name: Validate report_runner.py is the main report script
+        run: |
+          set -euo pipefail
+          test -f report_runner.py
+          python -m py_compile report_runner.py
+          python - <<'PY'
+          from pathlib import Path
+
+          src = Path('report_runner.py').read_text(encoding='utf-8', errors='replace')
+          print('report_runner.py first lines:')
+          print('\n'.join(src.splitlines()[:12]))
+
+          bad_markers = [
+              'add_argument("--ads", required=True',
+              "add_argument('--ads', required=True",
+              '--pause-history',
+              '--bid-history',
+          ]
+          required_markers = [
+              '--root',
+              '--reports-root',
+              '--store',
+              '--full-refresh',
+              '--send-telegram',
+          ]
+
+          bad = [m for m in bad_markers if m in src]
+          missing = [m for m in required_markers if m not in src]
+          if bad or missing:
+              raise SystemExit(
+                  'Неверный report_runner.py в репозитории: сейчас лежит не основной отчетный файл. '
+                  'Нужно заменить файл report_runner.py на последнюю версию основного отчета. '
+                  f'bad_markers={bad}; missing_markers={missing}'
+              )
+
+          print('report_runner identity: OK')
+          PY
+
+      - name: Normalize REPORT_ENV and fail fast checks
+        env:
+          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'full_refresh' }}
+          SEND_TELEGRAM_INPUT: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.send_telegram) || 'true' }}
+          TARGET_DATE_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.target_date || '' }}
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, re
+          import os
+          import re
+          from datetime import datetime
+          from pathlib import Path
+          import boto3
 
-          blob_candidates = [
-              'REPORT_ENV_SECRET', 'REPORT_ENV_VAR',
-              'REPORT_ENV_TOPFACE_SECRET', 'REPORT_ENV_TOPFACE_VAR',
-              'WB_REPORT_ENV_SECRET', 'WB_REPORT_ENV_VAR',
-              'WB_ENV_SECRET', 'WB_ENV_VAR',
-          ]
+          run_mode = os.environ.get('RUN_MODE', 'full_refresh')
+          send_telegram = os.environ.get('SEND_TELEGRAM_INPUT', 'true').lower() == 'true'
+          target_date = os.environ.get('TARGET_DATE_INPUT', '').strip()
 
           def parse_env_blob(text):
               result = {}
@@ -160,22 +165,12 @@ jobs:
                   result[key] = value
               return result
 
-          source = ''
-          parsed = {}
-          for candidate in blob_candidates:
-              value = os.environ.get(candidate, '')
-              if value.strip():
-                  source = candidate
-                  parsed = parse_env_blob(value)
-                  break
-
-          if source:
-              print(f'REPORT_ENV source: {source}; loaded variables: {len(parsed)}')
-          else:
-              print('REPORT_ENV source: MISSING; using individual fallback variables if present')
+          parsed = parse_env_blob(os.environ.get('REPORT_ENV', ''))
+          print(f'REPORT_ENV: {"OK" if parsed else "MISSING/EMPTY"}; loaded={len(parsed)}')
 
           env = dict(os.environ)
-          env.update(parsed)
+          # REPORT_ENV has priority over empty job env fallbacks.
+          env.update({k: v for k, v in parsed.items() if str(v).strip()})
 
           def first(names, default=''):
               for name in names:
@@ -184,258 +179,98 @@ jobs:
                       return str(value).strip(), name
               return default, 'default' if default else ''
 
-          final = dict(parsed)
+          access, access_src = first(['YC_ACCESS_KEY_ID', 'AWS_ACCESS_KEY_ID', 'S3_ACCESS_KEY_ID', 'ACCESS_KEY_ID'])
+          secret, secret_src = first(['YC_SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY', 'S3_SECRET_ACCESS_KEY', 'SECRET_ACCESS_KEY'])
+          bucket, bucket_src = first(['YC_BUCKET_NAME', 'S3_BUCKET', 'S3_BUCKET_NAME', 'BUCKET_NAME', 'BUCKET'])
+          endpoint, endpoint_src = first(['YC_ENDPOINT_URL', 'S3_ENDPOINT_URL', 'AWS_ENDPOINT_URL'], 'https://storage.yandexcloud.net')
 
-          storage_access, storage_access_src = first([
-              'YC_ACCESS_KEY_ID', 'AWS_ACCESS_KEY_ID', 'S3_ACCESS_KEY_ID', 'ACCESS_KEY_ID',
-              'YANDEX_ACCESS_KEY_ID', 'YANDEX_STORAGE_ACCESS_KEY_ID', 'OBJECT_STORAGE_ACCESS_KEY_ID',
-              'FALLBACK_STORAGE_ACCESS_1', 'FALLBACK_STORAGE_ACCESS_2', 'FALLBACK_STORAGE_ACCESS_3',
-              'FALLBACK_STORAGE_ACCESS_4', 'FALLBACK_STORAGE_ACCESS_5',
-          ])
-          storage_secret, storage_secret_src = first([
-              'YC_SECRET_ACCESS_KEY', 'AWS_SECRET_ACCESS_KEY', 'S3_SECRET_ACCESS_KEY', 'SECRET_ACCESS_KEY',
-              'YANDEX_SECRET_ACCESS_KEY', 'YANDEX_STORAGE_SECRET_ACCESS_KEY', 'OBJECT_STORAGE_SECRET_ACCESS_KEY',
-              'FALLBACK_STORAGE_SECRET_1', 'FALLBACK_STORAGE_SECRET_2', 'FALLBACK_STORAGE_SECRET_3',
-              'FALLBACK_STORAGE_SECRET_4', 'FALLBACK_STORAGE_SECRET_5',
-          ])
-          storage_bucket, storage_bucket_src = first([
-              'YC_BUCKET_NAME', 'YC_BUCKET', 'S3_BUCKET', 'S3_BUCKET_NAME', 'BUCKET_NAME', 'BUCKET',
-              'YANDEX_BUCKET_NAME', 'YANDEX_STORAGE_BUCKET', 'OBJECT_STORAGE_BUCKET',
-              'FALLBACK_STORAGE_BUCKET_1', 'FALLBACK_STORAGE_BUCKET_2', 'FALLBACK_STORAGE_BUCKET_3',
-              'FALLBACK_STORAGE_BUCKET_4', 'FALLBACK_STORAGE_BUCKET_5',
-          ], default='wb-analis')
-          storage_endpoint, storage_endpoint_src = first([
-              'YC_ENDPOINT_URL', 'S3_ENDPOINT_URL', 'AWS_ENDPOINT_URL', 'YANDEX_ENDPOINT_URL',
-              'YANDEX_STORAGE_ENDPOINT_URL', 'OBJECT_STORAGE_ENDPOINT_URL',
-              'FALLBACK_STORAGE_ENDPOINT_1', 'FALLBACK_STORAGE_ENDPOINT_2',
-          ], default='https://storage.yandexcloud.net')
+          token, token_src = first(['TELEGRAM_BOT_TOKEN', 'TG_BOT_TOKEN', 'TELEGRAM_TOKEN', 'TG_TOKEN', 'BOT_TOKEN'])
+          chat, chat_src = first(['TELEGRAM_CHAT_ID', 'TG_CHAT_ID', 'TELEGRAM_CHAT', 'TG_CHAT', 'CHAT_ID'])
+          thread, thread_src = first(['TELEGRAM_MESSAGE_THREAD_ID', 'TELEGRAM_THREAD_ID', 'TG_THREAD_ID', 'THREAD_ID'])
 
-          telegram_token, telegram_token_src = first([
-              'TELEGRAM_BOT_TOKEN', 'TG_BOT_TOKEN', 'TELEGRAM_TOKEN', 'TG_TOKEN', 'BOT_TOKEN',
-              'WB_TELEGRAM_BOT_TOKEN', 'TOPFACE_TELEGRAM_BOT_TOKEN',
-              'TELEGRAM_BOT_TOKEN_TOPFACE', 'TELEGRAM_TOPFACE_BOT_TOKEN', 'TG_TOPFACE_BOT_TOKEN',
-              'TELEGRAM_BOT_TOKEN_SECRET', 'TG_BOT_TOKEN_SECRET', 'TELEGRAM_TOKEN_SECRET',
-              'TG_TOKEN_SECRET', 'BOT_TOKEN_SECRET', 'WB_TELEGRAM_BOT_TOKEN_SECRET',
-              'TOPFACE_TELEGRAM_BOT_TOKEN_SECRET',
-          ])
-          telegram_chat, telegram_chat_src = first([
-              'TELEGRAM_CHAT_ID', 'TG_CHAT_ID', 'TELEGRAM_CHAT', 'TG_CHAT', 'CHAT_ID',
-              'WB_TELEGRAM_CHAT_ID', 'TOPFACE_TELEGRAM_CHAT_ID',
-              'TELEGRAM_CHAT_ID_TOPFACE', 'TELEGRAM_TOPFACE_CHAT_ID', 'TG_TOPFACE_CHAT_ID',
-              'TELEGRAM_CHAT_ID_SECRET', 'TG_CHAT_ID_SECRET', 'TELEGRAM_CHAT_SECRET',
-              'TG_CHAT_SECRET', 'CHAT_ID_SECRET', 'WB_TELEGRAM_CHAT_ID_SECRET',
-              'TOPFACE_TELEGRAM_CHAT_ID_SECRET',
-          ])
-          telegram_thread, telegram_thread_src = first([
-              'TELEGRAM_MESSAGE_THREAD_ID', 'TELEGRAM_THREAD_ID', 'TG_MESSAGE_THREAD_ID',
-              'TG_THREAD_ID', 'MESSAGE_THREAD_ID', 'THREAD_ID',
-              'TELEGRAM_MESSAGE_THREAD_ID_SECRET', 'TG_MESSAGE_THREAD_ID_SECRET',
-              'TELEGRAM_THREAD_ID_SECRET', 'TG_THREAD_ID_SECRET',
-              'MESSAGE_THREAD_ID_SECRET', 'THREAD_ID_SECRET',
-          ])
-
-          # Canonical names required by old report_runner.py.
-          final['YC_ACCESS_KEY_ID'] = storage_access
-          final['YC_SECRET_ACCESS_KEY'] = storage_secret
-          final['YC_BUCKET_NAME'] = storage_bucket
-          final['YC_ENDPOINT_URL'] = storage_endpoint
-          if telegram_token:
-              final['TELEGRAM_BOT_TOKEN'] = telegram_token
-          if telegram_chat:
-              final['TELEGRAM_CHAT_ID'] = telegram_chat
-          if telegram_thread:
-              final['TELEGRAM_MESSAGE_THREAD_ID'] = telegram_thread
-
-          # Keep AWS/S3 aliases too for newer code variants.
-          if storage_access:
-              final.setdefault('AWS_ACCESS_KEY_ID', storage_access)
-              final.setdefault('S3_ACCESS_KEY_ID', storage_access)
-          if storage_secret:
-              final.setdefault('AWS_SECRET_ACCESS_KEY', storage_secret)
-              final.setdefault('S3_SECRET_ACCESS_KEY', storage_secret)
-          if storage_bucket:
-              final.setdefault('S3_BUCKET', storage_bucket)
-              final.setdefault('S3_BUCKET_NAME', storage_bucket)
-          if storage_endpoint:
-              final.setdefault('S3_ENDPOINT_URL', storage_endpoint)
-
-          github_env = os.environ['GITHUB_ENV']
-          sensitive_re = re.compile(r'(KEY|SECRET|TOKEN|PASSWORD|PASS|CHAT_ID|THREAD_ID)', re.I)
-          with open(github_env, 'a', encoding='utf-8') as f:
-              for key, value in final.items():
-                  if value is None:
-                      continue
-                  value = str(value)
-                  if value == '':
-                      continue
-                  if sensitive_re.search(key):
-                      print(f'::add-mask::{value}')
-                  f.write(f'{key}<<__{key}__\n{value}\n__{key}__\n')
-
-          print(f'Object Storage access: {"OK" if storage_access else "MISSING"} ({storage_access_src or "-"})')
-          print(f'Object Storage secret: {"OK" if storage_secret else "MISSING"} ({storage_secret_src or "-"})')
-          print(f'Object Storage bucket: OK ({storage_bucket_src})')
-          print(f'Object Storage endpoint: OK ({storage_endpoint_src})')
-          print(f'Telegram token: {"OK" if telegram_token else "MISSING"} ({telegram_token_src or "-"})')
-          print(f'Telegram chat: {"OK" if telegram_chat else "MISSING"} ({telegram_chat_src or "-"})')
-          print(f'Telegram thread: {"OK" if telegram_thread else "not set"} ({telegram_thread_src or "-"})')
-
-          if not storage_access or not storage_secret:
+          if not access or not secret or not bucket:
               raise SystemExit(
-                  'Object Storage credentials are not available. Expected them in REPORT_ENV first. '
-                  'No individual fallback variable provided either.'
+                  'Object Storage credentials missing before heavy calculations. '
+                  f'access={"OK" if access else "MISSING"}({access_src or "-"}); '
+                  f'secret={"OK" if secret else "MISSING"}({secret_src or "-"}); '
+                  f'bucket={"OK" if bucket else "MISSING"}({bucket_src or "-"}). '
+                  'Проверь REPORT_ENV: в нем должны быть рабочие ключи хранилища.'
               )
-          PY
 
-      - name: Resolve report date by MSK rule
-        env:
-          MANUAL_TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          from datetime import datetime, timedelta
-          from zoneinfo import ZoneInfo
-          import re
-
-          manual = os.environ.get('MANUAL_TARGET_DATE', '').strip()
-          if manual:
-              if not re.match(r'^\d{4}-\d{2}-\d{2}$', manual):
-                  raise SystemExit(f'target_date must be YYYY-MM-DD, got: {manual}')
-              target = manual
-              reason = 'manual target_date'
-              now_text = '-'
-          else:
-              now = datetime.now(ZoneInfo('Europe/Moscow'))
-              shift = 2 if now.hour < 19 else 1
-              target = (now.date() - timedelta(days=shift)).isoformat()
-              reason = 'MSK 00:00-18:59=>D-2, 19:00-23:59=>D-1'
-              now_text = now.strftime('%Y-%m-%d %H:%M:%S')
-
-          values = {
-              'REPORT_AS_OF_DATE': target,
-              'REPORT_REQUIRE_DATA_DATE': target,
-              'REPORT_REQUIRE_ADS_DATE': target,
-              'REPORT_REQUIRE_DAILY_ABC_DATE': target,
-              'WB_DAILY_TARGET_DATE': target,
-              'REPORT_MANUAL_TARGET_DATE': target,
-              'REPORT_KEEP_EXPLICIT_DATE': '1',
-              'REPORT_DATE_LOCKED_BY_MSK_WINDOW': '1',
-          }
-          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
-              for key, value in values.items():
-                  f.write(f'{key}={value}\n')
-          print(f'Report date: {target}; now_msk={now_text}; reason={reason}')
-          PY
-
-      - name: Diagnostics and report_runner identity guard
-        run: |
-          set -euo pipefail
-          echo "GitHub event: ${GITHUB_EVENT_NAME}"
-          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-          echo "REPORT_RUN_SOURCE=${REPORT_RUN_SOURCE}"
-          echo "REPORT_AS_OF_DATE=${REPORT_AS_OF_DATE}"
-          python --version
-          test -f report_runner.py
-          python -m py_compile report_runner.py
-          python - <<'PY'
-          from pathlib import Path
-          src = Path('report_runner.py').read_text(encoding='utf-8', errors='replace')
-          print('report_runner.py first lines:')
-          print('
-'.join(src.splitlines()[:12]))
-          bad_markers = [
-              'add_argument("--ads", required=True',
-              "add_argument('--ads', required=True",
-              '--pause-history',
-              '--bid-history',
-              'WB advertising Excel',
-          ]
-          required_markers = [
-              'WB TOPFACE analytics report',
-              '--full-refresh',
-              '--send-telegram',
-          ]
-          bad = [m for m in bad_markers if m in src]
-          missing = [m for m in required_markers if m not in src]
-          if bad or missing:
+          if send_telegram and run_mode not in {'smoke', 'preflight'} and (not token or not chat):
               raise SystemExit(
-                  'WRONG report_runner.py in repository. This workflow needs the main WB TOPFACE analytics report, '
-                  'not the advertising manager script. Replace repository file report_runner.py with '
-                  'report_runner_FIX68_correct_main_report_not_ads_20260713_v2.py. '
-                  f'bad_markers={bad}; missing_markers={missing}'
+                  'Telegram credentials missing before heavy calculations. '
+                  f'token={"OK" if token else "MISSING"}({token_src or "-"}); '
+                  f'chat={"OK" if chat else "MISSING"}({chat_src or "-"}). '
+                  'Проверь REPORT_ENV или старые TELEGRAM_* secrets.'
               )
-          print('report_runner identity: OK, main management report file detected')
-          PY
 
-      - name: Preflight Object Storage list
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          import boto3
-          bucket = os.environ['YC_BUCKET_NAME']
-          endpoint = os.environ.get('YC_ENDPOINT_URL') or 'https://storage.yandexcloud.net'
+          # Проверяем S3 сразу, до тяжелого расчета.
           s3 = boto3.client(
               's3',
               endpoint_url=endpoint,
-              aws_access_key_id=os.environ['YC_ACCESS_KEY_ID'],
-              aws_secret_access_key=os.environ['YC_SECRET_ACCESS_KEY'],
+              aws_access_key_id=access,
+              aws_secret_access_key=secret,
           )
           resp = s3.list_objects_v2(Bucket=bucket, Prefix='Отчёты/', MaxKeys=3)
-          print(f'Object Storage OK: bucket={bucket}, prefix=Отчёты/, objects_seen={len(resp.get("Contents", []))}')
-          PY
+          print(f'Object Storage: OK; bucket={bucket}; endpoint_source={endpoint_src}; objects_seen={len(resp.get("Contents", []))}')
+          print(f'Telegram: token={"OK" if token else "not requested/missing"}({token_src or "-"}); chat={"OK" if chat else "not requested/missing"}({chat_src or "-"}); thread={"OK" if thread else "not set"}({thread_src or "-"})')
 
-      - name: Preflight Telegram variables
-        env:
-          RUN_MODE: ${{ github.event.inputs.mode || 'current_week' }}
-          SEND_TELEGRAM_INPUT: ${{ github.event.inputs.send_telegram || 'true' }}
-        run: |
-          set -euo pipefail
-          if [ "${SEND_TELEGRAM_INPUT}" != "true" ] || [ "${RUN_MODE}" = "smoke" ] || [ "${RUN_MODE}" = "preflight" ]; then
-            echo "Telegram preflight skipped: send_telegram=${SEND_TELEGRAM_INPUT}, mode=${RUN_MODE}"
-            exit 0
-          fi
-          missing=0
-          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-            echo "Telegram token: MISSING"
-            missing=1
-          else
-            echo "Telegram token: OK"
-          fi
-          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
-            echo "Telegram chat: MISSING"
-            missing=1
-          else
-            echo "Telegram chat: OK"
-          fi
-          if [ "$missing" -ne 0 ]; then
-            echo "Telegram delivery was requested, but credentials are not available after REPORT_ENV normalization."
-            echo "Failing now before heavy report calculations."
-            exit 1
-          fi
+          values = {
+              'YC_ACCESS_KEY_ID': access,
+              'YC_SECRET_ACCESS_KEY': secret,
+              'YC_BUCKET_NAME': bucket,
+              'YC_ENDPOINT_URL': endpoint,
+              'AWS_ACCESS_KEY_ID': access,
+              'AWS_SECRET_ACCESS_KEY': secret,
+              'S3_BUCKET': bucket,
+              'S3_BUCKET_NAME': bucket,
+              'S3_ENDPOINT_URL': endpoint,
+          }
+          if token:
+              values['TELEGRAM_BOT_TOKEN'] = token
+          if chat:
+              values['TELEGRAM_CHAT_ID'] = chat
+          if thread:
+              values['TELEGRAM_MESSAGE_THREAD_ID'] = thread
+          if target_date:
+              if not re.match(r'^\d{4}-\d{2}-\d{2}$', target_date):
+                  raise SystemExit(f'target_date must be YYYY-MM-DD, got: {target_date}')
+              values['REPORT_MANUAL_TARGET_DATE'] = target_date
+              values['REPORT_KEEP_EXPLICIT_DATE'] = '1'
+
+          sensitive_re = re.compile(r'(KEY|SECRET|TOKEN|PASSWORD|PASS|CHAT_ID|THREAD_ID)', re.I)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as f:
+              for key, value in values.items():
+                  if value is None or str(value) == '':
+                      continue
+                  value = str(value)
+                  if sensitive_re.search(key):
+                      print(f'::add-mask::{value}')
+                  f.write(f'{key}<<__{key}__\n{value}\n__{key}__\n')
+          PY
 
       - name: Run report
         env:
-          RUN_MODE: ${{ github.event.inputs.mode || 'current_week' }}
-          SEND_TELEGRAM_INPUT: ${{ github.event.inputs.send_telegram || 'true' }}
+          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'full_refresh' }}
+          SEND_TELEGRAM_INPUT: ${{ github.event_name == 'workflow_dispatch' && format('{0}', inputs.send_telegram) || 'true' }}
         run: |
           set -euo pipefail
 
           echo "Run mode: ${RUN_MODE}"
           echo "Send Telegram: ${SEND_TELEGRAM_INPUT}"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
 
           ARGS=(--root "." --reports-root "Отчёты" --store "TOPFACE")
 
           case "${RUN_MODE}" in
-            current_week)
-              export WB_CURRENT_WEEK_ONLY="1"
-              ARGS+=(--current-week-only)
-              ;;
             full_refresh)
               export WB_CURRENT_WEEK_ONLY="0"
               ARGS+=(--full-refresh)
+              ;;
+            current_week)
+              export WB_CURRENT_WEEK_ONLY="1"
+              ARGS+=(--current-week-only)
               ;;
             pdf_only)
               export WB_CURRENT_WEEK_ONLY="1"
