@@ -328,7 +328,7 @@ jobs:
           print(f'Report date: {target}; now_msk={now_text}; reason={reason}')
           PY
 
-      - name: Diagnostics
+      - name: Diagnostics and report_runner identity guard
         run: |
           set -euo pipefail
           echo "GitHub event: ${GITHUB_EVENT_NAME}"
@@ -339,6 +339,35 @@ jobs:
           python --version
           test -f report_runner.py
           python -m py_compile report_runner.py
+          python - <<'PY'
+          from pathlib import Path
+          src = Path('report_runner.py').read_text(encoding='utf-8', errors='replace')
+          print('report_runner.py first lines:')
+          print('
+'.join(src.splitlines()[:12]))
+          bad_markers = [
+              'add_argument("--ads", required=True',
+              "add_argument('--ads', required=True",
+              '--pause-history',
+              '--bid-history',
+              'WB advertising Excel',
+          ]
+          required_markers = [
+              'WB TOPFACE analytics report',
+              '--full-refresh',
+              '--send-telegram',
+          ]
+          bad = [m for m in bad_markers if m in src]
+          missing = [m for m in required_markers if m not in src]
+          if bad or missing:
+              raise SystemExit(
+                  'WRONG report_runner.py in repository. This workflow needs the main WB TOPFACE analytics report, '
+                  'not the advertising manager script. Replace repository file report_runner.py with '
+                  'report_runner_FIX68_correct_main_report_not_ads_20260713_v2.py. '
+                  f'bad_markers={bad}; missing_markers={missing}'
+              )
+          print('report_runner identity: OK, main management report file detected')
+          PY
 
       - name: Preflight Object Storage list
         run: |
