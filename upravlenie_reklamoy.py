@@ -37,6 +37,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 import time
 import uuid
@@ -5842,6 +5843,1237 @@ def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFra
         summary["CORE-запросов с флагманом"] = int(LAST_CORE_FLAGSHIP_PAIRS_V77["query_text_norm"].astype(str).nunique()) if "query_text_norm" in LAST_CORE_FLAGSHIP_PAIRS_V77.columns else int(len(LAST_CORE_FLAGSHIP_PAIRS_V77))
         summary["Строк флагманов CORE"] = int(len(LAST_CORE_FLAGSHIP_PAIRS_V77))
     return summary
+
+
+
+# V84 OVERRIDES: CPM search cluster cleaner for test campaigns
+SCRIPT_VERSION = "v84-cpm-query-cleaner-2026-07-30"
+
+CPM_CLEANER_CAMPAIGN_IDS_DEFAULT = [38914318, 38914345]
+CPM_NORMQUERY_LIST_ENDPOINT = "/adv/v0/normquery/list"
+CPM_NORMQUERY_SET_MINUS_ENDPOINT = "/adv/v0/normquery/set-minus"
+CPM_CLEANER_OUTPUT_KEY = SERVICE_PREFIX + "CPM_чистка_запросов.xlsx"
+
+# Семантическое ядро тестовых CPM-кампаний: кисти/кисточки для теней.
+# Правило намеренно консервативное: широкий "кисть для макияжа" не оставляем,
+# "кисть для макияжа теней" оставляем, потому что есть явный маркер теней.
+CPM_SHADOW_QUERY_KEEP_MARKERS = (
+    "тен",          # теней / тени / тенями / тенюшки / теннй с опечаткой
+    "растуш",       # растушевка / растушевки
+    "тушев",        # тушевка / тушевки
+    "бочон",        # бочонок
+)
+CPM_BRUSH_MARKERS = ("кист", "кисточ", "аппликатор", "апликатор")
+CPM_EXCLUDE_OTHER_PRODUCT_MARKERS = (
+    "румян", "пудр", "тональ", "консил", "корректор", "хайлайт", "контур", "бронзер",
+    "бров", "стрел", "подвод", "губ", "помад", "блеск", "лак", "ногт", "тушь", "палет",
+)
+
+
+def _cpm_parse_campaign_ids(raw: Any = None) -> List[int]:
+    value = str(raw if raw is not None else os.getenv("CPM_CLEANER_CAMPAIGNS", "") or "").strip()
+    if not value:
+        return list(CPM_CLEANER_CAMPAIGN_IDS_DEFAULT)
+    ids: List[int] = []
+    for part in re.split(r"[,;\s]+", value):
+        if not part:
+            continue
+        m = re.search(r"\d+", part)
+        if m:
+            ids.append(int(m.group(0)))
+    return ids or list(CPM_CLEANER_CAMPAIGN_IDS_DEFAULT)
+
+
+def _cpm_parse_nm_map(raw: Any = None) -> Dict[int, List[int]]:
+    """Поддерживает JSON {"38914318":[123]} или строку 38914318:123,456;38914345:789."""
+    value = str(raw if raw is not None else os.getenv("CPM_CLEANER_NM_MAP", "") or "").strip()
+    out: Dict[int, List[int]] = {}
+    if not value:
+        return out
+    try:
+        obj = json.loads(value)
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                cid = _clean_int(k)
+                if cid is None:
+                    continue
+                if isinstance(v, (list, tuple)):
+                    vals = [_clean_int(x) for x in v]
+                else:
+                    vals = [_clean_int(v)]
+                vals = [int(x) for x in vals if x]
+                if vals:
+                    out[int(cid)] = sorted(set(vals))
+            return out
+    except Exception:
+        pass
+    for block in re.split(r"[;|]", value):
+        if ":" not in block:
+            continue
+        left, right = block.split(":", 1)
+        cid = _clean_int(left)
+        if cid is None:
+            continue
+        vals = [_clean_int(x) for x in re.split(r"[,\s]+", right) if x.strip()]
+        vals = [int(x) for x in vals if x]
+        if vals:
+            out[int(cid)] = sorted(set(vals))
+    return out
+
+
+def normalize_cpm_query_text(text: Any) -> str:
+    s0 = str(text or "").strip().lower().replace("ё", "е")
+    s0 = re.sub(r"[\u00a0\t\r\n]+", " ", s0)
+    s0 = re.sub(r"[^0-9a-zа-я ]+", " ", s0)
+    s0 = re.sub(r"\s+", " ", s0).strip()
+    return s0
+
+
+def classify_cpm_shadow_brush_query(query: Any, allow_sets: bool = False) -> Tuple[bool, str, str, str]:
+    """Возвращает: keep, action_text, query_group, reason_text."""
+    q = normalize_cpm_query_text(query)
+    if not q:
+        return False, "минус", "пустой запрос", "Минус: пустой поисковый кластер"
+
+    has_brush = any(m in q for m in CPM_BRUSH_MARKERS)
+    has_shadow = any(m in q for m in CPM_SHADOW_QUERY_KEEP_MARKERS)
+    has_set = "набор" in q or "комплект" in q
+    has_other = any(m in q for m in CPM_EXCLUDE_OTHER_PRODUCT_MARKERS)
+
+    # Сам продукт "тени" без кисти — нерелевантно.
+    if not has_brush:
+        return False, "минус", "не кисть", "Минус: запрос не про кисть/кисточку для теней"
+    if has_set and not allow_sets:
+        return False, "минус", "набор", "Минус: запрос про набор, а тестовые кампании чистятся под одиночные кисти для теней"
+    # Если есть явный другой товар и нет маркера теней, точно минус.
+    if has_other and not has_shadow:
+        return False, "минус", "другой товар", "Минус: запрос про другую кисть/категорию, не про кисти для теней"
+    if not has_shadow:
+        return False, "минус", "слишком широкий", "Минус: широкий запрос без явного смысла 'для теней'"
+
+    if "растуш" in q or "тушев" in q:
+        return True, "оставить", "кисти для растушевки теней", "Оставлено: запрос относится к кистям для растушевки/тушевки теней"
+    if "бочон" in q:
+        return True, "оставить", "кисть бочонок для теней", "Оставлено: запрос относится к кисти-бочонку для теней"
+    if "плоск" in q and "тен" in q:
+        return True, "оставить", "плоская кисть для теней", "Оставлено: запрос относится к плоской кисти для теней"
+    if "тен" in q:
+        return True, "оставить", "кисти для теней", "Оставлено: запрос относится к кистям/кисточкам для теней"
+    return True, "оставить", "похожий CORE", "Оставлено: запрос похож на CORE-семантику кистей для теней"
+
+
+def _cpm_extract_nm_ids_from_obj(obj: Any) -> List[int]:
+    ids: List[int] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = str(k).lower()
+            if key in {"nmid", "nm_id", "nmid", "nm", "nmids", "nm_ids", "nmids"} or "nmid" in key or key == "nm_id":
+                if isinstance(v, (list, tuple)):
+                    for x in v:
+                        val = _clean_int(x)
+                        if val:
+                            ids.append(int(val))
+                else:
+                    val = _clean_int(v)
+                    if val:
+                        ids.append(int(val))
+            ids.extend(_cpm_extract_nm_ids_from_obj(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            ids.extend(_cpm_extract_nm_ids_from_obj(item))
+    return sorted(set(ids))
+
+
+def _cpm_resolve_nm_ids_from_previous_output(path: Optional[str], campaign_ids: Sequence[int]) -> Dict[int, List[int]]:
+    out: Dict[int, List[int]] = {}
+    if not path or not Path(path).exists():
+        return out
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception:
+        return out
+    target = {int(x) for x in campaign_ids}
+    for sh in xl.sheet_names:
+        try:
+            df = pd.read_excel(path, sheet_name=sh)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        cid_cols = [c for c in df.columns if str(c).strip().lower() in {"campaign_id", "advert_id", "advertid", "id кампании"} or "campaign" in str(c).lower() or "кампан" in str(c).lower()]
+        nm_cols = [c for c in df.columns if str(c).strip().lower() in {"nm_id", "nmid", "nmids", "артикул wb", "артикул вб"} or "nm" in str(c).lower()]
+        if not cid_cols or not nm_cols:
+            continue
+        for cid_col in cid_cols:
+            cids = df[cid_col].map(_clean_int)
+            mask = cids.isin(target)
+            if not mask.any():
+                continue
+            part = df.loc[mask].copy()
+            for _, r in part.iterrows():
+                cid = _clean_int(r.get(cid_col))
+                if cid is None:
+                    continue
+                for nm_col in nm_cols:
+                    nm = _clean_int(r.get(nm_col))
+                    if nm:
+                        out.setdefault(int(cid), []).append(int(nm))
+    return {cid: sorted(set(vals)) for cid, vals in out.items() if vals}
+
+
+def _cpm_fetch_advert_nm_ids(config: RunnerConfig, campaign_id: int) -> Tuple[List[int], List[Dict[str, Any]]]:
+    """Пробует несколько известных форм получения карточек РК. Если WB поменял схему — просто логируем."""
+    logs: List[Dict[str, Any]] = []
+    candidates = [
+        ("GET", "/adv/v1/advert", {"id": campaign_id}),
+        ("GET", "/adv/v1/advert", {"ids": str(campaign_id)}),
+        ("GET", "/adv/v0/advert", {"id": campaign_id}),
+    ]
+    for method, endpoint, params in candidates:
+        try:
+            resp = requests.get(config.wb_base_url.rstrip("/") + endpoint, headers=wb_headers(config), params=params, timeout=60)
+            logs.append(_api_log_row(method, endpoint, params, str(resp.status_code), resp.text, campaign_id, "", "cpm_query_cleaner"))
+            if 200 <= resp.status_code < 300:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                ids = _cpm_extract_nm_ids_from_obj(data)
+                if ids:
+                    return ids, logs
+        except Exception as exc:
+            logs.append(_api_log_row(method, endpoint, params, "exception", repr(exc), campaign_id, "", "cpm_query_cleaner"))
+    return [], logs
+
+
+def _cpm_items_payload_variants(campaign_id: int, nm_id: Optional[int]) -> List[Dict[str, Any]]:
+    if nm_id:
+        return [
+            {"items": [{"advertId": int(campaign_id), "nmId": int(nm_id)}]},
+            {"items": [{"advert_id": int(campaign_id), "nm_id": int(nm_id)}]},
+            {"advertId": int(campaign_id), "nmId": int(nm_id)},
+            {"advert_id": int(campaign_id), "nm_id": int(nm_id)},
+        ]
+    return [
+        {"items": [{"advertId": int(campaign_id)}]},
+        {"items": [{"advert_id": int(campaign_id)}]},
+        {"advertId": int(campaign_id)},
+        {"advert_id": int(campaign_id)},
+    ]
+
+
+def _cpm_extract_norm_queries(data: Any, state: str = "active") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Рекурсивно вытаскивает active/excluded norm queries из разных форм ответа WB."""
+    active: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
+
+    def rec(obj: Any, current_state: str, meta: Dict[str, Any]):
+        nonlocal active, excluded
+        if isinstance(obj, dict):
+            local_meta = dict(meta)
+            for k in ["advertId", "advert_id", "nmId", "nm_id"]:
+                if k in obj:
+                    local_meta[k] = obj.get(k)
+            # Если это словарь одного запроса.
+            q = None
+            for k in ["normQuery", "norm_query", "normQueryText", "query", "query_text", "name", "text"]:
+                if k in obj and isinstance(obj.get(k), (str, int, float)):
+                    q = str(obj.get(k)).strip()
+                    break
+            if q:
+                row = dict(local_meta)
+                row.update({kk: vv for kk, vv in obj.items() if not isinstance(vv, (dict, list))})
+                row["norm_query"] = q
+                if current_state == "excluded":
+                    excluded.append(row)
+                else:
+                    active.append(row)
+            for k, v in obj.items():
+                lk = str(k).lower()
+                next_state = current_state
+                if lk in {"excluded", "minus", "minusqueries", "excludedqueries"} or "excluded" in lk or "minus" in lk:
+                    next_state = "excluded"
+                elif lk in {"active", "activequeries", "normqueries"} or "active" in lk:
+                    next_state = "active"
+                rec(v, next_state, local_meta)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, str):
+                    row = dict(meta)
+                    row["norm_query"] = item.strip()
+                    if current_state == "excluded":
+                        excluded.append(row)
+                    else:
+                        active.append(row)
+                else:
+                    rec(item, current_state, meta)
+
+    rec(data, state, {})
+    # дедуп по тексту + advert/nm
+    def dedup(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        seen = set()
+        out_rows = []
+        for r in rows:
+            key = (normalize_cpm_query_text(r.get("norm_query")), str(r.get("advertId", r.get("advert_id", ""))), str(r.get("nmId", r.get("nm_id", ""))))
+            if key in seen or not key[0]:
+                continue
+            seen.add(key)
+            out_rows.append(r)
+        return out_rows
+    return dedup(active), dedup(excluded)
+
+
+def _cpm_fetch_normquery_list(config: RunnerConfig, campaign_id: int, nm_id: Optional[int]) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    logs: List[Dict[str, Any]] = []
+    for payload in _cpm_items_payload_variants(campaign_id, nm_id):
+        try:
+            resp = requests.post(config.wb_base_url.rstrip("/") + CPM_NORMQUERY_LIST_ENDPOINT, headers=wb_headers(config), json=payload, timeout=60)
+            logs.append(_api_log_row("POST", CPM_NORMQUERY_LIST_ENDPOINT, payload, str(resp.status_code), resp.text, campaign_id, nm_id or "", "cpm_query_cleaner"))
+            if 200 <= resp.status_code < 300:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+                active, excluded = _cpm_extract_norm_queries(data)
+                return pd.DataFrame(active), pd.DataFrame(excluded), logs
+        except Exception as exc:
+            logs.append(_api_log_row("POST", CPM_NORMQUERY_LIST_ENDPOINT, payload, "exception", repr(exc), campaign_id, nm_id or "", "cpm_query_cleaner"))
+    return pd.DataFrame(), pd.DataFrame(), logs
+
+
+def _cpm_set_minus_payload_variants(campaign_id: int, nm_id: Optional[int], norm_queries: Sequence[str]) -> List[Dict[str, Any]]:
+    qs = [str(q).strip() for q in norm_queries if str(q).strip()]
+    if nm_id:
+        return [
+            {"items": [{"advert_id": int(campaign_id), "nm_id": int(nm_id), "norm_queries": qs}]},
+            {"items": [{"advertId": int(campaign_id), "nmId": int(nm_id), "normQueries": qs}]},
+            {"advert_id": int(campaign_id), "nm_id": int(nm_id), "norm_queries": qs},
+            {"advertId": int(campaign_id), "nmId": int(nm_id), "normQueries": qs},
+        ]
+    return [
+        {"items": [{"advert_id": int(campaign_id), "norm_queries": qs}]},
+        {"items": [{"advertId": int(campaign_id), "normQueries": qs}]},
+    ]
+
+
+def _cpm_apply_set_minus(config: RunnerConfig, campaign_id: int, nm_id: Optional[int], norm_queries: Sequence[str], dry_run: bool) -> List[Dict[str, Any]]:
+    logs: List[Dict[str, Any]] = []
+    norm_queries = sorted(set([str(q).strip() for q in norm_queries if str(q).strip()]))
+    if not norm_queries:
+        return logs
+    for payload in _cpm_set_minus_payload_variants(campaign_id, nm_id, norm_queries):
+        if dry_run:
+            logs.append(_api_log_row("POST", CPM_NORMQUERY_SET_MINUS_ENDPOINT, payload, "dry_run_no_call", "Минус-фразы не отправлены: dry-run", campaign_id, nm_id or "", "cpm_query_cleaner"))
+            return logs
+        try:
+            resp = requests.post(config.wb_base_url.rstrip("/") + CPM_NORMQUERY_SET_MINUS_ENDPOINT, headers=wb_headers(config), json=payload, timeout=60)
+            logs.append(_api_log_row("POST", CPM_NORMQUERY_SET_MINUS_ENDPOINT, payload, str(resp.status_code), resp.text, campaign_id, nm_id or "", "cpm_query_cleaner"))
+            if 200 <= resp.status_code < 300:
+                return logs
+        except Exception as exc:
+            logs.append(_api_log_row("POST", CPM_NORMQUERY_SET_MINUS_ENDPOINT, payload, "exception", repr(exc), campaign_id, nm_id or "", "cpm_query_cleaner"))
+    return logs
+
+
+def _cpm_build_cleaner_rows(active_df: pd.DataFrame, excluded_df: pd.DataFrame, campaign_id: int, nm_id: Optional[int], allow_sets: bool = False) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    rows: List[Dict[str, Any]] = []
+    excluded_norms = set()
+    if excluded_df is not None and not excluded_df.empty and "norm_query" in excluded_df.columns:
+        excluded_norms = set(excluded_df["norm_query"].map(normalize_cpm_query_text))
+        for q in excluded_df["norm_query"].dropna().astype(str).tolist():
+            rows.append({
+                "datetime_msk": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+                "campaign_id": campaign_id,
+                "nm_id": nm_id or "",
+                "norm_query": q,
+                "norm_query_clean": normalize_cpm_query_text(q),
+                "decision": "уже в минусе",
+                "query_group": "уже исключён",
+                "reason": "Запрос уже находится в минус-фразах WB",
+            })
+
+    keep_queries: List[str] = []
+    minus_queries: List[str] = []
+    if active_df is None or active_df.empty or "norm_query" not in active_df.columns:
+        rows.append({
+            "datetime_msk": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+            "campaign_id": campaign_id,
+            "nm_id": nm_id or "",
+            "norm_query": "",
+            "norm_query_clean": "",
+            "decision": "нет данных",
+            "query_group": "нет активных кластеров",
+            "reason": "WB не вернул активные поисковые кластеры для проверки",
+        })
+        return pd.DataFrame(rows), keep_queries, minus_queries
+
+    for _, r in active_df.iterrows():
+        q = str(r.get("norm_query", "") or "").strip()
+        q_clean = normalize_cpm_query_text(q)
+        keep, decision, group, reason = classify_cpm_shadow_brush_query(q, allow_sets=allow_sets)
+        if keep:
+            keep_queries.append(q)
+        else:
+            if q_clean not in excluded_norms:
+                minus_queries.append(q)
+            else:
+                decision = "уже в минусе"
+                reason = "Запрос уже находится в минус-фразах WB"
+        row = {
+            "datetime_msk": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+            "campaign_id": campaign_id,
+            "nm_id": nm_id or "",
+            "norm_query": q,
+            "norm_query_clean": q_clean,
+            "decision": decision,
+            "query_group": group,
+            "reason": reason,
+        }
+        # пробрасываем статистику, если WB вернул поля.
+        for col in ["views", "impressions", "clicks", "orders", "ctr", "cpc", "cpm", "sum", "expense", "atbs", "carts"]:
+            if col in active_df.columns:
+                row[col] = r.get(col)
+        rows.append(row)
+    return pd.DataFrame(rows), sorted(set(keep_queries)), sorted(set(minus_queries))
+
+
+def run_cpm_query_cleaner(args: argparse.Namespace) -> int:
+    config = load_runner_config()
+    s3 = make_s3_client(config)
+    bucket = config.yc_bucket_name
+    campaign_ids = _cpm_parse_campaign_ids(getattr(args, "campaigns", None))
+    allow_sets = bool(getattr(args, "allow_sets", False))
+    dry_run = not bool(getattr(args, "apply_cpm_minus", False))
+
+    workdir = Path(tempfile.mkdtemp(prefix="wb_cpm_cleaner_"))
+    all_logs: List[Dict[str, Any]] = []
+    all_rows: List[pd.DataFrame] = []
+
+    previous_output_path = maybe_download_key_to_dir(s3, bucket, RUN_OUTPUT_KEY, workdir)
+    nm_map = _cpm_parse_nm_map(getattr(args, "nm_map", None))
+    prev_nm_map = _cpm_resolve_nm_ids_from_previous_output(previous_output_path, campaign_ids)
+    for cid, vals in prev_nm_map.items():
+        nm_map.setdefault(cid, [])
+        nm_map[cid] = sorted(set(nm_map[cid] + vals))
+
+    # Если nm_id нет, пробуем вытащить через API карточки кампании.
+    for cid in campaign_ids:
+        if not nm_map.get(cid):
+            ids, logs = _cpm_fetch_advert_nm_ids(config, cid)
+            all_logs.extend(logs)
+            if ids:
+                nm_map[cid] = ids
+
+    for cid in campaign_ids:
+        nm_ids = nm_map.get(cid) or [None]
+        for nm_id in nm_ids:
+            active, excluded, logs = _cpm_fetch_normquery_list(config, int(cid), int(nm_id) if nm_id else None)
+            all_logs.extend(logs)
+            rows, keep_queries, minus_queries = _cpm_build_cleaner_rows(active, excluded, int(cid), int(nm_id) if nm_id else None, allow_sets=allow_sets)
+            if rows is not None and not rows.empty:
+                all_rows.append(rows)
+
+            # Если endpoint set-minus задаёт полный список, безопаснее отправлять union текущих excluded + новых минусов.
+            already_minus = []
+            if excluded is not None and not excluded.empty and "norm_query" in excluded.columns:
+                already_minus = excluded["norm_query"].dropna().astype(str).tolist()
+            target_minus = sorted(set(already_minus + minus_queries))
+            if minus_queries:
+                all_logs.extend(_cpm_apply_set_minus(config, int(cid), int(nm_id) if nm_id else None, target_minus, dry_run=dry_run))
+            else:
+                all_logs.append(_api_log_row("SKIP", CPM_NORMQUERY_SET_MINUS_ENDPOINT, {"campaign_id": cid, "nm_id": nm_id, "minus_queries": []}, "nothing_to_minus", "Нет новых запросов для минуса", cid, nm_id or "", "cpm_query_cleaner"))
+            time.sleep(0.25)
+
+    result = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame({"note": ["Нет данных CPM-чистки"]})
+    summary_rows = []
+    if not result.empty and "decision" in result.columns:
+        summary_rows = result.groupby(["campaign_id", "nm_id", "decision"], dropna=False).size().reset_index(name="rows").to_dict("records")
+    summary_df = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame({"note": ["Нет строк для сводки"]})
+
+    local_out = workdir / "CPM_чистка_запросов.xlsx"
+    with pd.ExcelWriter(local_out, engine="xlsxwriter") as writer:
+        summary_df.to_excel(writer, sheet_name="Сводка", index=False)
+        result.to_excel(writer, sheet_name="CPM_чистка_запросов", index=False)
+        pd.DataFrame({
+            "parameter": ["campaign_ids", "apply", "allow_sets", "logic"],
+            "value": [", ".join(map(str, campaign_ids)), "да" if not dry_run else "нет, dry-run", "да" if allow_sets else "нет", "Оставляем только кисти/кисточки для теней и близкую семантику; остальное минусуем"],
+        }).to_excel(writer, sheet_name="Параметры", index=False)
+
+    # Обновляем API-лог.
+    api_log_path = maybe_download_key_to_dir(s3, bucket, API_LOG_KEY, workdir)
+    old_log = pd.read_excel(api_log_path) if api_log_path and Path(api_log_path).exists() else pd.DataFrame()
+    new_log = pd.DataFrame(all_logs)
+    api_log = pd.concat([old_log, new_log], ignore_index=True) if not old_log.empty else new_log
+    api_log_out = workdir / "Лог_API.xlsx"
+    api_log.to_excel(api_log_out, index=False)
+
+    upload_s3_bytes(s3, bucket, CPM_CLEANER_OUTPUT_KEY, local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    upload_s3_bytes(s3, bucket, API_LOG_KEY, api_log_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Для артефактов GitHub.
+    shutil.copy2(local_out, Path.cwd() / "CPM_чистка_запросов.xlsx")
+    shutil.copy2(api_log_out, Path.cwd() / "Лог_API.xlsx")
+
+    print("=== CPM query cleaner ===")
+    print(f"SCRIPT_VERSION={SCRIPT_VERSION}")
+    print(f"campaign_ids={campaign_ids}")
+    print(f"apply={'yes' if not dry_run else 'no/dry-run'}")
+    print(f"rows={len(result)}")
+    if not result.empty and "decision" in result.columns:
+        print(result["decision"].value_counts(dropna=False).to_string())
+    print(f"Uploaded: {CPM_CLEANER_OUTPUT_KEY}")
+    return 0
+
+
+_MAIN_V83 = main
+
+
+def build_cpm_cleaner_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="WB CPM Search Cluster Cleaner")
+    p.add_argument("--campaigns", default="38914318,38914345", help="ID CPM-кампаний через запятую")
+    p.add_argument("--nm-map", default=os.getenv("CPM_CLEANER_NM_MAP", ""), help="Опционально: 38914318:NM1,NM2;38914345:NM3 или JSON")
+    p.add_argument("--apply-cpm-minus", action="store_true", help="Реально отправлять минус-фразы через WB API. Без флага только dry-run")
+    p.add_argument("--allow-sets", action="store_true", help="Не минусовать запросы с 'набор/комплект' для кистей теней")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"cpm-cleaner", "cpm_query_cleaner", "cpm-clean"}:
+        parser = build_cpm_cleaner_parser()
+        args = parser.parse_args(argv[1:])
+        return run_cpm_query_cleaner(args)
+    return _MAIN_V83(argv)
+
+
+if False and __name__ == "__main__":
+    raise SystemExit(main())
+
+
+# V85 OVERRIDES: CPM query cleaner + query-level bid manager
+SCRIPT_VERSION = "v85-cpm-query-bids-manager-2026-07-30"
+
+CPM_NORMQUERY_STATS_ENDPOINT = "/adv/v1/normquery/stats"
+CPM_NORMQUERY_GET_BIDS_ENDPOINT = "/adv/v0/normquery/get-bids"
+CPM_NORMQUERY_SET_BIDS_ENDPOINT = "/adv/v0/normquery/bids"
+CPM_BID_RECOMMENDATIONS_ENDPOINT = "/api/advert/v0/bids/recommendations"
+CPM_MANAGER_OUTPUT_KEY = SERVICE_PREFIX + "CPM_управление_запросами.xlsx"
+CPM_MIN_BID_RUB_DEFAULT = 340
+CPM_BID_STEP_RUB_DEFAULT = 40
+CPM_MAX_BID_RUB_DEFAULT = 1500
+CPM_BAD_POSITION_LIMIT = 8
+CPM_VISIBILITY_TARGET_PCT = 95.0
+CPM_POSTCHECK_MIN_HOURS = 20.0
+CPM_POSTCHECK_MAX_DAYS = 3
+
+
+def _v85_as_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    s = str(value).strip().replace("\u00a0", " ").replace("%", "").replace(",", ".")
+    if not s:
+        return default
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return default
+    try:
+        return float(m.group(0))
+    except Exception:
+        return default
+
+
+def _v85_as_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    x = _v85_as_float(value, float("nan"))
+    if pd.isna(x):
+        return default
+    try:
+        return int(round(float(x)))
+    except Exception:
+        return default
+
+
+def _v85_parse_dt(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        return pd.to_datetime(value).to_pydatetime()
+    except Exception:
+        return None
+
+
+def _v85_extract_items_any(data: Any) -> List[Any]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("items", "data", "result", "results", "list", "payload"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+            if isinstance(val, dict):
+                nested = _v85_extract_items_any(val)
+                if nested:
+                    return nested
+        return [data]
+    return []
+
+
+def _v85_query_key(row: Dict[str, Any]) -> str:
+    return "|".join([
+        str(row.get("campaign_id", "")),
+        str(row.get("nm_id", "")),
+        normalize_cpm_query_text(row.get("norm_query", "")),
+    ])
+
+
+def _v85_payload_variants_items(campaign_id: int, nm_id: Optional[int] = None, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str, Any]]:
+    item_snake: Dict[str, Any] = {"advert_id": int(campaign_id)}
+    item_camel: Dict[str, Any] = {"advertId": int(campaign_id)}
+    if nm_id:
+        item_snake["nm_id"] = int(nm_id)
+        item_camel["nmId"] = int(nm_id)
+    payloads = [
+        {"items": [item_snake]},
+        {"items": [item_camel]},
+        {"advert_id": int(campaign_id), **({"nm_id": int(nm_id)} if nm_id else {})},
+        {"advertId": int(campaign_id), **({"nmId": int(nm_id)} if nm_id else {})},
+    ]
+    if date_from and date_to:
+        dated = []
+        for p in payloads:
+            for d1, d2 in [
+                ({"date_from": date_from, "date_to": date_to}, {}),
+                ({"from": date_from, "to": date_to}, {}),
+                ({"dateFrom": date_from, "dateTo": date_to}, {}),
+                ({"begin": date_from, "end": date_to}, {}),
+            ]:
+                q = dict(p)
+                q.update(d1)
+                dated.append(q)
+        payloads = dated
+    return payloads
+
+
+def _v85_call_wb_post_variants(config: RunnerConfig, endpoint: str, payloads: Sequence[Dict[str, Any]], campaign_id: int = "", nm_id: Any = "", placement: str = "") -> Tuple[Any, List[Dict[str, Any]]]:
+    logs: List[Dict[str, Any]] = []
+    last_data: Any = None
+    for payload in payloads:
+        try:
+            resp = requests.post(config.wb_base_url.rstrip("/") + endpoint, headers=wb_headers(config), json=payload, timeout=60)
+            logs.append(_api_log_row("POST", endpoint, payload, str(resp.status_code), resp.text, campaign_id, nm_id or "", placement))
+            if 200 <= resp.status_code < 300:
+                try:
+                    return resp.json(), logs
+                except Exception:
+                    return {}, logs
+            try:
+                last_data = resp.json()
+            except Exception:
+                last_data = resp.text
+        except Exception as exc:
+            logs.append(_api_log_row("POST", endpoint, payload, "exception", repr(exc), campaign_id, nm_id or "", placement))
+    return last_data, logs
+
+
+def _v85_fetch_query_bids(config: RunnerConfig, campaign_id: int, nm_id: Optional[int]) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    data, logs = _v85_call_wb_post_variants(
+        config,
+        CPM_NORMQUERY_GET_BIDS_ENDPOINT,
+        _v85_payload_variants_items(campaign_id, nm_id),
+        campaign_id,
+        nm_id or "",
+        "cpm_get_query_bids",
+    )
+    rows: List[Dict[str, Any]] = []
+    for item in _v85_extract_items_any(data):
+        if not isinstance(item, dict):
+            continue
+        base_cid = _clean_int(item.get("advert_id") or item.get("advertId") or item.get("advert_id")) or campaign_id
+        base_nm = _clean_int(item.get("nm_id") or item.get("nmId") or item.get("nmid")) or nm_id
+        # API может вернуть либо список norm_queries с bid внутри, либо одну строку.
+        nq = item.get("norm_queries") or item.get("normQueries") or item.get("queries") or item.get("items")
+        if isinstance(nq, list):
+            for qitem in nq:
+                if isinstance(qitem, dict):
+                    q = qitem.get("norm_query") or qitem.get("normQuery") or qitem.get("query") or qitem.get("name")
+                    bid = qitem.get("bid") or qitem.get("bid_rub") or qitem.get("bidRub")
+                else:
+                    q = qitem
+                    bid = item.get("bid")
+                if q:
+                    rows.append({"campaign_id": int(base_cid), "nm_id": int(base_nm) if base_nm else "", "norm_query": str(q), "current_bid_rub": _v85_as_int(bid, None)})
+        else:
+            q = item.get("norm_query") or item.get("normQuery") or item.get("query") or item.get("name")
+            bid = item.get("bid") or item.get("bid_rub") or item.get("bidRub")
+            if q:
+                rows.append({"campaign_id": int(base_cid), "nm_id": int(base_nm) if base_nm else "", "norm_query": str(q), "current_bid_rub": _v85_as_int(bid, None)})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["campaign_id", "nm_id", "norm_query", "current_bid_rub", "norm_query_clean"]), logs
+    df["norm_query_clean"] = df["norm_query"].map(normalize_cpm_query_text)
+    df = df.drop_duplicates(subset=["campaign_id", "nm_id", "norm_query_clean"], keep="last")
+    return df, logs
+
+
+def _v85_find_first_value(obj: Any, names: Sequence[str]) -> Optional[Any]:
+    names_l = {str(n).lower() for n in names}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k).lower() in names_l:
+                return v
+        for v in obj.values():
+            found = _v85_find_first_value(v, names)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _v85_find_first_value(v, names)
+            if found is not None:
+                return found
+    return None
+
+
+def _v85_flatten_stats_obj(obj: Any, campaign_id: int, nm_id: Optional[int], parent_query: str = "", parent_date: str = "") -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if isinstance(obj, list):
+        for item in obj:
+            rows.extend(_v85_flatten_stats_obj(item, campaign_id, nm_id, parent_query, parent_date))
+        return rows
+    if not isinstance(obj, dict):
+        return rows
+
+    q = obj.get("norm_query") or obj.get("normQuery") or obj.get("query") or obj.get("name") or obj.get("text") or parent_query
+    d = obj.get("date") or obj.get("dt") or obj.get("day") or obj.get("stat_date") or obj.get("statDate") or parent_date
+    lower_keys = {str(k).lower(): k for k in obj.keys()}
+    metric_aliases = {
+        "impressions": ["views", "impressions", "shows", "show", "count", "shw"],
+        "clicks": ["clicks", "click", "clk"],
+        "orders": ["orders", "shks", "ordered", "order", "orders_count", "ordercount"],
+        "spend": ["spend", "expense", "sum", "cost", "costs", "ad_spend"],
+        "ctr": ["ctr"],
+        "cpc": ["cpc"],
+        "cpm": ["cpm"],
+        "position": ["position", "avg_position", "avgposition", "median_position", "medianposition", "pos"],
+        "visibility": ["visibility", "visible", "visibility_pct", "visibilitypercent"],
+    }
+    metrics: Dict[str, Any] = {}
+    for out_name, aliases in metric_aliases.items():
+        for a in aliases:
+            if a.lower() in lower_keys:
+                metrics[out_name] = obj.get(lower_keys[a.lower()])
+                break
+    if q and metrics:
+        rows.append({
+            "campaign_id": campaign_id,
+            "nm_id": nm_id or "",
+            "date": str(d or ""),
+            "norm_query": str(q),
+            "norm_query_clean": normalize_cpm_query_text(q),
+            **metrics,
+        })
+    for k, v in obj.items():
+        if isinstance(v, (list, dict)):
+            rows.extend(_v85_flatten_stats_obj(v, campaign_id, nm_id, str(q or parent_query), str(d or parent_date)))
+    return rows
+
+
+def _v85_fetch_query_stats(config: RunnerConfig, campaign_id: int, nm_id: Optional[int], days: int = 7) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    today = _now_msk().date()
+    date_to = today.strftime("%Y-%m-%d")
+    date_from = (today - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d")
+    data, logs = _v85_call_wb_post_variants(
+        config,
+        CPM_NORMQUERY_STATS_ENDPOINT,
+        _v85_payload_variants_items(campaign_id, nm_id, date_from, date_to),
+        campaign_id,
+        nm_id or "",
+        "cpm_query_stats",
+    )
+    rows = _v85_flatten_stats_obj(data, campaign_id, nm_id)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["campaign_id", "nm_id", "date", "norm_query", "norm_query_clean", "impressions", "clicks", "orders", "spend", "ctr", "cpo", "clicks_per_order", "position", "visibility"]), logs
+    for c in ["impressions", "clicks", "orders", "spend", "ctr", "cpc", "cpm", "position", "visibility"]:
+        if c in df.columns:
+            df[c] = df[c].map(lambda x: _v85_as_float(x, 0.0))
+        else:
+            df[c] = 0.0
+    df["cpo"] = np.where(df["orders"] > 0, df["spend"] / df["orders"], np.nan)
+    df["clicks_per_order"] = np.where(df["orders"] > 0, df["clicks"] / df["orders"], np.nan)
+    return df, logs
+
+
+def _v85_try_detect_min_bid(config: RunnerConfig, campaign_id: int, nm_id: Optional[int], fallback: int) -> Tuple[int, str, List[Dict[str, Any]]]:
+    # WB recommendations endpoint сейчас работает только для CPM-кампаний; схема ответа может меняться.
+    payloads = _v85_payload_variants_items(campaign_id, nm_id)
+    data, logs = _v85_call_wb_post_variants(config, CPM_BID_RECOMMENDATIONS_ENDPOINT, payloads, campaign_id, nm_id or "", "cpm_bid_recommendations")
+    numbers: List[int] = []
+    def walk(x: Any, key_hint: str = ""):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                kh = (key_hint + " " + str(k)).lower()
+                if isinstance(v, (int, float, str)) and "bid" in kh:
+                    val = _v85_as_int(v, None)
+                    if val and 10 <= val <= 100000:
+                        numbers.append(int(val))
+                else:
+                    walk(v, kh)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, key_hint)
+    walk(data)
+    # Для минимума берём самый маленький разумный bid, но не ниже fallback, чтобы не уронить ниже твоего безопасного минимума.
+    if numbers:
+        detected = min(numbers)
+        return max(int(fallback), int(detected)), f"WB recommendations, минимум среди bid-полей={detected}; применён безопасный минимум {max(int(fallback), int(detected))}", logs
+    return int(fallback), f"fallback {fallback} ₽: WB не вернул явный минимальный bid", logs
+
+
+def _v85_apply_query_bids(config: RunnerConfig, bid_rows: Sequence[Dict[str, Any]], dry_run: bool) -> List[Dict[str, Any]]:
+    logs: List[Dict[str, Any]] = []
+    # API ограничен 100 items за запрос и 2 запроса/сек.
+    clean_items = []
+    for r in bid_rows:
+        bid = _v85_as_int(r.get("target_bid_rub"), None)
+        q = str(r.get("norm_query", "") or "").strip()
+        cid = _clean_int(r.get("campaign_id"))
+        nm = _clean_int(r.get("nm_id"))
+        if not bid or not q or not cid or not nm:
+            continue
+        clean_items.append({"advert_id": int(cid), "nm_id": int(nm), "norm_query": q, "bid": int(bid)})
+    for i in range(0, len(clean_items), 100):
+        chunk = clean_items[i:i+100]
+        if not chunk:
+            continue
+        payload = {"bids": chunk}
+        if dry_run:
+            logs.append(_api_log_row("POST", CPM_NORMQUERY_SET_BIDS_ENDPOINT, payload, "dry_run_no_call", "Ставки поисковых кластеров не отправлены: dry-run", "", "", "cpm_query_bids"))
+        else:
+            try:
+                resp = requests.post(config.wb_base_url.rstrip("/") + CPM_NORMQUERY_SET_BIDS_ENDPOINT, headers=wb_headers(config), json=payload, timeout=60)
+                logs.append(_api_log_row("POST", CPM_NORMQUERY_SET_BIDS_ENDPOINT, payload, str(resp.status_code), resp.text, "", "", "cpm_query_bids"))
+            except Exception as exc:
+                logs.append(_api_log_row("POST", CPM_NORMQUERY_SET_BIDS_ENDPOINT, payload, "exception", repr(exc), "", "", "cpm_query_bids"))
+        time.sleep(0.55)
+    return logs
+
+
+def _v85_load_previous_cpm_output(s3, bucket: str, workdir: Path) -> pd.DataFrame:
+    path = maybe_download_key_to_dir(s3, bucket, CPM_MANAGER_OUTPUT_KEY, workdir)
+    if not path:
+        return pd.DataFrame()
+    try:
+        xl = pd.ExcelFile(path)
+        for sh in ["CPM_решения_ставки", "CPM_управление_запросами", "CPM_чистка_запросов"]:
+            if sh in xl.sheet_names:
+                df = pd.read_excel(path, sheet_name=sh)
+                if not df.empty:
+                    return df
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def _v85_previous_by_key(prev_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    if prev_df is None or prev_df.empty:
+        return out
+    cols = {str(c).lower(): c for c in prev_df.columns}
+    if not any("query" in str(c).lower() for c in prev_df.columns):
+        return out
+    df = prev_df.copy()
+    if "norm_query" not in df.columns:
+        qcols = [c for c in df.columns if "query" in str(c).lower() or "запрос" in str(c).lower()]
+        if qcols:
+            df["norm_query"] = df[qcols[0]]
+    for col in ["campaign_id", "nm_id", "norm_query"]:
+        if col not in df.columns:
+            return out
+    if "datetime_msk" in df.columns:
+        df["_dt"] = pd.to_datetime(df["datetime_msk"], errors="coerce")
+        df = df.sort_values("_dt")
+    for _, r in df.iterrows():
+        key = _v85_query_key(r.to_dict())
+        out[key] = r.to_dict()
+    return out
+
+
+def _v85_calc_traffic_status(cur: Dict[str, Any], prev: Optional[Dict[str, Any]]) -> Tuple[bool, bool, str]:
+    """returns improved, dropped, russian reason"""
+    if not prev:
+        return False, False, "Нет предыдущего замера для post-check"
+    cur_clicks = _v85_as_float(cur.get("clicks_last"), 0.0)
+    prev_clicks = _v85_as_float(prev.get("clicks_last"), _v85_as_float(prev.get("clicks"), 0.0))
+    cur_share = _v85_as_float(cur.get("impression_share_pct_last"), 0.0)
+    prev_share = _v85_as_float(prev.get("impression_share_pct_last"), _v85_as_float(prev.get("impression_share_pct"), 0.0))
+    cur_pos = _v85_as_float(cur.get("position_last"), 0.0)
+    prev_pos = _v85_as_float(prev.get("position_last"), _v85_as_float(prev.get("position"), 0.0))
+    cur_vis = _v85_as_float(cur.get("visibility_last"), 0.0)
+    prev_vis = _v85_as_float(prev.get("visibility_last"), _v85_as_float(prev.get("visibility"), 0.0))
+
+    improved_parts = []
+    dropped_parts = []
+    if cur_clicks > prev_clicks * 1.10 and cur_clicks - prev_clicks >= 2:
+        improved_parts.append("клики выросли")
+    if cur_share > prev_share + 5:
+        improved_parts.append("доля показов выросла")
+    if cur_pos > 0 and prev_pos > 0 and cur_pos <= max(1, prev_pos - 2):
+        improved_parts.append("позиция улучшилась")
+    if cur_vis > prev_vis + 5:
+        improved_parts.append("видимость выросла")
+
+    if prev_clicks > 0 and cur_clicks < prev_clicks * 0.85:
+        dropped_parts.append("клики упали")
+    if cur_share + 5 < prev_share:
+        dropped_parts.append("доля показов упала")
+    if cur_pos > 0 and prev_pos > 0 and cur_pos >= prev_pos + 3:
+        dropped_parts.append("позиция ухудшилась")
+    if cur_vis + 5 < prev_vis:
+        dropped_parts.append("видимость упала")
+    if improved_parts:
+        return True, False, "CORE-трафик улучшился: " + ", ".join(improved_parts)
+    if dropped_parts:
+        return False, True, "CORE-трафик ухудшился: " + ", ".join(dropped_parts)
+    return False, False, "Существенного изменения CORE-трафика не видно"
+
+
+def _v85_build_stats_snapshot(stats: pd.DataFrame) -> pd.DataFrame:
+    if stats is None or stats.empty:
+        return pd.DataFrame(columns=["campaign_id", "nm_id", "norm_query_clean"])
+    df = stats.copy()
+    if "date" in df.columns:
+        df["_date"] = pd.to_datetime(df["date"], errors="coerce")
+    else:
+        df["_date"] = pd.NaT
+    # Последняя дата с данными; если даты нет, берём всё.
+    last_date = df["_date"].max() if "_date" in df.columns else pd.NaT
+    if pd.notna(last_date):
+        last = df.loc[df["_date"] == last_date].copy()
+        prev_dates = sorted([d for d in df["_date"].dropna().unique() if d < last_date])
+        prev = df.loc[df["_date"] == prev_dates[-1]].copy() if prev_dates else pd.DataFrame()
+    else:
+        last = df.copy()
+        prev = pd.DataFrame()
+    group_cols = ["campaign_id", "nm_id", "norm_query", "norm_query_clean"]
+    agg_map = {"impressions":"sum", "clicks":"sum", "orders":"sum", "spend":"sum", "ctr":"mean", "position":"median", "visibility":"mean", "cpm":"mean", "cpc":"mean"}
+    for c in agg_map:
+        if c not in last.columns:
+            last[c] = 0.0
+        if not prev.empty and c not in prev.columns:
+            prev[c] = 0.0
+    last_agg = last.groupby(group_cols, dropna=False).agg(agg_map).reset_index()
+    last_agg = last_agg.rename(columns={c: f"{c}_last" for c in agg_map})
+    if not prev.empty:
+        prev_agg = prev.groupby(group_cols, dropna=False).agg(agg_map).reset_index().rename(columns={c: f"{c}_prev" for c in agg_map})
+        out = last_agg.merge(prev_agg, on=group_cols, how="left")
+    else:
+        out = last_agg.copy()
+        for c in agg_map:
+            out[f"{c}_prev"] = np.nan
+    # Доля показов внутри кампании/nm по последнему и предыдущему дню.
+    out["total_impressions_last"] = out.groupby(["campaign_id", "nm_id"], dropna=False)["impressions_last"].transform("sum")
+    out["impression_share_pct_last"] = np.where(out["total_impressions_last"] > 0, out["impressions_last"] / out["total_impressions_last"] * 100, np.nan)
+    if "impressions_prev" in out.columns:
+        out["total_impressions_prev"] = out.groupby(["campaign_id", "nm_id"], dropna=False)["impressions_prev"].transform("sum")
+        out["impression_share_pct_prev"] = np.where(out["total_impressions_prev"] > 0, out["impressions_prev"] / out["total_impressions_prev"] * 100, np.nan)
+    out["cpo_last"] = np.where(out["orders_last"] > 0, out["spend_last"] / out["orders_last"], np.nan)
+    out["clicks_per_order_last"] = np.where(out["orders_last"] > 0, out["clicks_last"] / out["orders_last"], np.nan)
+    return out
+
+
+def _v85_decide_cpm_query_bid(row: Dict[str, Any], prev: Optional[Dict[str, Any]], min_bid: int, max_bid: int, step: int, max_cpo: float) -> Dict[str, Any]:
+    q = row.get("norm_query", "")
+    keep, cleaner_decision, group, cleaner_reason = classify_cpm_shadow_brush_query(q, allow_sets=False)
+    current_bid = _v85_as_int(row.get("current_bid_rub"), None)
+    if current_bid is None or current_bid <= 0:
+        current_bid = 0
+    target_bid = current_bid
+    bid_action = "hold"
+    bid_reason = "Ставку не меняем"
+
+    cpo = _v85_as_float(row.get("cpo_last"), float("nan"))
+    cpo_ok = pd.isna(cpo) or cpo <= max_cpo or _v85_as_float(row.get("orders_last"), 0.0) == 0
+    position = _v85_as_float(row.get("position_last"), 0.0)
+    visibility = _v85_as_float(row.get("visibility_last"), 0.0)
+    clicks = _v85_as_float(row.get("clicks_last"), 0.0)
+    impressions = _v85_as_float(row.get("impressions_last"), 0.0)
+    poor_target = (position > CPM_BAD_POSITION_LIMIT if position > 0 else False) or (visibility > 0 and visibility < CPM_VISIBILITY_TARGET_PCT)
+
+    improved, dropped, traffic_reason = _v85_calc_traffic_status(row, prev)
+    now = _now_msk()
+    prev_dt = _v85_parse_dt(prev.get("datetime_msk")) if prev else None
+    hours_since_prev = ((now.replace(tzinfo=None) - prev_dt).total_seconds() / 3600.0) if prev_dt else 9999.0
+    prev_action = str(prev.get("bid_action", "") if prev else "")
+    prev_old_bid = _v85_as_int(prev.get("current_bid_rub"), None) if prev else None
+    prev_target_bid = _v85_as_int(prev.get("target_bid_rub"), None) if prev else None
+
+    if not keep:
+        return {
+            "is_core_like": False,
+            "query_group": group,
+            "cleaner_decision": cleaner_decision,
+            "cleaner_reason": cleaner_reason,
+            "current_bid_rub": current_bid,
+            "target_bid_rub": current_bid,
+            "bid_action": "no_bid_non_core_minus",
+            "bid_reason": "Ставку не управляем: запрос должен быть заминусован",
+            "traffic_status": traffic_reason,
+        }
+
+    # Снижение после прошлого снижения откатываем, если трафик упал.
+    if prev and prev_action in {"lower", "rollback_after_no_growth"} and hours_since_prev >= CPM_POSTCHECK_MIN_HOURS and dropped and prev_old_bid and prev_target_bid and prev_target_bid < prev_old_bid:
+        target_bid = min(max_bid, max(min_bid, int(prev_old_bid)))
+        bid_action = "restore_after_traffic_drop"
+        bid_reason = "После снижения ставки CORE-трафик ухудшился. Возвращаем предыдущую ставку. " + traffic_reason
+    # Повышение без эффекта можно откатить через 1-3 дня.
+    elif prev and prev_action in {"raise", "raise_to_min", "raise_bad_position"} and hours_since_prev >= CPM_POSTCHECK_MIN_HOURS and hours_since_prev <= 24 * CPM_POSTCHECK_MAX_DAYS and (not improved) and prev_old_bid and prev_target_bid and prev_target_bid > prev_old_bid:
+        target_bid = max(min_bid, int(prev_old_bid))
+        bid_action = "rollback_after_no_growth"
+        bid_reason = "После повышения ставки не видно роста CORE-трафика по запросу. Откатываем к предыдущей ставке. " + traffic_reason
+    elif current_bid < min_bid:
+        target_bid = min(max_bid, min_bid)
+        bid_action = "raise_to_min"
+        bid_reason = f"CORE-запрос оставлен в кампании, но ставка ниже минимальной. Поднимаем до минимальной ставки {min_bid} ₽."
+    elif poor_target and cpo_ok:
+        target_bid = min(max_bid, max(min_bid, current_bid + step))
+        if target_bid > current_bid:
+            bid_action = "raise_bad_position"
+            bid_reason = "CORE-запрос ниже цели: позиция хуже топ-8 или видимость ниже 95%. CPO допустимый, повышаем ставку по этому запросу."
+        else:
+            bid_action = "hold_at_max"
+            bid_reason = "CORE-запрос ниже цели, но ставка уже упёрлась в максимальный лимит для CPM-запросов."
+    elif not cpo_ok and _v85_as_float(row.get("orders_last"), 0.0) > 0:
+        # Снижаем аккуратно, но не ниже минимума.
+        target_bid = max(min_bid, current_bid - step)
+        if target_bid < current_bid:
+            bid_action = "lower_high_cpo"
+            bid_reason = f"CPO по запросу выше допустимого порога {max_cpo:.0f} ₽. Аккуратно снижаем ставку, но не ниже минимума."
+        else:
+            bid_action = "hold_min_high_cpo"
+            bid_reason = "CPO высокий, но ставка уже на минимальном уровне для CORE-запроса."
+    else:
+        bid_action = "hold"
+        bid_reason = "CORE-запрос в допустимом состоянии: нет основания менять ставку. " + traffic_reason
+
+    return {
+        "is_core_like": True,
+        "query_group": group,
+        "cleaner_decision": "оставить",
+        "cleaner_reason": cleaner_reason,
+        "current_bid_rub": current_bid,
+        "target_bid_rub": int(target_bid) if target_bid is not None else current_bid,
+        "bid_action": bid_action,
+        "bid_reason": bid_reason,
+        "traffic_status": traffic_reason,
+    }
+
+
+def run_cpm_query_manager(args: argparse.Namespace) -> int:
+    config = load_runner_config()
+    s3 = make_s3_client(config)
+    bucket = config.yc_bucket_name
+    campaign_ids = _cpm_parse_campaign_ids(getattr(args, "campaigns", None))
+    allow_sets = bool(getattr(args, "allow_sets", False))
+    apply_minus = bool(getattr(args, "apply_cpm_minus", False))
+    apply_bids = bool(getattr(args, "apply_cpm_bids", False))
+    dry_minus = not apply_minus
+    dry_bids = not apply_bids
+    fallback_min_bid = int(getattr(args, "min_bid", CPM_MIN_BID_RUB_DEFAULT) or CPM_MIN_BID_RUB_DEFAULT)
+    step = int(getattr(args, "bid_step", CPM_BID_STEP_RUB_DEFAULT) or CPM_BID_STEP_RUB_DEFAULT)
+    max_bid = int(getattr(args, "max_bid", CPM_MAX_BID_RUB_DEFAULT) or CPM_MAX_BID_RUB_DEFAULT)
+    max_cpo = float(getattr(args, "max_cpo", 160.0) or 160.0)
+    stats_days = int(getattr(args, "stats_days", 7) or 7)
+
+    workdir = Path(tempfile.mkdtemp(prefix="wb_cpm_manager_"))
+    all_logs: List[Dict[str, Any]] = []
+    manager_rows: List[Dict[str, Any]] = []
+    cleaner_rows_all: List[pd.DataFrame] = []
+    bid_apply_rows: List[Dict[str, Any]] = []
+    min_bid_rows: List[Dict[str, Any]] = []
+
+    previous_output_path = maybe_download_key_to_dir(s3, bucket, RUN_OUTPUT_KEY, workdir)
+    nm_map = _cpm_parse_nm_map(getattr(args, "nm_map", None))
+    prev_nm_map = _cpm_resolve_nm_ids_from_previous_output(previous_output_path, campaign_ids)
+    for cid, vals in prev_nm_map.items():
+        nm_map.setdefault(cid, [])
+        nm_map[cid] = sorted(set(nm_map[cid] + vals))
+    for cid in campaign_ids:
+        if not nm_map.get(cid):
+            ids, logs = _cpm_fetch_advert_nm_ids(config, cid)
+            all_logs.extend(logs)
+            if ids:
+                nm_map[cid] = ids
+
+    prev_manager = _v85_load_previous_cpm_output(s3, bucket, workdir)
+    prev_by_key = _v85_previous_by_key(prev_manager)
+
+    for cid in campaign_ids:
+        nm_ids = nm_map.get(cid) or [None]
+        for nm_id in nm_ids:
+            cid_i = int(cid)
+            nm_i = int(nm_id) if nm_id else None
+            min_bid, min_source, logs = _v85_try_detect_min_bid(config, cid_i, nm_i, fallback_min_bid)
+            all_logs.extend(logs)
+            min_bid_rows.append({"campaign_id": cid_i, "nm_id": nm_i or "", "min_bid_rub": min_bid, "source": min_source})
+
+            active, excluded, logs = _cpm_fetch_normquery_list(config, cid_i, nm_i)
+            all_logs.extend(logs)
+            clean_rows, keep_queries, minus_queries = _cpm_build_cleaner_rows(active, excluded, cid_i, nm_i, allow_sets=allow_sets)
+            if clean_rows is not None and not clean_rows.empty:
+                cleaner_rows_all.append(clean_rows)
+
+            # set-minus: отправляем полный список уже исключённых + новые минусы.
+            already_minus = []
+            if excluded is not None and not excluded.empty and "norm_query" in excluded.columns:
+                already_minus = excluded["norm_query"].dropna().astype(str).tolist()
+            target_minus = sorted(set(already_minus + minus_queries))
+            if minus_queries:
+                all_logs.extend(_cpm_apply_set_minus(config, cid_i, nm_i, target_minus, dry_run=dry_minus))
+            else:
+                all_logs.append(_api_log_row("SKIP", CPM_NORMQUERY_SET_MINUS_ENDPOINT, {"campaign_id": cid_i, "nm_id": nm_i, "minus_queries": []}, "nothing_to_minus", "Нет новых запросов для минуса", cid_i, nm_i or "", "cpm_query_manager"))
+
+            bids_df, logs = _v85_fetch_query_bids(config, cid_i, nm_i)
+            all_logs.extend(logs)
+            stats_df, logs = _v85_fetch_query_stats(config, cid_i, nm_i, days=stats_days)
+            all_logs.extend(logs)
+            snap = _v85_build_stats_snapshot(stats_df)
+
+            # Основа — активные кластеры. Если WB не вернул active, но вернул ставки, тоже покажем их.
+            base = active.copy() if active is not None and not active.empty else pd.DataFrame()
+            if base.empty and not bids_df.empty:
+                base = bids_df[["campaign_id", "nm_id", "norm_query", "norm_query_clean"]].copy()
+            if base.empty:
+                manager_rows.append({
+                    "datetime_msk": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
+                    "campaign_id": cid_i,
+                    "nm_id": nm_i or "",
+                    "norm_query": "",
+                    "bid_action": "нет данных",
+                    "bid_reason": "WB не вернул активные поисковые кластеры/ставки для управления",
+                })
+                continue
+            if "norm_query" not in base.columns:
+                # Приводим возможные названия.
+                for c in base.columns:
+                    if "query" in str(c).lower() or "запрос" in str(c).lower():
+                        base["norm_query"] = base[c]
+                        break
+            base["norm_query_clean"] = base["norm_query"].map(normalize_cpm_query_text)
+            if "campaign_id" not in base.columns:
+                base["campaign_id"] = cid_i
+            if "nm_id" not in base.columns:
+                base["nm_id"] = nm_i or ""
+
+            merged = base.merge(bids_df[["campaign_id", "nm_id", "norm_query_clean", "current_bid_rub"]], on=["campaign_id", "nm_id", "norm_query_clean"], how="left") if not bids_df.empty else base.copy()
+            if not snap.empty:
+                stat_cols = [c for c in snap.columns if c not in {"norm_query"}]
+                merged = merged.merge(snap[stat_cols], on=["campaign_id", "nm_id", "norm_query_clean"], how="left")
+            for _, r in merged.iterrows():
+                row = r.to_dict()
+                row.setdefault("campaign_id", cid_i)
+                row.setdefault("nm_id", nm_i or "")
+                row["datetime_msk"] = _now_msk().strftime("%Y-%m-%d %H:%M:%S")
+                key = _v85_query_key(row)
+                prev = prev_by_key.get(key)
+                decision = _v85_decide_cpm_query_bid(row, prev, min_bid=min_bid, max_bid=max_bid, step=step, max_cpo=max_cpo)
+                out_row = {**row, **decision}
+                out_row["min_bid_rub"] = min_bid
+                out_row["min_bid_source"] = min_source
+                out_row["bid_step_rub"] = step
+                out_row["max_bid_rub"] = max_bid
+                out_row["max_cpo_rub"] = max_cpo
+                manager_rows.append(out_row)
+                if decision.get("is_core_like") and _v85_as_int(decision.get("target_bid_rub"), 0) != _v85_as_int(decision.get("current_bid_rub"), 0):
+                    bid_apply_rows.append(out_row)
+            time.sleep(0.25)
+
+    manager_df = pd.DataFrame(manager_rows) if manager_rows else pd.DataFrame({"note": ["Нет данных CPM-управления"]})
+    cleaner_df = pd.concat(cleaner_rows_all, ignore_index=True) if cleaner_rows_all else pd.DataFrame({"note": ["Нет данных CPM-чистки"]})
+    min_bid_df = pd.DataFrame(min_bid_rows) if min_bid_rows else pd.DataFrame({"note": ["Минимальная ставка не определялась"]})
+    to_apply_df = pd.DataFrame(bid_apply_rows) if bid_apply_rows else pd.DataFrame({"note": ["Нет изменений ставок поисковых кластеров"]})
+
+    if bid_apply_rows:
+        all_logs.extend(_v85_apply_query_bids(config, bid_apply_rows, dry_run=dry_bids))
+    else:
+        all_logs.append(_api_log_row("SKIP", CPM_NORMQUERY_SET_BIDS_ENDPOINT, {}, "nothing_to_change", "Нет изменений ставок поисковых кластеров", "", "", "cpm_query_bids"))
+
+    summary_rows = []
+    if not manager_df.empty and "bid_action" in manager_df.columns:
+        summary_rows += manager_df.groupby("bid_action", dropna=False).size().reset_index(name="rows").to_dict("records")
+    summary_df = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame({"note": ["Нет сводки"]})
+
+    local_out = workdir / "CPM_управление_запросами.xlsx"
+    with pd.ExcelWriter(local_out, engine="xlsxwriter") as writer:
+        summary_df.to_excel(writer, sheet_name="Сводка", index=False)
+        manager_df.to_excel(writer, sheet_name="CPM_решения_ставки", index=False)
+        cleaner_df.to_excel(writer, sheet_name="CPM_чистка_запросов", index=False)
+        to_apply_df.to_excel(writer, sheet_name="CPM_ставки_к_API", index=False)
+        min_bid_df.to_excel(writer, sheet_name="Минимальные_ставки", index=False)
+        pd.DataFrame({
+            "parameter": ["campaign_ids", "apply_minus", "apply_bids", "min_bid_fallback", "bid_step", "max_bid", "max_cpo", "logic"],
+            "value": [", ".join(map(str, campaign_ids)), "да" if apply_minus else "нет, dry-run", "да" if apply_bids else "нет, dry-run", fallback_min_bid, step, max_bid, max_cpo, "CPM: чистка не-CORE запросов + ставки по каждому CORE-запросу отдельно"],
+        }).to_excel(writer, sheet_name="Параметры", index=False)
+
+    api_log_path = maybe_download_key_to_dir(s3, bucket, API_LOG_KEY, workdir)
+    old_log = pd.read_excel(api_log_path) if api_log_path and Path(api_log_path).exists() else pd.DataFrame()
+    new_log = pd.DataFrame(all_logs)
+    api_log = pd.concat([old_log, new_log], ignore_index=True) if not old_log.empty else new_log
+    api_log_out = workdir / "Лог_API.xlsx"
+    api_log.to_excel(api_log_out, index=False)
+
+    upload_s3_bytes(s3, bucket, CPM_MANAGER_OUTPUT_KEY, local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    upload_s3_bytes(s3, bucket, CPM_CLEANER_OUTPUT_KEY, local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    upload_s3_bytes(s3, bucket, API_LOG_KEY, api_log_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    shutil.copy2(local_out, Path.cwd() / "CPM_управление_запросами.xlsx")
+    shutil.copy2(local_out, Path.cwd() / "CPM_чистка_запросов.xlsx")
+    shutil.copy2(api_log_out, Path.cwd() / "Лог_API.xlsx")
+
+    print("=== CPM query manager ===")
+    print(f"SCRIPT_VERSION={SCRIPT_VERSION}")
+    print(f"campaign_ids={campaign_ids}")
+    print(f"apply_minus={'yes' if apply_minus else 'no/dry-run'}")
+    print(f"apply_bids={'yes' if apply_bids else 'no/dry-run'}")
+    print(f"rows={len(manager_df)}")
+    if not manager_df.empty and "bid_action" in manager_df.columns:
+        print(manager_df["bid_action"].value_counts(dropna=False).to_string())
+    print(f"Uploaded: {CPM_MANAGER_OUTPUT_KEY}")
+    return 0
+
+
+_MAIN_V84 = main
+
+
+def build_cpm_manager_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="WB CPM Search Cluster Cleaner + Query Bid Manager")
+    p.add_argument("--campaigns", default="38914318,38914345", help="ID CPM-кампаний через запятую")
+    p.add_argument("--nm-map", default=os.getenv("CPM_CLEANER_NM_MAP", ""), help="Опционально: 38914318:NM1,NM2;38914345:NM3 или JSON")
+    p.add_argument("--apply-cpm-minus", action="store_true", help="Реально отправлять минус-фразы через WB API")
+    p.add_argument("--apply-cpm-bids", action="store_true", help="Реально отправлять ставки поисковых кластеров через WB API")
+    p.add_argument("--allow-sets", action="store_true", help="Не минусовать запросы с 'набор/комплект' для кистей теней")
+    p.add_argument("--min-bid", type=int, default=int(os.getenv("CPM_MIN_BID_RUB", CPM_MIN_BID_RUB_DEFAULT)), help="Fallback минимальной ставки CPM по запросу, ₽")
+    p.add_argument("--bid-step", type=int, default=int(os.getenv("CPM_BID_STEP_RUB", CPM_BID_STEP_RUB_DEFAULT)), help="Шаг изменения ставки CPM по запросу, ₽")
+    p.add_argument("--max-bid", type=int, default=int(os.getenv("CPM_MAX_BID_RUB", CPM_MAX_BID_RUB_DEFAULT)), help="Защитный максимум ставки CPM по запросу, ₽")
+    p.add_argument("--max-cpo", type=float, default=float(os.getenv("CPM_MAX_CPO_RUB", "160")), help="Порог адекватного CPO по запросу, ₽")
+    p.add_argument("--stats-days", type=int, default=int(os.getenv("CPM_STATS_DAYS", "7")), help="Окно статистики поисковых кластеров, дней")
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"cpm-manager", "cpm_query_manager", "cpm-bids", "cpm-cleaner-bids"}:
+        parser = build_cpm_manager_parser()
+        args = parser.parse_args(argv[1:])
+        return run_cpm_query_manager(args)
+    return _MAIN_V84(argv)
 
 
 if __name__ == "__main__":
