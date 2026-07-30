@@ -1,6 +1,6 @@
 name: Загрузка Внешних источников
 # Назначение: Торгстат АБС-анализ и Точки входа ВБ.
-# Python в репозитории: download_external_sources_v5.py
+# Python в репозитории: download_external_sources.py
 # Workflow в репозитории: .github/workflows/download_external_sources.yml
 
 run-name: Загрузка внешних источников — ${{ github.event.inputs.source || 'all' }} / ${{ github.event.inputs.mode || 'auto' }}
@@ -89,18 +89,18 @@ jobs:
           echo "Workflow: Загрузка Внешних источников"
           echo "Sources: Торгстат АБС-анализ и Точки входа ВБ"
 
-      - name: Verify Python v5
+      - name: Verify Python v6
         shell: bash
         run: |
           set -euo pipefail
 
-          SCRIPT_PATH="./download_external_sources_v5.py"
+          SCRIPT_PATH="./download_external_sources.py"
 
           echo "Files in repository root:"
           find . -maxdepth 2 -type f | sort
 
           if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "::error::Не найден $SCRIPT_PATH. Загрузите download_external_sources_v5.py в корень репозитория."
+            echo "::error::Не найден $SCRIPT_PATH. Загрузите download_external_sources.py в корень репозитория."
             exit 1
           fi
 
@@ -108,8 +108,8 @@ jobs:
           echo "Selected script: $SCRIPT_PATH"
           echo "Detected: $ACTUAL_VERSION"
 
-          if ! grep -q 'EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V5_20260730' "$SCRIPT_PATH"; then
-            echo "::error::В репозитории лежит не версия V5. Старый Python-файл запускать запрещено."
+          if ! grep -q 'EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V6_20260730' "$SCRIPT_PATH"; then
+            echo "::error::В download_external_sources.py лежит не версия V6. Замените содержимое файла на актуальную версию."
             exit 1
           fi
 
