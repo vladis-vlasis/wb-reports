@@ -1,4 +1,4 @@
-# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V2_20260730
+# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V5_20260730
 """Загрузка внешних источников в Yandex Object Storage.
 
 Источники:
@@ -40,7 +40,7 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V2_20260730"
+VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V5_20260730"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "ABC"
 DEFAULT_WB_ENTRY_FOLDER = "Точки входа"
@@ -330,9 +330,22 @@ def apply_wb_auth(req: CurlRequest, auth: Dict[str, str]) -> CurlRequest:
     return CurlRequest(req.url, req.method, headers, req.body)
 
 
-def sanitized_headers(headers: Dict[str, str], *, keep_content_type: bool = True) -> Dict[str, str]:
+def sanitized_headers(
+    headers: Dict[str, str],
+    *,
+    keep_content_type: bool = True,
+    keep_download_token: bool = False,
+) -> Dict[str, str]:
+    """Удалить браузерные/транспортные заголовки перед requests.
+
+    x-download-token запрещён для обычных запросов, но обязателен при скачивании
+    готового XLSX с downloads-content-analytics.wildberries.ru.
+    """
     output: Dict[str, str] = {}
-    blocked = {"host", "content-length", "connection", "accept-encoding", "x-download-token"}
+    blocked = {"host", "content-length", "connection", "accept-encoding"}
+    if not keep_download_token:
+        blocked.add("x-download-token")
+
     for key, value in (headers or {}).items():
         low = key.lower().strip()
         if low.startswith(":") or low in blocked:
@@ -728,7 +741,11 @@ def build_file_headers(file_template: Optional[CurlRequest], auth: Dict[str, str
     header_set(headers, "origin", "https://seller.wildberries.ru")
     header_set(headers, "referer", "https://seller.wildberries.ru/")
     header_set(headers, "x-download-token", token)
-    return sanitized_headers(headers)
+
+    prepared = sanitized_headers(headers, keep_download_token=True)
+    if not header_get(prepared, "x-download-token"):
+        fail("WB download: внутренний сбой — x-download-token потерян перед запросом")
+    return prepared
 
 
 def try_download_wb_file(
@@ -744,6 +761,11 @@ def try_download_wb_file(
         fail(f"WB tokensjrpc: не найден download token в ответе: {str(token_data)[:1000]}")
     url = f"{WB_FILE_BASE}/{report_id}"
     headers = build_file_headers(file_template, auth, token)
+    log(
+        "WB file request: "
+        f"x-download-token={'set' if header_get(headers, 'x-download-token') else 'missing'}, "
+        f"cookie={'set' if header_get(headers, 'cookie') else 'missing'}"
+    )
     response = session.get(url, headers=headers, timeout=180, allow_redirects=True)
     content_type = response.headers.get("content-type", "")
     log(f"WB file GET: status={response.status_code}, content-type={content_type}, bytes={len(response.content):,}")
@@ -807,7 +829,10 @@ def download_wb_entry_period(
                     upload_to_s3(content, key)
                     return key
                 if status in {401, 403}:
-                    fail("WB download: авторизация истекла. Обнови secret WB_ENTRY_POINTS_CURLS")
+                    fail(
+                        "WB download: сервер отклонил x-download-token или сессию "
+                        f"(HTTP {status}). Ответ: {preview}"
+                    )
                 last_error = f"download status={status}, response={preview}"
             except SystemExit:
                 raise
@@ -831,6 +856,14 @@ def self_test() -> None:
     assert count == 2 and replaced["params"]["startDate"] == "2026-07-20"
     token_response = {"jsonrpc": "2.0", "result": {"token": "x" * 120}}
     assert extract_download_token(token_response) == "x" * 120
+
+    ordinary = sanitized_headers({"x-download-token": "secret", "accept": "*/*"})
+    assert header_get(ordinary, "x-download-token") == ""
+    file_headers = sanitized_headers(
+        {"x-download-token": "secret", "accept": "*/*"},
+        keep_download_token=True,
+    )
+    assert header_get(file_headers, "x-download-token") == "secret"
     log("self-test: OK")
 
 
