@@ -1,4 +1,4 @@
-# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V6_20260730
+# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V7_20260730
 """Загрузка внешних источников в Yandex Object Storage.
 
 Источники:
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import io
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -40,7 +42,7 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V6_20260730"
+VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V7_20260730"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "ABC"
 DEFAULT_WB_ENTRY_FOLDER = "Точки входа"
@@ -470,8 +472,56 @@ def update_request_dates(req: CurlRequest, start: dt.date, end: dt.date) -> Curl
     return CurlRequest(url, req.method, dict(req.headers or {}), body)
 
 
+def looks_like_zip(content: bytes) -> bool:
+    return bool(content and content[:2] == b"PK")
+
+
 def looks_like_xlsx(content: bytes) -> bool:
-    return bool(content and content[:2] == b"PK" and len(content) > 1000)
+    """Быстрая проверка достаточно крупного ZIP/XLSX-ответа."""
+    return bool(looks_like_zip(content) and len(content) > 1000)
+
+
+def is_real_xlsx(content: bytes) -> bool:
+    """Проверить, что ZIP является непосредственно XLSX, а не внешним архивом."""
+    if not looks_like_zip(content):
+        return False
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            return "[Content_Types].xml" in names and "xl/workbook.xml" in names
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
+def unwrap_wb_xlsx(content: bytes) -> Tuple[bytes, str]:
+    """Извлечь XLSX из ответа WB или вернуть прямой XLSX."""
+    if is_real_xlsx(content):
+        return content, "direct_xlsx"
+
+    if not looks_like_zip(content):
+        preview = content[:300].decode("utf-8", errors="replace")
+        fail(f"WB вернул не ZIP/XLSX: {preview}")
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            members = [
+                name
+                for name in archive.namelist()
+                if not name.endswith("/") and name.lower().endswith(".xlsx")
+            ]
+            if not members:
+                names_preview = ", ".join(archive.namelist()[:20])
+                fail(f"В архиве WB нет XLSX. Содержимое: {names_preview}")
+
+            member = max(members, key=lambda name: archive.getinfo(name).file_size)
+            inner = archive.read(member)
+    except zipfile.BadZipFile as exc:
+        fail(f"WB вернул повреждённый ZIP: {exc}")
+
+    if not is_real_xlsx(inner):
+        fail(f"Файл {member!r} внутри архива WB не является корректным XLSX")
+
+    return inner, member
 
 
 def normalize_header(value: Any) -> str:
@@ -497,8 +547,8 @@ def validate_torgstat_xlsx(content: bytes) -> Tuple[str, int]:
 
 
 def validate_wb_entry_xlsx(content: bytes) -> Tuple[str, int, int]:
-    if not looks_like_xlsx(content):
-        fail(f"WB вернул не XLSX: {content[:300].decode('utf-8', errors='replace')}")
+    if not is_real_xlsx(content):
+        fail("WB вернул ZIP, который не является корректным XLSX")
     path = write_temp_xlsx(content)
     try:
         # У файлов WB неверный dimension в XML, поэтому read_only=False обязателен.
@@ -770,7 +820,16 @@ def try_download_wb_file(
     content_type = response.headers.get("content-type", "")
     log(f"WB file GET: status={response.status_code}, content-type={content_type}, bytes={len(response.content):,}")
     if response.status_code == 200 and looks_like_xlsx(response.content):
-        return response.content, response.status_code, "ready"
+        xlsx_content, source = unwrap_wb_xlsx(response.content)
+        if source == "direct_xlsx":
+            log(f"WB payload: direct XLSX, bytes={len(xlsx_content):,}")
+        else:
+            log(
+                "WB payload: outer ZIP extracted, "
+                f"member={source!r}, xlsx_bytes={len(xlsx_content):,}"
+            )
+        return xlsx_content, response.status_code, "ready"
+
     preview = response.text[:500] if not looks_like_xlsx(response.content) else ""
     return None, response.status_code, preview
 
@@ -864,6 +923,21 @@ def self_test() -> None:
         keep_download_token=True,
     )
     assert header_get(file_headers, "x-download-token") == "secret"
+
+    fake_xlsx_buffer = io.BytesIO()
+    with zipfile.ZipFile(fake_xlsx_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("xl/workbook.xml", "<workbook/>")
+    fake_xlsx = fake_xlsx_buffer.getvalue()
+
+    outer_buffer = io.BytesIO()
+    with zipfile.ZipFile(outer_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("report.xlsx", fake_xlsx)
+
+    extracted, member = unwrap_wb_xlsx(outer_buffer.getvalue())
+    assert member == "report.xlsx"
+    assert extracted == fake_xlsx
+    assert is_real_xlsx(extracted)
     log("self-test: OK")
 
 
