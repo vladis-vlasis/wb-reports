@@ -37,6 +37,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -4935,6 +4936,7 @@ def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame
 def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
     summary = _MAKE_SUMMARY_JSON_V76(mode, decisions, successful, api_log, windows, args)
     summary["Версия"] = SCRIPT_VERSION
+    summary["Исправление v88"] = "добавлен import shutil для cpm-manager: копирование CPM_управление_запросами.xlsx больше не падает с NameError"
     summary["CORE 90 дней"] = "собирается; дополнительно выбираются 2 флагмана на каждый CORE-запрос"
     summary["CORE флагманы"] = "1-й по заказам за 90 дней; 2-й по CTR за 30 дней при 5000+ показов, иначе 2-й по заказам"
     summary["Цель флагмана"] = "позиция 1-8 и видимость не ниже 95%; пока логируется, на ставки не влияет"
@@ -7381,7 +7383,7 @@ def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFra
 # =========================
 # V87 OVERRIDES: active-only flagships, manual pauses respected
 # =========================
-SCRIPT_VERSION = "v87-active-only-manual-pauses-respected-2026-07-30"
+SCRIPT_VERSION = "v88-import-shutil-cpm-manager-fix-2026-07-30"
 VERSION = "FIX59_ACTIVE_ONLY_MANUAL_PAUSES_RESPECTED"
 
 CPM_KNOWN_NM_TO_ARTICLE_V87 = {
@@ -7557,19 +7559,20 @@ def collect_query_stats_api_v86(config: RunnerConfig, decisions: pd.DataFrame, d
 def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
     summary = _MAKE_SUMMARY_JSON_PRE_V87(mode, decisions, successful, api_log, windows, args)
     summary["Версия"] = SCRIPT_VERSION
+    summary["Исправление v88"] = "добавлен import shutil для cpm-manager: копирование CPM_управление_запросами.xlsx больше не падает с NameError"
     summary["Контур управления"] = "Только активные РК предмета Кисти косметические; paused РК считаются ручной паузой и не трогаются; остальные категории только логируются"
     summary["Паузы"] = "авто-start и авто-pause отключены в основном контуре; ручные паузы сохраняются"
     summary["Режим флагмана CORE"] = "все оставшиеся активные РК кистей считаются флагманами; поисковые активные флагманы держатся не ниже 10 ₽"
     if decisions is not None and not decisions.empty:
         if "current_active_flagship_v87" in decisions.columns:
-            summary["Активных флагманов v87"] = int(decisions["current_active_flagship_v87"].fillna(False).astype(bool).sum())
+            summary["Активных флагманов v88"] = int(decisions["current_active_flagship_v87"].fillna(False).astype(bool).sum())
         if "manual_pause_respected_v87" in decisions.columns:
-            summary["Ручных пауз сохранено v87"] = int(decisions["manual_pause_respected_v87"].fillna(False).astype(bool).sum())
+            summary["Ручных пауз сохранено v88"] = int(decisions["manual_pause_respected_v87"].fillna(False).astype(bool).sum())
         if "reason_code" in decisions.columns:
             rc = decisions["reason_code"].astype(str)
-            summary["Авто-start заблокировано v87"] = int(rc.eq("MANUAL_PAUSE_RESPECTED_NO_AUTO_START").sum())
-            summary["Активных search-флагманов поднято до 10 v87"] = int(rc.eq("ACTIVE_FLAGSHIP_SEARCH_MIN10_RAISE").sum())
-            summary["Автопауз активных флагманов заблокировано v87"] = int(rc.eq("ACTIVE_FLAGSHIP_NO_AUTO_PAUSE").sum())
+            summary["Авто-start заблокировано v88"] = int(rc.eq("MANUAL_PAUSE_RESPECTED_NO_AUTO_START").sum())
+            summary["Активных search-флагманов поднято до 10 v88"] = int(rc.eq("ACTIVE_FLAGSHIP_SEARCH_MIN10_RAISE").sum())
+            summary["Автопауз активных флагманов заблокировано v88"] = int(rc.eq("ACTIVE_FLAGSHIP_NO_AUTO_PAUSE").sum())
     return summary
 
 if __name__ == "__main__":
