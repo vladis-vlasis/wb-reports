@@ -1,4 +1,4 @@
-# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V9_20260730
+# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V10_20260730
 """Загрузка внешних источников в Yandex Object Storage.
 
 Источники:
@@ -23,6 +23,8 @@ GitHub Secrets:
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime as dt
 import io
 import json
@@ -42,7 +44,7 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V9_20260730"
+VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V10_20260730"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "ABC"
 DEFAULT_WB_ENTRY_FOLDER = "Точки входа"
@@ -645,12 +647,35 @@ def download_torgstat_period(raw_curl: str, start: dt.date, end: dt.date, report
     if not looks_like_xlsx(content):
         try:
             data = response.json()
-            link = find_first_url(data)
-            if link:
-                second = requests.get(link, headers=headers, timeout=180, allow_redirects=True)
-                content = second.content
-        except Exception:
+
+            # Новый формат Торгстата: XLSX приходит внутри JSON как Base64,
+            # например result.data.data = "UEsDB...".
+            decoded = find_first_base64_xlsx(data)
+            if decoded is not None:
+                content = decoded
+                log(f"Torgstat payload: Base64 XLSX extracted, bytes={len(content):,}")
+            else:
+                link = find_first_url(data)
+                if link:
+                    second = requests.get(
+                        link,
+                        headers=headers,
+                        timeout=180,
+                        allow_redirects=True,
+                    )
+                    log(
+                        "Torgstat linked file response: "
+                        f"status={second.status_code}, bytes={len(second.content):,}"
+                    )
+                    if second.status_code >= 400:
+                        fail(
+                            f"Торгстат linked file HTTP {second.status_code}: "
+                            f"{second.text[:1000]}"
+                        )
+                    content = second.content
+        except (ValueError, json.JSONDecodeError):
             pass
+
     sheet, row = validate_torgstat_xlsx(content)
     log(f"Torgstat XLSX OK: sheet={sheet}, header_row={row}")
     upload_to_s3(content, key)
@@ -670,6 +695,81 @@ def find_first_url(obj: Any) -> Optional[str]:
             found = find_first_url(value)
             if found:
                 return found
+    return None
+
+
+def decode_base64_xlsx_candidate(value: str) -> Optional[bytes]:
+    """Попытаться декодировать строку Base64 и вернуть XLSX/ZIP-контейнер."""
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+
+    # Поддержка data:application/...;base64,...
+    if ";base64," in candidate[:200]:
+        candidate = candidate.split(";base64,", 1)[1]
+
+    # Base64 XLSX/ZIP обычно начинается с UEsDB (PK...).
+    # Ограничение длины защищает от попыток декодировать обычные короткие строки.
+    compact = re.sub(r"\s+", "", candidate)
+    if len(compact) < 500 or not compact.startswith(("UEs", "PK")):
+        return None
+
+    padding = (-len(compact)) % 4
+    compact += "=" * padding
+
+    try:
+        decoded = base64.b64decode(compact, validate=False)
+    except (ValueError, binascii.Error):
+        return None
+
+    if looks_like_zip(decoded):
+        return decoded
+    return None
+
+
+def find_first_base64_xlsx(obj: Any) -> Optional[bytes]:
+    """Рекурсивно найти XLSX, закодированный в Base64 внутри JSON."""
+    if isinstance(obj, dict):
+        # Сначала проверяем поля, наиболее вероятно содержащие файл.
+        preferred = []
+        other = []
+        for key, value in obj.items():
+            key_norm = str(key).lower()
+            target = preferred if any(
+                token in key_norm
+                for token in ("data", "file", "content", "base64", "excel", "xlsx")
+            ) else other
+            target.append(value)
+
+        for value in preferred + other:
+            found = find_first_base64_xlsx(value)
+            if found is not None:
+                return found
+
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_first_base64_xlsx(value)
+            if found is not None:
+                return found
+
+    elif isinstance(obj, str):
+        decoded = decode_base64_xlsx_candidate(obj)
+        if decoded is not None:
+            return decoded
+
+        # Иногда один из уровней ответа сам является JSON-строкой.
+        stripped = obj.strip()
+        if stripped.startswith(("{", "[")) and len(stripped) > 2:
+            try:
+                nested = json.loads(stripped)
+            except (ValueError, json.JSONDecodeError):
+                nested = None
+            if nested is not None:
+                return find_first_base64_xlsx(nested)
+
     return None
 
 
@@ -942,6 +1042,7 @@ def self_test() -> None:
     with zipfile.ZipFile(fake_xlsx_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", "<Types/>")
         archive.writestr("xl/workbook.xml", "<workbook/>")
+        archive.writestr("xl/worksheets/sheet1.xml", "x" * 3000)
     fake_xlsx = fake_xlsx_buffer.getvalue()
 
     outer_buffer = io.BytesIO()
@@ -952,6 +1053,18 @@ def self_test() -> None:
     assert member == "report.xlsx"
     assert extracted == fake_xlsx
     assert is_real_xlsx(extracted)
+
+    nested_torgstat_response = {
+        "result": {
+            "data": {
+                "data": base64.b64encode(fake_xlsx).decode("ascii")
+            }
+        }
+    }
+    decoded_torgstat = find_first_base64_xlsx(nested_torgstat_response)
+    assert decoded_torgstat == fake_xlsx
+    assert is_real_xlsx(decoded_torgstat)
+
     log("self-test: OK")
 
 
