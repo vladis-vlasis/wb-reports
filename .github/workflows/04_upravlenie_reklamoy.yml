@@ -7,6 +7,8 @@ on:
     # Основной контур schedule: каждые 10 минут с 18:00 до 23:50 МСК; manual запускается сразу.
     # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
     - cron: "*/10 15-20 * * *"
+    # CPM-чистка и управление ставками поисковых кластеров: каждые 2 часа, без ограничения 18:00-23:59.
+    - cron: "0 */2 * * *"
 
 permissions:
   contents: read
@@ -17,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v83_one_flagship_per_query_2026-07-27"
+  WORKFLOW_VERSION: "v85_cpm_query_bids_manager_2026-07-30"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -168,10 +170,16 @@ jobs:
           reason = "manual_dispatch_single_mode"
           lock_name = f"manual_main_{now_msk:%Y-%m-%d_%H%M%S}"
           if event_name == "schedule":
-              run_slot = "main_run"
-              allowed = 18 <= now_msk.hour <= 23
-              reason = "main_18_00_23_59_msk_window" if allowed else "BLOCKED_MAIN_TIME_GUARD"
-              lock_name = f"main_run_{now_msk:%Y-%m-%d}"
+              if schedule == "0 */2 * * *":
+                  run_slot = "cpm_query_cleaner"
+                  allowed = True
+                  reason = "cpm_query_cleaner_every_2_hours"
+                  lock_name = f"cpm_query_cleaner_{now_msk:%Y-%m-%d_%H}"
+              else:
+                  run_slot = "main_run"
+                  allowed = 18 <= now_msk.hour <= 23
+                  reason = "main_18_00_23_59_msk_window" if allowed else "BLOCKED_MAIN_TIME_GUARD"
+                  lock_name = f"main_run_{now_msk:%Y-%m-%d}"
 
           print("=== Slot resolution ===")
           print(f"event_name={event_name}")
@@ -262,6 +270,9 @@ jobs:
             main_run)
               CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start"
               ;;
+            cpm_query_cleaner)
+              CMD="python upravlenie_reklamoy.py cpm-manager --campaigns 38914318,38914345 --apply-cpm-minus --apply-cpm-bids --min-bid 340 --bid-step 40 --max-cpo 160"
+              ;;
             *)
               echo "Unknown RUN_SLOT=${RUN_SLOT}"
               exit 2
@@ -321,3 +332,5 @@ jobs:
             Лог_API.xlsx
             История_ставок.xlsx
             История_пауз.xlsx
+            CPM_чистка_запросов.xlsx
+            CPM_управление_запросами.xlsx
