@@ -2629,7 +2629,15 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
 
         # Append API log to existing log if any.
         api_log_path = maybe_download_key_to_dir(s3, bucket, API_LOG_KEY, workdir)
-        full_api_log = append_excel(api_log_path, api_log)
+        api_log_parts_v86 = []
+        try:
+            if 'query_stats_api_log_v86' in locals() and query_stats_api_log_v86 is not None and not query_stats_api_log_v86.empty:
+                api_log_parts_v86.append(query_stats_api_log_v86)
+        except Exception:
+            pass
+        api_log_parts_v86.append(api_log)
+        api_log_for_append_v86 = pd.concat(api_log_parts_v86, ignore_index=True) if api_log_parts_v86 else api_log
+        full_api_log = append_excel(api_log_path, api_log_for_append_v86)
         summary = make_summary_json(mode, decisions, successful, full_api_log, windows, args)
 
         # Расчёт проблемных кистей и отправка в TG отключены по ТЗ.
@@ -3939,6 +3947,9 @@ def run_s3_legacy(args: argparse.Namespace) -> int:
                 decisions = _filter_night_decisions(decisions, ph_for_rollback, bh_for_restore, getattr(args, "night_experiment_slot", "") or "")
                 payload = build_payload_preview(decisions)
         write_outputs(str(local_out), decisions, core, payload, windows, postcheck)
+        # V86: ежедневный сбор статистики по запросам через API для CPC/CPM основного контура.
+        query_stats_api_v86, query_stats_api_log_v86 = collect_query_stats_api_v86(config, decisions, days=1)
+        append_v86_sheets_to_output(str(local_out), query_stats_api_v86)
 
         successful, api_log = apply_api_actions(
             decisions,
@@ -6986,6 +6997,8 @@ def run_cpm_query_manager(args: argparse.Namespace) -> int:
                 prev = prev_by_key.get(key)
                 decision = _v85_decide_cpm_query_bid(row, prev, min_bid=min_bid, max_bid=max_bid, step=step, max_cpo=max_cpo)
                 out_row = {**row, **decision}
+                if "supplier_article" not in out_row or not str(out_row.get("supplier_article", "") or "").strip():
+                    out_row["supplier_article"] = _v87_article_from_nm(out_row.get("nm_id"))
                 out_row["min_bid_rub"] = min_bid
                 out_row["min_bid_source"] = min_source
                 out_row["bid_step_rub"] = step
@@ -7015,6 +7028,16 @@ def run_cpm_query_manager(args: argparse.Namespace) -> int:
     with pd.ExcelWriter(local_out, engine="xlsxwriter") as writer:
         summary_df.to_excel(writer, sheet_name="Сводка", index=False)
         manager_df.to_excel(writer, sheet_name="CPM_решения_ставки", index=False)
+        # V86: отдельный лист именно со статистикой по каждому CPM-запросу/кластеру, без смешивания с решением.
+        cpm_stats_cols = [c for c in [
+            "datetime_msk", "campaign_id", "supplier_article", "nm_id", "norm_query", "norm_query_clean",
+            "impressions", "clicks", "orders", "spend", "ctr", "cpc", "cpm", "cpo", "clicks_per_order",
+            "position", "visibility", "current_bid_rub", "min_bid_rub", "query_group", "is_core_like", "bid_action", "bid_reason"
+        ] if c in manager_df.columns]
+        if cpm_stats_cols:
+            manager_df[cpm_stats_cols].to_excel(writer, sheet_name="CPM_статистика_запросов", index=False)
+        else:
+            pd.DataFrame({"note": ["CPM-статистика по запросам не получена"]}).to_excel(writer, sheet_name="CPM_статистика_запросов", index=False)
         cleaner_df.to_excel(writer, sheet_name="CPM_чистка_запросов", index=False)
         to_apply_df.to_excel(writer, sheet_name="CPM_ставки_к_API", index=False)
         min_bid_df.to_excel(writer, sheet_name="Минимальные_ставки", index=False)
@@ -7075,6 +7098,479 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return run_cpm_query_manager(args)
     return _MAIN_V84(argv)
 
+
+
+# =========================
+# V86 OVERRIDES: brush-only management + flagship start + query API stats + all-campaign logging
+# =========================
+SCRIPT_VERSION = "v86-brush-only-flagship-start-api-stats-all-log-2026-07-30"
+VERSION = "FIX58_BRUSH_ONLY_FLAGSHIP_START_API_STATS_ALL_LOG"
+
+# Новое правило пользователя: автоматически управляем только кистями.
+# Все остальные категории не меняем через API, но логируем на отдельном листе.
+MANAGED_SUBJECTS_CANON = {"Кисти косметические"}
+PAUSE_ALLOWED_SUBJECTS_CANON = set()
+
+LAST_ALL_CAMPAIGNS_MONITOR_V86 = pd.DataFrame()
+LAST_QUERY_STATS_API_V86 = pd.DataFrame()
+LAST_QUERY_STATS_API_LOG_V86 = pd.DataFrame()
+LAST_RAW_ADS_DAILY_V86 = pd.DataFrame()
+LAST_RAW_CAMPAIGNS_V86 = pd.DataFrame()
+
+_FILTER_MANAGED_SUBJECTS_PRE_V86 = filter_managed_subjects
+_BUILD_CAMPAIGN_BASE_V85 = build_campaign_base
+_WRITE_OUTPUTS_V85 = write_outputs
+_MAKE_SUMMARY_JSON_V85 = make_summary_json
+_APPLY_FLAGSHIP_CORE_PRIORITY_PRE_V86 = apply_flagship_core_priority_v79
+_SELECT_CORE_FLAGSHIP_PAIRS_PRE_V86 = select_core_flagship_pairs_v77
+
+
+def filter_managed_subjects(df: pd.DataFrame, label: str = "") -> pd.DataFrame:
+    """V86: сохраняем сырой срез для общего лога, но в управление пропускаем только кисти."""
+    global LAST_RAW_ADS_DAILY_V86, LAST_RAW_CAMPAIGNS_V86
+    try:
+        raw = df.copy() if df is not None else pd.DataFrame()
+        if str(label).lower() == "ads_daily":
+            LAST_RAW_ADS_DAILY_V86 = raw.copy()
+        elif str(label).lower() == "campaigns":
+            LAST_RAW_CAMPAIGNS_V86 = raw.copy()
+    except Exception:
+        pass
+    return _FILTER_MANAGED_SUBJECTS_PRE_V86(df, label)
+
+
+def _v86_subject_from_ads(ads: pd.DataFrame) -> pd.DataFrame:
+    if ads is None or ads.empty or "campaign_id" not in ads.columns or "subject_norm" not in ads.columns:
+        return pd.DataFrame(columns=["campaign_id", "subject_from_ads_daily_v86"])
+    tmp = ads[["campaign_id", "subject_norm"]].dropna().copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["campaign_id", "subject_from_ads_daily_v86"])
+    tmp["subject_from_ads_daily_v86"] = tmp["subject_norm"].map(canon_subject)
+    return tmp.groupby("campaign_id", as_index=False)["subject_from_ads_daily_v86"].agg(lambda s: s.value_counts().index[0] if len(s) else "")
+
+
+def build_all_campaigns_monitor_v86(ads: pd.DataFrame, campaigns: pd.DataFrame, bid_history: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
+    """Лог по всем рекламным кампаниям: ничего не меняет, только показывает динамику ставок/трафика/заказов."""
+    try:
+        ads_log = LAST_RAW_ADS_DAILY_V86 if LAST_RAW_ADS_DAILY_V86 is not None and not LAST_RAW_ADS_DAILY_V86.empty else ads
+        campaigns_log = LAST_RAW_CAMPAIGNS_V86 if LAST_RAW_CAMPAIGNS_V86 is not None and not LAST_RAW_CAMPAIGNS_V86.empty else campaigns
+        current = campaign_window_metrics(ads_log, windows["current_start"], windows["current_end"], "cur")
+        base = campaign_window_metrics(ads_log, windows["base_start"], windows["base_end"], "base")
+        recent7_start = windows["as_of"] - pd.Timedelta(days=7)
+        recent7_end = windows["as_of"] - pd.Timedelta(days=1)
+        recent7 = campaign_window_metrics(ads_log, recent7_start, recent7_end, "7d")
+        yesterday = campaign_window_metrics(ads_log, recent7_end, recent7_end, "yday")
+        if campaigns_log is not None and not campaigns_log.empty:
+            df = campaigns_log.copy()
+        else:
+            parts = [x[["campaign_id"]] for x in [current, base, recent7, yesterday] if x is not None and not x.empty and "campaign_id" in x.columns]
+            df = pd.concat(parts, ignore_index=True).drop_duplicates() if parts else pd.DataFrame(columns=["campaign_id"])
+        for part in [current, base, recent7, yesterday]:
+            if part is not None and not part.empty and "campaign_id" in part.columns:
+                df = df.merge(part, on="campaign_id", how="left")
+        subj = _v86_subject_from_ads(ads_log)
+        if not subj.empty:
+            df = df.drop(columns=[c for c in df.columns if str(c).startswith("subject_from_ads_daily_v86")], errors="ignore")
+            df = df.merge(subj, on="campaign_id", how="left")
+        if "subject_norm" not in df.columns:
+            df["subject_norm"] = ""
+        df["subject_norm"] = df["subject_norm"].map(canon_subject)
+        fill_mask = df["subject_norm"].astype(str).str.strip().eq("")
+        if "subject_from_ads_daily_v86" in df.columns:
+            df.loc[fill_mask, "subject_norm"] = df.loc[fill_mask, "subject_from_ads_daily_v86"].map(canon_subject)
+        if bid_history is not None and not bid_history.empty and "campaign_id" in bid_history.columns:
+            bh = bid_history.copy()
+            if "event_date" in bh.columns:
+                bh["event_date"] = to_date(bh["event_date"])
+            sort_cols = [c for c in ["event_date", "run_datetime"] if c in bh.columns]
+            if sort_cols:
+                bh = bh.sort_values(sort_cols)
+            last = bh.groupby("campaign_id", as_index=False).tail(1)
+            keep = [c for c in ["campaign_id", "event_date", "old_bid_rub", "new_bid_rub", "direction", "reason_code", "api_status"] if c in last.columns]
+            if keep:
+                last = last[keep].rename(columns={
+                    "event_date": "last_bid_change_date",
+                    "old_bid_rub": "last_old_bid_rub",
+                    "new_bid_rub": "last_new_bid_rub",
+                    "direction": "last_bid_direction",
+                    "reason_code": "last_bid_reason_code",
+                    "api_status": "last_bid_api_status",
+                })
+                df = df.merge(last, on="campaign_id", how="left")
+        for c in ["impressions_cur", "clicks_cur", "orders_cur", "spend_cur", "order_sum_cur", "impressions_base", "clicks_base", "orders_base", "spend_base", "order_sum_base"]:
+            if c not in df.columns:
+                df[c] = 0
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        df["drr_pct_cur_log"] = np.where(df["order_sum_cur"] > 0, df["spend_cur"] / df["order_sum_cur"] * 100.0, np.nan)
+        df["cpo_cur_log"] = np.where(df["orders_cur"] > 0, df["spend_cur"] / df["orders_cur"], np.nan)
+        df["ctr_pct_cur_log"] = np.where(df["impressions_cur"] > 0, df["clicks_cur"] / df["impressions_cur"] * 100.0, np.nan)
+        df["clicks_delta_pct_log"] = np.where(df["clicks_base"].abs() > 0, (df["clicks_cur"] - df["clicks_base"]) / df["clicks_base"].abs() * 100.0, np.nan)
+        df["orders_delta_pct_log"] = np.where(df["orders_base"].abs() > 0, (df["orders_cur"] - df["orders_base"]) / df["orders_base"].abs() * 100.0, np.nan)
+        df["spend_delta_pct_log"] = np.where(df["spend_base"].abs() > 0, (df["spend_cur"] - df["spend_base"]) / df["spend_base"].abs() * 100.0, np.nan)
+        if "supplier_article" not in df.columns:
+            df["supplier_article"] = ""
+        df["supplier_article"] = df["supplier_article"].astype(str).str.strip()
+        df["management_scope_v86"] = np.where(
+            df["subject_norm"].map(is_managed_subject_value) & ~df["supplier_article"].isin(EXCLUDED_ARTICLES_FROM_AUTOMATION),
+            "управляем: кисти",
+            "только логирование: вне контура управления",
+        )
+        df["management_note_v86"] = np.where(
+            df["management_scope_v86"].str.startswith("управляем"),
+            "Кампания участвует в расчёте решений и API payload",
+            "Кампания не меняется кодом; фиксируем ставки, трафик, заказы и последствия изменений",
+        )
+        preferred = [
+            "campaign_id", "supplier_article", "nm_id", "subject_norm", "placement", "campaign_status",
+            "management_scope_v86", "management_note_v86", "real_bid_rub",
+            "impressions_cur", "clicks_cur", "orders_cur", "spend_cur", "order_sum_cur", "drr_pct_cur_log", "cpo_cur_log", "ctr_pct_cur_log",
+            "impressions_base", "clicks_base", "orders_base", "spend_base", "order_sum_base", "clicks_delta_pct_log", "orders_delta_pct_log", "spend_delta_pct_log",
+            "last_bid_change_date", "last_old_bid_rub", "last_new_bid_rub", "last_bid_direction", "last_bid_reason_code", "last_bid_api_status",
+        ]
+        cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+        return df[cols].copy()
+    except Exception as exc:
+        return pd.DataFrame({"note": [f"Не удалось сформировать общий лог РК: {exc!r}"]})
+
+
+def build_campaign_base(ads: pd.DataFrame, campaigns: pd.DataFrame, orders: pd.DataFrame, bid_history: pd.DataFrame, windows: Dict[str, pd.Timestamp]) -> pd.DataFrame:
+    global LAST_ALL_CAMPAIGNS_MONITOR_V86
+    LAST_ALL_CAMPAIGNS_MONITOR_V86 = build_all_campaigns_monitor_v86(ads, campaigns, bid_history, windows)
+    return _BUILD_CAMPAIGN_BASE_V85(ads, campaigns, orders, bid_history, windows)
+
+
+def _v86_is_paused_status(value: Any) -> bool:
+    s = str(value or "").strip().lower()
+    return "пауз" in s or s in {"paused", "pause"}
+
+
+def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd.DataFrame) -> pd.DataFrame:
+    """V86: флагманские поисковые РК держим активными и не ниже 10 ₽; paused-флагман запускаем обратно."""
+    out = _APPLY_FLAGSHIP_CORE_PRIORITY_PRE_V86(decisions, flagship_pairs)
+    if out is None or out.empty or "is_core_flagship_article_v79" not in out.columns:
+        return out
+    for idx, row in out.iterrows():
+        if not bool(row.get("is_core_flagship_article_v79", False)):
+            continue
+        placement = str(row.get("placement", "") or "").lower()
+        if placement != "search":
+            continue
+        target_missed = bool(row.get("core_flagship_target_missed_v79", False))
+        current_bid = pd.to_numeric(row.get("real_bid_rub", np.nan), errors="coerce")
+        new_bid_existing = pd.to_numeric(row.get("new_bid_rub", np.nan), errors="coerce")
+        bid_effective = current_bid if pd.notna(current_bid) else new_bid_existing
+        is_paused = _v86_is_paused_status(row.get("campaign_status", "")) or str(row.get("action", "")).lower() == "hold_paused"
+        if not target_missed:
+            continue
+        floor_bid = float(CORE_FLAGSHIP_SEARCH_MIN_BID_RUB_V82)
+        if is_paused:
+            out.at[idx, "action"] = "start"
+            out.at[idx, "new_bid_rub"] = int(max(floor_bid, float(bid_effective) if pd.notna(bid_effective) else floor_bid))
+            out.at[idx, "reason_code"] = "FLAGSHIP_CORE_START_PAUSED_MIN10"
+            out.at[idx, "reason_text"] = (
+                "Флагманская поисковая РК была на паузе, а цель CORE не выполнена: нужна позиция 1-8, "
+                "видимость 95%+ и рост кликов. Запускаем РК обратно и держим ставку не ниже 10 ₽."
+            )
+            out.at[idx, "flagship_priority_applied_v79"] = "флагманская поисковая РК на паузе: запуск обратно с полом 10 ₽"
+            continue
+        if pd.isna(bid_effective) or float(bid_effective) < floor_bid:
+            out.at[idx, "action"] = "raise"
+            out.at[idx, "new_bid_rub"] = int(floor_bid)
+            out.at[idx, "reason_code"] = "FLAGSHIP_CORE_MIN10_RAISE"
+            out.at[idx, "reason_text"] = _flagship_raise_to_10_reason_v81(row, int(floor_bid))
+            out.at[idx, "flagship_priority_applied_v79"] = "активный флагман ниже 10 ₽: поднимаем до минимума флагмана"
+    return out
+
+
+def _v86_filter_meaningful_core_queries(flagship_pairs: pd.DataFrame) -> pd.DataFrame:
+    """Убирает из флагманов мусорные запросы: чисто числовые nm_id и почти пустые строки. Не режет нормальную семантику."""
+    if flagship_pairs is None or flagship_pairs.empty:
+        return flagship_pairs
+    out = flagship_pairs.copy()
+    q = out.get("query_text", out.get("query_text_norm", pd.Series([""] * len(out), index=out.index))).astype(str).str.lower().str.replace("ё", "е", regex=False).str.strip()
+    has_letter = q.str.contains(r"[a-zа-я]", regex=True, na=False)
+    only_number = q.str.fullmatch(r"\d+", na=False)
+    out = out[has_letter & ~only_number].copy()
+    return out
+
+
+def select_core_flagship_pairs_v77(query_article: pd.DataFrame) -> pd.DataFrame:
+    """V86: 1 CORE-запрос = 1 флагман, но без числового/мусорного запроса как флагмана."""
+    return _v86_filter_meaningful_core_queries(_SELECT_CORE_FLAGSHIP_PAIRS_PRE_V86(query_article))
+
+
+def collect_query_stats_api_v86(config: RunnerConfig, decisions: pd.DataFrame, days: int = 1, max_campaigns: int = 80) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Единый сбор статистики поисковых кластеров API для CPC/CPM строк основного контура. Не управляет ставками."""
+    if decisions is None or decisions.empty:
+        return pd.DataFrame({"note": ["Нет решений для сбора API-статистики запросов"]}), pd.DataFrame()
+    work = decisions.copy()
+    if "campaign_id" not in work.columns:
+        return pd.DataFrame({"note": ["В решениях нет campaign_id"]}), pd.DataFrame()
+    if "subject_norm" in work.columns:
+        work = work[work["subject_norm"].map(is_managed_subject_value)].copy()
+    if "placement" in work.columns:
+        work = work[work["placement"].astype(str).str.lower().isin(["search", "combined", "cpm"])].copy()
+    subset = [c for c in ["campaign_id", "nm_id", "placement"] if c in work.columns]
+    if subset:
+        work = work.drop_duplicates(subset=subset).head(int(max_campaigns))
+    rows_all: List[pd.DataFrame] = []
+    logs_all: List[Dict[str, Any]] = []
+    for _, r in work.iterrows():
+        cid = _clean_int(r.get("campaign_id"))
+        if not cid:
+            continue
+        nm = _clean_int(r.get("nm_id")) if "nm_id" in work.columns else None
+        placement = str(r.get("placement", "") or "").lower()
+        stats, logs = _v85_fetch_query_stats(config, int(cid), int(nm) if nm else None, days=max(1, int(days)))
+        logs_all.extend(logs)
+        if stats is not None and not stats.empty:
+            stats = stats.copy()
+            stats["supplier_article"] = str(r.get("supplier_article", "") or "")
+            stats["subject_norm"] = str(r.get("subject_norm", "") or "")
+            stats["placement"] = placement
+            stats["payment_type"] = "cpc" if placement == "search" else "cpm"
+            stats["source_v86"] = "WB normquery stats API"
+            rows_all.append(stats)
+        time.sleep(0.15)
+    stats_df = pd.concat(rows_all, ignore_index=True) if rows_all else pd.DataFrame({"note": ["WB API не вернул статистику поисковых запросов по основному контуру"]})
+    log_df = pd.DataFrame(logs_all) if logs_all else pd.DataFrame()
+    return stats_df, log_df
+
+
+def append_v86_sheets_to_output(path: str, query_stats_api: Optional[pd.DataFrame] = None) -> None:
+    mode = "a" if Path(path).exists() else "w"
+    with pd.ExcelWriter(path, engine="openpyxl", mode=mode, if_sheet_exists="replace") as writer:
+        if LAST_ALL_CAMPAIGNS_MONITOR_V86 is not None and not LAST_ALL_CAMPAIGNS_MONITOR_V86.empty:
+            LAST_ALL_CAMPAIGNS_MONITOR_V86.to_excel(writer, sheet_name="Все_РК_лог", index=False)
+        else:
+            pd.DataFrame({"note": ["Общий лог всех рекламных кампаний не сформирован"]}).to_excel(writer, sheet_name="Все_РК_лог", index=False)
+        if query_stats_api is not None and not query_stats_api.empty:
+            query_stats_api.to_excel(writer, sheet_name="Статистика_запросов_API", index=False)
+        else:
+            pd.DataFrame({"note": ["API-статистика поисковых запросов не собиралась в этом запуске"]}).to_excel(writer, sheet_name="Статистика_запросов_API", index=False)
+
+
+def write_outputs(path: str, decisions: pd.DataFrame, core: pd.DataFrame, payload: pd.DataFrame, windows: Dict[str, pd.Timestamp], postcheck: Optional[pd.DataFrame] = None) -> None:
+    _WRITE_OUTPUTS_V85(path, decisions, core, payload, windows, postcheck)
+    with pd.ExcelWriter(path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        if decisions is not None and not decisions.empty:
+            decisions.to_excel(writer, sheet_name="Решения", index=False)
+        else:
+            pd.DataFrame({"note": ["Нет решений"]}).to_excel(writer, sheet_name="Решения", index=False)
+    append_v86_sheets_to_output(path, None)
+
+
+def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
+    summary = _MAKE_SUMMARY_JSON_V85(mode, decisions, successful, api_log, windows, args)
+    summary["Версия"] = SCRIPT_VERSION
+    summary["Контур управления"] = "Только Кисти косметические; карандаши и остальные категории только логируются"
+    summary["CORE 90 дней"] = "собирается; стратегия 1 CORE-запрос = 1 флагманский товар"
+    summary["CORE флагманы"] = "1 флагман на 1 запрос: выбран по максимуму заказов за 90 дней; CTR только tie-breaker, второй флагман отключён"
+    summary["Цель флагмана"] = "позиция 1-8 и видимость 95%+; влияет на поисковые ставки и запуск paused-флагманов"
+    summary["Режим флагмана CORE"] = "поисковый флагман ниже цели держится не ниже 10 ₽; если paused — запускается обратно; снижение разрешено только как откат неэффективного повышения без роста CORE-трафика"
+    summary["Все РК логирование"] = f"логируются все кампании на листе Все_РК_лог; строк: {len(LAST_ALL_CAMPAIGNS_MONITOR_V86) if LAST_ALL_CAMPAIGNS_MONITOR_V86 is not None else 0}"
+    summary["API статистика запросов"] = "добавлен лист Статистика_запросов_API; основной сбор через WB normquery stats API, отдельно CPM-manager собирает статистику по каждому запросу"
+    if decisions is not None and not decisions.empty and "reason_code" in decisions.columns:
+        summary["Флагманских запусков с паузы"] = int(decisions["reason_code"].astype(str).eq("FLAGSHIP_CORE_START_PAUSED_MIN10").sum())
+        summary["Флагманских повышений до 10"] = int(decisions["reason_code"].astype(str).eq("FLAGSHIP_CORE_MIN10_RAISE").sum())
+    if successful is not None and not successful.empty:
+        summary["Фактических успешных API действий текущего запуска"] = int(len(successful))
+    return summary
+
+
+# =========================
+# V87 OVERRIDES: active-only flagships, manual pauses respected
+# =========================
+SCRIPT_VERSION = "v87-active-only-manual-pauses-respected-2026-07-30"
+VERSION = "FIX59_ACTIVE_ONLY_MANUAL_PAUSES_RESPECTED"
+
+CPM_KNOWN_NM_TO_ARTICLE_V87 = {
+    87705142: "901/5",
+    110254263: "901/11",
+}
+
+def _v87_article_from_nm(nm_id: Any) -> str:
+    nm = _clean_int(nm_id)
+    return CPM_KNOWN_NM_TO_ARTICLE_V87.get(int(nm), "") if nm else ""
+
+# Пользовательское правило v87:
+# - паузы поставлены вручную, значит paused РК не запускать обратно и не трогать ставками;
+# - работаем только с оставшимися активными РК;
+# - активные РК в контуре кистей считаем флагманами;
+# - основной контур меняет только ставки, без авто-пауз и без авто-start.
+_APPLY_FLAGSHIP_CORE_PRIORITY_PRE_V87 = apply_flagship_core_priority_v79
+_COLLECT_QUERY_STATS_API_PRE_V87 = collect_query_stats_api_v86
+_MAKE_SUMMARY_JSON_PRE_V87 = make_summary_json
+
+
+def _v87_is_active_status(value: Any) -> bool:
+    s = str(value or "").strip().lower()
+    if _v86_is_paused_status(s):
+        return False
+    return ("актив" in s) or (s in {"active", "enabled", "on", "работает"})
+
+
+def _v87_is_managed_brush_row(row: pd.Series) -> bool:
+    subject_ok = is_managed_subject_value(row.get("subject_norm", ""))
+    article = str(row.get("supplier_article", "") or "").strip()
+    return bool(subject_ok and article not in EXCLUDED_ARTICLES_FROM_AUTOMATION)
+
+
+def _v87_bid_effective(row: pd.Series) -> Any:
+    current_bid = pd.to_numeric(row.get("real_bid_rub", np.nan), errors="coerce")
+    new_bid = pd.to_numeric(row.get("new_bid_rub", np.nan), errors="coerce")
+    return current_bid if pd.notna(current_bid) else new_bid
+
+
+def _v87_respect_manual_pauses(out: pd.DataFrame) -> pd.DataFrame:
+    """Любые paused РК оставляем в покое: не start, не raise/lower, не pause повторно."""
+    if out is None or out.empty:
+        return out
+    if "campaign_status" not in out.columns:
+        return out
+    for idx, row in out.iterrows():
+        is_paused = _v86_is_paused_status(row.get("campaign_status", "")) or str(row.get("action", "") or "").lower() == "hold_paused"
+        if not is_paused:
+            continue
+        bid_effective = _v87_bid_effective(row)
+        out.at[idx, "action"] = "hold_paused"
+        out.at[idx, "new_bid_rub"] = bid_effective if pd.notna(bid_effective) else row.get("new_bid_rub", "")
+        out.at[idx, "reason_code"] = "MANUAL_PAUSE_RESPECTED_NO_AUTO_START"
+        out.at[idx, "reason_text"] = (
+            "РК находится на паузе вручную. Автоматический запуск обратно и изменение ставки запрещены: "
+            "работаем только с оставшимися активными РК."
+        )
+        out.at[idx, "flagship_priority_applied_v79"] = "ручная пауза сохранена; API действий нет"
+        out.at[idx, "current_active_flagship_v87"] = False
+        out.at[idx, "manual_pause_respected_v87"] = True
+    return out
+
+
+def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd.DataFrame) -> pd.DataFrame:
+    """V87: paused РК не трогаем; все активные РК кистей считаем флагманами."""
+    out = _APPLY_FLAGSHIP_CORE_PRIORITY_PRE_V87(decisions, flagship_pairs)
+    if out is None or out.empty:
+        return out
+
+    for col, default in [
+        ("current_active_flagship_v87", False),
+        ("manual_pause_respected_v87", False),
+        ("v87_management_rule", ""),
+    ]:
+        if col not in out.columns:
+            out[col] = default
+
+    # Сначала отменяем все попытки start/raise/lower по paused строкам, включая V86 auto-start.
+    out = _v87_respect_manual_pauses(out)
+
+    floor_bid = int(CORE_FLAGSHIP_SEARCH_MIN_BID_RUB_V82)
+    for idx, row in out.iterrows():
+        if not _v87_is_managed_brush_row(row):
+            continue
+        if not _v87_is_active_status(row.get("campaign_status", "")):
+            continue
+
+        placement = str(row.get("placement", "") or "").lower()
+        action = str(row.get("action", "") or "").lower()
+        bid_effective = _v87_bid_effective(row)
+        out.at[idx, "current_active_flagship_v87"] = True
+        out.at[idx, "v87_management_rule"] = "активная РК кистей = флагман; управляем только ставками, без авто-паузы и без авто-start"
+
+        # Активные флагманы не отправляем в паузу автоматически.
+        if action == "pause":
+            out.at[idx, "action"] = "hold"
+            out.at[idx, "new_bid_rub"] = bid_effective if pd.notna(bid_effective) else row.get("new_bid_rub", "")
+            out.at[idx, "reason_code"] = "ACTIVE_FLAGSHIP_NO_AUTO_PAUSE"
+            out.at[idx, "reason_text"] = (
+                "Активная РК кистей считается флагманом текущего контура. Автопауза отключена: "
+                "паузы ставятся вручную, код управляет только ставками активных РК."
+            )
+            out.at[idx, "flagship_priority_applied_v79"] = "автопауза активного флагмана заблокирована"
+            continue
+
+        # Активные поисковые флагманы держим не ниже 10 ₽.
+        if placement == "search":
+            if pd.isna(bid_effective) or float(bid_effective) < float(floor_bid):
+                out.at[idx, "action"] = "raise"
+                out.at[idx, "new_bid_rub"] = floor_bid
+                out.at[idx, "reason_code"] = "ACTIVE_FLAGSHIP_SEARCH_MIN10_RAISE"
+                out.at[idx, "reason_text"] = (
+                    "Активная поисковая РК кистей считается флагманом. По текущему правилу ставка флагмана "
+                    "не должна быть ниже 10 ₽, поэтому поднимаем до 10 ₽."
+                )
+                out.at[idx, "flagship_priority_applied_v79"] = "активный поисковый флагман ниже 10 ₽: поднять до 10"
+                continue
+
+            # Обычное экономическое снижение search-флагмана блокируем. Разрешаем только откат повышения по CORE-трафику,
+            # но он всё равно не может увести ставку ниже 10 ₽.
+            if action == "lower":
+                rc = row.get("reason_code", "")
+                allowed_rollback = _is_allowed_flagship_traffic_rollback_v80(rc, row)
+                proposed = pd.to_numeric(row.get("new_bid_rub", np.nan), errors="coerce")
+                if allowed_rollback and pd.notna(proposed) and float(proposed) >= float(floor_bid):
+                    out.at[idx, "reason_code"] = "ACTIVE_FLAGSHIP_CORE_ROLLBACK_ALLOWED"
+                    old_text = str(row.get("reason_text", "") or "").strip()
+                    out.at[idx, "reason_text"] = (
+                        "Активный поисковый флагман: разрешён только откат неэффективного повышения, "
+                        "если CORE-трафик не вырос. " + old_text
+                    )
+                    out.at[idx, "flagship_priority_applied_v79"] = "разрешён откат повышения флагмана, не ниже 10"
+                else:
+                    out.at[idx, "action"] = "hold"
+                    out.at[idx, "new_bid_rub"] = bid_effective
+                    out.at[idx, "reason_code"] = "ACTIVE_FLAGSHIP_NO_ECONOMIC_LOWER"
+                    out.at[idx, "reason_text"] = (
+                        "Активная поисковая РК кистей считается флагманом. Обычное экономическое снижение запрещено: "
+                        "снижать можно только как откат неэффективного повышения по CORE-трафику и не ниже 10 ₽."
+                    )
+                    out.at[idx, "flagship_priority_applied_v79"] = "экономическое снижение активного флагмана заблокировано"
+                continue
+
+        # Для активных combined/CPM-флагманов автопаузы запрещены; ставки можно менять обычной логикой.
+        elif placement in {"combined", "cpm"}:
+            if action == "lower":
+                # Снижение combined не запрещаем полностью: оно может быть нужно после теста,
+                # но причина должна быть видна как управление активным флагманом.
+                out.at[idx, "flagship_priority_applied_v79"] = "активный CPM/combined-флагман: снижение оставлено только как управление ставкой, не пауза"
+            elif action == "raise":
+                out.at[idx, "flagship_priority_applied_v79"] = "активный CPM/combined-флагман: повышение ставки"
+            elif action == "hold":
+                out.at[idx, "flagship_priority_applied_v79"] = "активный CPM/combined-флагман: держим ставку"
+
+    return out
+
+
+def collect_query_stats_api_v86(config: RunnerConfig, decisions: pd.DataFrame, days: int = 1, max_campaigns: int = 80) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """V87: API-статистику запросов основного контура собираем только по активным РК кистей."""
+    if decisions is None or decisions.empty:
+        return pd.DataFrame({"note": ["Нет решений для сбора API-статистики запросов"]}), pd.DataFrame()
+    work = decisions.copy()
+    if "campaign_status" in work.columns:
+        work = work[~work["campaign_status"].map(_v86_is_paused_status)].copy()
+    if "subject_norm" in work.columns:
+        work = work[work["subject_norm"].map(is_managed_subject_value)].copy()
+    if work.empty:
+        return pd.DataFrame({"note": ["Нет активных РК кистей для сбора API-статистики запросов"]}), pd.DataFrame()
+    return _COLLECT_QUERY_STATS_API_PRE_V87(config, work, days=days, max_campaigns=max_campaigns)
+
+
+def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
+    summary = _MAKE_SUMMARY_JSON_PRE_V87(mode, decisions, successful, api_log, windows, args)
+    summary["Версия"] = SCRIPT_VERSION
+    summary["Контур управления"] = "Только активные РК предмета Кисти косметические; paused РК считаются ручной паузой и не трогаются; остальные категории только логируются"
+    summary["Паузы"] = "авто-start и авто-pause отключены в основном контуре; ручные паузы сохраняются"
+    summary["Режим флагмана CORE"] = "все оставшиеся активные РК кистей считаются флагманами; поисковые активные флагманы держатся не ниже 10 ₽"
+    if decisions is not None and not decisions.empty:
+        if "current_active_flagship_v87" in decisions.columns:
+            summary["Активных флагманов v87"] = int(decisions["current_active_flagship_v87"].fillna(False).astype(bool).sum())
+        if "manual_pause_respected_v87" in decisions.columns:
+            summary["Ручных пауз сохранено v87"] = int(decisions["manual_pause_respected_v87"].fillna(False).astype(bool).sum())
+        if "reason_code" in decisions.columns:
+            rc = decisions["reason_code"].astype(str)
+            summary["Авто-start заблокировано v87"] = int(rc.eq("MANUAL_PAUSE_RESPECTED_NO_AUTO_START").sum())
+            summary["Активных search-флагманов поднято до 10 v87"] = int(rc.eq("ACTIVE_FLAGSHIP_SEARCH_MIN10_RAISE").sum())
+            summary["Автопауз активных флагманов заблокировано v87"] = int(rc.eq("ACTIVE_FLAGSHIP_NO_AUTO_PAUSE").sum())
+    return summary
 
 if __name__ == "__main__":
     raise SystemExit(main())
