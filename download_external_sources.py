@@ -1,4 +1,4 @@
-# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V7_20260730
+# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V8_20260730
 """Загрузка внешних источников в Yandex Object Storage.
 
 Источники:
@@ -42,7 +42,7 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V7_20260730"
+VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V8_20260730"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "ABC"
 DEFAULT_WB_ENTRY_FOLDER = "Точки входа"
@@ -611,7 +611,12 @@ def torgstat_key(start: dt.date, end: dt.date, reports_root: str, abc_folder: st
 
 def wb_entry_key(store: str, start: dt.date, end: dt.date, reports_root: str, folder: str) -> str:
     filename = f"wb_entry_points__{fmt_dmy(start)}-{fmt_dmy(end)}__at_{timestamp_suffix()}.xlsx"
-    return f"{reports_root.rstrip('/')}/{folder.strip('/') or DEFAULT_WB_ENTRY_FOLDER}/{filename}"
+    return (
+        f"{reports_root.rstrip('/')}/"
+        f"{folder.strip('/') or DEFAULT_WB_ENTRY_FOLDER}/"
+        f"{store.strip('/')}/"
+        f"{filename}"
+    )
 
 
 def download_torgstat_period(raw_curl: str, start: dt.date, end: dt.date, reports_root: str, abc_folder: str, dry_run: bool) -> str:
