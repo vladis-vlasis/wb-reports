@@ -8,6 +8,7 @@ on:
     # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
     - cron: "*/10 15-20 * * *"
     # CPM-чистка и управление ставками поисковых кластеров: каждые 2 часа, без ограничения 18:00-23:59.
+    # v87: CPM stats-days=1; основной run управляет только активными кистями; paused РК не запускаем, остальные РК логируются.
     - cron: "0 */2 * * *"
 
 permissions:
@@ -19,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v85_cpm_query_bids_manager_2026-07-30"
+  WORKFLOW_VERSION: "v87_active_only_manual_pauses_respected_2026-07-30"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
@@ -265,13 +266,13 @@ jobs:
 
           case "${RUN_SLOT}" in
             manual_main)
-              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start"
+              CMD="python upravlenie_reklamoy.py run --skip-price"
               ;;
             main_run)
-              CMD="python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start"
+              CMD="python upravlenie_reklamoy.py run --skip-price"
               ;;
             cpm_query_cleaner)
-              CMD="python upravlenie_reklamoy.py cpm-manager --campaigns 38914318,38914345 --apply-cpm-minus --apply-cpm-bids --min-bid 340 --bid-step 40 --max-cpo 160"
+              CMD="python upravlenie_reklamoy.py cpm-manager --campaigns 38914318,38914345 --apply-cpm-minus --apply-cpm-bids --min-bid 340 --bid-step 40 --max-cpo 160 --stats-days 1"
               ;;
             *)
               echo "Unknown RUN_SLOT=${RUN_SLOT}"
