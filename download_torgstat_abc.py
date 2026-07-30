@@ -1,19 +1,24 @@
-# VERSION: TORGSTAT_ABC_NO_MTD_DAILY_WEEKLY_1330_20260604
-"""Download Torgstat/WB ABC report and upload it to Yandex Object Storage.
+# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V2_20260730
+"""Загрузка внешних источников в Yandex Object Storage.
 
-Repository filename should be: download_torgstat_abc.py
+Источники:
+1. Торгстат — АБС-анализ.
+2. Wildberries — «Портрет покупателя → Точки входа».
 
-Primary mode: replay a browser "Copy as cURL" export request stored in secret
-TORGSTAT_ABC_CURL. The script tries to replace the period in URL/body with the
-requested dates, downloads XLSX, validates that it is an ABC report, and uploads
-it with the SAME Torgstat naming pattern that existing report parsing expects.
+Имя файла в репозитории: download_external_sources.py
 
-Important: auto mode no longer exports cumulative MTD periods like 01.MM-факт день.
-It downloads only daily ABC, and on Mondays additionally the last closed Mon-Sun week:
+GitHub Secrets:
+- TORGSTAT_ABC_CURL: один актуальный Copy as cURL запроса выгрузки Торгстат.
+- WB_ENTRY_POINTS_CURLS: несколько Copy as cURL подряд из кабинета WB. Код сам
+  распознаёт запросы по URL. Достаточно запросов /file-manager/download и
+  /tokensjrpc; список отчётов и конечный URL файла код умеет построить сам.
+- REPORT_ENV или отдельные YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY,
+  YC_BUCKET_NAME, YC_ENDPOINT_URL.
 
-  Отчёты/ABC/wb_abc_report_goods__01.05.2026-27.05.2026__at_2026-05-28_21-30.xlsx
-
-Downstream report_runner.py reads ABC reports from exactly Отчёты/ABC/.
+Режим auto:
+- ежедневно: Торгстат АБС за вчера;
+- по понедельникам: Торгстат АБС за закрытую неделю и Точки входа ВБ за
+  закрытую неделю понедельник–воскресенье.
 """
 from __future__ import annotations
 
@@ -26,20 +31,25 @@ import shlex
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "TORGSTAT_ABC_NO_MTD_DAILY_WEEKLY_1330_20260604"
+VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V2_20260730"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "ABC"
+DEFAULT_WB_ENTRY_FOLDER = "Точки входа"
 DEFAULT_STORE = "TOPFACE"
-DEFAULT_TZ_OFFSET_HOURS = 3  # Used only for date choice in GitHub Actions.
+DEFAULT_TZ_OFFSET_HOURS = 3
+WB_REPORT_TYPE = "CUSTOMER_PROFILE_ENTRY_POINTS_REPORT_V2"
+WB_MANAGER_BASE = "https://seller-content.wildberries.ru/ns/analytics-api/content-analytics/api/v1/file-manager"
+WB_TOKEN_URL = "https://seller-content.wildberries.ru/ns/suppliers-auth-tokens/suppliers-portal-core/api/v1/tokensjrpc"
+WB_FILE_BASE = "https://downloads-content-analytics.wildberries.ru/api/v1/file-manager/download"
 
 START_KEYS = {
     "datefrom", "fromdate", "begindate", "startdate", "datestart", "periodstart",
@@ -60,49 +70,43 @@ DATE_RE = re.compile(r"(?:\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4}|\d{2}/\d{2}/\d{4
 class CurlRequest:
     url: str
     method: str = "GET"
-    headers: Dict[str, str] = None
-    body: Optional[bytes] = None
+    headers: Dict[str, str] | None = None
+    body: bytes | None = None
 
     def __post_init__(self) -> None:
         if self.headers is None:
             self.headers = {}
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def log(message: str) -> None:
+    print(message, flush=True)
 
 
-def fail(msg: str, code: int = 1) -> None:
-    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+def fail(message: str, code: int = 1) -> None:
+    print(f"ERROR: {message}", file=sys.stderr, flush=True)
     raise SystemExit(code)
 
 
 def load_report_env() -> None:
-    """Load KEY=VALUE lines from REPORT_ENV into os.environ if missing/empty.
-
-    GitHub Actions passes absent secrets as empty strings if they are listed in env.
-    This loader therefore treats an existing empty env var as missing and fills it
-    from REPORT_ENV. It also tolerates CRLF and pasted literal \n sequences.
-    """
+    """Загрузить KEY=VALUE из общего секрета REPORT_ENV, не затирая отдельные secrets."""
     raw = os.environ.get("REPORT_ENV", "") or ""
     if not raw.strip():
-        log("report_env: REPORT_ENV is empty/not passed")
+        log("report_env: REPORT_ENV пустой/не передан; использую отдельные env/secrets")
         return
 
-    # Some copies end up with literal \n instead of real newlines.
     normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
     if "\n" not in normalized and "\\n" in normalized:
         normalized = normalized.replace("\\n", "\n")
 
     loaded: List[str] = []
-    skipped_existing: List[str] = []
+    skipped: List[str] = []
     bad_lines = 0
     for line in normalized.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
-            line = line[len("export ") :].strip()
+            line = line[len("export "):].strip()
         if "=" not in line:
             bad_lines += 1
             continue
@@ -113,555 +117,401 @@ def load_report_env() -> None:
             bad_lines += 1
             continue
         if (os.environ.get(key) or "").strip():
-            skipped_existing.append(key)
+            skipped.append(key)
             continue
         os.environ[key] = value
         loaded.append(key)
 
     interesting = [
         "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY", "YC_BUCKET_NAME", "YC_ENDPOINT_URL",
-        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "S3_BUCKET", "S3_ENDPOINT_URL",
+        "TORGSTAT_ABC_CURL", "WB_ENTRY_POINTS_CURLS",
     ]
-    state = ", ".join(f"{k}={'set' if (os.environ.get(k) or '').strip() else 'empty'}" for k in interesting)
-    log(f"report_env: present=yes, loaded_keys={loaded}, skipped_existing={skipped_existing}, bad_lines={bad_lines}")
+    state = ", ".join(f"{key}={'set' if (os.environ.get(key) or '').strip() else 'empty'}" for key in interesting)
+    log(f"report_env: loaded_keys={loaded}, skipped_existing={skipped}, bad_lines={bad_lines}")
     log(f"env_state: {state}")
 
 
-def parse_date(s: str) -> dt.date:
-    s = (s or "").strip()
-    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
-        try:
-            return dt.datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    fail(f"Неверный формат даты: {s}. Используй YYYY-MM-DD или DD.MM.YYYY")
-
-
-def fmt_dmy(d: dt.date) -> str:
-    return d.strftime("%d.%m.%Y")
-
-
-def fmt_iso(d: dt.date) -> str:
-    return d.strftime("%Y-%m-%d")
+def now_local() -> dt.datetime:
+    return dt.datetime.now(dt.UTC) + dt.timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)
 
 
 def today_local() -> dt.date:
-    # Avoid timezone dependencies in GitHub runner.
-    return (dt.datetime.now(dt.UTC) + dt.timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)).date()
+    return now_local().date()
 
 
-def period_for_mode(mode: str, date_from: Optional[str], date_to: Optional[str]) -> List[Tuple[dt.date, dt.date, str]]:
-    mode = (mode or "auto").lower().strip()
+def parse_date(value: str) -> dt.date:
+    value = (value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    fail(f"Неверный формат даты: {value}. Используй YYYY-MM-DD или DD.MM.YYYY")
+
+
+def fmt_iso(value: dt.date) -> str:
+    return value.strftime("%Y-%m-%d")
+
+
+def fmt_dmy(value: dt.date) -> str:
+    return value.strftime("%d.%m.%Y")
+
+
+def previous_full_week(reference: Optional[dt.date] = None) -> Tuple[dt.date, dt.date]:
+    reference = reference or today_local()
+    last_sunday = reference - dt.timedelta(days=reference.weekday() + 1)
+    return last_sunday - dt.timedelta(days=6), last_sunday
+
+
+def torgstat_periods(mode: str, date_from: str, date_to: str) -> List[Tuple[dt.date, dt.date, str]]:
+    mode = mode.lower().strip()
     today = today_local()
     yesterday = today - dt.timedelta(days=1)
-
-    def dedupe_periods(periods: List[Tuple[dt.date, dt.date, str]]) -> List[Tuple[dt.date, dt.date, str]]:
-        seen = set()
-        out: List[Tuple[dt.date, dt.date, str]] = []
-        for start, end, label in periods:
-            key = (start, end)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append((start, end, label))
-        return out
-
     if mode == "custom":
         if not date_from or not date_to:
-            fail("mode=custom требует --date-from и --date-to")
-        start, end = parse_date(date_from), parse_date(date_to)
-        return [(start, end, "custom")]
+            fail("mode=custom требует date_from и date_to")
+        return [(parse_date(date_from), parse_date(date_to), "custom")]
     if mode == "daily":
         target = parse_date(date_from) if date_from else yesterday
         return [(target, target, "daily")]
     if mode == "weekly":
-        # Previous full Monday-Sunday week relative to local today.
-        last_sunday = today - dt.timedelta(days=today.weekday() + 1)
-        start = last_sunday - dt.timedelta(days=6)
-        return [(start, last_sunday, "weekly")]
+        start, end = previous_full_week(today)
+        return [(start, end, "weekly")]
     if mode == "auto":
-        # STRICT RULE 2026-06-04:
-        # Do NOT download cumulative MTD ABC files like 01.MM-факт день.
-        # They make current-month gross profit unstable and duplicate weekly/daily facts.
-        # Current month GP is built downstream from weekly ABC + daily ABC for an incomplete week.
-        periods = [
-            (yesterday, yesterday, "daily"),
-        ]
-        if today.weekday() == 0:  # Monday: also export the last closed Monday-Sunday week.
-            last_sunday = today - dt.timedelta(days=1)
-            start = last_sunday - dt.timedelta(days=6)
-            periods.append((start, last_sunday, "weekly"))
-        return dedupe_periods(periods)
-    fail(f"Неизвестный mode={mode}. Допустимо: auto, daily, weekly, custom")
+        result = [(yesterday, yesterday, "daily")]
+        if today.weekday() == 0:
+            start, end = previous_full_week(today)
+            result.append((start, end, "weekly"))
+        return result
+    fail(f"Неизвестный mode={mode}")
+
+
+def wb_periods(mode: str, date_from: str, date_to: str) -> List[Tuple[dt.date, dt.date, str]]:
+    mode = mode.lower().strip()
+    today = today_local()
+    yesterday = today - dt.timedelta(days=1)
+    if mode == "custom":
+        if not date_from or not date_to:
+            fail("mode=custom требует date_from и date_to")
+        return [(parse_date(date_from), parse_date(date_to), "custom")]
+    if mode == "daily":
+        target = parse_date(date_from) if date_from else yesterday
+        return [(target, target, "daily")]
+    if mode == "weekly":
+        start, end = previous_full_week(today)
+        return [(start, end, "weekly")]
+    if mode == "auto":
+        if today.weekday() != 0:
+            log("WB entry-points: auto — сегодня не понедельник, недельную выгрузку пропускаю")
+            return []
+        start, end = previous_full_week(today)
+        return [(start, end, "weekly")]
+    fail(f"Неизвестный mode={mode}")
+
+
+def split_curl_commands(raw: str) -> List[str]:
+    """Разделить multiline secret с несколькими Copy as cURL."""
+    raw = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+    starts = [m.start() for m in re.finditer(r"(?mi)^\s*curl(?:\.exe)?\s+", raw)]
+    if not starts:
+        return [raw]
+    starts.append(len(raw))
+    return [raw[starts[i]:starts[i + 1]].strip() for i in range(len(starts) - 1)]
 
 
 def clean_multiline_curl(raw: str) -> str:
     raw = (raw or "").strip()
     if not raw:
-        fail("TORGSTAT_ABC_CURL пустой. Сохрани Copy as cURL в GitHub Secret TORGSTAT_ABC_CURL")
-    # Chrome often copies line continuations with backslash-newline.
+        fail("Пустой Copy as cURL")
     raw = raw.replace("\\\r\n", " ").replace("\\\n", " ")
     raw = raw.replace("\r\n", " ").replace("\n", " ")
-    return raw.strip()
-
-
-REQUEST_HEADER_KEYS = {
-    "accept", "accept-language", "authorization", "content-type", "cookie", "origin",
-    "referer", "user-agent", "x-csrf-token", "x-requested-with", "sec-ch-ua",
-    "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-fetch-dest", "sec-fetch-mode",
-    "sec-fetch-site", "priority",
-}
-
-
-def parse_devtools_headers_block(raw: str) -> Optional[CurlRequest]:
-    """Parse a manually copied Chrome DevTools Headers block.
-
-    Fallback for cases when the secret contains the visible Headers panel rather
-    than Copy -> Copy as cURL. Russian Chrome shows pairs like:
-      URL запроса\nhttps://...\nМетод запроса\nGET\ncookie\n...
-    """
-    lines = [ln.strip() for ln in (raw or "").replace("\r\n", "\n").split("\n") if ln.strip()]
-    if not lines:
-        return None
-
-    url: Optional[str] = None
-    method = "GET"
-    headers: Dict[str, str] = {}
-    scheme = "https"
-    authority = ""
-    path = ""
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        low = line.lower()
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-
-        if line.startswith(("http://", "https://")):
-            url = line
-            i += 1
-            continue
-
-        if low in {"url запроса", "request url"} and nxt:
-            url = nxt
-            i += 2
-            continue
-        if low in {"метод запроса", "request method"} and nxt:
-            method = nxt.upper()
-            i += 2
-            continue
-
-        if low == ":method" and nxt:
-            method = nxt.upper()
-            i += 2
-            continue
-        if low == ":scheme" and nxt:
-            scheme = nxt
-            i += 2
-            continue
-        if low == ":authority" and nxt:
-            authority = nxt
-            i += 2
-            continue
-        if low == ":path" and nxt:
-            path = nxt
-            i += 2
-            continue
-
-        if low in REQUEST_HEADER_KEYS and nxt:
-            headers[line] = nxt
-            i += 2
-            continue
-
-        i += 1
-
-    if not url and authority and path:
-        url = f"{scheme}://{authority}{path}"
-
-    if not url:
-        return None
-
-    clean_headers: Dict[str, str] = {}
-    for k, v in headers.items():
-        lk = k.lower().strip()
-        if lk in REQUEST_HEADER_KEYS:
-            clean_headers[k] = v
-    return CurlRequest(url=url, method=method, headers=clean_headers, body=None)
+    return re.sub(r"\s+", " ", raw).strip()
 
 
 def parse_curl(raw: str) -> CurlRequest:
-    raw = (raw or "").strip()
-    looks_like_curl = bool(re.match(r"^\s*(curl|curl\.exe)\b", raw, flags=re.I))
-    if not looks_like_curl:
-        parsed = parse_devtools_headers_block(raw)
-        if parsed:
-            log("secret_parse: parsed DevTools Headers block, not cURL")
-            return parsed
-
     text = clean_multiline_curl(raw)
     text = re.sub(r"\s+[\^`]\s+", " ", text)
-    parts = shlex.split(text, posix=True)
-    if not parts:
-        fail("Copy as cURL не распознан")
-    if parts[0].lower() in {"curl", "curl.exe"}:
+    try:
+        parts = shlex.split(text, posix=True)
+    except ValueError as exc:
+        fail(f"Copy as cURL не распознан: {exc}")
+    if parts and parts[0].lower() in {"curl", "curl.exe"}:
         parts = parts[1:]
+
     url: Optional[str] = None
     method = "GET"
     headers: Dict[str, str] = {}
     body_parts: List[str] = []
     i = 0
     while i < len(parts):
-        p = parts[i]
-        if p in ("-X", "--request") and i + 1 < len(parts):
+        item = parts[i]
+        if item in {"-X", "--request"} and i + 1 < len(parts):
             method = parts[i + 1].upper()
             i += 2
             continue
-        if p in ("-H", "--header") and i + 1 < len(parts):
-            h = parts[i + 1]
-            if ":" in h:
-                k, v = h.split(":", 1)
-                headers[k.strip()] = v.strip()
+        if item in {"-H", "--header"} and i + 1 < len(parts):
+            header = parts[i + 1]
+            if ":" in header:
+                key, value = header.split(":", 1)
+                headers[key.strip()] = value.strip()
             i += 2
             continue
-        if p in ("-b", "--cookie", "--cookie-raw") and i + 1 < len(parts):
+        if item in {"-b", "--cookie", "--cookie-raw"} and i + 1 < len(parts):
             headers["cookie"] = parts[i + 1].strip()
             i += 2
             continue
-        if p in ("--url",) and i + 1 < len(parts):
+        if item == "--url" and i + 1 < len(parts):
             url = parts[i + 1]
             i += 2
             continue
-        if p in ("--data", "--data-raw", "--data-binary", "--data-ascii", "-d") and i + 1 < len(parts):
+        if item in {"--data", "--data-raw", "--data-binary", "--data-ascii", "-d"} and i + 1 < len(parts):
             body_parts.append(parts[i + 1])
-            if method == "GET":
-                method = "POST"
+            method = "POST" if method == "GET" else method
             i += 2
             continue
-        if p in ("--compressed", "--location", "-L", "--insecure", "-k", "--globoff"):
-            i += 1
-            continue
-        if p.startswith("http://") or p.startswith("https://"):
-            url = p
+        if item.startswith(("http://", "https://")):
+            url = item
             i += 1
             continue
         i += 1
+
     if not url:
-        parsed = parse_devtools_headers_block(raw)
-        if parsed:
-            log("secret_parse: parsed DevTools Headers block after cURL parse fallback")
-            return parsed
         fail("В Copy as cURL не найден URL")
     body = "&".join(body_parts).encode("utf-8") if body_parts else None
     return CurlRequest(url=url, method=method, headers=headers, body=body)
 
-def norm_key(k: str) -> str:
-    return re.sub(r"[^a-z0-9_\[\]]+", "", str(k).lower())
+
+def header_get(headers: Dict[str, str], name: str) -> str:
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return ""
 
 
-def format_like(original_value: Any, new_date: dt.date) -> str:
-    s = str(original_value)
-    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", s):
+def header_set(headers: Dict[str, str], name: str, value: str) -> None:
+    for key in list(headers):
+        if key.lower() == name.lower():
+            headers.pop(key, None)
+    headers[name] = value
+
+
+def is_valid_jwt_like(value: str) -> bool:
+    value = (value or "").strip()
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", value))
+
+
+def best_wb_auth_headers(requests_: Sequence[CurlRequest]) -> Dict[str, str]:
+    """Собрать актуальные auth/cookie из всех cURL и игнорировать повреждённые JWT."""
+    result: Dict[str, str] = {}
+    for req in requests_:
+        value = header_get(req.headers or {}, "authorizev3")
+        if value and is_valid_jwt_like(value):
+            result["authorizev3"] = value
+        cookie = header_get(req.headers or {}, "cookie")
+        if cookie and len(cookie) > len(result.get("cookie", "")):
+            result["cookie"] = cookie
+        for name in ("user-agent", "accept-language", "root-version"):
+            value = header_get(req.headers or {}, name)
+            if value:
+                result[name] = value
+    if not result.get("authorizev3"):
+        fail("WB_ENTRY_POINTS_CURLS: не найден целый authorizev3. Скопируй cURL без ручных вставок внутрь токена")
+    if not result.get("cookie"):
+        fail("WB_ENTRY_POINTS_CURLS: не найдены cookies")
+    return result
+
+
+def apply_wb_auth(req: CurlRequest, auth: Dict[str, str]) -> CurlRequest:
+    headers = dict(req.headers or {})
+    for key, value in auth.items():
+        header_set(headers, key, value)
+    return CurlRequest(req.url, req.method, headers, req.body)
+
+
+def sanitized_headers(headers: Dict[str, str], *, keep_content_type: bool = True) -> Dict[str, str]:
+    output: Dict[str, str] = {}
+    blocked = {"host", "content-length", "connection", "accept-encoding", "x-download-token"}
+    for key, value in (headers or {}).items():
+        low = key.lower().strip()
+        if low.startswith(":") or low in blocked:
+            continue
+        if not keep_content_type and low == "content-type":
+            continue
+        output[key] = value
+    return output
+
+
+def request_json(session: requests.Session, req: CurlRequest, timeout: int = 180) -> Any:
+    headers = sanitized_headers(req.headers or {})
+    response = session.request(req.method, req.url, headers=headers, data=req.body, timeout=timeout, allow_redirects=True)
+    log(f"HTTP {req.method} {urlparse(req.url).path}: status={response.status_code}, bytes={len(response.content):,}")
+    if response.status_code >= 400:
+        fail(f"HTTP {response.status_code}: {response.text[:1000]}")
+    try:
+        return response.json()
+    except Exception:
+        return {"raw": response.text[:3000]}
+
+
+def norm_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9_\[\]]+", "", str(key).lower())
+
+
+def format_like(original: Any, new_date: dt.date) -> str:
+    text = str(original)
+    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", text):
         return fmt_dmy(new_date)
-    if re.fullmatch(r"\d{2}/\d{2}/\d{4}", s):
+    if re.fullmatch(r"\d{2}/\d{2}/\d{4}", text):
         return new_date.strftime("%d/%m/%Y")
     return fmt_iso(new_date)
-
-
-def replace_date_tokens_text(text: str, start: dt.date, end: dt.date) -> Tuple[str, int]:
-    """Fallback: replace the first two distinct date tokens in a text blob."""
-    matches = list(DATE_RE.finditer(text))
-    if not matches:
-        return text, 0
-    distinct: List[str] = []
-    for m in matches:
-        v = m.group(0)
-        if v not in distinct:
-            distinct.append(v)
-    repl: Dict[str, str] = {}
-    if len(distinct) >= 1:
-        repl[distinct[0]] = format_like(distinct[0], start)
-    if len(distinct) >= 2:
-        repl[distinct[1]] = format_like(distinct[1], end)
-    # If there is only one date, set it to start for daily/custom single-date APIs.
-    out = text
-    for old, new in repl.items():
-        out = out.replace(old, new)
-    return out, len(repl)
-
-
-def replace_dates_in_mapping(items: List[Tuple[str, str]], start: dt.date, end: dt.date) -> Tuple[List[Tuple[str, str]], int]:
-    changed = 0
-    out: List[Tuple[str, str]] = []
-    for k, v in items:
-        nk = norm_key(k)
-        if nk in START_KEYS or "datefrom" in nk or "startdate" in nk or nk.endswith("from"):
-            out.append((k, format_like(v, start)))
-            changed += 1
-        elif nk in END_KEYS or "dateto" in nk or "enddate" in nk or nk.endswith("to"):
-            out.append((k, format_like(v, end)))
-            changed += 1
-        else:
-            out.append((k, v))
-    return out, changed
 
 
 def replace_dates_json(obj: Any, start: dt.date, end: dt.date) -> Tuple[Any, int]:
     changed = 0
     if isinstance(obj, dict):
-        new = {}
-        for k, v in obj.items():
-            nk = norm_key(k)
-            if nk in START_KEYS or "datefrom" in nk or "startdate" in nk or nk.endswith("from"):
-                new[k] = format_like(v, start)
+        output: Dict[str, Any] = {}
+        for key, value in obj.items():
+            normalized = norm_key(key)
+            if normalized in START_KEYS or "datefrom" in normalized or "startdate" in normalized or normalized.endswith("from"):
+                output[key] = format_like(value, start)
                 changed += 1
-            elif nk in END_KEYS or "dateto" in nk or "enddate" in nk or nk.endswith("to"):
-                new[k] = format_like(v, end)
+            elif normalized in END_KEYS or "dateto" in normalized or "enddate" in normalized or normalized.endswith("to"):
+                output[key] = format_like(value, end)
                 changed += 1
             else:
-                new[k], c = replace_dates_json(v, start, end)
-                changed += c
-        return new, changed
+                output[key], nested = replace_dates_json(value, start, end)
+                changed += nested
+        return output, changed
     if isinstance(obj, list):
-        arr = []
-        for v in obj:
-            nv, c = replace_dates_json(v, start, end)
-            arr.append(nv)
-            changed += c
-        return arr, changed
+        output_list = []
+        for value in obj:
+            new_value, nested = replace_dates_json(value, start, end)
+            output_list.append(new_value)
+            changed += nested
+        return output_list, changed
     return obj, 0
+
+
+def replace_date_tokens(text: str, start: dt.date, end: dt.date) -> Tuple[str, int]:
+    matches = list(DATE_RE.finditer(text))
+    if not matches:
+        return text, 0
+    distinct: List[str] = []
+    for match in matches:
+        value = match.group(0)
+        if value not in distinct:
+            distinct.append(value)
+    replacements: Dict[str, str] = {}
+    if distinct:
+        replacements[distinct[0]] = format_like(distinct[0], start)
+    if len(distinct) > 1:
+        replacements[distinct[1]] = format_like(distinct[1], end)
+    output = text
+    for old, new in replacements.items():
+        output = output.replace(old, new)
+    return output, len(replacements)
 
 
 def update_request_dates(req: CurlRequest, start: dt.date, end: dt.date) -> CurlRequest:
     url = req.url
-    total_changed = 0
+    body = req.body
+    changed = 0
 
     parsed = urlparse(url)
-    q_items = parse_qsl(parsed.query, keep_blank_values=True)
-    if q_items:
-        new_q_items, c = replace_dates_in_mapping(q_items, start, end)
-        total_changed += c
-        url = urlunparse(parsed._replace(query=urlencode(new_q_items, doseq=True)))
-
-    body = req.body
-    content_type = ""
-    for hk, hv in req.headers.items():
-        if hk.lower() == "content-type":
-            content_type = hv.lower()
-            break
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    new_query: List[Tuple[str, str]] = []
+    for key, value in query:
+        normalized = norm_key(key)
+        if normalized in START_KEYS or "datefrom" in normalized or "startdate" in normalized or normalized.endswith("from"):
+            new_query.append((key, format_like(value, start)))
+            changed += 1
+        elif normalized in END_KEYS or "dateto" in normalized or "enddate" in normalized or normalized.endswith("to"):
+            new_query.append((key, format_like(value, end)))
+            changed += 1
+        else:
+            new_query.append((key, value))
+    if query:
+        url = urlunparse(parsed._replace(query=urlencode(new_query, doseq=True)))
 
     if body:
-        body_text = body.decode("utf-8", errors="replace")
-        body_changed = 0
-        if "json" in content_type or body_text.strip().startswith(("{", "[")):
-            try:
-                data = json.loads(body_text)
-                new_data, body_changed = replace_dates_json(data, start, end)
-                if body_changed:
-                    body_text = json.dumps(new_data, ensure_ascii=False, separators=(",", ":"))
-            except Exception:
-                body_text, body_changed = replace_date_tokens_text(body_text, start, end)
-        else:
-            pairs = parse_qsl(body_text, keep_blank_values=True)
-            if pairs:
-                new_pairs, body_changed = replace_dates_in_mapping(pairs, start, end)
-                if body_changed:
-                    body_text = urlencode(new_pairs, doseq=True)
-                else:
-                    body_text, body_changed = replace_date_tokens_text(body_text, start, end)
-            else:
-                body_text, body_changed = replace_date_tokens_text(body_text, start, end)
-        total_changed += body_changed
-        body = body_text.encode("utf-8")
-
-    if total_changed == 0:
-        # Last-resort URL regex replacement. Useful when dates are embedded in path or compact payload.
-        new_url, c = replace_date_tokens_text(url, start, end)
-        total_changed += c
-        url = new_url
-
-    if total_changed == 0:
-        fail(
-            "Не нашёл даты в Copy as cURL, поэтому не могу безопасно заменить период. "
-            "Открой Torgstat, выставь любой период, нажми Скачать и скопируй именно запрос скачивания из Network."
-        )
-
-    log(f"date_replace: changed_fields={total_changed}, period={fmt_dmy(start)}-{fmt_dmy(end)}")
-    return CurlRequest(url=url, method=req.method, headers=dict(req.headers), body=body)
-
-
-def request_download(req: CurlRequest) -> bytes:
-    headers = dict(req.headers)
-    # Let requests handle compressed response; remove HTTP/2 pseudo/noise headers if copied.
-    for k in list(headers.keys()):
-        lk = k.lower()
-        if lk.startswith(":") or lk in {"content-length", "host"}:
-            headers.pop(k, None)
-
-    header_names = {k.lower() for k in headers}
-    if "cookie" not in header_names and "authorization" not in header_names:
-        fail(
-            "В TORGSTAT_ABC_CURL нет авторизации: не найден header cookie/authorization. "
-            "Скопируй не URL, а строку Network через: Правой кнопкой по wbapi-report-goods → "
-            "Копировать → Копировать как cURL (bash), либо вставь полный блок Headers с cookie."
-        )
-
-    safe_header_list = ", ".join(sorted(k.lower() for k in headers.keys()))
-    log(f"request_headers: {safe_header_list}")
-    session = requests.Session()
-    log(f"request: {req.method} {req.url.split('?')[0]}")
-    resp = session.request(
-        req.method,
-        req.url,
-        headers=headers,
-        data=req.body,
-        timeout=180,
-        allow_redirects=True,
-    )
-    ct = resp.headers.get("content-type", "")
-    log(f"response: status={resp.status_code}, content-type={ct}, bytes={len(resp.content):,}")
-    if resp.status_code >= 400:
-        preview = resp.text[:1000] if resp.text else ""
-        fail(f"Torgstat вернул HTTP {resp.status_code}. Ответ: {preview}")
-
-    content = resp.content
-    # Some Torgstat exports return JSON with a temporary download link or embedded XLSX.
-    if not looks_like_xlsx(content):
+        text = body.decode("utf-8", errors="replace")
         try:
-            js = resp.json()
-            embedded = find_xlsx_bytes_in_json(js)
-            if embedded:
-                log("response: found embedded XLSX in JSON")
-                content = embedded
-            else:
-                url = find_download_url(js)
-                if url:
-                    log("response: found download URL in JSON, fetching XLSX")
-                    r2 = session.get(url, headers=headers, timeout=180, allow_redirects=True)
-                    log(f"download_url_response: status={r2.status_code}, bytes={len(r2.content):,}")
-                    if r2.status_code >= 400:
-                        fail(f"Download URL вернул HTTP {r2.status_code}: {r2.text[:1000]}")
-                    content = r2.content
-        except Exception as e:
-            log(f"response: JSON export parsing skipped: {e}")
-    return content
+            data = json.loads(text)
+            data, body_changed = replace_dates_json(data, start, end)
+            if body_changed:
+                text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            changed += body_changed
+        except Exception:
+            text, body_changed = replace_date_tokens(text, start, end)
+            changed += body_changed
+        body = text.encode("utf-8")
+
+    if changed == 0:
+        url, url_changed = replace_date_tokens(url, start, end)
+        changed += url_changed
+    if changed == 0:
+        fail("Не нашёл даты в TORGSTAT_ABC_CURL")
+    log(f"date_replace: changed_fields={changed}, period={fmt_dmy(start)}-{fmt_dmy(end)}")
+    return CurlRequest(url, req.method, dict(req.headers or {}), body)
+
 
 def looks_like_xlsx(content: bytes) -> bool:
     return bool(content and content[:2] == b"PK" and len(content) > 1000)
 
 
-def find_download_url(obj: Any) -> Optional[str]:
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, str) and v.startswith(("http://", "https://")) and any(t in k.lower() for t in ["url", "link", "download", "file"]):
-                return v
-            found = find_download_url(v)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for v in obj:
-            found = find_download_url(v)
-            if found:
-                return found
-    return None
-
-
-def find_xlsx_bytes_in_json(obj: Any) -> Optional[bytes]:
-    """Find embedded XLSX bytes in a JSON response, including base64 data URLs."""
-    import base64
-
-    if isinstance(obj, str):
-        s = obj.strip()
-        if s.startswith("data:") and ";base64," in s:
-            s = s.split(",", 1)[1].strip()
-        # XLSX is a ZIP file, usually encoded as base64 starting with UEsDB.
-        if len(s) > 1000 and re.fullmatch(r"[A-Za-z0-9+/=_\-\s]+", s):
-            compact = re.sub(r"\s+", "", s)
-            for candidate in (compact, compact.replace("-", "+").replace("_", "/")):
-                try:
-                    raw = base64.b64decode(candidate + "=" * (-len(candidate) % 4), validate=False)
-                except Exception:
-                    continue
-                if looks_like_xlsx(raw):
-                    return raw
-        return None
-
-    if isinstance(obj, dict):
-        for v in obj.values():
-            found = find_xlsx_bytes_in_json(v)
-            if found:
-                return found
-    elif isinstance(obj, list):
-        for v in obj:
-            found = find_xlsx_bytes_in_json(v)
-            if found:
-                return found
-    return None
-
-
 def normalize_header(value: Any) -> str:
-    s = str(value or "").strip().lower().replace("ё", "е")
-    s = re.sub(r"\s+", " ", s)
-    return s
+    return re.sub(r"\s+", " ", str(value or "").strip().lower().replace("ё", "е"))
 
 
-def validate_xlsx(content: bytes) -> Tuple[str, int, List[str]]:
+def validate_torgstat_xlsx(content: bytes) -> Tuple[str, int]:
     if not looks_like_xlsx(content):
-        sample = content[:500].decode("utf-8", errors="replace")
-        fail(f"Скачанный файл не похож на XLSX. Первые байты/текст: {sample}")
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
+        fail(f"Торгстат вернул не XLSX: {content[:300].decode('utf-8', errors='replace')}")
+    path = write_temp_xlsx(content)
     try:
-        wb = load_workbook(tmp_path, read_only=True, data_only=True)
-        required_any_gp = ["валовая прибыль", "валов прибыль", "gross profit"]
-        required_any_art = ["артикул wb", "артикул вб", "nm", "nm id", "nmid"]
-        best_sheet = ""
-        best_row = 0
-        best_headers: List[str] = []
+        wb = load_workbook(path, read_only=True, data_only=True)
         for ws in wb.worksheets:
-            for ridx, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 30), values_only=True), start=1):
-                headers = [normalize_header(v) for v in row if v is not None]
-                if not headers:
-                    continue
-                has_gp = any(any(token in h for token in required_any_gp) for h in headers)
-                has_art = any(any(token in h for token in required_any_art) for h in headers)
-                if has_gp and has_art:
-                    best_sheet = ws.title
-                    best_row = ridx
-                    best_headers = headers
-                    return best_sheet, best_row, best_headers
-        fail(
-            "XLSX скачан, но не похож на АБС-отчёт: не нашёл одновременно колонки "
-            "'Валовая прибыль' и 'Артикул WB' в первых 30 строках."
-        )
+            for row_index, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 30), values_only=True), 1):
+                headers = [normalize_header(value) for value in row if value is not None]
+                has_gp = any("валов" in header and "приб" in header for header in headers)
+                has_article = any(token in header for header in headers for token in ("артикул wb", "артикул вб", "nm id", "nmid"))
+                if has_gp and has_article:
+                    return ws.title, row_index
+        fail("XLSX Торгстата не содержит колонок валовой прибыли и артикула WB")
     finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+        safe_remove(path)
 
 
-def output_filename(store: str, start: dt.date, end: dt.date) -> str:
-    # IMPORTANT: preserve Torgstat filename family. Existing downstream code parses this pattern.
-    # Example from manual downloads:
-    # wb_abc_report_goods__27.04.2026-03.05.2026__at_2026-05-19_20-26.xlsx
-    ts = (dt.datetime.now(dt.UTC) + dt.timedelta(hours=DEFAULT_TZ_OFFSET_HOURS)).strftime("%Y-%m-%d_%H-%M")
-    return f"wb_abc_report_goods__{fmt_dmy(start)}-{fmt_dmy(end)}__at_{ts}.xlsx"
+def validate_wb_entry_xlsx(content: bytes) -> Tuple[str, int, int]:
+    if not looks_like_xlsx(content):
+        fail(f"WB вернул не XLSX: {content[:300].decode('utf-8', errors='replace')}")
+    path = write_temp_xlsx(content)
+    try:
+        # У файлов WB неверный dimension в XML, поэтому read_only=False обязателен.
+        wb = load_workbook(path, read_only=False, data_only=True)
+        for ws in wb.worksheets:
+            for row_index, row in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 30), values_only=True), 1):
+                headers = {normalize_header(value) for value in row if value is not None}
+                required = {"раздел", "точка входа", "показы", "переходы в карточку", "заказы"}
+                if required.issubset(headers):
+                    return ws.title, row_index, ws.max_row
+        fail("XLSX WB не похож на отчёт «Точки входа»: не найдены ожидаемые колонки")
+    finally:
+        safe_remove(path)
 
 
-def output_key(store: str, start: dt.date, end: dt.date, reports_root: str, abc_folder: str) -> str:
-    """Return the exact Object Storage key expected by report_runner.py.
+def write_temp_xlsx(content: bytes) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as handle:
+        handle.write(content)
+        return handle.name
 
-    ABC reports must be stored directly under:
-        Отчёты/ABC/
 
-    There must be no store-level folder and no weekly/monthly subfolder here.
-    """
-    folder = abc_folder.strip("/") or DEFAULT_ABC_FOLDER
-    if folder.replace("\\", "/").strip("/") != "ABC":
-        log(f"WARN: abc_folder={folder!r}; downstream report expects 'ABC'. Using 'ABC'.")
-        folder = "ABC"
-    return f"{reports_root.rstrip('/')}/{folder}/{output_filename(store, start, end)}"
+def safe_remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def s3_client():
@@ -670,22 +520,15 @@ def s3_client():
     access = os.environ.get("YC_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
     secret = os.environ.get("YC_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
     if not access or not secret:
-        fail("Нет YC_ACCESS_KEY_ID/YC_SECRET_ACCESS_KEY. Добавь secrets или положи их в REPORT_ENV")
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint,
-        region_name=region,
-        aws_access_key_id=access,
-        aws_secret_access_key=secret,
-    )
+        fail("Нет YC_ACCESS_KEY_ID/YC_SECRET_ACCESS_KEY")
+    return boto3.client("s3", endpoint_url=endpoint, region_name=region, aws_access_key_id=access, aws_secret_access_key=secret)
 
 
 def upload_to_s3(content: bytes, key: str) -> None:
     bucket = os.environ.get("YC_BUCKET_NAME") or os.environ.get("S3_BUCKET") or os.environ.get("AWS_BUCKET")
     if not bucket:
-        fail("Нет YC_BUCKET_NAME. Добавь secret или положи его в REPORT_ENV")
-    client = s3_client()
-    client.put_object(
+        fail("Нет YC_BUCKET_NAME")
+    s3_client().put_object(
         Bucket=bucket,
         Key=key,
         Body=content,
@@ -694,66 +537,314 @@ def upload_to_s3(content: bytes, key: str) -> None:
     log(f"uploaded: s3://{bucket}/{key}")
 
 
-def run_download(raw_curl: str, store: str, start: dt.date, end: dt.date, reports_root: str, abc_folder: str, dry_run: bool = False) -> str:
-    base_req = parse_curl(raw_curl)
-    req = update_request_dates(base_req, start, end)
-    key = output_key(store, start, end, reports_root, abc_folder)
-    filename = output_filename(store, start, end)
-    log(f"target_filename: {filename}")
-    log(f"target_key: {key}")
+def timestamp_suffix() -> str:
+    return now_local().strftime("%Y-%m-%d_%H-%M")
+
+
+def torgstat_key(start: dt.date, end: dt.date, reports_root: str, abc_folder: str) -> str:
+    filename = f"wb_abc_report_goods__{fmt_dmy(start)}-{fmt_dmy(end)}__at_{timestamp_suffix()}.xlsx"
+    return f"{reports_root.rstrip('/')}/{abc_folder.strip('/') or DEFAULT_ABC_FOLDER}/{filename}"
+
+
+def wb_entry_key(store: str, start: dt.date, end: dt.date, reports_root: str, folder: str) -> str:
+    filename = f"wb_entry_points__{fmt_dmy(start)}-{fmt_dmy(end)}__at_{timestamp_suffix()}.xlsx"
+    return f"{reports_root.rstrip('/')}/{folder.strip('/') or DEFAULT_WB_ENTRY_FOLDER}/{filename}"
+
+
+def download_torgstat_period(raw_curl: str, start: dt.date, end: dt.date, reports_root: str, abc_folder: str, dry_run: bool) -> str:
+    req = update_request_dates(parse_curl(raw_curl), start, end)
+    key = torgstat_key(start, end, reports_root, abc_folder)
+    log(f"Torgstat target_key: {key}")
     if dry_run:
-        log("dry_run: request was parsed and dates were replaced; download/upload skipped")
         return key
-    content = request_download(req)
-    sheet, header_row, headers = validate_xlsx(content)
-    log(f"xlsx_validation: OK, sheet={sheet}, header_row={header_row}, headers_sample={headers[:8]}")
+    headers = sanitized_headers(req.headers or {})
+    if not header_get(headers, "cookie") and not header_get(headers, "authorization"):
+        fail("TORGSTAT_ABC_CURL не содержит cookie/authorization")
+    response = requests.request(req.method, req.url, headers=headers, data=req.body, timeout=180, allow_redirects=True)
+    log(f"Torgstat response: status={response.status_code}, bytes={len(response.content):,}")
+    if response.status_code >= 400:
+        fail(f"Торгстат HTTP {response.status_code}: {response.text[:1000]}")
+    content = response.content
+    if not looks_like_xlsx(content):
+        try:
+            data = response.json()
+            link = find_first_url(data)
+            if link:
+                second = requests.get(link, headers=headers, timeout=180, allow_redirects=True)
+                content = second.content
+        except Exception:
+            pass
+    sheet, row = validate_torgstat_xlsx(content)
+    log(f"Torgstat XLSX OK: sheet={sheet}, header_row={row}")
     upload_to_s3(content, key)
     return key
 
 
+def find_first_url(obj: Any) -> Optional[str]:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if isinstance(value, str) and value.startswith(("http://", "https://")) and any(token in key.lower() for token in ("url", "link", "download", "file")):
+                return value
+            found = find_first_url(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_first_url(value)
+            if found:
+                return found
+    return None
+
+
+def classify_wb_requests(raw: str) -> Tuple[CurlRequest, CurlRequest, CurlRequest, Optional[CurlRequest], Dict[str, str]]:
+    commands = split_curl_commands(raw)
+    if not commands:
+        fail("WB_ENTRY_POINTS_CURLS пустой")
+    requests_ = [parse_curl(command) for command in commands]
+    create_req: Optional[CurlRequest] = None
+    list_req: Optional[CurlRequest] = None
+    token_req: Optional[CurlRequest] = None
+    file_req: Optional[CurlRequest] = None
+
+    for req in requests_:
+        parsed = urlparse(req.url)
+        path = parsed.path.lower()
+        host = parsed.netloc.lower()
+        if "downloads-content-analytics.wildberries.ru" in host:
+            file_req = req
+        elif path.endswith("/file-manager/downloads") or "/file-manager/downloads" in path:
+            list_req = req
+        elif path.endswith("/file-manager/download") and "seller-content.wildberries.ru" in host:
+            create_req = req
+        elif path.endswith("/tokensjrpc") or path.endswith("/tokens/rpc"):
+            token_req = req
+
+    if not create_req:
+        fail("WB_ENTRY_POINTS_CURLS: не найден cURL /file-manager/download")
+    if not token_req:
+        fail("WB_ENTRY_POINTS_CURLS: не найден cURL /tokensjrpc")
+
+    auth = best_wb_auth_headers(requests_)
+    create_req = apply_wb_auth(create_req, auth)
+    token_req = apply_wb_auth(token_req, auth)
+
+    if not list_req:
+        list_req = CurlRequest(
+            url=f"{WB_MANAGER_BASE}/downloads?report_types={WB_REPORT_TYPE}",
+            method="GET",
+            headers=dict(create_req.headers or {}),
+            body=None,
+        )
+    else:
+        list_req = apply_wb_auth(list_req, auth)
+
+    if file_req:
+        file_req = apply_wb_auth(file_req, auth)
+    return create_req, list_req, token_req, file_req, auth
+
+
+def prepare_wb_create_request(template: CurlRequest, start: dt.date, end: dt.date, report_id: str) -> CurlRequest:
+    try:
+        payload = json.loads((template.body or b"{}").decode("utf-8"))
+    except Exception as exc:
+        fail(f"Не удалось прочитать JSON /file-manager/download: {exc}")
+    payload["id"] = report_id
+    payload["reportType"] = WB_REPORT_TYPE
+    params = payload.setdefault("params", {})
+    params["startDate"] = fmt_iso(start)
+    params["endDate"] = fmt_iso(end)
+    params.setdefault("nmsIDs", [])
+    params.setdefault("subjectIDs", [])
+    params.setdefault("brandNames", [])
+    params.setdefault("tagIds", [])
+    params.setdefault("vendorCodes", [])
+    headers = dict(template.headers or {})
+    header_set(headers, "content-type", "application/json")
+    return CurlRequest(template.url, "POST", headers, json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def prepare_token_request(template: CurlRequest) -> CurlRequest:
+    payload = {"method": "generateToken", "params": {"team": "content-analytics"}, "jsonrpc": "2.0", "id": f"json-rpc_{uuid.uuid4().hex[:10]}"}
+    headers = dict(template.headers or {})
+    header_set(headers, "content-type", "application/json")
+    return CurlRequest(template.url or WB_TOKEN_URL, "POST", headers, json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+
+
+def find_dict_by_id(obj: Any, report_id: str) -> Optional[Dict[str, Any]]:
+    if isinstance(obj, dict):
+        for key in ("id", "reportId", "reportID", "uuid"):
+            if str(obj.get(key, "")) == report_id:
+                return obj
+        for value in obj.values():
+            found = find_dict_by_id(value, report_id)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_dict_by_id(value, report_id)
+            if found:
+                return found
+    return None
+
+
+def report_state(entry: Optional[Dict[str, Any]]) -> str:
+    if not entry:
+        return "not_found"
+    for key in ("status", "state", "reportStatus", "fileStatus"):
+        if key in entry:
+            return str(entry[key]).strip().lower()
+    for key in ("isReady", "ready", "completed"):
+        if entry.get(key) is True:
+            return "ready"
+    return "found"
+
+
+def extract_download_token(obj: Any) -> Optional[str]:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if "token" in key.lower() and isinstance(value, str) and len(value.strip()) > 50:
+                return value.strip()
+        if "result" in obj and isinstance(obj["result"], str) and len(obj["result"].strip()) > 50:
+            return obj["result"].strip()
+        for value in obj.values():
+            found = extract_download_token(value)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = extract_download_token(value)
+            if found:
+                return found
+    elif isinstance(obj, str) and len(obj.strip()) > 100:
+        return obj.strip()
+    return None
+
+
+def build_file_headers(file_template: Optional[CurlRequest], auth: Dict[str, str], token: str) -> Dict[str, str]:
+    headers = dict(file_template.headers or {}) if file_template else {}
+    for key, value in auth.items():
+        header_set(headers, key, value)
+    header_set(headers, "accept", "*/*")
+    header_set(headers, "origin", "https://seller.wildberries.ru")
+    header_set(headers, "referer", "https://seller.wildberries.ru/")
+    header_set(headers, "x-download-token", token)
+    return sanitized_headers(headers)
+
+
+def try_download_wb_file(
+    session: requests.Session,
+    report_id: str,
+    token_req_template: CurlRequest,
+    file_template: Optional[CurlRequest],
+    auth: Dict[str, str],
+) -> Tuple[Optional[bytes], int, str]:
+    token_data = request_json(session, prepare_token_request(token_req_template))
+    token = extract_download_token(token_data)
+    if not token:
+        fail(f"WB tokensjrpc: не найден download token в ответе: {str(token_data)[:1000]}")
+    url = f"{WB_FILE_BASE}/{report_id}"
+    headers = build_file_headers(file_template, auth, token)
+    response = session.get(url, headers=headers, timeout=180, allow_redirects=True)
+    content_type = response.headers.get("content-type", "")
+    log(f"WB file GET: status={response.status_code}, content-type={content_type}, bytes={len(response.content):,}")
+    if response.status_code == 200 and looks_like_xlsx(response.content):
+        return response.content, response.status_code, "ready"
+    preview = response.text[:500] if not looks_like_xlsx(response.content) else ""
+    return None, response.status_code, preview
+
+
+def download_wb_entry_period(
+    raw_curls: str,
+    store: str,
+    start: dt.date,
+    end: dt.date,
+    reports_root: str,
+    folder: str,
+    dry_run: bool,
+    max_wait_seconds: int,
+) -> str:
+    create_template, list_template, token_template, file_template, auth = classify_wb_requests(raw_curls)
+    report_id = str(uuid.uuid4())
+    key = wb_entry_key(store, start, end, reports_root, folder)
+    log(f"WB entry-points report_id={report_id}")
+    log(f"WB entry-points target_key: {key}")
+    if dry_run:
+        prepared = prepare_wb_create_request(create_template, start, end, report_id)
+        log(f"WB dry_run: create_url={prepared.url}, token_url={token_template.url}")
+        return key
+
+    session = requests.Session()
+    create_data = request_json(session, prepare_wb_create_request(create_template, start, end, report_id))
+    log(f"WB create response: {str(create_data)[:500]}")
+
+    deadline = time.monotonic() + max_wait_seconds
+    attempt = 0
+    last_state = "unknown"
+    last_error = ""
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            list_data = request_json(session, list_template)
+            entry = find_dict_by_id(list_data, report_id)
+            last_state = report_state(entry)
+            log(f"WB poll #{attempt}: state={last_state}")
+            failed_tokens = ("fail", "error", "cancel", "reject")
+            if any(token in last_state for token in failed_tokens):
+                fail(f"WB не сформировал отчёт {report_id}: state={last_state}, entry={entry}")
+        except SystemExit:
+            raise
+        except Exception as exc:
+            last_error = str(exc)
+            log(f"WB list warning: {last_error}")
+
+        # Через первые 10 секунд пробуем файл независимо от названия статуса WB.
+        if attempt >= 2 or last_state in {"ready", "done", "success", "completed", "created", "finished"}:
+            try:
+                content, status, preview = try_download_wb_file(session, report_id, token_template, file_template, auth)
+                if content:
+                    sheet, header_row, rows = validate_wb_entry_xlsx(content)
+                    log(f"WB XLSX OK: sheet={sheet}, header_row={header_row}, rows={rows}")
+                    upload_to_s3(content, key)
+                    return key
+                if status in {401, 403}:
+                    fail("WB download: авторизация истекла. Обнови secret WB_ENTRY_POINTS_CURLS")
+                last_error = f"download status={status}, response={preview}"
+            except SystemExit:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                log(f"WB download waiting: {last_error}")
+
+        time.sleep(10)
+
+    fail(f"WB отчёт не был скачан за {max_wait_seconds // 60} мин. Последний state={last_state}; {last_error}")
+
+
 def self_test() -> None:
-    sample = "curl 'https://example.com/export?dateFrom=2026-05-01&dateTo=2026-05-27' -H 'accept: application/json' -H 'cookie: session=abc' --data-raw '{\"startDate\":\"2026-05-01\",\"endDate\":\"2026-05-27\"}'"
-    req = parse_curl(sample)
-    new = update_request_dates(req, dt.date(2026, 5, 10), dt.date(2026, 5, 11))
-    assert "2026-05-10" in new.url and "2026-05-11" in new.url
-    assert b"2026-05-10" in (new.body or b"") and b"2026-05-11" in (new.body or b"")
-    assert "cookie" in {k.lower() for k in new.headers}
-
-    raw_headers = """URL запроса
-https://torgstat.ru/api/trpc/wbapi-report-goods?batch=1&input=%7B%220%22%3A%7B%22dateFrom%22%3A%222026-05-01%22%2C%22dateTo%22%3A%222026-05-27%22%7D%7D
-Метод запроса
-GET
-content-type
-application/json
-cookie
-__Secure-next-auth.session-token=test
-referer
-https://torgstat.ru/wb-seller/sales
-user-agent
-Mozilla/5.0
-"""
-    req2 = parse_curl(raw_headers)
-    new2 = update_request_dates(req2, dt.date(2026, 5, 12), dt.date(2026, 5, 13))
-    assert "2026-05-12" in new2.url and "2026-05-13" in new2.url
-    assert "cookie" in {k.lower() for k in new2.headers}
-
-    cmd_curl = 'curl "https://example.com/export?dateFrom=2026-05-01&dateTo=2026-05-27" ^ -H "cookie: session=abc" ^ --compressed'
-    req3 = parse_curl(cmd_curl)
-    assert "cookie" in {k.lower() for k in req3.headers}
-
-    fn = output_filename("TOPFACE", dt.date(2026, 5, 1), dt.date(2026, 5, 27))
-    assert fn.startswith("wb_abc_report_goods__01.05.2026-27.05.2026__at_")
-    assert fn.endswith(".xlsx")
+    commands = split_curl_commands("curl 'https://a.test/x' \\\n -H 'accept: */*'\n\ncurl 'https://b.test/y' -d '{\"x\":1}'")
+    assert len(commands) == 2
+    assert parse_curl(commands[1]).method == "POST"
+    start, end = previous_full_week(dt.date(2026, 7, 30))
+    assert start == dt.date(2026, 7, 20) and end == dt.date(2026, 7, 26)
+    payload = {"params": {"startDate": "2026-07-13", "endDate": "2026-07-19"}}
+    replaced, count = replace_dates_json(payload, start, end)
+    assert count == 2 and replaced["params"]["startDate"] == "2026-07-20"
+    token_response = {"jsonrpc": "2.0", "result": {"token": "x" * 120}}
+    assert extract_download_token(token_response) == "x" * 120
     log("self-test: OK")
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Download Torgstat ABC report to S3")
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Загрузка внешних источников: Торгстат АБС-анализ и Точки входа ВБ")
+    parser.add_argument("--source", default="all", choices=["all", "torgstat_abc", "wb_entry_points"])
     parser.add_argument("--mode", default="auto", choices=["auto", "daily", "weekly", "custom"])
     parser.add_argument("--store", default=DEFAULT_STORE)
     parser.add_argument("--date-from", default="")
     parser.add_argument("--date-to", default="")
     parser.add_argument("--reports-root", default=os.environ.get("REPORTS_ROOT", DEFAULT_REPORTS_ROOT))
     parser.add_argument("--abc-folder", default=os.environ.get("ABC_FOLDER", DEFAULT_ABC_FOLDER))
+    parser.add_argument("--wb-entry-folder", default=os.environ.get("WB_ENTRY_POINTS_FOLDER", DEFAULT_WB_ENTRY_FOLDER))
+    parser.add_argument("--wb-max-wait-minutes", type=int, default=20)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
@@ -764,19 +855,45 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     load_report_env()
-    raw_curl = os.environ.get("TORGSTAT_ABC_CURL", "")
-    periods = period_for_mode(args.mode, args.date_from or None, args.date_to or None)
-    log(f"mode={args.mode}, store={args.store}, periods={[(fmt_dmy(a), fmt_dmy(b), label) for a,b,label in periods]}")
-    uploaded_keys = []
-    for start, end, label in periods:
-        if start > end:
-            fail(f"Некорректный период {fmt_dmy(start)}-{fmt_dmy(end)}")
-        log(f"--- download {label}: {fmt_dmy(start)}-{fmt_dmy(end)} ---")
-        key = run_download(raw_curl, args.store, start, end, args.reports_root, args.abc_folder, dry_run=args.dry_run)
-        uploaded_keys.append(key)
-        time.sleep(1)
+    results: List[str] = []
+
+    if args.source in {"all", "torgstat_abc"}:
+        raw_torgstat = os.environ.get("TORGSTAT_ABC_CURL", "")
+        if not raw_torgstat.strip():
+            fail("Не задан secret TORGSTAT_ABC_CURL")
+        periods = torgstat_periods(args.mode, args.date_from, args.date_to)
+        log(f"Torgstat periods={[(fmt_dmy(a), fmt_dmy(b), label) for a, b, label in periods]}")
+        for start, end, label in periods:
+            if start > end:
+                fail(f"Некорректный период {start}—{end}")
+            log(f"--- Torgstat {label}: {fmt_dmy(start)}-{fmt_dmy(end)} ---")
+            results.append(download_torgstat_period(raw_torgstat, start, end, args.reports_root, args.abc_folder, args.dry_run))
+            time.sleep(1)
+
+    if args.source in {"all", "wb_entry_points"}:
+        periods = wb_periods(args.mode, args.date_from, args.date_to)
+        if periods:
+            raw_wb = os.environ.get("WB_ENTRY_POINTS_CURLS", "")
+            if not raw_wb.strip():
+                fail("Не задан secret WB_ENTRY_POINTS_CURLS")
+            log(f"WB entry-points periods={[(fmt_dmy(a), fmt_dmy(b), label) for a, b, label in periods]}")
+            for start, end, label in periods:
+                if start > end:
+                    fail(f"Некорректный период {start}—{end}")
+                log(f"--- WB entry-points {label}: {fmt_dmy(start)}-{fmt_dmy(end)} ---")
+                results.append(download_wb_entry_period(
+                    raw_wb,
+                    args.store,
+                    start,
+                    end,
+                    args.reports_root,
+                    args.wb_entry_folder,
+                    args.dry_run,
+                    max(1, args.wb_max_wait_minutes) * 60,
+                ))
+
     log("DONE")
-    for key in uploaded_keys:
+    for key in results:
         log(f"RESULT_KEY={key}")
     return 0
 
