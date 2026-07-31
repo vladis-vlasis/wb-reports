@@ -1,9 +1,10 @@
-name: Документы по поставкам TOPFACE V6
-# Python в корне репозитория: wb_supply_documents_TOPFACE_v6_20260731.py
-# Workflow: .github/workflows/wb_supply_documents_TOPFACE_v6_20260731.yml
-# ВАЖНО: workflow запускает строго файл V6 и проверяет внутреннюю VERSION V6.
+name: Документы по поставкам TOPFACE V7
+# ПОСТОЯННЫЕ ИМЕНА В GITHUB:
+# Python:   wb_supply_documents.py
+# Workflow: .github/workflows/wb_supply_documents.yml
+# Название скачанного файла с припиской v7 — только для различения версий у пользователя.
 
-run-name: Поставки и УПД TOPFACE V6 — ${{ github.event.inputs.mode || 'auto' }}
+run-name: Поставки и УПД TOPFACE V7 — ${{ github.event.inputs.mode || 'auto' }}
 
 on:
   schedule:
@@ -38,16 +39,15 @@ on:
         type: boolean
 
 jobs:
-  wb-supply-documents-v6:
-    name: Контроль поставок, УПД и актов TOPFACE V6
+  wb-supply-documents:
+    name: Контроль поставок, УПД и актов TOPFACE V7
     runs-on: ubuntu-latest
     timeout-minutes: 90
     concurrency:
-      group: wb-supply-documents-topface-v6
+      group: wb-supply-documents-topface
       cancel-in-progress: false
 
     env:
-      # Используются только уже существующие secrets репозитория.
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -79,18 +79,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests boto3 openpyxl
 
-      - name: Verify exact V6 script
+      - name: Verify repository script
         shell: bash
         run: |
           set -euo pipefail
-          SCRIPT_PATH="./wb_supply_documents_TOPFACE_v6_20260731.py"
-          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V6_20260731"
+          SCRIPT_PATH="./wb_supply_documents.py"
+          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731"
 
           echo "Files in repository root:"
           find . -maxdepth 2 -type f | sort
 
           if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "::error::Не найден $SCRIPT_PATH. Файл должен лежать в корне репозитория без переименования."
+            echo "::error::Не найден $SCRIPT_PATH. В GitHub файл всегда должен называться wb_supply_documents.py."
             exit 1
           fi
 
@@ -99,7 +99,7 @@ jobs:
           echo "Detected: $ACTUAL_VERSION"
 
           if ! grep -q "$EXPECTED_VERSION" "$SCRIPT_PATH"; then
-            echo "::error::В $SCRIPT_PATH находится не версия $EXPECTED_VERSION."
+            echo "::error::В $SCRIPT_PATH находится не версия $EXPECTED_VERSION. Замени содержимое постоянного файла wb_supply_documents.py кодом из wb_supply_documents_v7.py."
             exit 1
           fi
 
@@ -117,7 +117,7 @@ jobs:
           [ -n "${TELEGRAM_CHAT_ID:-}" ] || { echo "::error::Пустой существующий secret TELEGRAM_CHAT_ID"; exit 1; }
           echo "Existing secrets: OK (values are not printed)"
 
-      - name: Run supply and document monitor V6
+      - name: Run supply and document monitor
         shell: bash
         run: |
           set -euo pipefail
@@ -145,6 +145,6 @@ jobs:
           fi
 
           echo "script=$WB_SUPPLY_DOCUMENTS_SCRIPT"
-          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V6_20260731"
+          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731"
           echo "mode=$MODE lookback=$LOOKBACK document_lookback=$DOC_LOOKBACK force_notify=$FORCE_NOTIFY dry_run=$DRY_RUN"
           python "$WB_SUPPLY_DOCUMENTS_SCRIPT" "${ARGS[@]}"
