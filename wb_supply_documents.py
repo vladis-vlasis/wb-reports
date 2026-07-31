@@ -73,7 +73,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V9_20260731"
+VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V10_20260731"
 STORE_NAME = "TOPFACE"
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -98,6 +98,7 @@ STATUS_NAMES = {
 }
 ALL_STATUS_IDS = [1, 2, 3, 4, 5, 6]
 DEFAULT_NOTIFY_STATUS_IDS = {4, 5, 6}
+DEFAULT_TELEGRAM_MIN_SUPPLY_QTY = 100
 
 TELEGRAM_TOKEN_ALIASES = (
     "TELEGRAM_BOT_TOKEN",
@@ -1445,6 +1446,30 @@ def supply_sort_key(supply: SupplySummary) -> Tuple[dt.date, int]:
     return supply_reference_date(supply) or dt.date.min, supply.supply_id
 
 
+def supply_telegram_quantity(supply: SupplySummary) -> int:
+    """Количество для фильтра Telegram.
+
+    Берём максимум из заявки, приёмки и количества связанных УПД. Это не даёт
+    скрыть обычную поставку, если одно из полей Supplies API временно неполное.
+    """
+    upd_quantities = [to_int(item.get("total_qty"), 0) for item in supply.upd_documents]
+    return max(
+        [
+            to_int(supply.planned_qty, 0),
+            to_int(supply.unloading_qty, 0),
+            to_int(supply.accepted_qty, 0),
+            to_int(supply.ready_qty, 0),
+            *upd_quantities,
+        ],
+        default=0,
+    )
+
+
+def supply_visible_in_telegram(supply: SupplySummary, minimum_qty: int) -> bool:
+    """Поставки меньше minimum_qty не показываются и не отправляют XML в Telegram."""
+    return supply_telegram_quantity(supply) >= max(to_int(minimum_qty, 0), 0)
+
+
 # ---------------------------------------------------------------------------
 # Основной процесс
 # ---------------------------------------------------------------------------
@@ -1521,6 +1546,7 @@ def run(args: argparse.Namespace) -> int:
         log(f"DRY RUN: registry_exists={not registry_was_new}")
         log(f"DRY RUN: lookback_days={args.lookback_days}; document_lookback_days={args.document_lookback_days}")
         log(f"DRY RUN: upd_send_mode={args.upd_send_mode}; supply_message_mode={args.supply_message_mode}")
+        log(f"DRY RUN: telegram_min_supply_qty={args.telegram_min_supply_qty}")
         if supply_message_from and supply_message_to:
             log(f"DRY RUN: supply_message_period={supply_message_from} — {supply_message_to}")
         return 0
@@ -1766,6 +1792,20 @@ def run(args: argparse.Namespace) -> int:
         data["notified_state_hash"] = (previous or {}).get("notified_state_hash", "")
         old_supplies[str(supply_id)] = data
 
+    # УПД и акты по маленьким доприёмкам продолжаем скачивать и хранить,
+    # но поставки меньше порога не включаем в Telegram и не прикладываем их XML.
+    telegram_supply_events: Dict[int, Dict[str, Any]] = {
+        supply_id: event
+        for supply_id, event in supply_events.items()
+        if supply_visible_in_telegram(summaries_by_id[supply_id], args.telegram_min_supply_qty)
+    }
+    suppressed_small_supply_ids = sorted(set(supply_events) - set(telegram_supply_events))
+    if suppressed_small_supply_ids:
+        log(
+            f"Telegram: скрыто поставок меньше {args.telegram_min_supply_qty} шт.: "
+            f"{len(suppressed_small_supply_ids)}; IDs={suppressed_small_supply_ids}"
+        )
+
     unmatched_new_upds: List[Dict[str, Any]] = []
     for record in newly_downloaded:
         if record.get("kind") != "upd":
@@ -1798,6 +1838,7 @@ def run(args: argparse.Namespace) -> int:
             "to": supply_message_to.isoformat() if supply_message_to else "",
         },
         "upd_send_mode": args.upd_send_mode,
+        "telegram_min_supply_qty": args.telegram_min_supply_qty,
         "supplies": [asdict(summary) for summary in all_summaries],
         "discrepancies": discrepancy_rows,
         "new_documents": newly_downloaded,
@@ -1825,23 +1866,24 @@ def run(args: argparse.Namespace) -> int:
         message_parts.append("Поставки: только новые события и изменения")
     message_parts.extend([
         f"УПД в Telegram: {'сообщение + XML' if args.upd_send_mode == 'message_and_upd' else 'только сообщение'}",
+        f"Минимальный размер поставки для Telegram: {args.telegram_min_supply_qty} шт.",
         "",
     ])
 
     ordered_supply_ids = sorted(
-        supply_events,
+        telegram_supply_events,
         key=lambda supply_id: supply_sort_key(summaries_by_id[supply_id]),
         reverse=True,
     )
     for supply_id in ordered_supply_ids:
-        event = supply_events[supply_id]
+        event = telegram_supply_events[supply_id]
         message_parts.append(supply_event_text(summaries_by_id[supply_id], event.get("new_upds", [])))
         message_parts.append("")
     for upd in unmatched_new_upds:
         message_parts.append(unmatched_upd_text(upd))
         message_parts.append("")
 
-    if not supply_events and not unmatched_new_upds:
+    if not telegram_supply_events and not unmatched_new_upds:
         if supply_message_from and supply_message_to:
             message_parts.append("Поставки за выбранный период не найдены. Новых УПД тоже нет.")
         else:
@@ -1856,7 +1898,8 @@ def run(args: argparse.Namespace) -> int:
     message_parts.extend([
         "",
         f"Поставок в контроле: {len(all_summaries)}",
-        f"Поставок отправлено в сообщении: {len(supply_events)}",
+        f"Поставок отправлено в сообщении: {len(telegram_supply_events)}",
+        f"Мелких доприёмок скрыто (<{args.telegram_min_supply_qty} шт.): {len(suppressed_small_supply_ids)}",
         f"Новых документов скачано: {len(newly_downloaded)}",
         f"Осталось документов в очереди: {documents_remaining}",
         f"Новых УПД: {new_upd_count}",
@@ -1876,6 +1919,14 @@ def run(args: argparse.Namespace) -> int:
                 service_name = metadata.get("service_name", "")
                 record = old_documents.get(str(service_name), {})
                 upd = record.get("upd") or {}
+                linked_supply_id = to_int(upd.get("supply_id"), 0)
+                linked_supply = summaries_by_id.get(linked_supply_id) if linked_supply_id else None
+                if linked_supply and not supply_visible_in_telegram(linked_supply, args.telegram_min_supply_qty):
+                    log(
+                        f"Telegram: XML {filename} не отправлен — поставка {linked_supply_id} "
+                        f"меньше {args.telegram_min_supply_qty} шт.; файл сохранён в Object Storage"
+                    )
+                    continue
                 caption = (
                     f"TOPFACE | УПД №{upd.get('document_number') or 'без номера'} | "
                     f"Склад: {upd.get('warehouse') or 'не определён'} | "
@@ -1888,7 +1939,15 @@ def run(args: argparse.Namespace) -> int:
         notified_at = now_msk().isoformat()
         for supply_id in supply_events:
             old_supplies[str(supply_id)]["notified_state_hash"] = summaries_by_id[supply_id].state_hash
-            old_supplies[str(supply_id)]["notified_at"] = notified_at
+            if supply_id in telegram_supply_events:
+                old_supplies[str(supply_id)]["notified_at"] = notified_at
+                old_supplies[str(supply_id)].pop("telegram_suppressed_at", None)
+                old_supplies[str(supply_id)].pop("telegram_suppressed_reason", None)
+            else:
+                old_supplies[str(supply_id)]["telegram_suppressed_at"] = notified_at
+                old_supplies[str(supply_id)]["telegram_suppressed_reason"] = (
+                    f"quantity_below_{args.telegram_min_supply_qty}"
+                )
         for record in newly_downloaded:
             service_name = str(record.get("service_name", ""))
             if service_name in old_documents:
@@ -1900,7 +1959,9 @@ def run(args: argparse.Namespace) -> int:
         "status": "ok" if telegram_ok else "telegram_error",
         "supplies_found": len(shallow_supplies),
         "supplies_deep_checked": len(deep_candidates),
-        "supplies_sent": len(supply_events),
+        "supplies_sent": len(telegram_supply_events),
+        "supplies_suppressed_small": len(suppressed_small_supply_ids),
+        "telegram_min_supply_qty": args.telegram_min_supply_qty,
         "supply_message_mode": args.supply_message_mode,
         "supply_message_from": supply_message_from.isoformat() if supply_message_from else "",
         "supply_message_to": supply_message_to.isoformat() if supply_message_to else "",
@@ -1911,6 +1972,7 @@ def run(args: argparse.Namespace) -> int:
         "new_acceptance_acts": new_acceptance_count,
         "supplies_with_discrepancies": discrepancy_supply_count,
         "supply_events": len(supply_events),
+        "telegram_supply_events": len(telegram_supply_events),
         "unmatched_upds": len(unmatched_new_upds),
         "xlsx_key": daily_xlsx_key,
         "snapshot_key": snapshot_key,
@@ -1921,7 +1983,8 @@ def run(args: argparse.Namespace) -> int:
     log(
         "Готово: "
         f"поставок={len(all_summaries)}, deep={len(deep_candidates)}, "
-        f"отправлено={len(supply_events)}, новых документов={len(newly_downloaded)}, "
+        f"отправлено={len(telegram_supply_events)}, скрыто_мелких={len(suppressed_small_supply_ids)}, "
+        f"новых документов={len(newly_downloaded)}, "
         f"осталось={documents_remaining}, upd_mode={args.upd_send_mode}, telegram_ok={telegram_ok}"
     )
     return 0 if telegram_ok or args.no_telegram else 2
@@ -1973,6 +2036,17 @@ def self_test() -> int:
         "period", 7, "2026-07-10", "2026-07-20", dt.date(2026, 7, 31)
     )
     assert custom_from == dt.date(2026, 7, 10) and custom_to == dt.date(2026, 7, 20)
+
+    small_supply = SupplySummary(
+        supply_id=1, status_id=5, status_name="Принято", planned_qty=99, accepted_qty=99
+    )
+    boundary_supply = SupplySummary(
+        supply_id=2, status_id=5, status_name="Принято", planned_qty=100, accepted_qty=100
+    )
+    assert not supply_visible_in_telegram(small_supply, 100)
+    assert supply_visible_in_telegram(boundary_supply, 100)
+    small_supply.upd_documents = [{"total_qty": 120}]
+    assert supply_visible_in_telegram(small_supply, 100)
     log("SELF_TEST: OK")
     return 0
 
@@ -2002,6 +2076,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--supply-period-days", type=int, default=int(os.getenv("WB_SUPPLY_MESSAGE_PERIOD_DAYS", "7")))
     parser.add_argument("--supply-date-from", default=os.getenv("WB_SUPPLY_MESSAGE_DATE_FROM", ""))
     parser.add_argument("--supply-date-to", default=os.getenv("WB_SUPPLY_MESSAGE_DATE_TO", ""))
+    parser.add_argument(
+        "--telegram-min-supply-qty",
+        type=int,
+        default=int(os.getenv("WB_TELEGRAM_MIN_SUPPLY_QTY", str(DEFAULT_TELEGRAM_MIN_SUPPLY_QTY))),
+        help="Поставки с меньшим количеством сохраняются, но не показываются и не отправляют XML в Telegram",
+    )
     parser.add_argument("--force-notify", action="store_true")
     parser.add_argument("--no-telegram", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
