@@ -22,14 +22,13 @@ TOPFACE: контроль поставок FBW и документов Wildberri
    который используется report_runner.
 
 GitHub Secrets / REPORT_ENV:
-- WB_API_TOKEN                 токен WB с категориями "Поставки" и "Документы"
-- YC_ACCESS_KEY_ID
-- YC_SECRET_ACCESS_KEY
-- YC_BUCKET_NAME
-- YC_ENDPOINT_URL              необязательно, по умолчанию storage.yandexcloud.net
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
-- TELEGRAM_MESSAGE_THREAD_ID   необязательно
+- REPORT_ENV                  существующий общий секрет с доступом к Object Storage
+- WB_PROMO_KEY_TOPFACE        существующий токен WB для TOPFACE
+- TELEGRAM_BOT_TOKEN          существующий Telegram-бот
+- TELEGRAM_CHAT_ID            существующий чат
+
+Дополнительно поддерживаются прежние алиасы WB_API_TOKEN/TOPFACE_WB_API_TOKEN.
+TELEGRAM_MESSAGE_THREAD_ID можно хранить внутри REPORT_ENV, но он необязателен.
 
 Скрипт не загружает документы в Диадок и ничего не подписывает.
 """
@@ -67,7 +66,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V1_20260731"
+VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V4_EXISTING_SYSTEM_20260731"
 STORE_NAME = "TOPFACE"
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -119,6 +118,7 @@ TELEGRAM_THREAD_ALIASES = (
     "TOPFACE_TELEGRAM_MESSAGE_THREAD_ID",
 )
 WB_TOKEN_ALIASES = (
+    "WB_PROMO_KEY_TOPFACE",
     "WB_API_TOKEN",
     "TOPFACE_WB_API_TOKEN",
     "WB_TOKEN",
@@ -319,6 +319,15 @@ def load_report_env() -> None:
             loaded.append(key)
     if loaded:
         log(f"REPORT_ENV: загружены переменные: {', '.join(loaded)}")
+
+    # Совместимость со старыми версиями скрипта/workflow:
+    # существующий repository secret WB_PROMO_KEY_TOPFACE используется как WB_API_TOKEN.
+    # Новый secret создавать не требуется.
+    promo_token = str(os.getenv("WB_PROMO_KEY_TOPFACE", "") or "").strip()
+    if promo_token and not str(os.getenv("WB_API_TOKEN", "") or "").strip():
+        os.environ["WB_API_TOKEN"] = promo_token
+    if promo_token and not str(os.getenv("TOPFACE_WB_API_TOKEN", "") or "").strip():
+        os.environ["TOPFACE_WB_API_TOKEN"] = promo_token
 
 
 def first_env(names: Sequence[str]) -> Tuple[str, str]:
@@ -1355,7 +1364,7 @@ def run(args: argparse.Namespace) -> int:
     load_report_env()
     token, token_source = first_env(WB_TOKEN_ALIASES)
     if not token:
-        fail("Не найден WB_API_TOKEN. Токен должен иметь категории 'Поставки' и 'Документы'.")
+        fail("Не найден токен WB. Ожидаю существующий secret WB_PROMO_KEY_TOPFACE либо токен в REPORT_ENV. Для работы токен должен иметь категории 'Поставки' и 'Документы'.")
     log(f"WB token: найден в {token_source}; значение не выводится")
 
     telegram_token, telegram_chat, _ = telegram_credentials()
@@ -1364,16 +1373,19 @@ def run(args: argparse.Namespace) -> int:
 
     root_prefix = (args.root_prefix or os.getenv("WB_SUPPLY_DOCS_ROOT", DEFAULT_ROOT_PREFIX)).strip("/")
     storage = make_storage(args.local_storage)
+
+    # Dry-run проверяет секреты и конфигурацию, но не обращается к WB, Telegram
+    # или Object Storage. Это позволяет безопасно проверить workflow.
+    if args.dry_run:
+        log(f"DRY RUN: root_prefix={root_prefix}")
+        log(f"DRY RUN: lookback_days={args.lookback_days}; document_lookback_days={args.document_lookback_days}")
+        log("DRY RUN: secrets/configuration OK; внешние запросы не выполнялись")
+        return 0
+
     registry_key = join_key(root_prefix, REGISTRY_RELATIVE_KEY)
     registry, registry_was_new = load_registry(storage, registry_key)
     old_supplies: Dict[str, Dict[str, Any]] = registry.setdefault("supplies", {})
     old_documents: Dict[str, Dict[str, Any]] = registry.setdefault("documents", {})
-
-    if args.dry_run:
-        log(f"DRY RUN: root_prefix={root_prefix}")
-        log(f"DRY RUN: registry_exists={not registry_was_new}")
-        log(f"DRY RUN: lookback_days={args.lookback_days}; document_lookback_days={args.document_lookback_days}")
-        return 0
 
     client = WBClient(token)
     date_to = today_msk()
