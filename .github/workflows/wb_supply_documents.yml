@@ -1,10 +1,10 @@
-name: Документы по поставкам TOPFACE V9
+name: Документы по поставкам TOPFACE V10
 # ПОСТОЯННЫЕ ИМЕНА В GITHUB:
 # Python:   wb_supply_documents.py
 # Workflow: .github/workflows/wb_supply_documents.yml
-# Файлы wb_supply_documents_v9.* — только версия для скачивания и замены содержимого.
+# Файлы wb_supply_documents_v10.* — только версия для скачивания и замены содержимого.
 
-run-name: Поставки и УПД TOPFACE V9 — ${{ github.event.inputs.supply_message_mode || 'changes_only' }}
+run-name: Поставки и УПД TOPFACE V10 — ${{ github.event.inputs.supply_message_mode || 'changes_only' }}
 
 on:
   schedule:
@@ -64,6 +64,12 @@ on:
         default: ""
         type: string
 
+      telegram_min_supply_qty:
+        description: "Не писать в Telegram о поставках меньше этого количества"
+        required: true
+        default: "100"
+        type: string
+
       lookback_days:
         description: "Сколько дней поставок загружать из WB"
         required: true
@@ -90,7 +96,7 @@ on:
 
 jobs:
   wb-supply-documents:
-    name: Контроль поставок, УПД и актов TOPFACE V9
+    name: Контроль поставок, УПД и актов TOPFACE V10
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
@@ -111,6 +117,7 @@ jobs:
       # 0 = скачать все новые документы, а не только первые 20.
       WB_MAX_DOCUMENT_DOWNLOADS: "0"
       WB_FIRST_RUN_NOTIFY_DAYS: "3"
+      WB_TELEGRAM_MIN_SUPPLY_QTY: "100"
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -134,7 +141,7 @@ jobs:
         run: |
           set -euo pipefail
           SCRIPT_PATH="./wb_supply_documents.py"
-          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V9_20260731"
+          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V10_20260731"
 
           if [ ! -f "$SCRIPT_PATH" ]; then
             echo "::error::Не найден $SCRIPT_PATH. В GitHub файл всегда называется wb_supply_documents.py."
@@ -146,7 +153,7 @@ jobs:
           echo "Detected: $ACTUAL_VERSION"
 
           if ! grep -q "$EXPECTED_VERSION" "$SCRIPT_PATH"; then
-            echo "::error::В wb_supply_documents.py находится не версия $EXPECTED_VERSION. Замени содержимое кодом из wb_supply_documents_v9.py."
+            echo "::error::В wb_supply_documents.py находится не версия $EXPECTED_VERSION. Замени содержимое кодом из wb_supply_documents_v10.py."
             exit 1
           fi
 
@@ -175,16 +182,23 @@ jobs:
           SUPPLY_PERIOD="${{ github.event.inputs.supply_period || '7_days' }}"
           SUPPLY_DATE_FROM="${{ github.event.inputs.supply_date_from || '' }}"
           SUPPLY_DATE_TO="${{ github.event.inputs.supply_date_to || '' }}"
+          TELEGRAM_MIN_SUPPLY_QTY="${{ github.event.inputs.telegram_min_supply_qty || '100' }}"
           LOOKBACK="${{ github.event.inputs.lookback_days || '45' }}"
           DOC_LOOKBACK="${{ github.event.inputs.document_lookback_days || '21' }}"
           FORCE_NOTIFY="${{ github.event.inputs.force_notify || 'false' }}"
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+
+          if [[ ! "$TELEGRAM_MIN_SUPPLY_QTY" =~ ^[0-9]+$ ]]; then
+            echo "::error::telegram_min_supply_qty должен быть целым неотрицательным числом"
+            exit 1
+          fi
 
           ARGS=(
             --lookback-days "$LOOKBACK"
             --document-lookback-days "$DOC_LOOKBACK"
             --root-prefix "Документы по поставкам/TOPFACE"
             --upd-send-mode "$UPD_SEND_MODE"
+            --telegram-min-supply-qty "$TELEGRAM_MIN_SUPPLY_QTY"
           )
 
           case "$SUPPLY_MESSAGE_UI" in
@@ -231,8 +245,9 @@ jobs:
           fi
 
           echo "script=$WB_SUPPLY_DOCUMENTS_SCRIPT"
-          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V9_20260731"
+          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V10_20260731"
           echo "upd_send_mode=$UPD_SEND_MODE"
+          echo "telegram_min_supply_qty=$TELEGRAM_MIN_SUPPLY_QTY"
           echo "supply_message_mode=$SUPPLY_MESSAGE_UI supply_period=$SUPPLY_PERIOD custom=$SUPPLY_DATE_FROM..$SUPPLY_DATE_TO"
           echo "lookback=$LOOKBACK document_lookback=$DOC_LOOKBACK force_notify=$FORCE_NOTIFY dry_run=$DRY_RUN"
           python "$WB_SUPPLY_DOCUMENTS_SCRIPT" "${ARGS[@]}"
