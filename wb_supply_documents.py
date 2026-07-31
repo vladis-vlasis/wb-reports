@@ -3,8 +3,8 @@
 """
 TOPFACE: контроль поставок FBW и документов Wildberries.
 
-Файл в репозитории: wb_supply_documents_TOPFACE_v6_20260731.py
-Версия: WB_SUPPLY_DOCUMENTS_TOPFACE_V6_20260731
+Файл в репозитории: wb_supply_documents.py
+Версия: WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731
 
 Что делает скрипт:
 1. Получает все поставки FBW за скользящий период через Supplies API.
@@ -70,7 +70,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V6_20260731"
+VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731"
 STORE_NAME = "TOPFACE"
 MSK = ZoneInfo("Europe/Moscow")
 
