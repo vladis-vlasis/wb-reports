@@ -1,8 +1,6 @@
-name: Документы по поставкам TOPFACE
-# Python в корне репозитория: wb_supply_documents.py
-# Workflow: .github/workflows/wb_supply_documents.yml
+name: Документы по поставкам TOPFACE V5
 
-run-name: Поставки и УПД TOPFACE — ${{ github.event.inputs.mode || 'auto' }}
+run-name: Поставки и УПД TOPFACE V5 — ${{ github.event.inputs.mode || 'auto' }}
 
 on:
   schedule:
@@ -27,41 +25,36 @@ on:
         required: true
         default: "21"
       force_notify:
-        description: "Повторно прислать актуальные поставки со статусами 4/5/6"
+        description: "Повторно прислать актуальные принятые поставки"
         required: false
         default: false
         type: boolean
       dry_run:
-        description: "Проверить secrets и настройки без запросов к WB"
+        description: "Проверить настройки без запросов к WB"
         required: false
         default: false
         type: boolean
+
+concurrency:
+  group: wb-supply-documents-topface
+  cancel-in-progress: false
 
 jobs:
   wb-supply-documents:
     name: Контроль поставок, УПД и актов TOPFACE
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    concurrency:
-      group: wb-supply-documents-topface
-      cancel-in-progress: false
 
+    # Используются только уже существующие секреты репозитория.
     env:
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
-
-      # Можно хранить WB_API_TOKEN внутри REPORT_ENV либо отдельным secret.
-      WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
-
-      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
-      AWS_DEFAULT_REGION: ru-central1
-
-      # Используется тот же бот и чат, что у report_runner.
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+      AWS_DEFAULT_REGION: ru-central1
+      TZ: Europe/Moscow
+      PYTHONUNBUFFERED: "1"
 
       WB_SUPPLY_DOCS_ROOT: "Документы по поставкам/TOPFACE"
       WB_NOTIFY_STATUS_IDS: "4,5,6"
@@ -70,7 +63,6 @@ jobs:
       WB_MAX_DOCUMENT_DOWNLOADS: "20"
       WB_FIRST_RUN_NOTIFY_DAYS: "3"
       TELEGRAM_SEND_UPD_FILES: "1"
-      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
@@ -88,33 +80,129 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install requests boto3 openpyxl
 
-      - name: Show runtime
+      # Повторяет уже работающую схему других workflow:
+      # REPORT_ENV разбирается и переносится в GITHUB_ENV, а секрет TOPFACE
+      # одновременно публикуется под именем, которое ожидает старая версия скрипта.
+      - name: Load existing secrets and WB aliases
         shell: bash
         run: |
           set -euo pipefail
-          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
-          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
-          echo "Workflow: Документы по поставкам TOPFACE"
+          python - <<'PY'
+          import os
 
-      - name: Verify script and run self-test
-        shell: bash
-        run: |
-          set -euo pipefail
-          SCRIPT_PATH="./wb_supply_documents.py"
-
-          if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "::error::Не найден $SCRIPT_PATH. Загрузите wb_supply_documents.py в корень репозитория."
-            exit 1
-          fi
-
-          grep -q 'WB_SUPPLY_DOCUMENTS_TOPFACE_V1_20260731' "$SCRIPT_PATH" || {
-            echo "::error::В репозитории лежит другая версия wb_supply_documents.py"
-            exit 1
+          allowed_from_report_env = {
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "YC_ENDPOINT_URL",
+              "TELEGRAM_MESSAGE_THREAD_ID",
+              "TELEGRAM_THREAD_ID",
           }
 
-          python -m py_compile "$SCRIPT_PATH"
-          python "$SCRIPT_PATH" --self-test
-          echo "WB_SUPPLY_DOCUMENTS_SCRIPT=$SCRIPT_PATH" >> "$GITHUB_ENV"
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+          normalized = report_env.replace("\r\n", "\n").replace("\r", "\n")
+          if "\n" not in normalized and "\\n" in normalized:
+              normalized = normalized.replace("\\n", "\n")
+
+          for raw_line in normalized.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip().lstrip("\ufeff")
+              value = value.strip().strip('"').strip("'")
+              if key in allowed_from_report_env and value:
+                  parsed[key] = value
+
+          wb_token = (os.getenv("WB_PROMO_KEY_TOPFACE", "") or "").strip()
+          if not wb_token:
+              # На случай, если токен когда-нибудь перенесут внутрь REPORT_ENV.
+              for raw_line in normalized.splitlines():
+                  line = raw_line.strip()
+                  if line.startswith("export "):
+                      line = line[len("export "):].strip()
+                  if "=" not in line:
+                      continue
+                  key, value = line.split("=", 1)
+                  if key.strip() == "WB_PROMO_KEY_TOPFACE":
+                      wb_token = value.strip().strip('"').strip("'")
+                      break
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if not github_env:
+              raise SystemExit("GITHUB_ENV is not available")
+
+          loaded_names = []
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in sorted(allowed_from_report_env):
+                  value = (os.getenv(key, "") or parsed.get(key, "")).strip()
+                  if value:
+                      f.write(f"{key}={value}\n")
+                      loaded_names.append(key)
+
+              if wb_token:
+                  # Совместимость сразу со всеми версиями wb_supply_documents.py.
+                  for key in (
+                      "WB_PROMO_KEY_TOPFACE",
+                      "WB_API_TOKEN",
+                      "TOPFACE_WB_API_TOKEN",
+                      "WB_TOKEN",
+                      "WILDBERRIES_API_TOKEN",
+                  ):
+                      f.write(f"{key}={wb_token}\n")
+                  loaded_names.extend([
+                      "WB_PROMO_KEY_TOPFACE",
+                      "WB_API_TOKEN",
+                      "TOPFACE_WB_API_TOKEN",
+                      "WB_TOKEN",
+                      "WILDBERRIES_API_TOKEN",
+                  ])
+
+          print("Loaded environment names: " + ", ".join(sorted(set(loaded_names))))
+          PY
+
+      - name: Verify existing secrets and script
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "YC_ENDPOINT_URL",
+              "WB_API_TOKEN",
+              "TELEGRAM_BOT_TOKEN",
+              "TELEGRAM_CHAT_ID",
+          ]
+          missing = [name for name in required if not (os.getenv(name, "") or "").strip()]
+          if missing:
+              raise SystemExit("Не найдены существующие настройки: " + ", ".join(missing))
+
+          script = Path("wb_supply_documents_TOPFACE_v5_20260731.py")
+          if not script.is_file():
+              raise SystemExit("Не найден ./wb_supply_documents_TOPFACE_v5_20260731.py")
+
+          text = script.read_text(encoding="utf-8", errors="replace")
+          if "WB_SUPPLY_DOCUMENTS_TOPFACE" not in text:
+              raise SystemExit("В ./wb_supply_documents_TOPFACE_v5_20260731.py нет маркера проекта WB_SUPPLY_DOCUMENTS_TOPFACE")
+
+          print("Все существующие секреты доступны.")
+          print("WB token alias: WB_PROMO_KEY_TOPFACE -> WB_API_TOKEN; значение не выводится.")
+          print("Script: ./wb_supply_documents_TOPFACE_v5_20260731.py")
+          PY
+
+          python -m py_compile ./wb_supply_documents_TOPFACE_v5_20260731.py
+          python ./wb_supply_documents_TOPFACE_v5_20260731.py --self-test
+          echo "WB_SUPPLY_DOCUMENTS_SCRIPT=./wb_supply_documents_TOPFACE_v5_20260731.py" >> "$GITHUB_ENV"
 
       - name: Run supply and document monitor
         shell: bash
