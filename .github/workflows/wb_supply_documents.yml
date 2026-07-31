@@ -1,10 +1,10 @@
-name: Документы по поставкам TOPFACE V7
+name: Документы по поставкам TOPFACE V9
 # ПОСТОЯННЫЕ ИМЕНА В GITHUB:
 # Python:   wb_supply_documents.py
 # Workflow: .github/workflows/wb_supply_documents.yml
-# Название скачанного файла с припиской v7 — только для различения версий у пользователя.
+# Файлы wb_supply_documents_v9.* — только версия для скачивания и замены содержимого.
 
-run-name: Поставки и УПД TOPFACE V7 — ${{ github.event.inputs.mode || 'auto' }}
+run-name: Поставки и УПД TOPFACE V9 — ${{ github.event.inputs.supply_message_mode || 'changes_only' }}
 
 on:
   schedule:
@@ -12,37 +12,87 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Режим запуска"
+        description: "Технический режим запуска"
         required: true
         default: "auto"
         type: choice
         options:
           - auto
           - bootstrap
+
+      upd_send_mode:
+        description: "Как отправлять новый УПД в Telegram"
+        required: true
+        default: "message_and_upd"
+        type: choice
+        options:
+          - message_and_upd
+          - message_only
+
+      supply_message_mode:
+        description: "Какие поставки включить в сообщение"
+        required: true
+        default: "changes_only"
+        type: choice
+        options:
+          - changes_only
+          - selected_period
+
+      supply_period:
+        description: "Период поставок для selected_period"
+        required: true
+        default: "7_days"
+        type: choice
+        options:
+          - today
+          - 3_days
+          - 7_days
+          - 14_days
+          - 30_days
+          - 45_days
+          - custom
+
+      supply_date_from:
+        description: "Начало custom-периода, YYYY-MM-DD"
+        required: false
+        default: ""
+        type: string
+
+      supply_date_to:
+        description: "Конец custom-периода, YYYY-MM-DD"
+        required: false
+        default: ""
+        type: string
+
       lookback_days:
-        description: "Сколько дней поставок проверять"
+        description: "Сколько дней поставок загружать из WB"
         required: true
         default: "45"
+        type: string
+
       document_lookback_days:
         description: "Сколько дней документов WB проверять"
         required: true
         default: "21"
+        type: string
+
       force_notify:
-        description: "Повторно прислать актуальные поставки со статусами 4/5/6"
+        description: "Повторно отправить текущие события по поставкам"
         required: false
         default: false
         type: boolean
+
       dry_run:
-        description: "Проверить secrets и настройки без запросов к WB"
+        description: "Проверить secrets и параметры без запросов к WB"
         required: false
         default: false
         type: boolean
 
 jobs:
   wb-supply-documents:
-    name: Контроль поставок, УПД и актов TOPFACE V7
+    name: Контроль поставок, УПД и актов TOPFACE V9
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     concurrency:
       group: wb-supply-documents-topface
       cancel-in-progress: false
@@ -58,9 +108,9 @@ jobs:
       WB_NOTIFY_STATUS_IDS: "4,5,6"
       WB_DEEP_LOOKBACK_DAYS: "21"
       WB_MAX_DEEP_SUPPLIES: "180"
-      WB_MAX_DOCUMENT_DOWNLOADS: "20"
+      # 0 = скачать все новые документы, а не только первые 20.
+      WB_MAX_DOCUMENT_DOWNLOADS: "0"
       WB_FIRST_RUN_NOTIFY_DAYS: "3"
-      TELEGRAM_SEND_UPD_FILES: "1"
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -84,13 +134,10 @@ jobs:
         run: |
           set -euo pipefail
           SCRIPT_PATH="./wb_supply_documents.py"
-          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731"
-
-          echo "Files in repository root:"
-          find . -maxdepth 2 -type f | sort
+          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V9_20260731"
 
           if [ ! -f "$SCRIPT_PATH" ]; then
-            echo "::error::Не найден $SCRIPT_PATH. В GitHub файл всегда должен называться wb_supply_documents.py."
+            echo "::error::Не найден $SCRIPT_PATH. В GitHub файл всегда называется wb_supply_documents.py."
             exit 1
           fi
 
@@ -99,7 +146,7 @@ jobs:
           echo "Detected: $ACTUAL_VERSION"
 
           if ! grep -q "$EXPECTED_VERSION" "$SCRIPT_PATH"; then
-            echo "::error::В $SCRIPT_PATH находится не версия $EXPECTED_VERSION. Замени содержимое постоянного файла wb_supply_documents.py кодом из wb_supply_documents_v7.py."
+            echo "::error::В wb_supply_documents.py находится не версия $EXPECTED_VERSION. Замени содержимое кодом из wb_supply_documents_v9.py."
             exit 1
           fi
 
@@ -111,10 +158,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${WB_PROMO_KEY_TOPFACE:-}" ] || { echo "::error::Пустой существующий secret WB_PROMO_KEY_TOPFACE"; exit 1; }
-          [ -n "${REPORT_ENV:-}" ] || { echo "::error::Пустой существующий secret REPORT_ENV"; exit 1; }
-          [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || { echo "::error::Пустой существующий secret TELEGRAM_BOT_TOKEN"; exit 1; }
-          [ -n "${TELEGRAM_CHAT_ID:-}" ] || { echo "::error::Пустой существующий secret TELEGRAM_CHAT_ID"; exit 1; }
+          [ -n "${WB_PROMO_KEY_TOPFACE:-}" ] || { echo "::error::Пустой secret WB_PROMO_KEY_TOPFACE"; exit 1; }
+          [ -n "${REPORT_ENV:-}" ] || { echo "::error::Пустой secret REPORT_ENV"; exit 1; }
+          [ -n "${TELEGRAM_BOT_TOKEN:-}" ] || { echo "::error::Пустой secret TELEGRAM_BOT_TOKEN"; exit 1; }
+          [ -n "${TELEGRAM_CHAT_ID:-}" ] || { echo "::error::Пустой secret TELEGRAM_CHAT_ID"; exit 1; }
           echo "Existing secrets: OK (values are not printed)"
 
       - name: Run supply and document monitor
@@ -123,6 +170,11 @@ jobs:
           set -euo pipefail
 
           MODE="${{ github.event.inputs.mode || 'auto' }}"
+          UPD_SEND_MODE="${{ github.event.inputs.upd_send_mode || 'message_and_upd' }}"
+          SUPPLY_MESSAGE_UI="${{ github.event.inputs.supply_message_mode || 'changes_only' }}"
+          SUPPLY_PERIOD="${{ github.event.inputs.supply_period || '7_days' }}"
+          SUPPLY_DATE_FROM="${{ github.event.inputs.supply_date_from || '' }}"
+          SUPPLY_DATE_TO="${{ github.event.inputs.supply_date_to || '' }}"
           LOOKBACK="${{ github.event.inputs.lookback_days || '45' }}"
           DOC_LOOKBACK="${{ github.event.inputs.document_lookback_days || '21' }}"
           FORCE_NOTIFY="${{ github.event.inputs.force_notify || 'false' }}"
@@ -132,7 +184,41 @@ jobs:
             --lookback-days "$LOOKBACK"
             --document-lookback-days "$DOC_LOOKBACK"
             --root-prefix "Документы по поставкам/TOPFACE"
+            --upd-send-mode "$UPD_SEND_MODE"
           )
+
+          case "$SUPPLY_MESSAGE_UI" in
+            changes_only)
+              ARGS+=(--supply-message-mode changes_only)
+              ;;
+            selected_period)
+              ARGS+=(--supply-message-mode period)
+              case "$SUPPLY_PERIOD" in
+                today)   ARGS+=(--supply-period-days 1) ;;
+                3_days)  ARGS+=(--supply-period-days 3) ;;
+                7_days)  ARGS+=(--supply-period-days 7) ;;
+                14_days) ARGS+=(--supply-period-days 14) ;;
+                30_days) ARGS+=(--supply-period-days 30) ;;
+                45_days) ARGS+=(--supply-period-days 45) ;;
+                custom)
+                  if [[ ! "$SUPPLY_DATE_FROM" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || \
+                     [[ ! "$SUPPLY_DATE_TO" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+                    echo "::error::Для custom укажи supply_date_from и supply_date_to в формате YYYY-MM-DD"
+                    exit 1
+                  fi
+                  ARGS+=(--supply-date-from "$SUPPLY_DATE_FROM" --supply-date-to "$SUPPLY_DATE_TO")
+                  ;;
+                *)
+                  echo "::error::Неизвестный supply_period=$SUPPLY_PERIOD"
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error::Неизвестный supply_message_mode=$SUPPLY_MESSAGE_UI"
+              exit 1
+              ;;
+          esac
 
           if [ "$MODE" = "bootstrap" ]; then
             ARGS+=(--first-run-notify-days "$LOOKBACK")
@@ -145,6 +231,8 @@ jobs:
           fi
 
           echo "script=$WB_SUPPLY_DOCUMENTS_SCRIPT"
-          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731"
-          echo "mode=$MODE lookback=$LOOKBACK document_lookback=$DOC_LOOKBACK force_notify=$FORCE_NOTIFY dry_run=$DRY_RUN"
+          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V9_20260731"
+          echo "upd_send_mode=$UPD_SEND_MODE"
+          echo "supply_message_mode=$SUPPLY_MESSAGE_UI supply_period=$SUPPLY_PERIOD custom=$SUPPLY_DATE_FROM..$SUPPLY_DATE_TO"
+          echo "lookback=$LOOKBACK document_lookback=$DOC_LOOKBACK force_notify=$FORCE_NOTIFY dry_run=$DRY_RUN"
           python "$WB_SUPPLY_DOCUMENTS_SCRIPT" "${ARGS[@]}"
