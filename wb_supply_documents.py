@@ -4,7 +4,7 @@
 TOPFACE: контроль поставок FBW и документов Wildberries.
 
 Файл в репозитории: wb_supply_documents.py
-Версия: WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731
+Версия: WB_SUPPLY_DOCUMENTS_TOPFACE_V9_20260731
 
 Что делает скрипт:
 1. Получает все поставки FBW за скользящий период через Supplies API.
@@ -20,9 +20,12 @@ TOPFACE: контроль поставок FBW и документов Wildberri
    - акты сверки, если такая категория доступна в кабинете.
 4. Сохраняет файлы и сводки в Yandex Object Storage:
    Документы по поставкам/TOPFACE/...
-5. Сопоставляет УПД с поставкой по складу, дате и количеству.
-6. Отправляет уведомления и новые XML УПД в тот же Telegram-бот,
-   который используется report_runner.
+5. Сопоставляет УПД с поставкой сначала по точному supplyID из serviceName,
+   затем — резервно по складу, дате и количеству.
+6. Позволяет выбрать отправку в Telegram:
+   - сообщение и XML УПД;
+   - только сообщение без файла.
+7. Позволяет отправить поставки только с изменениями либо за выбранный период.
 
 GitHub Secrets / REPORT_ENV:
 - WB_PROMO_KEY_TOPFACE         существующий токен TOPFACE; должен иметь категории "Поставки" и "Документы"
@@ -70,7 +73,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V7_20260731"
+VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V9_20260731"
 STORE_NAME = "TOPFACE"
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -83,7 +86,7 @@ DOCUMENT_DOWNLOAD_URL = "https://documents-api.wildberries.ru/api/v1/documents/d
 DEFAULT_ROOT_PREFIX = "Документы по поставкам/TOPFACE"
 REGISTRY_RELATIVE_KEY = "_служебные файлы/registry.json"
 LAST_RUN_RELATIVE_KEY = "_служебные файлы/last_run.json"
-CURRENT_XLSX_RELATIVE_KEY = "Акты сверки/Сводка_поставок_TOPFACE.xlsx"
+CURRENT_XLSX_RELATIVE_KEY = "_служебные файлы/Сводка_поставок_TOPFACE.xlsx"
 
 STATUS_NAMES = {
     1: "Не запланировано",
@@ -810,6 +813,13 @@ def summary_from_supply(
     goods: List[Dict[str, Any]],
     previous: Optional[Dict[str, Any]] = None,
 ) -> Tuple[SupplySummary, List[Dict[str, Any]]]:
+    """Собирает сводку поставки.
+
+    Итоговые количества берутся из метода деталей поставки — это агрегаты WB по
+    всей поставке. Метод goods используется для детализации расхождений по SKU.
+    Такой порядок защищает от частичных/нестабильных товарных строк и не меняет
+    общий итог на количество строк или коробов.
+    """
     merged = {**shallow, **details}
     supply_id = supply_id_from(merged)
     if not supply_id:
@@ -822,7 +832,7 @@ def summary_from_supply(
     warehouse = canonical_warehouse(first_nonempty(warehouse_actual, warehouse_plan, warehouse_transit))
 
     item_rows: List[Dict[str, Any]] = []
-    planned_qty = accepted_qty = unloading_qty = ready_qty = 0
+    goods_planned = goods_accepted = goods_unloading = goods_ready = 0
     excess_qty = shortage_qty = discrepancy_articles = 0
     for item in goods:
         planned = to_int(item.get("quantity"), 0)
@@ -831,10 +841,10 @@ def summary_from_supply(
         ready = to_int(item.get("readyForSaleQuantity"), 0)
         excess = max(accepted - planned, 0)
         shortage = max(planned - accepted, 0)
-        planned_qty += planned
-        accepted_qty += accepted
-        unloading_qty += unloading
-        ready_qty += ready
+        goods_planned += planned
+        goods_accepted += accepted
+        goods_unloading += unloading
+        goods_ready += ready
         excess_qty += excess
         shortage_qty += shortage
         if excess or shortage:
@@ -856,11 +866,26 @@ def summary_from_supply(
                 "Недостача": shortage,
             })
 
+    def aggregate_value(field: str, goods_value: int, previous_field: str) -> int:
+        if field in details and details.get(field) is not None:
+            return to_int(details.get(field), 0)
+        if field in merged and merged.get(field) is not None:
+            return to_int(merged.get(field), 0)
+        if goods:
+            return goods_value
+        return to_int((previous or {}).get(previous_field), 0)
+
+    planned_qty = aggregate_value("quantity", goods_planned, "planned_qty")
+    accepted_qty = aggregate_value("acceptedQuantity", goods_accepted, "accepted_qty")
+    unloading_qty = aggregate_value("unloadingQuantity", goods_unloading, "unloading_qty")
+    ready_qty = aggregate_value("readyForSaleQuantity", goods_ready, "ready_qty")
+
+    # Если товарной детализации нет, расхождение считаем по общим итогам.
     if not goods:
-        planned_qty = to_int(first_nonempty(merged.get("quantity"), previous.get("planned_qty") if previous else 0), 0)
-        accepted_qty = to_int(first_nonempty(merged.get("acceptedQuantity"), previous.get("accepted_qty") if previous else 0), 0)
-        unloading_qty = to_int(first_nonempty(merged.get("unloadingQuantity"), previous.get("unloading_qty") if previous else 0), 0)
-        ready_qty = to_int(first_nonempty(merged.get("readyForSaleQuantity"), previous.get("ready_qty") if previous else 0), 0)
+        excess_qty = max(accepted_qty - planned_qty, 0)
+        shortage_qty = max(planned_qty - accepted_qty, 0)
+    elif not item_rows and accepted_qty != planned_qty:
+        # Редкий случай: агрегат уже обновился, а goods ещё нет. Не скрываем разницу.
         excess_qty = max(accepted_qty - planned_qty, 0)
         shortage_qty = max(planned_qty - accepted_qty, 0)
 
@@ -899,7 +924,6 @@ def summary_from_supply(
         "updated_date": summary.updated_date,
     })
     return summary, item_rows
-
 
 def shallow_summary(item: Dict[str, Any], previous: Optional[Dict[str, Any]] = None) -> SupplySummary:
     supply_id = supply_id_from(item)
@@ -1015,10 +1039,17 @@ def content_type_for_name(name: str) -> str:
     return "application/octet-stream"
 
 
-def extract_files_recursive(name: str, content: bytes, depth: int = 0, max_depth: int = 3) -> List[Tuple[str, bytes]]:
-    """Возвращает исходный файл и безопасно распакованные вложения ZIP."""
-    result: List[Tuple[str, bytes]] = [(safe_filename(name), content)]
-    if depth >= max_depth or not zipfile.is_zipfile(io.BytesIO(content)):
+def extract_files_recursive(name: str, content: bytes, depth: int = 0, max_depth: int = 1) -> List[Tuple[str, bytes]]:
+    """Возвращает исходный файл и только верхний уровень обычного ZIP.
+
+    XLSX/DOCX не распаковываются. Вложенные ZIP (например mchd.zip) тоже
+    сохраняются целиком, чтобы в Object Storage не появлялись технические XML.
+    """
+    safe_name = safe_filename(name)
+    result: List[Tuple[str, bytes]] = [(safe_name, content)]
+    if depth >= max_depth or not safe_name.lower().endswith(".zip"):
+        return result
+    if not zipfile.is_zipfile(io.BytesIO(content)):
         return result
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
@@ -1028,11 +1059,10 @@ def extract_files_recursive(name: str, content: bytes, depth: int = 0, max_depth
                 member_name = safe_filename(PurePosixPath(member.filename).name)
                 if not member_name:
                     continue
-                member_content = archive.read(member)
-                result.extend(extract_files_recursive(member_name, member_content, depth + 1, max_depth))
+                result.append((member_name, archive.read(member)))
     except (zipfile.BadZipFile, RuntimeError) as exc:
         log(f"ZIP {name}: не удалось распаковать: {exc}")
-    # Удаляем полные дубли по имени+хэшу.
+
     deduped: List[Tuple[str, bytes]] = []
     seen: set[Tuple[str, str]] = set()
     for item_name, item_content in result:
@@ -1041,7 +1071,6 @@ def extract_files_recursive(name: str, content: bytes, depth: int = 0, max_depth
             seen.add(key)
             deduped.append((item_name, item_content))
     return deduped
-
 
 def local_tag(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
@@ -1095,10 +1124,50 @@ def parse_upd_xml(xml_content: bytes, xml_filename: str = "") -> UPDInfo:
     )
 
 
-def match_upd_to_supply(upd: UPDInfo, supplies: Iterable[SupplySummary]) -> UPDInfo:
+def numeric_ids_from_text(*values: Any) -> List[int]:
+    result: List[int] = []
+    for value in values:
+        for match in re.finditer(r"(?<!\d)(\d{6,12})(?!\d)", str(value or "")):
+            number = to_int(match.group(1), 0)
+            if number and number not in result:
+                result.append(number)
+    return result
+
+
+def document_storage_id(service_name: str, response_name: str = "") -> str:
+    ids = numeric_ids_from_text(service_name, response_name)
+    if ids:
+        return str(ids[0])
+    return safe_filename(service_name or response_name, "document").replace(".", "_")
+
+
+def match_upd_to_supply(
+    upd: UPDInfo,
+    supplies: Iterable[SupplySummary],
+    service_name: str = "",
+) -> UPDInfo:
+    supplies_list = list(supplies)
+    supplies_by_id = {item.supply_id: item for item in supplies_list}
+
+    # В документах WB номер после UPD po markirovke-/act-income- и номер
+    # основания передачи совпадают с supplyID. Это основной и точный ключ.
+    direct_candidates = numeric_ids_from_text(
+        upd.acceptance_act_number,
+        service_name,
+        upd.xml_filename,
+        upd.document_number,
+    )
+    for candidate in direct_candidates:
+        if candidate in supplies_by_id:
+            upd.supply_id = candidate
+            upd.match_score = 200
+            upd.match_reason = f"точное совпадение с supplyID={candidate} по номеру документа/акта"
+            return upd
+
+    # Резервная эвристика нужна только для редких документов без номера поставки.
     doc_date = parse_date(upd.document_date)
     scored: List[Tuple[int, int, List[str]]] = []
-    for supply in supplies:
+    for supply in supplies_list:
         score = 0
         reasons: List[str] = []
         supply_warehouse = canonical_warehouse(supply.warehouse)
@@ -1157,6 +1226,27 @@ def match_upd_to_supply(upd: UPDInfo, supplies: Iterable[SupplySummary]) -> UPDI
             f"совпадение неоднозначно: лучший score={best_score}, второй={second_score}; " + ", ".join(reasons)
         )
     return upd
+
+
+def upd_info_from_dict(data: Dict[str, Any]) -> UPDInfo:
+    allowed = {field.name for field in __import__("dataclasses").fields(UPDInfo)}
+    return UPDInfo(**{key: value for key, value in (data or {}).items() if key in allowed})
+
+
+def attach_upd_to_summary(
+    summary: SupplySummary,
+    upd: UPDInfo,
+    service_name: str,
+    s3_key: str = "",
+) -> None:
+    upd_dict = asdict(upd)
+    upd_dict["service_name"] = service_name
+    upd_dict["s3_key"] = s3_key
+    for index, existing in enumerate(summary.upd_documents):
+        if str(existing.get("service_name")) == str(service_name):
+            summary.upd_documents[index] = upd_dict
+            return
+    summary.upd_documents.append(upd_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1311,6 +1401,50 @@ def unmatched_upd_text(upd: Dict[str, Any]) -> str:
     ])
 
 
+def supply_reference_date(supply: SupplySummary) -> Optional[dt.date]:
+    """Дата для отбора поставок в Telegram: дата поставки, затем факт/создание."""
+    return parse_date(first_nonempty(
+        supply.supply_date,
+        supply.fact_date,
+        supply.create_date,
+        supply.updated_date,
+    ))
+
+
+def resolve_supply_message_period(
+    mode: str,
+    period_days: int,
+    date_from_text: str,
+    date_to_text: str,
+    base_date: dt.date,
+) -> Tuple[Optional[dt.date], Optional[dt.date]]:
+    if mode == "changes_only":
+        return None, None
+    if mode != "period":
+        raise ValueError(f"Неизвестный режим отправки поставок: {mode}")
+
+    custom_from = parse_date(date_from_text) if str(date_from_text or "").strip() else None
+    custom_to = parse_date(date_to_text) if str(date_to_text or "").strip() else None
+    if custom_from or custom_to:
+        if not custom_from or not custom_to:
+            raise ValueError("Для произвольного периода нужно заполнить обе даты: from и to")
+        if custom_from > custom_to:
+            raise ValueError("Дата начала периода больше даты окончания")
+        return custom_from, custom_to
+
+    days = max(int(period_days or 1), 1)
+    return base_date - dt.timedelta(days=days - 1), base_date
+
+
+def supply_in_period(supply: SupplySummary, date_from: dt.date, date_to: dt.date) -> bool:
+    value = supply_reference_date(supply)
+    return bool(value and date_from <= value <= date_to)
+
+
+def supply_sort_key(supply: SupplySummary) -> Tuple[dt.date, int]:
+    return supply_reference_date(supply) or dt.date.min, supply.supply_id
+
+
 # ---------------------------------------------------------------------------
 # Основной процесс
 # ---------------------------------------------------------------------------
@@ -1373,16 +1507,33 @@ def run(args: argparse.Namespace) -> int:
     old_supplies: Dict[str, Dict[str, Any]] = registry.setdefault("supplies", {})
     old_documents: Dict[str, Dict[str, Any]] = registry.setdefault("documents", {})
 
+    run_date = today_msk()
+    supply_message_from, supply_message_to = resolve_supply_message_period(
+        args.supply_message_mode,
+        args.supply_period_days,
+        args.supply_date_from,
+        args.supply_date_to,
+        run_date,
+    )
+
     if args.dry_run:
         log(f"DRY RUN: root_prefix={root_prefix}")
         log(f"DRY RUN: registry_exists={not registry_was_new}")
         log(f"DRY RUN: lookback_days={args.lookback_days}; document_lookback_days={args.document_lookback_days}")
+        log(f"DRY RUN: upd_send_mode={args.upd_send_mode}; supply_message_mode={args.supply_message_mode}")
+        if supply_message_from and supply_message_to:
+            log(f"DRY RUN: supply_message_period={supply_message_from} — {supply_message_to}")
         return 0
 
     client = WBClient(token)
-    date_to = today_msk()
-    date_from = date_to - dt.timedelta(days=max(args.lookback_days, 1))
-    document_from = date_to - dt.timedelta(days=max(args.document_lookback_days, 1))
+    date_from = run_date - dt.timedelta(days=max(args.lookback_days, 1))
+    date_to = run_date
+    if supply_message_from:
+        date_from = min(date_from, supply_message_from)
+    if supply_message_to:
+        date_to = max(date_to, supply_message_to)
+    document_from = run_date - dt.timedelta(days=max(args.document_lookback_days, 1))
+    document_to = run_date
 
     log(f"Период поставок: {date_from} — {date_to}")
     shallow_supplies = client.list_supplies(date_from, date_to)
@@ -1430,8 +1581,8 @@ def run(args: argparse.Namespace) -> int:
             log("WARN " + message)
 
     # Документы.
-    log(f"Период документов: {document_from} — {date_to}")
-    documents = client.list_documents(document_from, date_to)
+    log(f"Период документов: {document_from} — {document_to}")
+    documents = client.list_documents(document_from, document_to)
     relevant_documents = [(doc, document_kind(doc)) for doc in documents]
     relevant_documents = [(doc, kind) for doc, kind in relevant_documents if kind]
     log(f"Релевантных документов: {len(relevant_documents)}")
@@ -1446,9 +1597,14 @@ def run(args: argparse.Namespace) -> int:
             new_document_candidates.append((doc, kind))
 
     new_document_candidates.sort(key=lambda pair: str(pair[0].get("creationTime", "")))
+    new_document_candidates_total = len(new_document_candidates)
     if args.max_document_downloads > 0:
         new_document_candidates = new_document_candidates[: args.max_document_downloads]
-    log(f"Новых документов для скачивания: {len(new_document_candidates)}")
+    documents_remaining = max(new_document_candidates_total - len(new_document_candidates), 0)
+    log(
+        f"Новых документов: найдено={new_document_candidates_total}, "
+        f"скачать сейчас={len(new_document_candidates)}, останется={documents_remaining}"
+    )
 
     newly_downloaded: List[Dict[str, Any]] = []
     upd_file_payloads: List[Tuple[str, bytes, Dict[str, Any]]] = []
@@ -1463,7 +1619,9 @@ def run(args: argparse.Namespace) -> int:
             creation_dt = parse_datetime(doc.get("creationTime")) or now_msk()
             month = creation_dt.astimezone(MSK).strftime("%Y-%m")
             folder = kind_folder(kind)
-            original_key = join_key(root_prefix, folder, month, "Оригиналы", response_name)
+            document_id = document_storage_id(service_name, response_name)
+            document_base_key = join_key(root_prefix, folder, month, document_id)
+            original_key = join_key(document_base_key, "Оригиналы", response_name)
             upload_bytes(storage, original_key, content, content_type_for_name(response_name))
 
             extracted = extract_files_recursive(response_name, content)
@@ -1479,7 +1637,7 @@ def run(args: argparse.Namespace) -> int:
                     stem, suffix = os.path.splitext(final_name)
                     final_name = f"{stem}_{hashlib.sha1(extracted_content).hexdigest()[:8]}{suffix}"
                 seen_names.add(final_name)
-                extracted_key = join_key(root_prefix, folder, month, final_name)
+                extracted_key = join_key(document_base_key, final_name)
                 upload_bytes(storage, extracted_key, extracted_content, content_type_for_name(final_name))
                 stored_files.append({"name": final_name, "key": extracted_key})
                 if kind == "upd" and final_name.lower().endswith(".xml") and parsed_upd is None:
@@ -1494,7 +1652,7 @@ def run(args: argparse.Namespace) -> int:
                 upd_file_payloads.append((response_name, content, {"service_name": service_name}))
 
             if parsed_upd:
-                parsed_upd = match_upd_to_supply(parsed_upd, summaries_by_id.values())
+                parsed_upd = match_upd_to_supply(parsed_upd, summaries_by_id.values(), service_name)
 
             doc_record: Dict[str, Any] = {
                 "service_name": service_name,
@@ -1511,18 +1669,33 @@ def run(args: argparse.Namespace) -> int:
                 doc_record["upd"] = asdict(parsed_upd)
                 if parsed_upd.supply_id and parsed_upd.supply_id in summaries_by_id:
                     summary = summaries_by_id[parsed_upd.supply_id]
-                    upd_dict = asdict(parsed_upd)
-                    upd_dict["service_name"] = service_name
-                    upd_dict["s3_key"] = next((f["key"] for f in stored_files if str(f["name"]).lower().endswith(".xml")), original_key)
-                    existing = {str(item.get("service_name")) for item in summary.upd_documents}
-                    if service_name not in existing:
-                        summary.upd_documents.append(upd_dict)
+                    xml_key = next((f["key"] for f in stored_files if str(f["name"]).lower().endswith(".xml")), original_key)
+                    attach_upd_to_summary(summary, parsed_upd, service_name, xml_key)
             old_documents[service_name] = doc_record
             newly_downloaded.append(doc_record)
         except Exception as exc:
             old_documents.setdefault(service_name, {})["last_error"] = str(exc)
             old_documents[service_name]["last_error_at"] = now_msk().isoformat()
             log(f"ERROR документ {service_name}: {exc}")
+
+    # Повторно связываем ранее скачанные УПД из registry. Это исправляет старые
+    # записи без supply_id без повторного скачивания файлов из WB.
+    rematched_existing = 0
+    for service_name, record in old_documents.items():
+        if record.get("kind") != "upd" or not isinstance(record.get("upd"), dict):
+            continue
+        upd_info = upd_info_from_dict(record.get("upd") or {})
+        previous_supply_id = upd_info.supply_id
+        upd_info = match_upd_to_supply(upd_info, summaries_by_id.values(), service_name)
+        record["upd"] = asdict(upd_info)
+        if upd_info.supply_id and upd_info.supply_id in summaries_by_id:
+            files = record.get("files") or []
+            xml_key = next((str(item.get("key", "")) for item in files if str(item.get("name", "")).lower().endswith(".xml")), "")
+            attach_upd_to_summary(summaries_by_id[upd_info.supply_id], upd_info, service_name, xml_key)
+            if previous_supply_id != upd_info.supply_id:
+                rematched_existing += 1
+    if rematched_existing:
+        log(f"УПД из registry заново связаны с поставками: {rematched_existing}")
 
     # Формируем строки документов из реестра за текущий скользящий период.
     for service_name, record in old_documents.items():
@@ -1547,6 +1720,18 @@ def run(args: argparse.Namespace) -> int:
     # Сохраняем поставки в реестр и определяем события.
     notify_status_ids = {to_int(value) for value in str(args.notify_status_ids).split(",") if to_int(value)} or DEFAULT_NOTIFY_STATUS_IDS
     supply_events: Dict[int, Dict[str, Any]] = {}
+    period_supply_ids: set[int] = set()
+    if supply_message_from and supply_message_to:
+        period_supply_ids = {
+            supply_id
+            for supply_id, summary in summaries_by_id.items()
+            if supply_in_period(summary, supply_message_from, supply_message_to)
+        }
+        log(
+            f"Поставок для отправки за период {supply_message_from} — {supply_message_to}: "
+            f"{len(period_supply_ids)}"
+        )
+
     for supply_id, summary in summaries_by_id.items():
         previous = old_supplies.get(str(supply_id))
         if notification_required(
@@ -1557,12 +1742,22 @@ def run(args: argparse.Namespace) -> int:
             notify_status_ids,
             args.force_notify,
         ):
-            supply_events.setdefault(supply_id, {"supply_changed": True, "new_upds": []})
+            supply_events.setdefault(supply_id, {"supply_changed": True, "new_upds": [], "period_selected": False})
+
+        if supply_id in period_supply_ids:
+            event = supply_events.setdefault(
+                supply_id,
+                {"supply_changed": False, "new_upds": [], "period_selected": True},
+            )
+            event["period_selected"] = True
 
         previous_upd_ids = {str(item.get("service_name")) for item in (previous or {}).get("upd_documents", [])}
         new_upds = [item for item in summary.upd_documents if str(item.get("service_name")) not in previous_upd_ids]
         if new_upds:
-            event = supply_events.setdefault(supply_id, {"supply_changed": False, "new_upds": []})
+            event = supply_events.setdefault(
+                supply_id,
+                {"supply_changed": False, "new_upds": [], "period_selected": False},
+            )
             event["new_upds"].extend(new_upds)
 
         data = asdict(summary)
@@ -1580,13 +1775,13 @@ def run(args: argparse.Namespace) -> int:
             unmatched_new_upds.append({**upd, "service_name": record.get("service_name")})
 
     # Excel и JSON-снимок.
-    run_date = today_msk()
     month = run_date.strftime("%Y-%m")
     all_summaries = list(summaries_by_id.values())
     xlsx_bytes = build_supply_workbook(all_summaries, discrepancy_rows, document_rows)
     daily_xlsx_key = join_key(
         root_prefix,
-        "Акты сверки",
+        "_служебные файлы",
+        "Сводки",
         month,
         f"Сверка_поставок_TOPFACE_{run_date.isoformat()}.xlsx",
     )
@@ -1596,7 +1791,13 @@ def run(args: argparse.Namespace) -> int:
     snapshot = {
         "script_version": VERSION,
         "generated_at": now_msk().isoformat(),
-        "period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
+        "supply_query_period": {"from": date_from.isoformat(), "to": date_to.isoformat()},
+        "supply_message_period": {
+            "mode": args.supply_message_mode,
+            "from": supply_message_from.isoformat() if supply_message_from else "",
+            "to": supply_message_to.isoformat() if supply_message_to else "",
+        },
+        "upd_send_mode": args.upd_send_mode,
         "supplies": [asdict(summary) for summary in all_summaries],
         "discrepancies": discrepancy_rows,
         "new_documents": newly_downloaded,
@@ -1604,18 +1805,35 @@ def run(args: argparse.Namespace) -> int:
     }
     snapshot_key = join_key(
         root_prefix,
-        "Акты сверки",
+        "_служебные файлы",
+        "Сводки",
         month,
         f"Сверка_поставок_TOPFACE_{run_date.isoformat()}.json",
     )
     upload_bytes(storage, snapshot_key, json_dumps(snapshot), "application/json")
 
-    # Telegram. Одно сообщение содержит все изменения, затем прикладываются новые XML.
+    # Telegram. Сначала сообщение, затем XML только в выбранном режиме.
     message_parts = [
         f"📋 Документы по поставкам TOPFACE — {run_date.strftime('%d.%m.%Y')}",
-        "",
     ]
-    for supply_id in sorted(supply_events):
+    if supply_message_from and supply_message_to:
+        message_parts.append(
+            f"Поставки за период: {supply_message_from.strftime('%d.%m.%Y')} — "
+            f"{supply_message_to.strftime('%d.%m.%Y')}"
+        )
+    else:
+        message_parts.append("Поставки: только новые события и изменения")
+    message_parts.extend([
+        f"УПД в Telegram: {'сообщение + XML' if args.upd_send_mode == 'message_and_upd' else 'только сообщение'}",
+        "",
+    ])
+
+    ordered_supply_ids = sorted(
+        supply_events,
+        key=lambda supply_id: supply_sort_key(summaries_by_id[supply_id]),
+        reverse=True,
+    )
+    for supply_id in ordered_supply_ids:
         event = supply_events[supply_id]
         message_parts.append(supply_event_text(summaries_by_id[supply_id], event.get("new_upds", [])))
         message_parts.append("")
@@ -1624,14 +1842,27 @@ def run(args: argparse.Namespace) -> int:
         message_parts.append("")
 
     if not supply_events and not unmatched_new_upds:
-        message_parts.append("Новых УПД и изменений по приёмке поставок не найдено.")
+        if supply_message_from and supply_message_to:
+            message_parts.append("Поставки за выбранный период не найдены. Новых УПД тоже нет.")
+        else:
+            message_parts.append("Новых УПД и изменений по приёмке поставок не найдено.")
+
+    discrepancy_supply_count = sum(
+        1 for summary in all_summaries
+        if summary.excess_qty > 0 or summary.shortage_qty > 0
+    )
+    new_upd_count = sum(1 for record in newly_downloaded if record.get("kind") == "upd")
+    new_acceptance_count = sum(1 for record in newly_downloaded if record.get("kind") == "acceptance")
     message_parts.extend([
         "",
         f"Поставок в контроле: {len(all_summaries)}",
-        f"Новых документов: {len(newly_downloaded)}",
-        f"Новых УПД: {sum(1 for record in newly_downloaded if record.get('kind') == 'upd')}",
-        f"Актов приёмки: {sum(1 for record in newly_downloaded if record.get('kind') == 'acceptance')}",
-        f"Актов сверки WB: {sum(1 for record in newly_downloaded if record.get('kind') == 'reconciliation')}",
+        f"Поставок отправлено в сообщении: {len(supply_events)}",
+        f"Новых документов скачано: {len(newly_downloaded)}",
+        f"Осталось документов в очереди: {documents_remaining}",
+        f"Новых УПД: {new_upd_count}",
+        f"Актов приёмки скачано: {new_acceptance_count}",
+        "Отчёт сверки поставок: сформирован",
+        f"Поставок с расхождениями: {discrepancy_supply_count}",
     ])
     if deep_errors:
         message_parts.append(f"⚠ Ошибок детальной проверки: {len(deep_errors)}")
@@ -1640,7 +1871,7 @@ def run(args: argparse.Namespace) -> int:
     telegram_ok = True
     if not args.no_telegram:
         telegram_ok = send_telegram_message(message)
-        if telegram_ok and parse_bool(os.getenv("TELEGRAM_SEND_UPD_FILES", "1"), True):
+        if telegram_ok and args.upd_send_mode == "message_and_upd":
             for filename, file_bytes, metadata in upd_file_payloads:
                 service_name = metadata.get("service_name", "")
                 record = old_documents.get(str(service_name), {})
@@ -1669,7 +1900,16 @@ def run(args: argparse.Namespace) -> int:
         "status": "ok" if telegram_ok else "telegram_error",
         "supplies_found": len(shallow_supplies),
         "supplies_deep_checked": len(deep_candidates),
+        "supplies_sent": len(supply_events),
+        "supply_message_mode": args.supply_message_mode,
+        "supply_message_from": supply_message_from.isoformat() if supply_message_from else "",
+        "supply_message_to": supply_message_to.isoformat() if supply_message_to else "",
+        "upd_send_mode": args.upd_send_mode,
         "new_documents": len(newly_downloaded),
+        "documents_remaining": documents_remaining,
+        "new_upds": new_upd_count,
+        "new_acceptance_acts": new_acceptance_count,
+        "supplies_with_discrepancies": discrepancy_supply_count,
         "supply_events": len(supply_events),
         "unmatched_upds": len(unmatched_new_upds),
         "xlsx_key": daily_xlsx_key,
@@ -1681,7 +1921,8 @@ def run(args: argparse.Namespace) -> int:
     log(
         "Готово: "
         f"поставок={len(all_summaries)}, deep={len(deep_candidates)}, "
-        f"новых документов={len(newly_downloaded)}, событий={len(supply_events)}, telegram_ok={telegram_ok}"
+        f"отправлено={len(supply_events)}, новых документов={len(newly_downloaded)}, "
+        f"осталось={documents_remaining}, upd_mode={args.upd_send_mode}, telegram_ok={telegram_ok}"
     )
     return 0 if telegram_ok or args.no_telegram else 2
 
@@ -1711,8 +1952,27 @@ def self_test() -> int:
     assert matched.supply_id == 12345678, matched
     assert "Принято без расхождений 556 шт." == supply.report_comment()
 
+    direct_supply = SupplySummary(supply_id=40715881, status_id=5, status_name="Принято", warehouse="Коледино")
+    direct = match_upd_to_supply(parse_upd_xml(sample_xml, "sample.xml"), [direct_supply], "UPD po markirovke-40715881")
+    assert direct.supply_id == 40715881 and direct.match_score == 200, direct
+
     xlsx = build_supply_workbook([supply], [], [])
     assert xlsx.startswith(b"PK")
+    assert len(extract_files_recursive("report.xlsx", xlsx)) == 1
+
+    outer = io.BytesIO()
+    with zipfile.ZipFile(outer, "w") as archive:
+        archive.writestr("act.xlsx", xlsx)
+        archive.writestr("mchd.zip", b"PK\x03\x04not-a-real-nested-archive")
+    extracted_names = [name for name, _ in extract_files_recursive("act.zip", outer.getvalue())]
+    assert extracted_names == ["act.zip", "act.xlsx", "mchd.zip"], extracted_names
+
+    period_from, period_to = resolve_supply_message_period("period", 7, "", "", dt.date(2026, 7, 31))
+    assert period_from == dt.date(2026, 7, 25) and period_to == dt.date(2026, 7, 31)
+    custom_from, custom_to = resolve_supply_message_period(
+        "period", 7, "2026-07-10", "2026-07-20", dt.date(2026, 7, 31)
+    )
+    assert custom_from == dt.date(2026, 7, 10) and custom_to == dt.date(2026, 7, 20)
     log("SELF_TEST: OK")
     return 0
 
@@ -1723,10 +1983,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--document-lookback-days", type=int, default=int(os.getenv("WB_DOCUMENT_LOOKBACK_DAYS", "21")))
     parser.add_argument("--deep-lookback-days", type=int, default=int(os.getenv("WB_DEEP_LOOKBACK_DAYS", "21")))
     parser.add_argument("--max-deep-supplies", type=int, default=int(os.getenv("WB_MAX_DEEP_SUPPLIES", "180")))
-    parser.add_argument("--max-document-downloads", type=int, default=int(os.getenv("WB_MAX_DOCUMENT_DOWNLOADS", "20")))
+    parser.add_argument("--max-document-downloads", type=int, default=int(os.getenv("WB_MAX_DOCUMENT_DOWNLOADS", "0")))
     parser.add_argument("--first-run-notify-days", type=int, default=int(os.getenv("WB_FIRST_RUN_NOTIFY_DAYS", "3")))
     parser.add_argument("--notify-status-ids", default=os.getenv("WB_NOTIFY_STATUS_IDS", "4,5,6"))
     parser.add_argument("--root-prefix", default=os.getenv("WB_SUPPLY_DOCS_ROOT", DEFAULT_ROOT_PREFIX))
+    parser.add_argument(
+        "--upd-send-mode",
+        choices=("message_and_upd", "message_only"),
+        default=os.getenv("WB_UPD_SEND_MODE", "message_and_upd"),
+        help="message_and_upd — сообщение и XML; message_only — только сообщение",
+    )
+    parser.add_argument(
+        "--supply-message-mode",
+        choices=("changes_only", "period"),
+        default=os.getenv("WB_SUPPLY_MESSAGE_MODE", "changes_only"),
+        help="changes_only — только изменения; period — все поставки за выбранный период",
+    )
+    parser.add_argument("--supply-period-days", type=int, default=int(os.getenv("WB_SUPPLY_MESSAGE_PERIOD_DAYS", "7")))
+    parser.add_argument("--supply-date-from", default=os.getenv("WB_SUPPLY_MESSAGE_DATE_FROM", ""))
+    parser.add_argument("--supply-date-to", default=os.getenv("WB_SUPPLY_MESSAGE_DATE_TO", ""))
     parser.add_argument("--force-notify", action="store_true")
     parser.add_argument("--no-telegram", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
