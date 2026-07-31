@@ -1,0 +1,148 @@
+name: Документы по поставкам TOPFACE
+# Python в корне репозитория: wb_supply_documents.py
+# Workflow: .github/workflows/wb_supply_documents.yml
+
+run-name: Поставки и УПД TOPFACE — ${{ github.event.inputs.mode || 'auto' }}
+
+on:
+  schedule:
+    # Каждый день в 19:30 МСК / 16:30 UTC.
+    - cron: "30 16 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим запуска"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - bootstrap
+      lookback_days:
+        description: "Сколько дней поставок проверять"
+        required: true
+        default: "45"
+      document_lookback_days:
+        description: "Сколько дней документов WB проверять"
+        required: true
+        default: "21"
+      force_notify:
+        description: "Повторно прислать актуальные поставки со статусами 4/5/6"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Проверить secrets и настройки без запросов к WB"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  wb-supply-documents:
+    name: Контроль поставок, УПД и актов TOPFACE
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    concurrency:
+      group: wb-supply-documents-topface
+      cancel-in-progress: false
+
+    env:
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+
+      # Можно хранить WB_API_TOKEN внутри REPORT_ENV либо отдельным secret.
+      WB_API_TOKEN: ${{ secrets.WB_API_TOKEN }}
+
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+      AWS_DEFAULT_REGION: ru-central1
+
+      # Используется тот же бот и чат, что у report_runner.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+      WB_SUPPLY_DOCS_ROOT: "Документы по поставкам/TOPFACE"
+      WB_NOTIFY_STATUS_IDS: "4,5,6"
+      WB_DEEP_LOOKBACK_DAYS: "21"
+      WB_MAX_DEEP_SUPPLIES: "180"
+      WB_MAX_DOCUMENT_DOWNLOADS: "20"
+      WB_FIRST_RUN_NOTIFY_DAYS: "3"
+      TELEGRAM_SEND_UPD_FILES: "1"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install requests boto3 openpyxl
+
+      - name: Show runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
+          echo "Workflow: Документы по поставкам TOPFACE"
+
+      - name: Verify script and run self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCRIPT_PATH="./wb_supply_documents.py"
+
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo "::error::Не найден $SCRIPT_PATH. Загрузите wb_supply_documents.py в корень репозитория."
+            exit 1
+          fi
+
+          grep -q 'WB_SUPPLY_DOCUMENTS_TOPFACE_V1_20260731' "$SCRIPT_PATH" || {
+            echo "::error::В репозитории лежит другая версия wb_supply_documents.py"
+            exit 1
+          }
+
+          python -m py_compile "$SCRIPT_PATH"
+          python "$SCRIPT_PATH" --self-test
+          echo "WB_SUPPLY_DOCUMENTS_SCRIPT=$SCRIPT_PATH" >> "$GITHUB_ENV"
+
+      - name: Run supply and document monitor
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MODE="${{ github.event.inputs.mode || 'auto' }}"
+          LOOKBACK="${{ github.event.inputs.lookback_days || '45' }}"
+          DOC_LOOKBACK="${{ github.event.inputs.document_lookback_days || '21' }}"
+          FORCE_NOTIFY="${{ github.event.inputs.force_notify || 'false' }}"
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+
+          ARGS=(
+            --lookback-days "$LOOKBACK"
+            --document-lookback-days "$DOC_LOOKBACK"
+            --root-prefix "Документы по поставкам/TOPFACE"
+          )
+
+          if [ "$MODE" = "bootstrap" ]; then
+            ARGS+=(--first-run-notify-days "$LOOKBACK")
+          fi
+          if [ "$FORCE_NOTIFY" = "true" ]; then
+            ARGS+=(--force-notify)
+          fi
+          if [ "$DRY_RUN" = "true" ]; then
+            ARGS+=(--dry-run)
+          fi
+
+          echo "script=$WB_SUPPLY_DOCUMENTS_SCRIPT"
+          echo "mode=$MODE lookback=$LOOKBACK document_lookback=$DOC_LOOKBACK force_notify=$FORCE_NOTIFY dry_run=$DRY_RUN"
+          python "$WB_SUPPLY_DOCUMENTS_SCRIPT" "${ARGS[@]}"
