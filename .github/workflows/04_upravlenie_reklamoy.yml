@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  WORKFLOW_VERSION: "v88_import_shutil_cpm_manager_fix_2026-07-30"
+  WORKFLOW_VERSION: "v89_cpm_profiles_effective_bid_fix_2026-08-01"
   WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
   PYTHON_VERSION: "3.11"
   STORE_NAME: "TOPFACE"
