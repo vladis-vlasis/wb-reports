@@ -4936,7 +4936,7 @@ def compute_engine(args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame
 def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
     summary = _MAKE_SUMMARY_JSON_V76(mode, decisions, successful, api_log, windows, args)
     summary["Версия"] = SCRIPT_VERSION
-    summary["Исправление v88"] = "добавлен import shutil для cpm-manager: копирование CPM_управление_запросами.xlsx больше не падает с NameError"
+    summary["Исправление v89"] = "CPM-cleaner разделяет семантические профили 901/11 и 901/5; query bid=0 больше не считается фактической ставкой, если есть ставка кампании"
     summary["CORE 90 дней"] = "собирается; дополнительно выбираются 2 флагмана на каждый CORE-запрос"
     summary["CORE флагманы"] = "1-й по заказам за 90 дней; 2-й по CTR за 30 дней при 5000+ показов, иначе 2-й по заказам"
     summary["Цель флагмана"] = "позиция 1-8 и видимость не ниже 95%; пока логируется, на ставки не влияет"
@@ -5882,6 +5882,89 @@ CPM_EXCLUDE_OTHER_PRODUCT_MARKERS = (
     "бров", "стрел", "подвод", "губ", "помад", "блеск", "лак", "ногт", "тушь", "палет",
 )
 
+# V89: разные CPM-кампании чистятся по разному смысловому ядру.
+# 38914318 / 901/11 — кисти для теней; 38914345 / 901/5 — румяна/контуринг/скульптор/хайлайтер.
+CPM_DEFAULT_PROFILE_BY_CAMPAIGN_V89 = {38914318: "shadow", 38914345: "blush_contour"}
+CPM_DEFAULT_PROFILE_BY_NM_V89 = {110254263: "shadow", 87705142: "blush_contour"}
+CPM_BLUSH_CONTOUR_KEEP_MARKERS_V89 = (
+    "румян", "контур", "скульпт", "бронзер", "хайлайт", "пудр", "скош", "кремов", "сух"
+)
+CPM_BLUSH_CONTOUR_EXCLUDE_MARKERS_V89 = (
+    "тен", "глаз", "бров", "стрел", "подвод", "консил", "корректор", "тональ",
+    "губ", "помад", "блеск", "лак", "ногт", "тушь", "палет"
+)
+
+
+def _cpm_parse_profile_map_v89(raw: Any = None) -> Dict[str, str]:
+    """Поддерживает строку 38914318:shadow;38914345:blush_contour или 87705142:blush_contour."""
+    value = str(raw if raw is not None else os.getenv("CPM_CLEANER_PROFILE_MAP", "") or "").strip()
+    out: Dict[str, str] = {}
+    if not value:
+        return out
+    for block in re.split(r"[;|]", value):
+        if ":" not in block:
+            continue
+        left, right = block.split(":", 1)
+        key = str(_clean_int(left) or left).strip()
+        profile = normalize_cpm_query_text(right).replace(" ", "_")
+        if key and profile:
+            out[key] = profile
+    return out
+
+
+def _cpm_profile_for_campaign_nm(campaign_id: Any = None, nm_id: Any = None, supplier_article: Any = None) -> str:
+    override = _cpm_parse_profile_map_v89()
+    cid = _clean_int(campaign_id)
+    nm = _clean_int(nm_id)
+    article = str(supplier_article or "").strip().lower()
+    for key in [str(cid) if cid else "", str(nm) if nm else "", article]:
+        if key and key in override:
+            return override[key]
+    if nm and int(nm) in CPM_DEFAULT_PROFILE_BY_NM_V89:
+        return CPM_DEFAULT_PROFILE_BY_NM_V89[int(nm)]
+    if cid and int(cid) in CPM_DEFAULT_PROFILE_BY_CAMPAIGN_V89:
+        return CPM_DEFAULT_PROFILE_BY_CAMPAIGN_V89[int(cid)]
+    if article == "901/5":
+        return "blush_contour"
+    if article == "901/11":
+        return "shadow"
+    return "shadow"
+
+
+def _classify_cpm_blush_contour_query_v89(query: Any, allow_sets: bool = False) -> Tuple[bool, str, str, str]:
+    q = normalize_cpm_query_text(query)
+    if not q:
+        return False, "минус", "пустой запрос", "Минус: пустой поисковый кластер"
+    has_brush = any(m in q for m in CPM_BRUSH_MARKERS)
+    has_target = any(m in q for m in CPM_BLUSH_CONTOUR_KEEP_MARKERS_V89)
+    has_wrong = any(m in q for m in CPM_BLUSH_CONTOUR_EXCLUDE_MARKERS_V89)
+    has_set = "набор" in q or "комплект" in q
+    if not has_brush:
+        return False, "минус", "не кисть", "Минус: запрос про косметику/бренд без явного маркера кисти"
+    if has_set and not allow_sets:
+        return False, "минус", "набор", "Минус: запрос про набор, а кампания чистится под одиночную кисть 901/5"
+    if has_wrong and not has_target:
+        return False, "минус", "другой товар", "Минус: запрос про другую кисть/категорию, не про румяна/контуринг 901/5"
+    if not has_target:
+        return False, "минус", "слишком широкий", "Минус: широкий запрос без явного смысла румяна/контуринг/скульптор/хайлайтер/пудра"
+    if "румян" in q and "контур" in q:
+        return True, "оставить", "кисти для румян и контуринга", "Оставлено: профиль 901/5 — румяна и контуринг"
+    if "румян" in q:
+        return True, "оставить", "кисти для румян", "Оставлено: профиль 901/5 — кисти для румян"
+    if "контур" in q:
+        return True, "оставить", "кисти для контуринга", "Оставлено: профиль 901/5 — кисти для контуринга"
+    if "скульпт" in q:
+        return True, "оставить", "кисти для скульптора", "Оставлено: профиль 901/5 — кисти для скульптора"
+    if "бронзер" in q:
+        return True, "оставить", "кисти для бронзера", "Оставлено: профиль 901/5 — кисти для бронзера"
+    if "хайлайт" in q:
+        return True, "оставить", "кисти для хайлайтера", "Оставлено: профиль 901/5 — кисти для хайлайтера"
+    if "пудр" in q:
+        return True, "оставить", "кисти для пудры", "Оставлено: профиль 901/5 — допускаем кисть для пудры по назначению товара"
+    if "скош" in q:
+        return True, "оставить", "скошенная кисть", "Оставлено: профиль 901/5 — скошенная кисть релевантна румянам/контурингу"
+    return True, "оставить", "похожий CORE 901/5", "Оставлено: запрос похож на CORE-семантику 901/5"
+
 
 def _cpm_parse_campaign_ids(raw: Any = None) -> List[int]:
     value = str(raw if raw is not None else os.getenv("CPM_CLEANER_CAMPAIGNS", "") or "").strip()
@@ -5942,9 +6025,12 @@ def normalize_cpm_query_text(text: Any) -> str:
     return s0
 
 
-def classify_cpm_shadow_brush_query(query: Any, allow_sets: bool = False) -> Tuple[bool, str, str, str]:
+def classify_cpm_shadow_brush_query(query: Any, allow_sets: bool = False, profile: Optional[str] = None) -> Tuple[bool, str, str, str]:
     """Возвращает: keep, action_text, query_group, reason_text."""
     q = normalize_cpm_query_text(query)
+    profile_norm = str(profile or "shadow").strip().lower()
+    if profile_norm in {"blush_contour", "rumyan_contour", "901_5", "901/5"}:
+        return _classify_cpm_blush_contour_query_v89(q, allow_sets=allow_sets)
     if not q:
         return False, "минус", "пустой запрос", "Минус: пустой поисковый кластер"
 
@@ -6189,53 +6275,73 @@ def _cpm_apply_set_minus(config: RunnerConfig, campaign_id: int, nm_id: Optional
 
 
 def _cpm_build_cleaner_rows(active_df: pd.DataFrame, excluded_df: pd.DataFrame, campaign_id: int, nm_id: Optional[int], allow_sets: bool = False) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """V89: строит итоговый whitelist/minus-list по профилю кампании.
+
+    Важно: excluded-запросы тоже пересчитываются по текущему профилю. Если раньше запрос был в минусе,
+    но для профиля 901/5 он релевантен, он попадает в строки как "снять из минуса" и не включается
+    в target_minus для set-minus. Если WB set-minus перезаписывает список, это позволит очистить ошибочные минусы.
+    """
     rows: List[Dict[str, Any]] = []
+    profile = _cpm_profile_for_campaign_nm(campaign_id, nm_id)
     excluded_norms = set()
+    keep_queries: List[str] = []
+    minus_queries: List[str] = []
+
     if excluded_df is not None and not excluded_df.empty and "norm_query" in excluded_df.columns:
         excluded_norms = set(excluded_df["norm_query"].map(normalize_cpm_query_text))
         for q in excluded_df["norm_query"].dropna().astype(str).tolist():
+            q_clean = normalize_cpm_query_text(q)
+            keep, decision, group, reason = classify_cpm_shadow_brush_query(q, allow_sets=allow_sets, profile=profile)
+            if keep:
+                keep_queries.append(q)
+                decision_out = "снять из минуса"
+                reason_out = "Запрос сейчас находится в минус-фразах WB, но по профилю кампании он релевантен; не включаем в новый список минусов"
+            else:
+                minus_queries.append(q)
+                decision_out = "уже в минусе"
+                reason_out = "Запрос уже находится в минус-фразах WB и остаётся нерелевантным по профилю кампании"
             rows.append({
                 "datetime_msk": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
                 "campaign_id": campaign_id,
                 "nm_id": nm_id or "",
+                "semantic_profile": profile,
                 "norm_query": q,
-                "norm_query_clean": normalize_cpm_query_text(q),
-                "decision": "уже в минусе",
-                "query_group": "уже исключён",
-                "reason": "Запрос уже находится в минус-фразах WB",
+                "norm_query_clean": q_clean,
+                "decision": decision_out,
+                "query_group": group,
+                "reason": reason_out,
             })
 
-    keep_queries: List[str] = []
-    minus_queries: List[str] = []
     if active_df is None or active_df.empty or "norm_query" not in active_df.columns:
         rows.append({
             "datetime_msk": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
             "campaign_id": campaign_id,
             "nm_id": nm_id or "",
+            "semantic_profile": profile,
             "norm_query": "",
             "norm_query_clean": "",
             "decision": "нет данных",
             "query_group": "нет активных кластеров",
             "reason": "WB не вернул активные поисковые кластеры для проверки",
         })
-        return pd.DataFrame(rows), keep_queries, minus_queries
+        return pd.DataFrame(rows), sorted(set(keep_queries)), sorted(set(minus_queries))
 
     for _, r in active_df.iterrows():
         q = str(r.get("norm_query", "") or "").strip()
         q_clean = normalize_cpm_query_text(q)
-        keep, decision, group, reason = classify_cpm_shadow_brush_query(q, allow_sets=allow_sets)
+        keep, decision, group, reason = classify_cpm_shadow_brush_query(q, allow_sets=allow_sets, profile=profile)
         if keep:
             keep_queries.append(q)
         else:
-            if q_clean not in excluded_norms:
-                minus_queries.append(q)
-            else:
+            minus_queries.append(q)
+            if q_clean in excluded_norms:
                 decision = "уже в минусе"
-                reason = "Запрос уже находится в минус-фразах WB"
+                reason = "Запрос уже находится в минус-фразах WB и остаётся нерелевантным по профилю кампании"
         row = {
             "datetime_msk": _now_msk().strftime("%Y-%m-%d %H:%M:%S"),
             "campaign_id": campaign_id,
             "nm_id": nm_id or "",
+            "semantic_profile": profile,
             "norm_query": q,
             "norm_query_clean": q_clean,
             "decision": decision,
@@ -6248,7 +6354,6 @@ def _cpm_build_cleaner_rows(active_df: pd.DataFrame, excluded_df: pd.DataFrame, 
                 row[col] = r.get(col)
         rows.append(row)
     return pd.DataFrame(rows), sorted(set(keep_queries)), sorted(set(minus_queries))
-
 
 def run_cpm_query_cleaner(args: argparse.Namespace) -> int:
     config = load_runner_config()
@@ -6263,6 +6368,7 @@ def run_cpm_query_cleaner(args: argparse.Namespace) -> int:
     all_rows: List[pd.DataFrame] = []
 
     previous_output_path = maybe_download_key_to_dir(s3, bucket, RUN_OUTPUT_KEY, workdir)
+    campaign_bid_map_v89 = _v89_load_campaign_bid_map(previous_output_path)
     nm_map = _cpm_parse_nm_map(getattr(args, "nm_map", None))
     prev_nm_map = _cpm_resolve_nm_ids_from_previous_output(previous_output_path, campaign_ids)
     for cid, vals in prev_nm_map.items():
@@ -6805,10 +6911,18 @@ def _v85_build_stats_snapshot(stats: pd.DataFrame) -> pd.DataFrame:
 
 def _v85_decide_cpm_query_bid(row: Dict[str, Any], prev: Optional[Dict[str, Any]], min_bid: int, max_bid: int, step: int, max_cpo: float) -> Dict[str, Any]:
     q = row.get("norm_query", "")
-    keep, cleaner_decision, group, cleaner_reason = classify_cpm_shadow_brush_query(q, allow_sets=False)
+    profile = _cpm_profile_for_campaign_nm(row.get("campaign_id"), row.get("nm_id"), row.get("supplier_article"))
+    keep, cleaner_decision, group, cleaner_reason = classify_cpm_shadow_brush_query(q, allow_sets=False, profile=profile)
     current_bid = _v85_as_int(row.get("current_bid_rub"), None)
+    current_bid_source = "query_bid"
     if current_bid is None or current_bid <= 0:
-        current_bid = 0
+        effective_bid = _v85_as_int(row.get("campaign_effective_bid_rub"), None)
+        if effective_bid is not None and effective_bid > 0:
+            current_bid = int(effective_bid)
+            current_bid_source = "campaign_bid_fallback"
+        else:
+            current_bid = 0
+            current_bid_source = "empty_query_bid"
     target_bid = current_bid
     bid_action = "hold"
     bid_reason = "Ставку не меняем"
@@ -6832,10 +6946,12 @@ def _v85_decide_cpm_query_bid(row: Dict[str, Any], prev: Optional[Dict[str, Any]
     if not keep:
         return {
             "is_core_like": False,
+            "semantic_profile": profile,
             "query_group": group,
             "cleaner_decision": cleaner_decision,
             "cleaner_reason": cleaner_reason,
             "current_bid_rub": current_bid,
+            "current_bid_source_v89": current_bid_source,
             "target_bid_rub": current_bid,
             "bid_action": "no_bid_non_core_minus",
             "bid_reason": "Ставку не управляем: запрос должен быть заминусован",
@@ -6879,16 +6995,42 @@ def _v85_decide_cpm_query_bid(row: Dict[str, Any], prev: Optional[Dict[str, Any]
 
     return {
         "is_core_like": True,
+        "semantic_profile": profile,
         "query_group": group,
         "cleaner_decision": "оставить",
         "cleaner_reason": cleaner_reason,
         "current_bid_rub": current_bid,
+        "current_bid_source_v89": current_bid_source,
         "target_bid_rub": int(target_bid) if target_bid is not None else current_bid,
         "bid_action": bid_action,
         "bid_reason": bid_reason,
         "traffic_status": traffic_reason,
     }
 
+
+def _v89_load_campaign_bid_map(previous_output_path: Optional[str]) -> Dict[Tuple[int, Optional[int]], int]:
+    out: Dict[Tuple[int, Optional[int]], int] = {}
+    if not previous_output_path or not Path(previous_output_path).exists():
+        return out
+    try:
+        df = pd.read_excel(previous_output_path, sheet_name="Решения")
+    except Exception:
+        return out
+    if df is None or df.empty or "campaign_id" not in df.columns:
+        return out
+    for _, r in df.iterrows():
+        cid = _clean_int(r.get("campaign_id"))
+        if cid is None:
+            continue
+        nm = _clean_int(r.get("nm_id"))
+        bid = _v85_as_int(r.get("real_bid_rub"), None)
+        if bid is None or bid <= 0:
+            bid = _v85_as_int(r.get("search_bid"), None) or _v85_as_int(r.get("reco_bid"), None)
+        if bid is None or bid <= 0:
+            continue
+        out[(int(cid), int(nm) if nm else None)] = int(bid)
+        out.setdefault((int(cid), None), int(bid))
+    return out
 
 def run_cpm_query_manager(args: argparse.Namespace) -> int:
     config = load_runner_config()
@@ -6914,6 +7056,7 @@ def run_cpm_query_manager(args: argparse.Namespace) -> int:
     min_bid_rows: List[Dict[str, Any]] = []
 
     previous_output_path = maybe_download_key_to_dir(s3, bucket, RUN_OUTPUT_KEY, workdir)
+    campaign_bid_map_v89 = _v89_load_campaign_bid_map(previous_output_path)
     nm_map = _cpm_parse_nm_map(getattr(args, "nm_map", None))
     prev_nm_map = _cpm_resolve_nm_ids_from_previous_output(previous_output_path, campaign_ids)
     for cid, vals in prev_nm_map.items():
@@ -6944,11 +7087,9 @@ def run_cpm_query_manager(args: argparse.Namespace) -> int:
             if clean_rows is not None and not clean_rows.empty:
                 cleaner_rows_all.append(clean_rows)
 
-            # set-minus: отправляем полный список уже исключённых + новые минусы.
-            already_minus = []
-            if excluded is not None and not excluded.empty and "norm_query" in excluded.columns:
-                already_minus = excluded["norm_query"].dropna().astype(str).tolist()
-            target_minus = sorted(set(already_minus + minus_queries))
+            # V89: set-minus формируем заново по профилю, а не просто сохраняем все старые минусы.
+            # Это важно для 901/5: если релевантный запрос ошибочно был в минусе, он не должен оставаться в target_minus.
+            target_minus = sorted(set(minus_queries))
             if minus_queries:
                 all_logs.extend(_cpm_apply_set_minus(config, cid_i, nm_i, target_minus, dry_run=dry_minus))
             else:
@@ -6995,6 +7136,8 @@ def run_cpm_query_manager(args: argparse.Namespace) -> int:
                 row.setdefault("campaign_id", cid_i)
                 row.setdefault("nm_id", nm_i or "")
                 row["datetime_msk"] = _now_msk().strftime("%Y-%m-%d %H:%M:%S")
+                row["semantic_profile"] = _cpm_profile_for_campaign_nm(cid_i, nm_i)
+                row["campaign_effective_bid_rub"] = campaign_bid_map_v89.get((cid_i, nm_i), campaign_bid_map_v89.get((cid_i, None), np.nan))
                 key = _v85_query_key(row)
                 prev = prev_by_key.get(key)
                 decision = _v85_decide_cpm_query_bid(row, prev, min_bid=min_bid, max_bid=max_bid, step=step, max_cpo=max_cpo)
@@ -7032,9 +7175,9 @@ def run_cpm_query_manager(args: argparse.Namespace) -> int:
         manager_df.to_excel(writer, sheet_name="CPM_решения_ставки", index=False)
         # V86: отдельный лист именно со статистикой по каждому CPM-запросу/кластеру, без смешивания с решением.
         cpm_stats_cols = [c for c in [
-            "datetime_msk", "campaign_id", "supplier_article", "nm_id", "norm_query", "norm_query_clean",
+            "datetime_msk", "campaign_id", "supplier_article", "nm_id", "semantic_profile", "norm_query", "norm_query_clean",
             "impressions", "clicks", "orders", "spend", "ctr", "cpc", "cpm", "cpo", "clicks_per_order",
-            "position", "visibility", "current_bid_rub", "min_bid_rub", "query_group", "is_core_like", "bid_action", "bid_reason"
+            "position", "visibility", "campaign_effective_bid_rub", "current_bid_rub", "current_bid_source_v89", "min_bid_rub", "query_group", "is_core_like", "bid_action", "bid_reason"
         ] if c in manager_df.columns]
         if cpm_stats_cols:
             manager_df[cpm_stats_cols].to_excel(writer, sheet_name="CPM_статистика_запросов", index=False)
@@ -7045,7 +7188,7 @@ def run_cpm_query_manager(args: argparse.Namespace) -> int:
         min_bid_df.to_excel(writer, sheet_name="Минимальные_ставки", index=False)
         pd.DataFrame({
             "parameter": ["campaign_ids", "apply_minus", "apply_bids", "min_bid_fallback", "bid_step", "max_bid", "max_cpo", "logic"],
-            "value": [", ".join(map(str, campaign_ids)), "да" if apply_minus else "нет, dry-run", "да" if apply_bids else "нет, dry-run", fallback_min_bid, step, max_bid, max_cpo, "CPM: чистка не-CORE запросов + ставки по каждому CORE-запросу отдельно"],
+            "value": [", ".join(map(str, campaign_ids)), "да" if apply_minus else "нет, dry-run", "да" if apply_bids else "нет, dry-run", fallback_min_bid, step, max_bid, max_cpo, "CPM v89: профильная чистка запросов по товару + ставки по каждому CORE-запросу отдельно; query bid=0 заменяется фактической ставкой кампании"],
         }).to_excel(writer, sheet_name="Параметры", index=False)
 
     api_log_path = maybe_download_key_to_dir(s3, bucket, API_LOG_KEY, workdir)
@@ -7383,8 +7526,8 @@ def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFra
 # =========================
 # V87 OVERRIDES: active-only flagships, manual pauses respected
 # =========================
-SCRIPT_VERSION = "v88-import-shutil-cpm-manager-fix-2026-07-30"
-VERSION = "FIX59_ACTIVE_ONLY_MANUAL_PAUSES_RESPECTED"
+SCRIPT_VERSION = "v89-cpm-profiles-effective-bid-fix-2026-08-01"
+VERSION = "FIX60_CPM_PROFILES_EFFECTIVE_BID_FIX"
 
 CPM_KNOWN_NM_TO_ARTICLE_V87 = {
     87705142: "901/5",
@@ -7559,20 +7702,20 @@ def collect_query_stats_api_v86(config: RunnerConfig, decisions: pd.DataFrame, d
 def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFrame, api_log: pd.DataFrame, windows: Dict[str, pd.Timestamp], args: argparse.Namespace) -> Dict[str, Any]:
     summary = _MAKE_SUMMARY_JSON_PRE_V87(mode, decisions, successful, api_log, windows, args)
     summary["Версия"] = SCRIPT_VERSION
-    summary["Исправление v88"] = "добавлен import shutil для cpm-manager: копирование CPM_управление_запросами.xlsx больше не падает с NameError"
+    summary["Исправление v89"] = "CPM-cleaner разделяет семантические профили 901/11 и 901/5; query bid=0 больше не считается фактической ставкой, если есть ставка кампании"
     summary["Контур управления"] = "Только активные РК предмета Кисти косметические; paused РК считаются ручной паузой и не трогаются; остальные категории только логируются"
     summary["Паузы"] = "авто-start и авто-pause отключены в основном контуре; ручные паузы сохраняются"
     summary["Режим флагмана CORE"] = "все оставшиеся активные РК кистей считаются флагманами; поисковые активные флагманы держатся не ниже 10 ₽"
     if decisions is not None and not decisions.empty:
         if "current_active_flagship_v87" in decisions.columns:
-            summary["Активных флагманов v88"] = int(decisions["current_active_flagship_v87"].fillna(False).astype(bool).sum())
+            summary["Активных флагманов v89"] = int(decisions["current_active_flagship_v87"].fillna(False).astype(bool).sum())
         if "manual_pause_respected_v87" in decisions.columns:
-            summary["Ручных пауз сохранено v88"] = int(decisions["manual_pause_respected_v87"].fillna(False).astype(bool).sum())
+            summary["Ручных пауз сохранено v89"] = int(decisions["manual_pause_respected_v87"].fillna(False).astype(bool).sum())
         if "reason_code" in decisions.columns:
             rc = decisions["reason_code"].astype(str)
-            summary["Авто-start заблокировано v88"] = int(rc.eq("MANUAL_PAUSE_RESPECTED_NO_AUTO_START").sum())
-            summary["Активных search-флагманов поднято до 10 v88"] = int(rc.eq("ACTIVE_FLAGSHIP_SEARCH_MIN10_RAISE").sum())
-            summary["Автопауз активных флагманов заблокировано v88"] = int(rc.eq("ACTIVE_FLAGSHIP_NO_AUTO_PAUSE").sum())
+            summary["Авто-start заблокировано v89"] = int(rc.eq("MANUAL_PAUSE_RESPECTED_NO_AUTO_START").sum())
+            summary["Активных search-флагманов поднято до 10 v89"] = int(rc.eq("ACTIVE_FLAGSHIP_SEARCH_MIN10_RAISE").sum())
+            summary["Автопауз активных флагманов заблокировано v89"] = int(rc.eq("ACTIVE_FLAGSHIP_NO_AUTO_PAUSE").sum())
     return summary
 
 if __name__ == "__main__":
