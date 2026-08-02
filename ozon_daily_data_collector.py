@@ -52,9 +52,10 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V11_SEARCH_PERIOD_PROBE_SUPPLY_FALLBACK_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V12_PERFORMANCE_API_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
+OZON_PERFORMANCE_API_BASE = "https://api-performance.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
 DEFAULT_STORE = "TOPFACE"
 DEFAULT_DAILY_LOOKBACK_DAYS = 90
@@ -468,6 +469,232 @@ class OzonSellerClient:
         return all_items, raw_pages
 
 
+
+class OzonPerformanceClient:
+    """Клиент Performance API.
+
+    Авторизация:
+    POST /api/client/token
+    client_id + client_secret + grant_type=client_credentials.
+
+    Методы чтения сделаны с fallback-вариантами, потому что Ozon постепенно
+    переводит рекламные инструменты между версиями API. Все успешные и
+    неуспешные ответы сохраняются сборщиком в raw JSON.
+    """
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        timeout: int = 180,
+    ):
+        self.base = OZON_PERFORMANCE_API_BASE.rstrip("/")
+        self.client_id = str(client_id)
+        self.client_secret = str(client_secret)
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": f"ozon-assist/{SCRIPT_VERSION}",
+        })
+        self.access_token = ""
+        self.token_expires_at = 0.0
+
+    def _ensure_token(self) -> None:
+        if self.access_token and time.time() < self.token_expires_at - 60:
+            return
+
+        url = self.base + "/api/client/token"
+        payload = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "grant_type": "client_credentials",
+        }
+        response = self.session.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=self.timeout,
+        )
+        if response.status_code != 200:
+            raise OzonApiError(
+                "POST",
+                "/api/client/token",
+                response.status_code,
+                response.text[:2000],
+                response.text[:6000],
+            )
+
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise OzonApiError(
+                "POST",
+                "/api/client/token",
+                200,
+                "Ответ token не является JSON",
+                response.text[:2000],
+            ) from exc
+
+        token = (
+            body.get("access_token")
+            or body.get("accessToken")
+            or body.get("token")
+        )
+        if not token:
+            raise OzonApiError(
+                "POST",
+                "/api/client/token",
+                200,
+                "В ответе отсутствует access_token",
+                safe_json(body),
+            )
+
+        self.access_token = str(token)
+        expires_in = body.get("expires_in") or body.get("expiresIn") or 1800
+        try:
+            expires_seconds = int(expires_in)
+        except Exception:
+            expires_seconds = 1800
+        self.token_expires_at = time.time() + max(300, expires_seconds)
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+        })
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Optional[Mapping[str, Any]] = None,
+        params: Optional[Mapping[str, Any]] = None,
+        retries: int = 6,
+    ) -> Any:
+        self._ensure_token()
+        url = self.base + path
+        last_error = ""
+
+        for attempt in range(1, retries + 1):
+            try:
+                response = self.session.request(
+                    method.upper(),
+                    url,
+                    json=dict(payload) if payload is not None else None,
+                    params=dict(params) if params is not None else None,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                if attempt == retries:
+                    raise OzonApiError(method.upper(), path, 0, last_error) from exc
+                time.sleep(min(60, 2 ** attempt))
+                continue
+
+            if response.status_code in {200, 201, 202}:
+                if not response.text.strip():
+                    return {}
+                try:
+                    return response.json()
+                except Exception:
+                    return {
+                        "_content_type": response.headers.get("Content-Type", ""),
+                        "_text": response.text,
+                    }
+
+            if response.status_code == 401 and attempt < retries:
+                self.access_token = ""
+                self.token_expires_at = 0.0
+                self._ensure_token()
+                continue
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < retries:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    seconds = int(float(retry_after)) if retry_after else min(90, 2 ** attempt)
+                except Exception:
+                    seconds = min(90, 2 ** attempt)
+                logging.warning(
+                    "Performance API повтор %s/%s %s после HTTP %s через %s сек",
+                    attempt,
+                    retries,
+                    path,
+                    response.status_code,
+                    seconds,
+                )
+                time.sleep(max(1, seconds))
+                continue
+
+            text_body = response.text[:6000]
+            try:
+                body = response.json()
+                message = (
+                    body.get("message")
+                    or body.get("error")
+                    or body.get("code")
+                    or text_body
+                )
+            except Exception:
+                message = text_body
+            raise OzonApiError(
+                method.upper(),
+                path,
+                response.status_code,
+                str(message),
+                text_body,
+            )
+
+        raise OzonApiError(method.upper(), path, 0, last_error or "Неизвестная ошибка")
+
+    def get(self, path: str, params: Optional[Mapping[str, Any]] = None) -> Any:
+        return self.request("GET", path, params=params)
+
+    def post(self, path: str, payload: Mapping[str, Any]) -> Any:
+        return self.request("POST", path, payload=payload)
+
+    def try_variants(
+        self,
+        variants: Sequence[Tuple[str, str, Optional[Mapping[str, Any]], Optional[Mapping[str, Any]]]],
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Пробует варианты method/path/payload/params до первого успеха."""
+        attempts: List[Dict[str, Any]] = []
+        last_exc: Optional[Exception] = None
+
+        for method, path, payload, params in variants:
+            try:
+                data = self.request(
+                    method,
+                    path,
+                    payload=payload,
+                    params=params,
+                )
+                meta = {
+                    "chosen_method": method,
+                    "chosen_path": path,
+                    "chosen_payload": payload,
+                    "chosen_params": params,
+                    "attempts": attempts,
+                }
+                return data, meta
+            except OzonApiError as exc:
+                last_exc = exc
+                attempts.append({
+                    "method": method,
+                    "path": path,
+                    "payload": payload,
+                    "params": params,
+                    "status": exc.status,
+                    "error": str(exc),
+                    "response_text": exc.response_text,
+                })
+                if exc.status in {400, 404, 405, 422}:
+                    continue
+                raise
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Не задано ни одного варианта Performance API")
+
 # ---------------------------------------------------------------------------
 # Report definitions
 # ---------------------------------------------------------------------------
@@ -496,9 +723,18 @@ class ReportResult:
 # ---------------------------------------------------------------------------
 
 class OzonFboCollector:
-    def __init__(self, client: OzonSellerClient, storage: S3Storage, store: str, target_date: date,
-                 mode: str, workdir: Path):
+    def __init__(
+        self,
+        client: OzonSellerClient,
+        storage: S3Storage,
+        store: str,
+        target_date: date,
+        mode: str,
+        workdir: Path,
+        performance_client: Optional[OzonPerformanceClient] = None,
+    ):
         self.client = client
+        self.performance_client = performance_client
         self.storage = storage
         self.store = store.upper().strip()
         self.target_date = target_date
@@ -1404,6 +1640,348 @@ class OzonFboCollector:
             "rows": len(df),
         }, ["/v2/analytics/stock_on_warehouses"]
 
+    # ------------------------- Performance API -------------------------
+
+    def _require_performance(self) -> OzonPerformanceClient:
+        if self.performance_client is None:
+            raise RuntimeError(
+                "Не заданы OZON_PERFORMANCE_CLIENT_ID и OZON_PERFORMANCE_CLIENT_SECRET"
+            )
+        return self.performance_client
+
+    @staticmethod
+    def _extract_performance_items(data: Any) -> List[Dict[str, Any]]:
+        if isinstance(data, list):
+            return [
+                dict(item) if isinstance(item, Mapping) else {"value": item}
+                for item in data
+            ]
+        if not isinstance(data, Mapping):
+            return []
+
+        paths = [
+            ("list",),
+            ("items",),
+            ("campaigns",),
+            ("products",),
+            ("rows",),
+            ("result",),
+            ("result", "items"),
+            ("result", "campaigns"),
+            ("result", "products"),
+            ("data",),
+            ("data", "items"),
+            ("data", "campaigns"),
+            ("data", "products"),
+        ]
+        items = extract_items(data, paths)
+        if items:
+            return items
+
+        # Иногда один объект возвращается без массива.
+        if any(
+            key in data
+            for key in ("id", "campaignId", "campaign_id", "sku", "productId")
+        ):
+            return [dict(data)]
+        return []
+
+    def fetch_ad_campaigns(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        client = self._require_performance()
+        data, meta = client.try_variants([
+            ("GET", "/api/client/campaign", None, None),
+            ("GET", "/api/client/campaigns", None, None),
+            ("POST", "/api/client/campaign", {}, None),
+        ])
+        items = self._extract_performance_items(data)
+        df = records_to_df(items, {
+            "Дата снимка": self.target_date.isoformat(),
+        })
+        raw = {"meta": meta, "response": data}
+        return df, raw, [meta["chosen_path"]]
+
+    def _campaign_ids_from_results(self) -> List[str]:
+        result = next(
+            (r for r in self.results if r.code == "ad_campaigns" and not r.df.empty),
+            None,
+        )
+        if result is None:
+            return []
+
+        candidates = [
+            "id", "campaignId", "campaign_id", "campaign.id", "advCampaignId"
+        ]
+        ids: List[str] = []
+        for column in candidates:
+            if column not in result.df.columns:
+                continue
+            for value in result.df[column].dropna().tolist():
+                text_value = str(value).strip()
+                if text_value and text_value.lower() != "nan":
+                    ids.append(text_value)
+        return sorted(set(ids))
+
+    def fetch_ad_products_bids(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        client = self._require_performance()
+        campaign_ids = self._campaign_ids_from_results()
+        if not campaign_ids:
+            return pd.DataFrame(), {"warning": "campaign_ids is empty"}, []
+
+        rows: List[Dict[str, Any]] = []
+        raw: List[Any] = []
+        used_paths: List[str] = []
+
+        for index, campaign_id in enumerate(campaign_ids, start=1):
+            product_data, product_meta = client.try_variants([
+                (
+                    "GET",
+                    f"/api/client/campaign/{campaign_id}/products",
+                    None,
+                    None,
+                ),
+                (
+                    "GET",
+                    f"/api/client/campaign/{campaign_id}/product",
+                    None,
+                    None,
+                ),
+            ])
+            used_paths.append(product_meta["chosen_path"])
+            products = self._extract_performance_items(product_data)
+
+            competitive_data: Any = {}
+            competitive_meta: Dict[str, Any] = {}
+            try:
+                competitive_data, competitive_meta = client.try_variants([
+                    (
+                        "GET",
+                        f"/api/client/campaign/{campaign_id}/products/bids/competitive",
+                        None,
+                        None,
+                    ),
+                    (
+                        "GET",
+                        f"/api/client/campaign/{campaign_id}/bids/competitive",
+                        None,
+                        None,
+                    ),
+                ])
+                used_paths.append(competitive_meta["chosen_path"])
+            except Exception as exc:
+                competitive_data = {"error": str(exc)}
+
+            competitive_items = self._extract_performance_items(competitive_data)
+            competitive_by_sku: Dict[str, Dict[str, Any]] = {}
+            for item in competitive_items:
+                key = (
+                    item.get("sku")
+                    or item.get("productId")
+                    or item.get("product_id")
+                    or item.get("offerId")
+                )
+                if key is not None:
+                    competitive_by_sku[str(key)] = item
+
+            for product in products:
+                row = {
+                    "Дата снимка": self.target_date.isoformat(),
+                    "campaign_id": campaign_id,
+                }
+                row.update(product)
+                key = (
+                    product.get("sku")
+                    or product.get("productId")
+                    or product.get("product_id")
+                    or product.get("offerId")
+                )
+                competitive = competitive_by_sku.get(str(key), {})
+                for key_name, value in competitive.items():
+                    if key_name not in row:
+                        row[f"competitive.{key_name}"] = value
+                rows.append(row)
+
+            raw.append({
+                "campaign_id": campaign_id,
+                "products_meta": product_meta,
+                "products_response": product_data,
+                "competitive_meta": competitive_meta,
+                "competitive_response": competitive_data,
+            })
+
+            if index % 20 == 0:
+                logging.info(
+                    "Performance API: товары и ставки %s/%s кампаний",
+                    index,
+                    len(campaign_ids),
+                )
+            time.sleep(0.12)
+
+        df = records_to_df(rows, {
+            "Дата снимка": self.target_date.isoformat(),
+        })
+        return df, raw, sorted(set(used_paths))
+
+    def _poll_statistics_report(
+        self,
+        client: OzonPerformanceClient,
+        report_id: str,
+        max_attempts: int = 60,
+    ) -> Tuple[Any, List[Any], str]:
+        raw: List[Any] = []
+        variants = [
+            f"/api/client/statistics/{report_id}",
+            f"/api/client/statistics/report/{report_id}",
+            f"/api/client/statistics/{report_id}/data",
+        ]
+        last_path = variants[0]
+
+        for attempt in range(1, max_attempts + 1):
+            for path in variants:
+                try:
+                    data = client.get(path)
+                    last_path = path
+                    raw.append({
+                        "attempt": attempt,
+                        "path": path,
+                        "response": data,
+                    })
+
+                    status = ""
+                    if isinstance(data, Mapping):
+                        status = str(
+                            data.get("status")
+                            or data.get("state")
+                            or data.get("reportStatus")
+                            or ""
+                        ).upper()
+
+                    if status in {"ERROR", "FAILED", "CANCELLED"}:
+                        raise RuntimeError(
+                            f"Performance report {report_id}: status={status}"
+                        )
+
+                    items = self._extract_performance_items(data)
+                    if items:
+                        return data, raw, path
+
+                    if status in {
+                        "OK", "DONE", "READY", "COMPLETED", "SUCCESS"
+                    }:
+                        return data, raw, path
+
+                except OzonApiError as exc:
+                    if exc.status in {404, 405}:
+                        continue
+                    raise
+
+            time.sleep(min(15, 2 + attempt // 5))
+
+        raise RuntimeError(
+            f"Performance report {report_id} не готов после {max_attempts} проверок"
+        )
+
+    def fetch_ad_statistics(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        client = self._require_performance()
+        campaign_ids = self._campaign_ids_from_results()
+        if not campaign_ids:
+            return pd.DataFrame(), {"warning": "campaign_ids is empty"}, []
+
+        # test/archive — выбранный день; daily — текущий рабочий период.
+        date_from = self.period_from.isoformat()
+        date_to = self.period_to.isoformat()
+
+        payload_variants = [
+            {
+                "campaigns": campaign_ids,
+                "dateFrom": date_from,
+                "dateTo": date_to,
+                "groupBy": "DATE",
+            },
+            {
+                "campaignIds": campaign_ids,
+                "dateFrom": date_from,
+                "dateTo": date_to,
+                "groupBy": ["DATE", "SKU"],
+            },
+            {
+                "campaigns": campaign_ids,
+                "from": date_from,
+                "to": date_to,
+                "groupBy": ["DATE", "SKU"],
+            },
+        ]
+
+        attempts: List[Any] = []
+        used_paths: List[str] = []
+
+        for payload in payload_variants:
+            try:
+                data, meta = client.try_variants([
+                    ("POST", "/api/client/statistics", payload, None),
+                    ("POST", "/api/client/statistics/json", payload, None),
+                    ("POST", "/api/client/statistics/campaign", payload, None),
+                ])
+                used_paths.append(meta["chosen_path"])
+                attempts.append({
+                    "request": payload,
+                    "meta": meta,
+                    "response": data,
+                })
+
+                direct_items = self._extract_performance_items(data)
+                if direct_items:
+                    df = records_to_df(direct_items, {
+                        "Дата выгрузки": self.target_date.isoformat(),
+                        "Период с": date_from,
+                        "Период по": date_to,
+                    })
+                    return df, attempts, sorted(set(used_paths))
+
+                report_id = None
+                if isinstance(data, Mapping):
+                    report_id = (
+                        data.get("UUID")
+                        or data.get("uuid")
+                        or data.get("reportId")
+                        or data.get("report_id")
+                        or data.get("id")
+                    )
+
+                if report_id:
+                    final_data, poll_raw, poll_path = self._poll_statistics_report(
+                        client,
+                        str(report_id),
+                    )
+                    used_paths.append(poll_path)
+                    attempts.append({
+                        "report_id": report_id,
+                        "poll": poll_raw,
+                    })
+                    items = self._extract_performance_items(final_data)
+                    df = records_to_df(items, {
+                        "Дата выгрузки": self.target_date.isoformat(),
+                        "Период с": date_from,
+                        "Период по": date_to,
+                        "report_id": str(report_id),
+                    })
+                    return df, attempts, sorted(set(used_paths))
+
+            except OzonApiError as exc:
+                attempts.append({
+                    "request": payload,
+                    "status": exc.status,
+                    "error": str(exc),
+                    "response_text": exc.response_text,
+                })
+                if exc.status in {400, 404, 405, 422}:
+                    continue
+                raise
+
+        raise RuntimeError(
+            "Не удалось подобрать рабочую схему отчёта Performance API. "
+            "См. Служебные/Ошибки_API и raw JSON."
+        )
+
     # ------------------------- collect/save -------------------------
     def collect_all(self) -> None:
         # Порядок важен: товарный справочник нужен для детализации поисковых запросов.
@@ -1432,6 +2010,42 @@ class OzonFboCollector:
                   ["id", "return_id", "posting_number", "sku"], optional=True)
         self._run("funnel", "Воронка продаж", "Воронка продаж", "Воронка_продаж",
                   self.fetch_funnel, "Дата", ["Дата", "sku"])
+        if self.performance_client is not None:
+            self._run(
+                "ad_campaigns",
+                "Реклама — кампании",
+                "Реклама/Кампании",
+                "Рекламные_кампании",
+                self.fetch_ad_campaigns,
+                "Дата снимка",
+                ["Дата снимка", "id", "campaignId", "campaign_id"],
+                snapshot=True,
+                optional=True,
+            )
+            self._run(
+                "ad_products_bids",
+                "Реклама — товары и ставки",
+                "Реклама/Товары и ставки",
+                "Реклама_товары_и_ставки",
+                self.fetch_ad_products_bids,
+                "Дата снимка",
+                ["Дата снимка", "campaign_id", "sku", "productId", "offerId"],
+                optional=True,
+            )
+            self._run(
+                "ad_statistics",
+                "Реклама — дневная статистика",
+                "Реклама/Статистика",
+                "Реклама_статистика",
+                self.fetch_ad_statistics,
+                "Дата",
+                ["Дата", "date", "campaignId", "campaign_id", "sku"],
+                optional=True,
+            )
+        else:
+            logging.warning(
+                "Performance API отключён: ключи рекламного аккаунта не заданы"
+            )
         self._run("product_queries", "Поисковые запросы — сводная", "Поисковые запросы", "Поисковые_запросы_сводная",
                   self.fetch_product_queries, "Дата", ["Дата", "offer_id", "sku", "query", "search_query", "query_text"], optional=True)
         self._run("product_query_details", "Поисковые запросы — товар × запрос", "Поисковые запросы по товарам",
@@ -1695,6 +2309,14 @@ def main() -> int:
     store = str(args.store).upper().strip() or DEFAULT_STORE
     client_id = env_first(f"OZON_CLIENT_ID_{store}", "OZON_CLIENT_ID")
     api_key = env_first(f"OZON_API_KEY_{store}", "OZON_API_KEY")
+    performance_client_id = env_first(
+        f"OZON_PERFORMANCE_CLIENT_ID_{store}",
+        "OZON_PERFORMANCE_CLIENT_ID",
+    )
+    performance_client_secret = env_first(
+        f"OZON_PERFORMANCE_CLIENT_SECRET_{store}",
+        "OZON_PERFORMANCE_CLIENT_SECRET",
+    )
     if not client_id or not api_key:
         raise RuntimeError(f"Не заданы OZON_CLIENT_ID_{store} и/или OZON_API_KEY_{store}")
 
@@ -1717,7 +2339,27 @@ def main() -> int:
     storage = S3Storage(access_key, secret_key, args.bucket, endpoint)
     storage.ensure_bucket()
     client = OzonSellerClient(client_id, api_key)
-    collector = OzonFboCollector(client, storage, store, target, args.mode, Path(args.workdir))
+    performance_client: Optional[OzonPerformanceClient] = None
+    if performance_client_id and performance_client_secret:
+        performance_client = OzonPerformanceClient(
+            performance_client_id,
+            performance_client_secret,
+        )
+        logging.info("Performance API: ключи найдены, рекламные отчёты включены")
+    else:
+        logging.warning(
+            "Performance API: ключи не найдены, рекламные отчёты будут пропущены"
+        )
+
+    collector = OzonFboCollector(
+        client,
+        storage,
+        store,
+        target,
+        args.mode,
+        Path(args.workdir),
+        performance_client=performance_client,
+    )
     collector.collect_all()
     collector.save_results()
     collector.save_diagnostics()
