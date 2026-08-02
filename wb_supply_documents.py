@@ -73,7 +73,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V10_20260731"
+VERSION = "WB_SUPPLY_DOCUMENTS_TOPFACE_V11_20260801"
 STORE_NAME = "TOPFACE"
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -1375,32 +1375,104 @@ def build_supply_workbook(
     return output.getvalue()
 
 
-def supply_event_text(supply: SupplySummary, new_upds: Sequence[Dict[str, Any]]) -> str:
+def document_linked_supply_id(
+    service_name: str,
+    record: Dict[str, Any],
+    valid_supply_ids: set[int],
+) -> Optional[int]:
+    """Определяет supplyID документа по точному номеру в данных WB."""
+    upd = record.get("upd") or {}
+    direct = to_int(upd.get("supply_id"), 0)
+    if direct and direct in valid_supply_ids:
+        return direct
+
+    file_names = [str(item.get("name", "")) for item in (record.get("files") or [])]
+    candidates = numeric_ids_from_text(
+        service_name,
+        record.get("name", ""),
+        record.get("category", ""),
+        *file_names,
+    )
+    for candidate in candidates:
+        if candidate in valid_supply_ids:
+            return candidate
+    return None
+
+
+def final_package_key(
+    acceptance_records: Sequence[Dict[str, Any]],
+    upd_records: Sequence[Dict[str, Any]],
+) -> str:
+    """Ключ конечного комплекта: акт приёмки + УПД."""
+    return stable_hash({
+        "acceptance": sorted(str(item.get("service_name", "")) for item in acceptance_records),
+        "upd": sorted(str(item.get("service_name", "")) for item in upd_records),
+    })
+
+
+def final_supply_event_text(
+    supply: SupplySummary,
+    acceptance_records: Sequence[Dict[str, Any]],
+    upd_records: Sequence[Dict[str, Any]],
+) -> str:
+    """Только конечная карточка поставки: акт уже сформирован, УПД найден."""
+    if supply.excess_qty == 0 and supply.shortage_qty == 0:
+        discrepancy_text = "нет"
+    else:
+        discrepancy_text = (
+            f"недостача {supply.shortage_qty} шт., "
+            f"излишки {supply.excess_qty} шт."
+        )
+
+    acceptance_numbers: List[str] = []
+    for record in acceptance_records:
+        ids = numeric_ids_from_text(record.get("service_name", ""), record.get("name", ""))
+        number = str(ids[0]) if ids else str(record.get("service_name", ""))
+        if number and number not in acceptance_numbers:
+            acceptance_numbers.append(number)
+
+    destination = canonical_warehouse(supply.warehouse_plan) or supply.warehouse or "не определён"
     lines = [
         f"📦 Поставка {supply.supply_id}",
-        f"Склад: {supply.warehouse or 'не определён'}",
-        supply.report_comment(),
+        f"Город/склад: {destination}",
+        f"Заявлено: {supply.planned_qty} шт.",
+        f"Принято: {supply.accepted_qty} шт.",
+        f"Расхождения: {discrepancy_text}",
+        f"📄 Акт приёмки: сформирован{(' №' + ', №'.join(acceptance_numbers)) if acceptance_numbers else ''}",
     ]
-    for upd in new_upds:
-        number = upd.get("document_number") or "без номера"
+
+    for record in upd_records:
+        upd = record.get("upd") or {}
+        number = upd.get("document_number") or record.get("service_name") or "без номера"
         date_value = upd.get("document_date") or "без даты"
-        lines.extend([
-            "",
-            f"📄 Скачан УПД №{number} от {date_value}",
-            "Загрузите УПД в ЭДО и передайте на подпись.",
-        ])
+        lines.append(f"📄 УПД: №{number} от {date_value}")
     return "\n".join(lines)
 
 
-def unmatched_upd_text(upd: Dict[str, Any]) -> str:
-    return "\n".join([
-        f"📄 Скачан УПД №{upd.get('document_number') or 'без номера'} от {upd.get('document_date') or 'без даты'}",
-        f"Склад: {upd.get('warehouse') or 'не определён'}",
-        f"Количество: {upd.get('total_qty', 0)} шт.",
-        "Поставка не определена автоматически — проверьте вручную.",
-        "Загрузите УПД в ЭДО и передайте на подпись.",
-    ])
+def upd_xml_payload(storage: Storage, record: Dict[str, Any]) -> Optional[Tuple[str, bytes]]:
+    """Читает XML УПД из Object Storage, в том числе если он скачан в прошлом запуске."""
+    upd = record.get("upd") or {}
+    preferred_key = str(upd.get("s3_key", "")).strip()
+    candidates: List[Tuple[str, str]] = []
+    for item in record.get("files") or []:
+        name = str(item.get("name", ""))
+        key = str(item.get("key", ""))
+        if name.lower().endswith(".xml") and key:
+            candidates.append((name, key))
+    if preferred_key:
+        preferred_name = PurePosixPath(preferred_key).name or str(upd.get("xml_filename") or "upd.xml")
+        candidates.insert(0, (preferred_name, preferred_key))
 
+    seen: set[str] = set()
+    for name, key in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            return safe_filename(name, "upd.xml"), storage.read_bytes(key)
+        except Exception as exc:
+            log(f"WARN УПД {record.get('service_name', '')}: не удалось прочитать {key}: {exc}")
+    return None
 
 def supply_reference_date(supply: SupplySummary) -> Optional[dt.date]:
     """Дата для отбора поставок в Telegram: дата поставки, затем факт/создание."""
@@ -1743,9 +1815,39 @@ def run(args: argparse.Namespace) -> int:
             "Качество сопоставления": upd.get("match_reason", ""),
         })
 
-    # Сохраняем поставки в реестр и определяем события.
-    notify_status_ids = {to_int(value) for value in str(args.notify_status_ids).split(",") if to_int(value)} or DEFAULT_NOTIFY_STATUS_IDS
-    supply_events: Dict[int, Dict[str, Any]] = {}
+    # Связываем акты приёмки и УПД с поставками.
+    # Telegram больше не реагирует на промежуточные статусы поставки.
+    valid_supply_ids = set(summaries_by_id)
+    acceptance_docs_by_supply: Dict[int, List[Dict[str, Any]]] = {}
+    upd_docs_by_supply: Dict[int, List[Dict[str, Any]]] = {}
+    for service_name, record in old_documents.items():
+        linked_supply_id = document_linked_supply_id(service_name, record, valid_supply_ids)
+        if not linked_supply_id:
+            continue
+        record["linked_supply_id"] = linked_supply_id
+        kind = str(record.get("kind", ""))
+        if kind == "acceptance":
+            acceptance_docs_by_supply.setdefault(linked_supply_id, []).append(record)
+        elif kind == "upd":
+            upd_docs_by_supply.setdefault(linked_supply_id, []).append(record)
+
+    newly_changed_final_ids: set[int] = set()
+    unmatched_new_upds: List[Dict[str, Any]] = []
+    for record in newly_downloaded:
+        service_name = str(record.get("service_name", ""))
+        linked_supply_id = document_linked_supply_id(service_name, record, valid_supply_ids)
+        if linked_supply_id and record.get("kind") in {"acceptance", "upd"}:
+            newly_changed_final_ids.add(linked_supply_id)
+        elif record.get("kind") == "upd":
+            upd = record.get("upd") or {}
+            unmatched_new_upds.append({**upd, "service_name": service_name})
+
+    if unmatched_new_upds:
+        log(
+            "WARN Новых УПД без точной привязки к поставке: "
+            + ", ".join(str(item.get("service_name", "")) for item in unmatched_new_upds)
+        )
+
     period_supply_ids: set[int] = set()
     if supply_message_from and supply_message_to:
         period_supply_ids = {
@@ -1754,66 +1856,67 @@ def run(args: argparse.Namespace) -> int:
             if supply_in_period(summary, supply_message_from, supply_message_to)
         }
         log(
-            f"Поставок для отправки за период {supply_message_from} — {supply_message_to}: "
+            f"Поставок в выбранном периоде {supply_message_from} — {supply_message_to}: "
             f"{len(period_supply_ids)}"
         )
 
+    # Конечное событие существует только тогда, когда для поставки есть и акт
+    # приёмки, и УПД. Изменения статуса 4/5/6 в Telegram не отправляются.
+    final_supply_events: Dict[int, Dict[str, Any]] = {}
     for supply_id, summary in summaries_by_id.items():
-        previous = old_supplies.get(str(supply_id))
-        if notification_required(
-            summary,
-            previous,
-            registry_was_new,
-            args.first_run_notify_days,
-            notify_status_ids,
-            args.force_notify,
-        ):
-            supply_events.setdefault(supply_id, {"supply_changed": True, "new_upds": [], "period_selected": False})
+        previous = old_supplies.get(str(supply_id)) or {}
+        acceptance_records = acceptance_docs_by_supply.get(supply_id, [])
+        upd_records = upd_docs_by_supply.get(supply_id, [])
+        current_final_key = ""
+        if acceptance_records and upd_records:
+            current_final_key = final_package_key(acceptance_records, upd_records)
 
-        if supply_id in period_supply_ids:
-            event = supply_events.setdefault(
-                supply_id,
-                {"supply_changed": False, "new_upds": [], "period_selected": True},
+        selected_by_period = bool(period_supply_ids and supply_id in period_supply_ids)
+        retry_pending = parse_bool(previous.get("final_notification_retry_pending"), False)
+        changed_after_notification = bool(
+            current_final_key
+            and previous.get("final_notification_key")
+            and previous.get("final_notification_key") != current_final_key
+        )
+        should_send = bool(
+            current_final_key
+            and (
+                selected_by_period
+                or args.force_notify
+                or retry_pending
+                or changed_after_notification
+                or supply_id in newly_changed_final_ids
             )
-            event["period_selected"] = True
-
-        previous_upd_ids = {str(item.get("service_name")) for item in (previous or {}).get("upd_documents", [])}
-        new_upds = [item for item in summary.upd_documents if str(item.get("service_name")) not in previous_upd_ids]
-        if new_upds:
-            event = supply_events.setdefault(
-                supply_id,
-                {"supply_changed": False, "new_upds": [], "period_selected": False},
-            )
-            event["new_upds"].extend(new_upds)
+        )
+        if should_send:
+            final_supply_events[supply_id] = {
+                "acceptance_records": acceptance_records,
+                "upd_records": upd_records,
+                "final_key": current_final_key,
+                "selected_by_period": selected_by_period,
+            }
 
         data = asdict(summary)
-        data["first_seen_at"] = (previous or {}).get("first_seen_at") or now_msk().isoformat()
+        data["first_seen_at"] = previous.get("first_seen_at") or now_msk().isoformat()
         data["last_seen_at"] = now_msk().isoformat()
-        data["notified_state_hash"] = (previous or {}).get("notified_state_hash", "")
+        data["notified_state_hash"] = previous.get("notified_state_hash", "")
+        data["final_notification_key"] = previous.get("final_notification_key", "")
+        data["final_notified_at"] = previous.get("final_notified_at", "")
+        data["final_notification_retry_pending"] = retry_pending
         old_supplies[str(supply_id)] = data
 
-    # УПД и акты по маленьким доприёмкам продолжаем скачивать и хранить,
-    # но поставки меньше порога не включаем в Telegram и не прикладываем их XML.
+    # Мелкие доприёмки скачиваются и остаются в S3/реестре, но Telegram молчит.
     telegram_supply_events: Dict[int, Dict[str, Any]] = {
         supply_id: event
-        for supply_id, event in supply_events.items()
+        for supply_id, event in final_supply_events.items()
         if supply_visible_in_telegram(summaries_by_id[supply_id], args.telegram_min_supply_qty)
     }
-    suppressed_small_supply_ids = sorted(set(supply_events) - set(telegram_supply_events))
+    suppressed_small_supply_ids = sorted(set(final_supply_events) - set(telegram_supply_events))
     if suppressed_small_supply_ids:
         log(
-            f"Telegram: скрыто поставок меньше {args.telegram_min_supply_qty} шт.: "
-            f"{len(suppressed_small_supply_ids)}; IDs={suppressed_small_supply_ids}"
+            f"Telegram: конечные комплекты поставок меньше {args.telegram_min_supply_qty} шт. скрыты: "
+            f"{suppressed_small_supply_ids}"
         )
-
-    unmatched_new_upds: List[Dict[str, Any]] = []
-    for record in newly_downloaded:
-        if record.get("kind") != "upd":
-            continue
-        upd = record.get("upd") or {}
-        if not upd.get("supply_id"):
-            unmatched_new_upds.append({**upd, "service_name": record.get("service_name")})
-
     # Excel и JSON-снимок.
     month = run_date.strftime("%Y-%m")
     all_summaries = list(summaries_by_id.values())
@@ -1853,110 +1956,87 @@ def run(args: argparse.Namespace) -> int:
     )
     upload_bytes(storage, snapshot_key, json_dumps(snapshot), "application/json")
 
-    # Telegram. Сначала сообщение, затем XML только в выбранном режиме.
-    message_parts = [
-        f"📋 Документы по поставкам TOPFACE — {run_date.strftime('%d.%m.%Y')}",
-    ]
-    if supply_message_from and supply_message_to:
-        message_parts.append(
-            f"Поставки за период: {supply_message_from.strftime('%d.%m.%Y')} — "
-            f"{supply_message_to.strftime('%d.%m.%Y')}"
-        )
-    else:
-        message_parts.append("Поставки: только новые события и изменения")
-    message_parts.extend([
-        f"УПД в Telegram: {'сообщение + XML' if args.upd_send_mode == 'message_and_upd' else 'только сообщение'}",
-        f"Минимальный размер поставки для Telegram: {args.telegram_min_supply_qty} шт.",
-        "",
-    ])
-
-    ordered_supply_ids = sorted(
-        telegram_supply_events,
-        key=lambda supply_id: supply_sort_key(summaries_by_id[supply_id]),
-        reverse=True,
-    )
-    for supply_id in ordered_supply_ids:
-        event = telegram_supply_events[supply_id]
-        message_parts.append(supply_event_text(summaries_by_id[supply_id], event.get("new_upds", [])))
-        message_parts.append("")
-    for upd in unmatched_new_upds:
-        message_parts.append(unmatched_upd_text(upd))
-        message_parts.append("")
-
-    if not telegram_supply_events and not unmatched_new_upds:
-        if supply_message_from and supply_message_to:
-            message_parts.append("Поставки за выбранный период не найдены. Новых УПД тоже нет.")
-        else:
-            message_parts.append("Новых УПД и изменений по приёмке поставок не найдено.")
-
+    # Telegram: только конкретные завершённые поставки. Если событий нет — не отправляем ничего.
     discrepancy_supply_count = sum(
         1 for summary in all_summaries
         if summary.excess_qty > 0 or summary.shortage_qty > 0
     )
     new_upd_count = sum(1 for record in newly_downloaded if record.get("kind") == "upd")
     new_acceptance_count = sum(1 for record in newly_downloaded if record.get("kind") == "acceptance")
-    message_parts.extend([
-        "",
-        f"Поставок в контроле: {len(all_summaries)}",
-        f"Поставок отправлено в сообщении: {len(telegram_supply_events)}",
-        f"Мелких доприёмок скрыто (<{args.telegram_min_supply_qty} шт.): {len(suppressed_small_supply_ids)}",
-        f"Новых документов скачано: {len(newly_downloaded)}",
-        f"Осталось документов в очереди: {documents_remaining}",
-        f"Новых УПД: {new_upd_count}",
-        f"Актов приёмки скачано: {new_acceptance_count}",
-        "Отчёт сверки поставок: сформирован",
-        f"Поставок с расхождениями: {discrepancy_supply_count}",
-    ])
-    if deep_errors:
-        message_parts.append(f"⚠ Ошибок детальной проверки: {len(deep_errors)}")
 
-    message = "\n".join(message_parts).strip()
+    ordered_supply_ids = sorted(
+        telegram_supply_events,
+        key=lambda supply_id: supply_sort_key(summaries_by_id[supply_id]),
+        reverse=True,
+    )
+    message_blocks = [
+        final_supply_event_text(
+            summaries_by_id[supply_id],
+            telegram_supply_events[supply_id]["acceptance_records"],
+            telegram_supply_events[supply_id]["upd_records"],
+        )
+        for supply_id in ordered_supply_ids
+    ]
+    message = "\n\n".join(message_blocks).strip()
+
     telegram_ok = True
-    if not args.no_telegram:
+    telegram_message_sent = False
+    if not args.no_telegram and message:
+        telegram_message_sent = True
         telegram_ok = send_telegram_message(message)
         if telegram_ok and args.upd_send_mode == "message_and_upd":
-            for filename, file_bytes, metadata in upd_file_payloads:
-                service_name = metadata.get("service_name", "")
-                record = old_documents.get(str(service_name), {})
-                upd = record.get("upd") or {}
-                linked_supply_id = to_int(upd.get("supply_id"), 0)
-                linked_supply = summaries_by_id.get(linked_supply_id) if linked_supply_id else None
-                if linked_supply and not supply_visible_in_telegram(linked_supply, args.telegram_min_supply_qty):
-                    log(
-                        f"Telegram: XML {filename} не отправлен — поставка {linked_supply_id} "
-                        f"меньше {args.telegram_min_supply_qty} шт.; файл сохранён в Object Storage"
+            sent_service_names: set[str] = set()
+            for supply_id in ordered_supply_ids:
+                supply = summaries_by_id[supply_id]
+                for record in telegram_supply_events[supply_id]["upd_records"]:
+                    service_name = str(record.get("service_name", ""))
+                    if not service_name or service_name in sent_service_names:
+                        continue
+                    sent_service_names.add(service_name)
+                    payload = upd_xml_payload(storage, record)
+                    if payload is None:
+                        log(f"WARN Telegram: XML для {service_name} не найден в Object Storage")
+                        telegram_ok = False
+                        continue
+                    filename, file_bytes = payload
+                    upd = record.get("upd") or {}
+                    caption = (
+                        f"TOPFACE | Поставка {supply_id} | {supply.warehouse or 'склад не определён'} | "
+                        f"УПД №{upd.get('document_number') or 'без номера'}"
                     )
-                    continue
-                caption = (
-                    f"TOPFACE | УПД №{upd.get('document_number') or 'без номера'} | "
-                    f"Склад: {upd.get('warehouse') or 'не определён'} | "
-                    f"Поставка: {upd.get('supply_id') or 'не определена'}"
-                )
-                if not send_telegram_document(filename, file_bytes, caption):
-                    telegram_ok = False
+                    if not send_telegram_document(filename, file_bytes, caption):
+                        telegram_ok = False
+    elif not message:
+        log("Telegram: новых завершённых комплектов «акт приёмки + УПД» нет; сообщение не отправлено")
 
-    if telegram_ok:
-        notified_at = now_msk().isoformat()
-        for supply_id in supply_events:
-            old_supplies[str(supply_id)]["notified_state_hash"] = summaries_by_id[supply_id].state_hash
-            if supply_id in telegram_supply_events:
-                old_supplies[str(supply_id)]["notified_at"] = notified_at
-                old_supplies[str(supply_id)].pop("telegram_suppressed_at", None)
-                old_supplies[str(supply_id)].pop("telegram_suppressed_reason", None)
-            else:
-                old_supplies[str(supply_id)]["telegram_suppressed_at"] = notified_at
-                old_supplies[str(supply_id)]["telegram_suppressed_reason"] = (
-                    f"quantity_below_{args.telegram_min_supply_qty}"
-                )
-        for record in newly_downloaded:
-            service_name = str(record.get("service_name", ""))
-            if service_name in old_documents:
-                old_documents[service_name]["notified_at"] = notified_at
+    notified_at = now_msk().isoformat()
+    if telegram_message_sent and telegram_ok:
+        for supply_id, event in telegram_supply_events.items():
+            old_supplies[str(supply_id)]["final_notification_key"] = event["final_key"]
+            old_supplies[str(supply_id)]["final_notified_at"] = notified_at
+            old_supplies[str(supply_id)]["final_notification_retry_pending"] = False
+            old_supplies[str(supply_id)].pop("telegram_suppressed_at", None)
+            old_supplies[str(supply_id)].pop("telegram_suppressed_reason", None)
+    elif telegram_message_sent and not telegram_ok:
+        for supply_id in telegram_supply_events:
+            old_supplies[str(supply_id)]["final_notification_retry_pending"] = True
+    for supply_id in suppressed_small_supply_ids:
+        old_supplies[str(supply_id)]["telegram_suppressed_at"] = notified_at
+        old_supplies[str(supply_id)]["telegram_suppressed_reason"] = (
+            f"quantity_below_{args.telegram_min_supply_qty}"
+        )
 
+    # Отмечаем только факт обработки документа; это не означает отправку отдельного
+    # Telegram-сообщения по промежуточному статусу поставки.
+    for record in newly_downloaded:
+        service_name = str(record.get("service_name", ""))
+        if service_name in old_documents:
+            old_documents[service_name]["processed_at"] = notified_at
     registry["script_version"] = VERSION
     registry["updated_at"] = now_msk().isoformat()
     registry["last_run"] = {
         "status": "ok" if telegram_ok else "telegram_error",
+        "telegram_message_sent": telegram_message_sent,
         "supplies_found": len(shallow_supplies),
         "supplies_deep_checked": len(deep_candidates),
         "supplies_sent": len(telegram_supply_events),
@@ -1971,7 +2051,7 @@ def run(args: argparse.Namespace) -> int:
         "new_upds": new_upd_count,
         "new_acceptance_acts": new_acceptance_count,
         "supplies_with_discrepancies": discrepancy_supply_count,
-        "supply_events": len(supply_events),
+        "final_supply_events": len(final_supply_events),
         "telegram_supply_events": len(telegram_supply_events),
         "unmatched_upds": len(unmatched_new_upds),
         "xlsx_key": daily_xlsx_key,
@@ -1983,7 +2063,8 @@ def run(args: argparse.Namespace) -> int:
     log(
         "Готово: "
         f"поставок={len(all_summaries)}, deep={len(deep_candidates)}, "
-        f"отправлено={len(telegram_supply_events)}, скрыто_мелких={len(suppressed_small_supply_ids)}, "
+        f"финальных_событий={len(final_supply_events)}, отправлено={len(telegram_supply_events)}, "
+        f"скрыто_мелких={len(suppressed_small_supply_ids)}, сообщение={telegram_message_sent}, "
         f"новых документов={len(newly_downloaded)}, "
         f"осталось={documents_remaining}, upd_mode={args.upd_send_mode}, telegram_ok={telegram_ok}"
     )
@@ -2047,6 +2128,16 @@ def self_test() -> int:
     assert supply_visible_in_telegram(boundary_supply, 100)
     small_supply.upd_documents = [{"total_qty": 120}]
     assert supply_visible_in_telegram(small_supply, 100)
+    acceptance_record = {"service_name": "act-income-2", "kind": "acceptance"}
+    upd_record = {
+        "service_name": "UPD po markirovke-2",
+        "kind": "upd",
+        "upd": {"document_number": "2", "document_date": "31.07.2026"},
+    }
+    card = final_supply_event_text(boundary_supply, [acceptance_record], [upd_record])
+    assert "Заявлено: 100 шт." in card
+    assert "Акт приёмки: сформирован" in card
+    assert "УПД: №2" in card
     log("SELF_TEST: OK")
     return 0
 
@@ -2059,7 +2150,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-deep-supplies", type=int, default=int(os.getenv("WB_MAX_DEEP_SUPPLIES", "180")))
     parser.add_argument("--max-document-downloads", type=int, default=int(os.getenv("WB_MAX_DOCUMENT_DOWNLOADS", "0")))
     parser.add_argument("--first-run-notify-days", type=int, default=int(os.getenv("WB_FIRST_RUN_NOTIFY_DAYS", "3")))
-    parser.add_argument("--notify-status-ids", default=os.getenv("WB_NOTIFY_STATUS_IDS", "4,5,6"))
+    parser.add_argument("--notify-status-ids", default=os.getenv("WB_NOTIFY_STATUS_IDS", "4,5,6"), help="Совместимость; статусы больше не являются триггером Telegram")
     parser.add_argument("--root-prefix", default=os.getenv("WB_SUPPLY_DOCS_ROOT", DEFAULT_ROOT_PREFIX))
     parser.add_argument(
         "--upd-send-mode",
@@ -2071,7 +2162,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--supply-message-mode",
         choices=("changes_only", "period"),
         default=os.getenv("WB_SUPPLY_MESSAGE_MODE", "changes_only"),
-        help="changes_only — только изменения; period — все поставки за выбранный период",
+        help="changes_only — новые конечные комплекты акт+УПД; period — готовые комплекты за выбранный период",
     )
     parser.add_argument("--supply-period-days", type=int, default=int(os.getenv("WB_SUPPLY_MESSAGE_PERIOD_DAYS", "7")))
     parser.add_argument("--supply-date-from", default=os.getenv("WB_SUPPLY_MESSAGE_DATE_FROM", ""))
