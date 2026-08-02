@@ -49,9 +49,10 @@ import requests
 from botocore.client import Config
 from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V6_ARCHIVE_1D_TEST_1D_DAILY_90D_NO_CRASH_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V7_EXCEL_CLEAN_API_LIMITS_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -607,7 +608,7 @@ class OzonFboCollector:
 
     def fetch_product_attributes(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         """Пробует актуальный и legacy-вариант endpoint; 404 не ломает сбор."""
-        endpoints = ["/v4/product/info/attributes", "/v3/products/info/attributes"]
+        endpoints = ["/v4/product/info/attributes"]
         last_exc: Optional[Exception] = None
         for endpoint in endpoints:
             rows: List[Dict[str, Any]] = []
@@ -859,30 +860,43 @@ class OzonFboCollector:
 
     # ------------------------- search -------------------------
     def fetch_product_queries(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Сводная поисковая аналитика. Timestamp передаётся в RFC3339."""
-        payload = {
-            "date_from": to_ozon_datetime(self.period_from),
-            "date_to": to_ozon_datetime(self.period_to, end=True),
-            "limit": 1000,
-            "offset": 0,
-            "sort": {"key": "orders", "order": "DESC"},
-        }
-        items, raw = self.client.offset_pages(
-            "/v1/analytics/product-queries", payload,
-            [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
-        )
-        return records_to_df(items, {
+        """Сводная поисковая аналитика с page_size до 1000."""
+        endpoint = "/v1/analytics/product-queries"
+        all_items: List[Dict[str, Any]] = []
+        raw: List[Any] = []
+        page = 1
+        page_size = 1000
+        for _ in range(500):
+            payload = {
+                "date_from": to_ozon_datetime(self.period_from),
+                "date_to": to_ozon_datetime(self.period_to, end=True),
+                "page": page,
+                "page_size": page_size,
+                "sort": {"key": "orders", "order": "DESC"},
+            }
+            data = self.client.post(endpoint, payload)
+            raw.append(data)
+            items = extract_items(
+                data,
+                [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
+            )
+            all_items.extend(items)
+            if not items or len(items) < page_size:
+                break
+            page += 1
+            time.sleep(0.12)
+
+        return records_to_df(all_items, {
             "Дата": self.target_date.isoformat(),
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
-        }), raw, ["/v1/analytics/product-queries"]
+        }), raw, [endpoint]
 
     def fetch_product_query_details(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Товар × запрос. При системной ошибке payload прекращает цикл после первого SKU."""
+        """Товар × запрос. Максимальный page_size метода — 100."""
         rows: List[Dict[str, Any]] = []
         raw: List[Any] = []
 
-        # Предпочитаем sku, поскольку этот метод в большинстве кабинетов использует Ozon SKU.
         source: List[Tuple[str, Any]] = [("sku", x) for x in self.sku_ids]
         if not source:
             source = [("offer_id", x) for x in self.offer_ids]
@@ -891,37 +905,53 @@ class OzonFboCollector:
 
         endpoint = "/v1/analytics/product-queries/details"
         for idx, (id_field, id_value) in enumerate(source, start=1):
-            payload = {
-                "date_from": to_ozon_datetime(self.period_from),
-                "date_to": to_ozon_datetime(self.period_to, end=True),
-                id_field: id_value,
-                "limit": 1000,
-                "offset": 0,
-            }
+            page = 1
             try:
-                items, pages = self.client.offset_pages(
-                    endpoint, payload,
-                    [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
-                    max_pages=50,
-                )
+                while page <= 100:
+                    payload = {
+                        "date_from": to_ozon_datetime(self.period_from),
+                        "date_to": to_ozon_datetime(self.period_to, end=True),
+                        id_field: id_value,
+                        "page": page,
+                        "page_size": 100,
+                    }
+                    data = self.client.post(endpoint, payload)
+                    raw.append(data)
+                    items = extract_items(
+                        data,
+                        [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
+                    )
+                    for item in items:
+                        row = dict(item)
+                        row.setdefault(id_field, id_value)
+                        rows.append(row)
+                    if not items or len(items) < 100:
+                        break
+                    page += 1
+                    time.sleep(0.10)
             except OzonApiError as exc:
-                # 400/422 на первом товаре означает несовместимую схему запроса:
-                # не создаём сотни одинаковых ошибок.
                 if exc.status in {400, 404, 422}:
-                    self.log_error("search_query_details_item", f"{id_field}={id_value}", exc, True)
+                    self.log_error(
+                        "search_query_details_item",
+                        f"{id_field}={id_value}",
+                        exc,
+                        True,
+                    )
                     if idx == 1:
-                        logging.warning("Детализация поисковых запросов недоступна с текущей схемой; цикл остановлен")
+                        logging.warning(
+                            "Детализация поисковых запросов недоступна с текущей схемой; цикл остановлен"
+                        )
                         break
                     continue
                 raise
-            raw.extend(pages)
-            for item in items:
-                row = dict(item)
-                row.setdefault(id_field, id_value)
-                rows.append(row)
+
             if idx % 50 == 0:
-                logging.info("Поисковые запросы: обработано товаров %s/%s", idx, len(source))
-            time.sleep(0.18)
+                logging.info(
+                    "Поисковые запросы: обработано товаров %s/%s",
+                    idx,
+                    len(source),
+                )
+            time.sleep(0.15)
 
         return records_to_df(rows, {
             "Дата": self.target_date.isoformat(),
@@ -930,21 +960,35 @@ class OzonFboCollector:
         }), raw, [endpoint]
 
     def fetch_search_queries_top(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        payload = {
-            "date_from": to_ozon_datetime(self.period_from),
-            "date_to": to_ozon_datetime(self.period_to, end=True),
-            "limit": 1000,
-            "offset": 0,
-        }
-        items, raw = self.client.offset_pages(
-            "/v1/search-queries/top", payload,
-            [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
-        )
-        return records_to_df(items, {
+        endpoint = "/v1/search-queries/top"
+        all_items: List[Dict[str, Any]] = []
+        raw: List[Any] = []
+        offset = 0
+        limit = 50
+        for _ in range(500):
+            payload = {
+                "date_from": to_ozon_datetime(self.period_from),
+                "date_to": to_ozon_datetime(self.period_to, end=True),
+                "limit": limit,
+                "offset": offset,
+            }
+            data = self.client.post(endpoint, payload)
+            raw.append(data)
+            items = extract_items(
+                data,
+                [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
+            )
+            all_items.extend(items)
+            if not items or len(items) < limit:
+                break
+            offset += len(items)
+            time.sleep(0.12)
+
+        return records_to_df(all_items, {
             "Дата": self.target_date.isoformat(),
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
-        }), raw, ["/v1/search-queries/top"]
+        }), raw, [endpoint]
 
     # ------------------------- supplies/warehouses -------------------------
     def fetch_supply_orders(self) -> Tuple[pd.DataFrame, Any, List[str]]:
@@ -956,6 +1000,8 @@ class OzonFboCollector:
             },
             "limit": 100,
             "last_id": "",
+            "sort_by": "CREATED_AT",
+            "sort_direction": "DESC",
         }
         # list
         items, raw_list = self.client.cursor_pages(
@@ -1000,9 +1046,33 @@ class OzonFboCollector:
         }, ["/v3/supply-order/list", "/v3/supply-order/get"]
 
     def fetch_warehouses(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        data = self.client.post("/v1/warehouse/list", {})
-        items = extract_items(data, [("result",), ("result", "items"), ("warehouses",), ("items",)])
-        return records_to_df(items, {"Дата снимка": self.target_date.isoformat()}), data, ["/v1/warehouse/list"]
+        """Старый /v1/warehouse/list отключён. Справочник строим из отчёта остатков по складам."""
+        source_result = next(
+            (r for r in self.results if r.code == "stocks_warehouses" and not r.df.empty),
+            None,
+        )
+        if source_result is None:
+            return pd.DataFrame(), {"source": "stocks_warehouses", "rows": 0}, [
+                "/v2/analytics/stock_on_warehouses"
+            ]
+
+        df = source_result.df.copy()
+        candidates = [
+            "warehouse_id", "warehouse_name", "cluster_name",
+            "warehouse", "cluster", "region",
+        ]
+        cols = [c for c in candidates if c in df.columns]
+        if not cols:
+            return pd.DataFrame(), {"source": "stocks_warehouses", "rows": len(df)}, [
+                "/v2/analytics/stock_on_warehouses"
+            ]
+
+        result = df[cols].drop_duplicates().reset_index(drop=True)
+        result["Дата снимка"] = self.target_date.isoformat()
+        return result, {
+            "source": "stocks_warehouses",
+            "rows": len(df),
+        }, ["/v2/analytics/stock_on_warehouses"]
 
     # ------------------------- collect/save -------------------------
     def collect_all(self) -> None:
@@ -1048,10 +1118,31 @@ class OzonFboCollector:
         self._run("warehouses", "Справочник складов", "Склады", "Склады",
                   self.fetch_warehouses, "Дата снимка", ["warehouse_id", "name"], snapshot=True, optional=True)
 
+    @staticmethod
+    def _clean_excel_value(value: Any) -> Any:
+        """Удаляет управляющие символы XML, запрещённые внутри XLSX."""
+        if value is None:
+            return value
+        if isinstance(value, str):
+            return ILLEGAL_CHARACTERS_RE.sub("", value)
+        return value
+
+    def _sanitize_dataframe_for_excel(self, df: pd.DataFrame) -> pd.DataFrame:
+        clean = df.copy()
+        clean.columns = [
+            ILLEGAL_CHARACTERS_RE.sub("", str(col)) for col in clean.columns
+        ]
+        object_cols = clean.select_dtypes(include=["object", "string"]).columns
+        for col in object_cols:
+            clean[col] = clean[col].map(self._clean_excel_value)
+        return clean
+
     def _excel_bytes(self, df: pd.DataFrame, sheet_name: str = "Данные") -> bytes:
         buffer = io.BytesIO()
+        df = self._sanitize_dataframe_for_excel(df)
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             safe_sheet = re.sub(r"[\\/*?:\[\]]", "_", sheet_name)[:31] or "Данные"
+            safe_sheet = ILLEGAL_CHARACTERS_RE.sub("", safe_sheet)
             df.to_excel(writer, sheet_name=safe_sheet, index=False)
             ws = writer.book[safe_sheet]
             ws.freeze_panes = "A2"
