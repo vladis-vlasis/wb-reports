@@ -1,4 +1,4 @@
-name: Ozon FBO — сбор всех данных v2
+name: Ozon FBO — сбор всех данных v4
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ on:
         default: TOPFACE
         options:
           - TOPFACE
+
   schedule:
     - cron: "20 12 * * *" # 15:20 МСК
 
@@ -37,6 +38,15 @@ jobs:
       contents: read
 
     env:
+      # Используем уже существующие секреты Yandex Cloud из WB-контура.
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+
+      # Бакет Ozon отдельный, поэтому его не берём из старого YC_BUCKET_NAME.
+      YC_BUCKET_NAME: ozon-assist
+      YC_ENDPOINT_URL: https://storage.yandexcloud.net
+
       OZON_MODE: ${{ github.event_name == 'schedule' && 'daily' || github.event.inputs.mode }}
       OZON_TARGET_DATE: ${{ github.event.inputs.target_date }}
       OZON_STORE: ${{ github.event.inputs.store || 'TOPFACE' }}
@@ -44,14 +54,12 @@ jobs:
       OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
       OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
 
+      # Пока не используются, но среда подготовлена.
       OZON_PERFORMANCE_CLIENT_ID_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_TOPFACE }}
       OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE }}
 
-      OZON_YC_ACCESS_KEY_ID: ${{ secrets.OZON_YC_ACCESS_KEY_ID }}
-      OZON_YC_SECRET_ACCESS_KEY: ${{ secrets.OZON_YC_SECRET_ACCESS_KEY }}
-      OZON_YC_BUCKET: ozon-assist
-      OZON_YC_ENDPOINT_URL: https://storage.yandexcloud.net
       PYTHONUNBUFFERED: "1"
+      TZ: "Europe/Moscow"
 
     steps:
       - name: Checkout
@@ -70,6 +78,77 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pandas openpyxl requests boto3
 
+      - name: Load existing secrets from REPORT_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "OZON_CLIENT_ID_TOPFACE",
+              "OZON_API_KEY_TOPFACE",
+              "OZON_PERFORMANCE_CLIENT_ID_TOPFACE",
+              "OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE",
+          ]
+
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+          for raw_line in report_env.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('"').strip("'")
+              if key in allowed and value:
+                  parsed[key] = value
+
+          github_env = os.environ["GITHUB_ENV"]
+          loaded = []
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in allowed:
+                  value = os.getenv(key) or parsed.get(key)
+                  if value:
+                      f.write(f"{key}={value}\n")
+                      loaded.append(key)
+
+          print("Loaded secret names: " + (", ".join(loaded) if loaded else "none"))
+          PY
+
+      - name: Verify required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "OZON_CLIENT_ID_TOPFACE",
+              "OZON_API_KEY_TOPFACE",
+          ]
+          missing = [name for name in required if not os.getenv(name)]
+          if missing:
+              raise SystemExit("Missing secrets after REPORT_ENV load: " + ", ".join(missing))
+
+          print("Required secrets are present.")
+          print("Target bucket:", os.getenv("YC_BUCKET_NAME"))
+          PY
+
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile ozon_daily_data_collector.py
+
       - name: Run Ozon collector
         shell: bash
         run: |
@@ -81,13 +160,13 @@ jobs:
           if [[ -n "${OZON_TARGET_DATE:-}" ]]; then
             ARGS+=(--target-date "$OZON_TARGET_DATE")
           fi
-          python ozon_daily_data_collector_v1.py "${ARGS[@]}"
+          python ozon_daily_data_collector.py "${ARGS[@]}"
 
       - name: Upload local diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-v2-failure-${{ github.run_id }}
+          name: ozon-data-collector-v4-failure-${{ github.run_id }}
           path: |
             output_ozon_v1/
           if-no-files-found: ignore
