@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v3
+Ozon FBO Daily Data Collector v5
 
 Назначение:
 - ежедневный read-only сбор максимально доступных нефинансовых данных Ozon Seller API;
 - отдельное хранение каждого отчёта в Yandex Object Storage (бакет ozon-assist);
 - недельные Excel-файлы с обновлением/дедупликацией;
 - мастер-справочники как актуальные снимки;
-- ручной режим archive: выгрузка выбранного дня в ZIP без смешивания отчётов;
+- test: тестовая выгрузка только целевой даты;
+- daily: ежедневное обновление последних 90 календарных дней;
+- archive: ZIP строго за выбранную дату;
 - магазин TOPFACE, архитектура готова к добавлению других магазинов.
 
 Правило целевой даты (как в действующем WB-сборщике):
@@ -49,12 +51,12 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V4_CORRECT_DELIVERY_NAMES_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V6_ARCHIVE_1D_TEST_1D_DAILY_90D_NO_CRASH_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
 DEFAULT_STORE = "TOPFACE"
-DEFAULT_ORDER_LOOKBACK_DAYS = 60
+DEFAULT_DAILY_LOOKBACK_DAYS = 90
 DEFAULT_RETRY_DAYS = 7
 MAX_EXCEL_CELL = 32000
 
@@ -108,6 +110,31 @@ def week_filename(prefix: str, d: date) -> str:
 def to_ozon_datetime(d: date, end: bool = False) -> str:
     suffix = "23:59:59.999Z" if end else "00:00:00.000Z"
     return f"{d.isoformat()}T{suffix}"
+
+
+def mode_period(mode: str, target_date: date) -> Tuple[date, date]:
+    """Возвращает включительный период получения событий."""
+    normalized = str(mode or "").strip().lower()
+    if normalized == "daily":
+        return target_date - timedelta(days=DEFAULT_DAILY_LOOKBACK_DAYS - 1), target_date
+    # test и archive строго за один календарный день; daily — 90 дней включительно.
+    return target_date, target_date
+
+
+def iter_days(start: date, end: date) -> Iterable[date]:
+    current = start
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
+
+
+def iter_date_chunks(start: date, end: date, chunk_days: int = 1) -> Iterable[Tuple[date, date]]:
+    """Разбивает диапазон, чтобы не упираться в MAX_OFFSET_EXCEEDED."""
+    current = start
+    while current <= end:
+        chunk_end = min(end, current + timedelta(days=max(1, chunk_days) - 1))
+        yield current, chunk_end
+        current = chunk_end + timedelta(days=1)
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +494,8 @@ class OzonFboCollector:
         self.storage = storage
         self.store = store.upper().strip()
         self.target_date = target_date
-        self.mode = mode
+        self.mode = str(mode or "test").strip().lower()
+        self.period_from, self.period_to = mode_period(self.mode, target_date)
         self.workdir = workdir
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.run_id = datetime.now(MOSCOW_TZ).strftime("%Y%m%d_%H%M%S")
@@ -476,6 +504,7 @@ class OzonFboCollector:
         self.catalog_items: List[Dict[str, Any]] = []
         self.catalog_ids: List[int] = []
         self.offer_ids: List[str] = []
+        self.sku_ids: List[int] = []
 
     @property
     def base_prefix(self) -> str:
@@ -562,31 +591,57 @@ class OzonFboCollector:
                 "offer_id": [], "product_id": batch, "sku": []}
             data = self.client.post("/v3/product/info/list", payload)
             raw.append(data)
-            rows.extend(extract_items(data, [("items",), ("result", "items")]))
+            batch_items = extract_items(data, [("items",), ("result", "items")])
+            rows.extend(batch_items)
+            for item in batch_items:
+                for candidate in ("sku", "fbo_sku", "fbs_sku"):
+                    try:
+                        value = item.get(candidate)
+                        if value not in (None, "", 0):
+                            self.sku_ids.append(int(value))
+                    except Exception:
+                        pass
             time.sleep(0.12)
+        self.sku_ids = sorted(set(self.sku_ids))
         return records_to_df(rows, {"Дата снимка": self.target_date.isoformat()}), raw, ["/v3/product/info/list"]
 
     def fetch_product_attributes(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        rows: List[Dict[str, Any]] = []
-        raw: List[Any] = []
-        cursor = ""
-        for _ in range(500):
-            payload = {
-                "filter": {"visibility": "ALL"},
-                "limit": 100,
-                "last_id": cursor,
-                "sort_dir": "ASC",
-            }
-            data = self.client.post("/v4/product/info/attributes", payload)
-            raw.append(data)
-            items = extract_items(data, [("result",), ("result", "items"), ("items",)])
-            rows.extend(items)
-            nxt = extract_cursor(data)
-            if not items or not nxt or nxt == cursor:
-                break
-            cursor = nxt
-            time.sleep(0.12)
-        return records_to_df(rows, {"Дата снимка": self.target_date.isoformat()}), raw, ["/v4/product/info/attributes"]
+        """Пробует актуальный и legacy-вариант endpoint; 404 не ломает сбор."""
+        endpoints = ["/v4/product/info/attributes", "/v3/products/info/attributes"]
+        last_exc: Optional[Exception] = None
+        for endpoint in endpoints:
+            rows: List[Dict[str, Any]] = []
+            raw: List[Any] = []
+            cursor = ""
+            try:
+                for _ in range(500):
+                    payload = {
+                        "filter": {"visibility": "ALL"},
+                        "limit": 100,
+                        "last_id": cursor,
+                        "sort_dir": "ASC",
+                    }
+                    data = self.client.post(endpoint, payload)
+                    raw.append(data)
+                    items = extract_items(data, [("result",), ("result", "items"), ("items",)])
+                    rows.extend(items)
+                    nxt = extract_cursor(data)
+                    if not items or not nxt or nxt == cursor:
+                        break
+                    cursor = nxt
+                    time.sleep(0.12)
+                return records_to_df(
+                    rows, {"Дата снимка": self.target_date.isoformat()}
+                ), raw, [endpoint]
+            except OzonApiError as exc:
+                last_exc = exc
+                if exc.status in {404, 405}:
+                    logging.warning("Метод атрибутов %s недоступен, пробуем fallback", endpoint)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        return pd.DataFrame(), [], endpoints
 
     def fetch_prices(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         items, raw = self.client.cursor_pages(
@@ -652,26 +707,33 @@ class OzonFboCollector:
 
     # ------------------------- orders/returns -------------------------
     def fetch_fbo_postings(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        since = self.target_date - timedelta(days=DEFAULT_ORDER_LOOKBACK_DAYS)
-        until = self.target_date + timedelta(days=1)
-        items, raw = self.client.offset_pages(
-            "/v2/posting/fbo/list",
-            {
-                "dir": "ASC",
-                "filter": {
-                    "since": to_ozon_datetime(since),
-                    "to": to_ozon_datetime(until, end=True),
-                    "status": "",
+        """FBO-заказы. Диапазон режется по дням, чтобы не получить MAX_OFFSET_EXCEEDED."""
+        all_postings: List[Dict[str, Any]] = []
+        raw_all: List[Any] = []
+        for day_from, day_to in iter_date_chunks(self.period_from, self.period_to, chunk_days=1):
+            items, raw = self.client.offset_pages(
+                "/v2/posting/fbo/list",
+                {
+                    "dir": "ASC",
+                    "filter": {
+                        "since": to_ozon_datetime(day_from),
+                        "to": to_ozon_datetime(day_to, end=True),
+                        "status": "",
+                    },
+                    "limit": 1000,
+                    "offset": 0,
+                    "translit": True,
+                    "with": {"analytics_data": True, "financial_data": False},
                 },
-                "limit": 1000,
-                "offset": 0,
-                "translit": True,
-                "with": {"analytics_data": True, "financial_data": False},
-            },
-            [("result",), ("result", "postings"), ("postings",)],
-        )
+                [("result",), ("result", "postings"), ("postings",)],
+                max_pages=100,
+            )
+            raw_all.extend(raw)
+            all_postings.extend(items)
+            logging.info("Заказы FBO: получен день %s, отправлений %s", day_from, len(items))
+
         rows: List[Dict[str, Any]] = []
-        for posting in items:
+        for posting in all_postings:
             base = {k: v for k, v in posting.items() if k != "products"}
             products = posting.get("products")
             if isinstance(products, list) and products:
@@ -684,15 +746,19 @@ class OzonFboCollector:
                     rows.append(row)
             else:
                 rows.append(posting)
-        df = records_to_df(rows, {"Дата обновления снимка": self.target_date.isoformat()})
-        return df, raw, ["/v2/posting/fbo/list"]
+        df = records_to_df(rows, {
+            "Дата обновления снимка": self.target_date.isoformat(),
+            "Период с": self.period_from.isoformat(),
+            "Период по": self.period_to.isoformat(),
+        })
+        return df, raw_all, ["/v2/posting/fbo/list"]
 
     def fetch_returns(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        since = self.target_date - timedelta(days=DEFAULT_ORDER_LOOKBACK_DAYS)
+        since = self.period_from
         payload = {
             "filter": {
                 "logistic_return_date": {"time_from": to_ozon_datetime(since),
-                                         "time_to": to_ozon_datetime(self.target_date + timedelta(days=1), end=True)},
+                                         "time_to": to_ozon_datetime(self.period_to, end=True)},
             },
             "limit": 500,
             "last_id": 0,
@@ -736,8 +802,8 @@ class OzonFboCollector:
             "conv_tocart_from_search", "conv_order", "position_category",
         ]
         payload = {
-            "date_from": self.target_date.isoformat(),
-            "date_to": self.target_date.isoformat(),
+            "date_from": self.period_from.isoformat(),
+            "date_to": self.period_to.isoformat(),
             "dimension": dimensions,
             "metrics": metrics,
             "filters": [],
@@ -781,15 +847,22 @@ class OzonFboCollector:
                 if k not in {"dimensions", "dimension", "metrics"}:
                     row[k] = scalarize(v)
             rows.append(row)
-        df = records_to_df(rows, {"Дата": self.target_date.isoformat()})
+        df = records_to_df(rows, {
+            "Период с": self.period_from.isoformat(),
+            "Период по": self.period_to.isoformat(),
+        })
+        if "day" in df.columns and "Дата" not in df.columns:
+            df["Дата"] = df["day"].astype(str).str[:10]
+        elif "Дата" not in df.columns:
+            df["Дата"] = self.target_date.isoformat()
         return df, raw, ["/v1/analytics/data"]
 
     # ------------------------- search -------------------------
     def fetch_product_queries(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        # Сводная аналитика запросов по товарам.
+        """Сводная поисковая аналитика. Timestamp передаётся в RFC3339."""
         payload = {
-            "date_from": self.target_date.isoformat(),
-            "date_to": self.target_date.isoformat(),
+            "date_from": to_ozon_datetime(self.period_from),
+            "date_to": to_ozon_datetime(self.period_to, end=True),
             "limit": 1000,
             "offset": 0,
             "sort": {"key": "orders", "order": "DESC"},
@@ -798,50 +871,68 @@ class OzonFboCollector:
             "/v1/analytics/product-queries", payload,
             [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
         )
-        return records_to_df(items, {"Дата": self.target_date.isoformat()}), raw, ["/v1/analytics/product-queries"]
+        return records_to_df(items, {
+            "Дата": self.target_date.isoformat(),
+            "Период с": self.period_from.isoformat(),
+            "Период по": self.period_to.isoformat(),
+        }), raw, ["/v1/analytics/product-queries"]
 
     def fetch_product_query_details(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        # Детализация по каждому SKU. Запросы выполняются последовательно с паузой.
+        """Товар × запрос. При системной ошибке payload прекращает цикл после первого SKU."""
         rows: List[Dict[str, Any]] = []
         raw: List[Any] = []
-        source = self.offer_ids
+
+        # Предпочитаем sku, поскольку этот метод в большинстве кабинетов использует Ozon SKU.
+        source: List[Tuple[str, Any]] = [("sku", x) for x in self.sku_ids]
+        if not source:
+            source = [("offer_id", x) for x in self.offer_ids]
         if not source:
             return pd.DataFrame(), raw, ["/v1/analytics/product-queries/details"]
-        for idx, offer_id in enumerate(source, start=1):
+
+        endpoint = "/v1/analytics/product-queries/details"
+        for idx, (id_field, id_value) in enumerate(source, start=1):
             payload = {
-                "date_from": self.target_date.isoformat(),
-                "date_to": self.target_date.isoformat(),
-                "offer_id": offer_id,
+                "date_from": to_ozon_datetime(self.period_from),
+                "date_to": to_ozon_datetime(self.period_to, end=True),
+                id_field: id_value,
                 "limit": 1000,
                 "offset": 0,
             }
             try:
                 items, pages = self.client.offset_pages(
-                    "/v1/analytics/product-queries/details", payload,
+                    endpoint, payload,
                     [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
                     max_pages=50,
                 )
             except OzonApiError as exc:
+                # 400/422 на первом товаре означает несовместимую схему запроса:
+                # не создаём сотни одинаковых ошибок.
                 if exc.status in {400, 404, 422}:
-                    # Некоторые версии принимают sku, а не offer_id. Пробуем sku из каталога невозможно
-                    # гарантированно связать без product-info, поэтому сохраняем ошибку и идём дальше.
-                    self.log_error("search_query_details_item", f"offer_id={offer_id}", exc, True)
+                    self.log_error("search_query_details_item", f"{id_field}={id_value}", exc, True)
+                    if idx == 1:
+                        logging.warning("Детализация поисковых запросов недоступна с текущей схемой; цикл остановлен")
+                        break
                     continue
                 raise
             raw.extend(pages)
             for item in items:
                 row = dict(item)
-                row.setdefault("offer_id", offer_id)
+                row.setdefault(id_field, id_value)
                 rows.append(row)
             if idx % 50 == 0:
-                logging.info("Поисковые запросы: обработано SKU %s/%s", idx, len(source))
+                logging.info("Поисковые запросы: обработано товаров %s/%s", idx, len(source))
             time.sleep(0.18)
-        return records_to_df(rows, {"Дата": self.target_date.isoformat()}), raw, ["/v1/analytics/product-queries/details"]
+
+        return records_to_df(rows, {
+            "Дата": self.target_date.isoformat(),
+            "Период с": self.period_from.isoformat(),
+            "Период по": self.period_to.isoformat(),
+        }), raw, [endpoint]
 
     def fetch_search_queries_top(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         payload = {
-            "date_from": self.target_date.isoformat(),
-            "date_to": self.target_date.isoformat(),
+            "date_from": to_ozon_datetime(self.period_from),
+            "date_to": to_ozon_datetime(self.period_to, end=True),
             "limit": 1000,
             "offset": 0,
         }
@@ -849,15 +940,19 @@ class OzonFboCollector:
             "/v1/search-queries/top", payload,
             [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
         )
-        return records_to_df(items, {"Дата": self.target_date.isoformat()}), raw, ["/v1/search-queries/top"]
+        return records_to_df(items, {
+            "Дата": self.target_date.isoformat(),
+            "Период с": self.period_from.isoformat(),
+            "Период по": self.period_to.isoformat(),
+        }), raw, ["/v1/search-queries/top"]
 
     # ------------------------- supplies/warehouses -------------------------
     def fetch_supply_orders(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         payload = {
             "filter": {
                 "states": [],
-                "created_date_from": (self.target_date - timedelta(days=180)).isoformat(),
-                "created_date_to": (self.target_date + timedelta(days=1)).isoformat(),
+                "created_date_from": self.period_from.isoformat(),
+                "created_date_to": (self.period_to + timedelta(days=1)).isoformat(),
             },
             "limit": 100,
             "last_id": "",
@@ -971,12 +1066,70 @@ class OzonFboCollector:
                 ws.column_dimensions[get_column_letter(col_idx)].width = min(60, max(10, max(sample, default=10) + 2))
         return buffer.getvalue()
 
+    def _detect_row_date_column(self, df: pd.DataFrame, preferred: str) -> Optional[str]:
+        candidates = [
+            preferred, "Дата", "day", "created_at", "in_process_at", "shipment_date",
+            "logistic_return_date", "return_date", "posting_date", "Дата заказа",
+            "Дата создания", "Дата события",
+        ]
+        for col in candidates:
+            if col and col in df.columns:
+                parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
+                if parsed.notna().any():
+                    return col
+        return None
+
+    def _save_weekly_partitioned(self, result: ReportResult, df: pd.DataFrame) -> None:
+        """Разносит 90-дневные события по ISO-неделям; агрегаты без даты идут в неделю target."""
+        date_col = self._detect_row_date_column(df, result.date_column)
+        if not date_col:
+            partitions = [(self.target_date, df)]
+        else:
+            work = df.copy()
+            parsed = pd.to_datetime(work[date_col], errors="coerce", utc=True)
+            work["_partition_date"] = parsed.dt.date
+            valid = work[work["_partition_date"].notna()].copy()
+            invalid = work[work["_partition_date"].isna()].drop(columns=["_partition_date"], errors="ignore")
+            partitions = []
+            if not valid.empty:
+                valid["_week_key"] = valid["_partition_date"].map(lambda d: iso_week(d))
+                for _, part in valid.groupby("_week_key", dropna=False):
+                    part_date = part["_partition_date"].iloc[0]
+                    partitions.append((part_date, part.drop(columns=["_partition_date", "_week_key"], errors="ignore")))
+            if not invalid.empty:
+                partitions.append((self.target_date, invalid))
+
+        written_keys = []
+        for partition_date, part_df in partitions:
+            filename = week_filename(result.filename_prefix, partition_date)
+            key = f"{self.base_prefix}/{result.folder}/{self.store}/Недельные/{filename}"
+            old = self.storage.read_excel(key)
+            merged = dedupe_merge(old, part_df, result.keys)
+            self.storage.upload_bytes(
+                key, self._excel_bytes(merged, result.title),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            written_keys.append(key)
+            logging.info("Сохранено: s3://%s/%s (%s строк)", self.storage.bucket, key, len(merged))
+        result.s3_key = "; ".join(written_keys)
+
     def save_results(self) -> None:
         archive_local_files: List[Tuple[str, str]] = []
         for result in self.results:
             if result.status in {"ERROR", "SKIPPED_OPTIONAL"}:
-                continue
-            df = result.df.copy()
+                if self.mode != "archive":
+                    continue
+                df = pd.DataFrame([{
+                    "Статус": result.status,
+                    "Отчёт": result.title,
+                    "Дата": self.target_date.isoformat(),
+                    "Период с": self.period_from.isoformat(),
+                    "Период по": self.period_to.isoformat(),
+                    "Ошибка": result.message,
+                    "Методы": ", ".join(result.method_paths),
+                }])
+            else:
+                df = result.df.copy()
             if df.empty:
                 # В archive режиме сохраняем и пустой отчёт, чтобы было видно, что метод отработал.
                 if self.mode != "archive":
@@ -999,16 +1152,16 @@ class OzonFboCollector:
                 key = f"{self.base_prefix}/{result.folder}/{self.store}/{result.filename_prefix}.xlsx"
                 merged = df
             else:
-                filename = week_filename(result.filename_prefix, self.target_date)
-                key = f"{self.base_prefix}/{result.folder}/{self.store}/Недельные/{filename}"
-                old = self.storage.read_excel(key)
-                # Для данных со снимком даты заменяем ключи текущей даты, для заказов ключи без даты
-                # обновляют изменившиеся статусы в пределах недельного файла.
-                merged = dedupe_merge(old, df, result.keys)
-            self.storage.upload_bytes(key, self._excel_bytes(merged, result.title),
-                                      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            result.s3_key = key
-            logging.info("Сохранено: s3://%s/%s (%s строк)", self.storage.bucket, key, len(merged))
+                self._save_weekly_partitioned(result, df)
+                # Сырые ответы сохраняются ниже.
+                merged = None
+                key = result.s3_key
+
+            if result.snapshot:
+                self.storage.upload_bytes(key, self._excel_bytes(merged, result.title),
+                                          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                result.s3_key = key
+                logging.info("Сохранено: s3://%s/%s (%s строк)", self.storage.bucket, key, len(merged))
 
             # Сырые ответы — отдельная служебная папка, не смешиваем с отчётами.
             if result.raw is not None:
@@ -1050,6 +1203,8 @@ class OzonFboCollector:
             "store": self.store,
             "mode": self.mode,
             "target_date": self.target_date.isoformat(),
+            "period_from": self.period_from.isoformat(),
+            "period_to": self.period_to.isoformat(),
             "started_at": datetime.now(MOSCOW_TZ).isoformat(),
             "reports": [
                 {
@@ -1072,8 +1227,21 @@ class OzonFboCollector:
         self.storage.upload_json(f"{base}/Последний_запуск.json", manifest)
         if self.errors:
             self.storage.upload_json(f"{base}/Ошибки_API/{self.target_date.isoformat()}_{self.run_id}.json", self.errors)
-        if any(r.status == "ERROR" and not r.optional for r in self.results):
-            raise RuntimeError("Есть ошибки обязательных отчётов. См. Служебные/Ошибки_API")
+        required_errors = [r for r in self.results if r.status == "ERROR" and not r.optional]
+        if required_errors:
+            names = ", ".join(r.title for r in required_errors)
+            if self.mode == "daily":
+                raise RuntimeError(
+                    "Есть ошибки обязательных отчётов в daily: "
+                    + names
+                    + ". См. Служебные/Ошибки_API"
+                )
+            logging.error(
+                "В режиме %s есть ошибки обязательных отчётов: %s. "
+                "Архив/тест сохранён с diagnostics и workflow не прерывается.",
+                self.mode,
+                names,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1090,7 +1258,7 @@ def env_first(*names: str, default: str = "") -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Ozon FBO: ежедневный сбор всех нефинансовых данных")
-    p.add_argument("--mode", choices=["daily", "archive"], default=env_first("OZON_MODE", default="daily"))
+    p.add_argument("--mode", choices=["test", "daily", "archive"], default=env_first("OZON_MODE", default="test"))
     p.add_argument("--target-date", default=env_first("OZON_TARGET_DATE"))
     p.add_argument("--store", default=env_first("OZON_STORE", "STORE", default=DEFAULT_STORE))
     p.add_argument("--bucket", default=env_first("OZON_YC_BUCKET", "YC_BUCKET_NAME", default=DEFAULT_BUCKET))
@@ -1124,6 +1292,10 @@ def main() -> int:
     logging.info("Магазин: %s", store)
     logging.info("Режим: %s", args.mode)
     logging.info("Целевая дата: %s", target)
+    p_from, p_to = mode_period(args.mode, target)
+    logging.info("Период событий: %s — %s", p_from, p_to)
+    if args.mode in {"test", "archive"} and p_from != p_to:
+        raise RuntimeError(f"Режим {args.mode} обязан работать строго за 1 день")
     logging.info("Бакет: %s", args.bucket)
 
     storage = S3Storage(access_key, secret_key, args.bucket, endpoint)
