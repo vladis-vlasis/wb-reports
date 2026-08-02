@@ -52,7 +52,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V7_EXCEL_CLEAN_API_LIMITS_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V8_NO_PRODUCT_ATTRIBUTES_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -606,44 +606,6 @@ class OzonFboCollector:
         self.sku_ids = sorted(set(self.sku_ids))
         return records_to_df(rows, {"Дата снимка": self.target_date.isoformat()}), raw, ["/v3/product/info/list"]
 
-    def fetch_product_attributes(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Пробует актуальный и legacy-вариант endpoint; 404 не ломает сбор."""
-        endpoints = ["/v4/product/info/attributes"]
-        last_exc: Optional[Exception] = None
-        for endpoint in endpoints:
-            rows: List[Dict[str, Any]] = []
-            raw: List[Any] = []
-            cursor = ""
-            try:
-                for _ in range(500):
-                    payload = {
-                        "filter": {"visibility": "ALL"},
-                        "limit": 100,
-                        "last_id": cursor,
-                        "sort_dir": "ASC",
-                    }
-                    data = self.client.post(endpoint, payload)
-                    raw.append(data)
-                    items = extract_items(data, [("result",), ("result", "items"), ("items",)])
-                    rows.extend(items)
-                    nxt = extract_cursor(data)
-                    if not items or not nxt or nxt == cursor:
-                        break
-                    cursor = nxt
-                    time.sleep(0.12)
-                return records_to_df(
-                    rows, {"Дата снимка": self.target_date.isoformat()}
-                ), raw, [endpoint]
-            except OzonApiError as exc:
-                last_exc = exc
-                if exc.status in {404, 405}:
-                    logging.warning("Метод атрибутов %s недоступен, пробуем fallback", endpoint)
-                    continue
-                raise
-        if last_exc:
-            raise last_exc
-        return pd.DataFrame(), [], endpoints
-
     def fetch_prices(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         items, raw = self.client.cursor_pages(
             "/v5/product/info/prices",
@@ -1082,9 +1044,6 @@ class OzonFboCollector:
                   ["Дата снимка", "product_id", "offer_id"], snapshot=True)
         self._run("product_info", "Подробная информация о товарах", "Информация о товарах", "Информация_о_товарах",
                   self.fetch_product_info, "Дата снимка",
-                  ["Дата снимка", "id", "product_id", "offer_id"], snapshot=True, optional=True)
-        self._run("attributes", "Атрибуты товаров", "Атрибуты товаров", "Атрибуты_товаров",
-                  self.fetch_product_attributes, "Дата снимка",
                   ["Дата снимка", "id", "product_id", "offer_id"], snapshot=True, optional=True)
         self._run("prices", "Цены", "Цены", "Цены", self.fetch_prices, "Дата снимка",
                   ["Дата снимка", "product_id", "offer_id"])
