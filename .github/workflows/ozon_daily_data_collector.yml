@@ -1,18 +1,19 @@
-name: Ozon FBO — сбор всех данных v4
+name: Ozon FBO — сбор всех данных v6
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Режим: daily — обновить недельные отчёты; archive — ZIP всех отчётов за выбранный день"
+        description: "test — 1 день; daily — последние 90 дней; archive — ZIP строго 1 выбранного дня"
         required: true
         type: choice
-        default: daily
+        default: test
         options:
+          - test
           - daily
           - archive
       target_date:
-        description: "Дата YYYY-MM-DD. Пусто = автоматически: после 15:00 МСК вчера, до 15:00 МСК позавчера"
+        description: "YYYY-MM-DD. Пусто: после 15:00 МСК вчера, до 15:00 МСК позавчера"
         required: false
         type: string
       store:
@@ -24,7 +25,7 @@ on:
           - TOPFACE
 
   schedule:
-    - cron: "20 12 * * *" # 15:20 МСК
+    - cron: "20 12 * * *" # ежедневно 15:20 МСК; режим daily
 
 concurrency:
   group: ozon-fbo-data-${{ github.event.inputs.store || 'TOPFACE' }}
@@ -33,17 +34,12 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-    permissions:
-      contents: read
+    timeout-minutes: 240
 
     env:
-      # Используем уже существующие секреты Yandex Cloud из WB-контура.
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-
-      # Бакет Ozon отдельный, поэтому его не берём из старого YC_BUCKET_NAME.
       YC_BUCKET_NAME: ozon-assist
       YC_ENDPOINT_URL: https://storage.yandexcloud.net
 
@@ -53,8 +49,6 @@ jobs:
 
       OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
       OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
-
-      # Пока не используются, но среда подготовлена.
       OZON_PERFORMANCE_CLIENT_ID_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_TOPFACE }}
       OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE }}
 
@@ -71,37 +65,30 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install pandas openpyxl requests boto3
 
-      - name: Load existing secrets from REPORT_ENV
-        shell: bash
+      - name: Load REPORT_ENV
         run: |
           set -euo pipefail
           python - <<'PY'
           import os
-
-          allowed = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "OZON_CLIENT_ID_TOPFACE",
-              "OZON_API_KEY_TOPFACE",
+          allowed = {
+              "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY",
+              "OZON_CLIENT_ID_TOPFACE", "OZON_API_KEY_TOPFACE",
               "OZON_PERFORMANCE_CLIENT_ID_TOPFACE",
               "OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE",
-          ]
-
-          report_env = os.getenv("REPORT_ENV", "") or ""
+          }
           parsed = {}
-          for raw_line in report_env.splitlines():
-              line = raw_line.strip()
+          for raw in (os.getenv("REPORT_ENV", "") or "").splitlines():
+              line = raw.strip()
               if not line or line.startswith("#"):
                   continue
               if line.startswith("export "):
-                  line = line[len("export "):].strip()
+                  line = line[7:].strip()
               if "=" not in line:
                   continue
               key, value = line.split("=", 1)
@@ -109,54 +96,35 @@ jobs:
               value = value.strip().strip('"').strip("'")
               if key in allowed and value:
                   parsed[key] = value
-
-          github_env = os.environ["GITHUB_ENV"]
-          loaded = []
-          with open(github_env, "a", encoding="utf-8") as f:
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               for key in allowed:
                   value = os.getenv(key) or parsed.get(key)
                   if value:
-                      f.write(f"{key}={value}\n")
-                      loaded.append(key)
-
-          print("Loaded secret names: " + (", ".join(loaded) if loaded else "none"))
+                      fh.write(f"{key}={value}\n")
           PY
 
-      - name: Verify required secrets
-        shell: bash
+      - name: Verify secrets
         run: |
           set -euo pipefail
           python - <<'PY'
           import os
-
           required = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "OZON_CLIENT_ID_TOPFACE",
-              "OZON_API_KEY_TOPFACE",
+              "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY",
+              "OZON_CLIENT_ID_TOPFACE", "OZON_API_KEY_TOPFACE",
           ]
-          missing = [name for name in required if not os.getenv(name)]
+          missing = [x for x in required if not os.getenv(x)]
           if missing:
-              raise SystemExit("Missing secrets after REPORT_ENV load: " + ", ".join(missing))
-
-          print("Required secrets are present.")
-          print("Target bucket:", os.getenv("YC_BUCKET_NAME"))
+              raise SystemExit("Missing secrets: " + ", ".join(missing))
+          print("Required secrets are present")
           PY
 
-      - name: Validate Python syntax
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m py_compile ozon_daily_data_collector.py
+      - name: Validate code
+        run: python -m py_compile ozon_daily_data_collector.py
 
-      - name: Run Ozon collector
-        shell: bash
+      - name: Run collector
         run: |
           set -euo pipefail
-          ARGS=(
-            --mode "$OZON_MODE"
-            --store "$OZON_STORE"
-          )
+          ARGS=(--mode "$OZON_MODE" --store "$OZON_STORE")
           if [[ -n "${OZON_TARGET_DATE:-}" ]]; then
             ARGS+=(--target-date "$OZON_TARGET_DATE")
           fi
@@ -166,8 +134,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-v4-failure-${{ github.run_id }}
-          path: |
-            output_ozon_v1/
+          name: ozon-data-collector-v6-failure-${{ github.run_id }}
+          path: output_ozon_v1/
           if-no-files-found: ignore
           retention-days: 7
