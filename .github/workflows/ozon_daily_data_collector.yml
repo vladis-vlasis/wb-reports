@@ -1,4 +1,4 @@
-name: Ozon FBO — сбор данных v8 без атрибутов
+name: Ozon FBO — сбор данных v9 Premium
 
 on:
   workflow_dispatch:
@@ -134,7 +134,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-v8-failure-${{ github.run_id }}
+          name: ozon-data-collector-v9-failure-${{ github.run_id }}
           path: output_ozon_v1/
           if-no-files-found: ignore
           retention-days: 7
