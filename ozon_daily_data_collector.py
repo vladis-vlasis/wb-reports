@@ -52,7 +52,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V8_NO_PRODUCT_ATTRIBUTES_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V9_PREMIUM_PRODUCT_QUERIES_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -141,6 +141,13 @@ def iter_date_chunks(start: date, end: date, chunk_days: int = 1) -> Iterable[Tu
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def batched(values: Sequence[Any], size: int) -> Iterable[List[Any]]:
+    """Разбивает список на пакеты допустимого размера API."""
+    size = max(1, int(size))
+    for idx in range(0, len(values), size):
+        yield list(values[idx:idx + size])
 
 def safe_json(value: Any) -> str:
     try:
@@ -822,135 +829,166 @@ class OzonFboCollector:
 
     # ------------------------- search -------------------------
     def fetch_product_queries(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Сводная поисковая аналитика с page_size до 1000."""
+        """Premium: общая аналитика запросов по товарам.
+
+        API требует непустой массив skus. Отправляем SKU пакетами до 1000.
+        """
         endpoint = "/v1/analytics/product-queries"
+        sku_values = sorted({int(x) for x in self.sku_ids if x not in (None, "", 0)})
+        if not sku_values:
+            return pd.DataFrame(), {"warning": "sku_ids is empty"}, [endpoint]
+
         all_items: List[Dict[str, Any]] = []
         raw: List[Any] = []
-        page = 1
         page_size = 1000
-        for _ in range(500):
-            payload = {
-                "date_from": to_ozon_datetime(self.period_from),
-                "date_to": to_ozon_datetime(self.period_to, end=True),
-                "page": page,
-                "page_size": page_size,
-                "sort": {"key": "orders", "order": "DESC"},
-            }
-            data = self.client.post(endpoint, payload)
-            raw.append(data)
-            items = extract_items(
-                data,
-                [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
-            )
-            all_items.extend(items)
-            if not items or len(items) < page_size:
-                break
-            page += 1
-            time.sleep(0.12)
 
-        return records_to_df(all_items, {
+        for batch_no, sku_batch in enumerate(batched(sku_values, 1000), start=1):
+            page = 1
+            while page <= 500:
+                payload = {
+                    "date_from": to_ozon_datetime(self.period_from),
+                    "date_to": to_ozon_datetime(self.period_to, end=True),
+                    "skus": sku_batch,
+                    "page": page,
+                    "page_size": page_size,
+                }
+                data = self.client.post(endpoint, payload)
+                raw.append({
+                    "batch_no": batch_no,
+                    "page": page,
+                    "skus_count": len(sku_batch),
+                    "response": data,
+                })
+                items = extract_items(
+                    data,
+                    [
+                        ("items",),
+                        ("result", "items"),
+                        ("result", "rows"),
+                        ("rows",),
+                    ],
+                )
+                for item in items:
+                    row = dict(item)
+                    row.setdefault("sku_batch_no", batch_no)
+                    all_items.append(row)
+
+                if not items or len(items) < page_size:
+                    break
+                page += 1
+                time.sleep(0.12)
+
+            logging.info(
+                "Поисковые запросы — сводная: пакет %s, SKU %s, строк накоплено %s",
+                batch_no,
+                len(sku_batch),
+                len(all_items),
+            )
+
+        df = records_to_df(all_items, {
             "Дата": self.target_date.isoformat(),
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
-        }), raw, [endpoint]
+            "Тип подписки": "Premium",
+        })
+        return df, raw, [endpoint]
 
     def fetch_product_query_details(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Товар × запрос. Максимальный page_size метода — 100."""
-        rows: List[Dict[str, Any]] = []
-        raw: List[Any] = []
+        """Premium: детализация SKU × поисковый запрос.
 
-        source: List[Tuple[str, Any]] = [("sku", x) for x in self.sku_ids]
-        if not source:
-            source = [("offer_id", x) for x in self.offer_ids]
-        if not source:
-            return pd.DataFrame(), raw, ["/v1/analytics/product-queries/details"]
-
+        Метод требует массив skus и page_size не более 100.
+        SKU передаются пакетами по 100, чтобы избежать ошибок валидации.
+        """
         endpoint = "/v1/analytics/product-queries/details"
-        for idx, (id_field, id_value) in enumerate(source, start=1):
-            page = 1
-            try:
-                while page <= 100:
-                    payload = {
-                        "date_from": to_ozon_datetime(self.period_from),
-                        "date_to": to_ozon_datetime(self.period_to, end=True),
-                        id_field: id_value,
-                        "page": page,
-                        "page_size": 100,
-                    }
-                    data = self.client.post(endpoint, payload)
-                    raw.append(data)
-                    items = extract_items(
-                        data,
-                        [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
-                    )
-                    for item in items:
-                        row = dict(item)
-                        row.setdefault(id_field, id_value)
-                        rows.append(row)
-                    if not items or len(items) < 100:
-                        break
-                    page += 1
-                    time.sleep(0.10)
-            except OzonApiError as exc:
-                if exc.status in {400, 404, 422}:
-                    self.log_error(
-                        "search_query_details_item",
-                        f"{id_field}={id_value}",
-                        exc,
-                        True,
-                    )
-                    if idx == 1:
-                        logging.warning(
-                            "Детализация поисковых запросов недоступна с текущей схемой; цикл остановлен"
-                        )
-                        break
-                    continue
-                raise
+        sku_values = sorted({int(x) for x in self.sku_ids if x not in (None, "", 0)})
+        if not sku_values:
+            return pd.DataFrame(), {"warning": "sku_ids is empty"}, [endpoint]
 
-            if idx % 50 == 0:
-                logging.info(
-                    "Поисковые запросы: обработано товаров %s/%s",
-                    idx,
-                    len(source),
-                )
-            time.sleep(0.15)
-
-        return records_to_df(rows, {
-            "Дата": self.target_date.isoformat(),
-            "Период с": self.period_from.isoformat(),
-            "Период по": self.period_to.isoformat(),
-        }), raw, [endpoint]
-
-    def fetch_search_queries_top(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        endpoint = "/v1/search-queries/top"
         all_items: List[Dict[str, Any]] = []
         raw: List[Any] = []
-        offset = 0
-        limit = 50
-        for _ in range(500):
-            payload = {
-                "date_from": to_ozon_datetime(self.period_from),
-                "date_to": to_ozon_datetime(self.period_to, end=True),
-                "limit": limit,
-                "offset": offset,
-            }
-            data = self.client.post(endpoint, payload)
-            raw.append(data)
-            items = extract_items(
-                data,
-                [("items",), ("result", "items"), ("result", "rows"), ("rows",)],
-            )
-            all_items.extend(items)
-            if not items or len(items) < limit:
-                break
-            offset += len(items)
-            time.sleep(0.12)
+        page_size = 100
 
-        return records_to_df(all_items, {
+        for batch_no, sku_batch in enumerate(batched(sku_values, 100), start=1):
+            page = 1
+            while page <= 1000:
+                payload = {
+                    "date_from": to_ozon_datetime(self.period_from),
+                    "date_to": to_ozon_datetime(self.period_to, end=True),
+                    "skus": sku_batch,
+                    "page": page,
+                    "page_size": page_size,
+                }
+                data = self.client.post(endpoint, payload)
+                raw.append({
+                    "batch_no": batch_no,
+                    "page": page,
+                    "skus_count": len(sku_batch),
+                    "response": data,
+                })
+                items = extract_items(
+                    data,
+                    [
+                        ("items",),
+                        ("result", "items"),
+                        ("result", "rows"),
+                        ("rows",),
+                    ],
+                )
+                for item in items:
+                    row = dict(item)
+                    row.setdefault("sku_batch_no", batch_no)
+                    all_items.append(row)
+
+                if not items or len(items) < page_size:
+                    break
+                page += 1
+                time.sleep(0.12)
+
+            logging.info(
+                "Поисковые запросы — детализация: пакет %s, SKU %s, строк накоплено %s",
+                batch_no,
+                len(sku_batch),
+                len(all_items),
+            )
+            time.sleep(0.15)
+
+        df = records_to_df(all_items, {
             "Дата": self.target_date.isoformat(),
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
-        }), raw, [endpoint]
+            "Тип подписки": "Premium",
+        })
+
+        # Удобные унифицированные колонки для будущего Ads Manager.
+        aliases = {
+            "Поисковый запрос": ["query", "search_query", "query_text", "text"],
+            "Позиция": ["position", "avg_position", "average_position", "median_position"],
+            "Пользователи поиска": ["unique_search_users", "search_users"],
+            "Просмотры карточки": ["unique_view_users", "view_users"],
+            "Конверсия в просмотр": ["view_conversion", "conversion"],
+            "Продажи по запросу, руб": ["gmv", "revenue", "order_sum"],
+            "Заказы по запросу, шт": ["orders", "orders_count", "ordered_units"],
+        }
+        for target, candidates in aliases.items():
+            if target in df.columns:
+                continue
+            for candidate in candidates:
+                if candidate in df.columns:
+                    df[target] = df[candidate]
+                    break
+
+        if (
+            "Пользователи поиска" in df.columns
+            and "Просмотры карточки" in df.columns
+            and "CTR-аналог, %" not in df.columns
+        ):
+            search_users = pd.to_numeric(df["Пользователи поиска"], errors="coerce")
+            view_users = pd.to_numeric(df["Просмотры карточки"], errors="coerce")
+            df["CTR-аналог, %"] = (
+                view_users.div(search_users.where(search_users.ne(0))).mul(100)
+            )
+
+        return df, raw, [endpoint]
 
     # ------------------------- supplies/warehouses -------------------------
     def fetch_supply_orders(self) -> Tuple[pd.DataFrame, Any, List[str]]:
@@ -1065,12 +1103,10 @@ class OzonFboCollector:
         self._run("funnel", "Воронка продаж", "Воронка продаж", "Воронка_продаж",
                   self.fetch_funnel, "Дата", ["Дата", "sku"])
         self._run("product_queries", "Поисковые запросы — сводная", "Поисковые запросы", "Поисковые_запросы_сводная",
-                  self.fetch_product_queries, "Дата", ["Дата", "offer_id", "sku", "query"], optional=True)
+                  self.fetch_product_queries, "Дата", ["Дата", "offer_id", "sku", "query", "search_query", "query_text"], optional=True)
         self._run("product_query_details", "Поисковые запросы — товар × запрос", "Поисковые запросы по товарам",
                   "Поисковые_запросы_по_товарам", self.fetch_product_query_details, "Дата",
-                  ["Дата", "offer_id", "sku", "query", "search_query"], optional=True)
-        self._run("search_top", "Популярные поисковые запросы", "Поисковая аналитика", "Популярные_запросы",
-                  self.fetch_search_queries_top, "Дата", ["Дата", "query", "search_query"], optional=True)
+                  ["Дата", "offer_id", "sku", "query", "search_query", "query_text"], optional=True)
         self._run("supplies", "Поставки FBO", "Поставки", "Поставки",
                   self.fetch_supply_orders, "Дата обновления снимка",
                   ["order_id", "supply_order_id", "product.sku", "product.offer_id"], optional=True)
