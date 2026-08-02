@@ -1,10 +1,10 @@
-name: Документы по поставкам TOPFACE V10
+name: Документы по поставкам TOPFACE V11
 # ПОСТОЯННЫЕ ИМЕНА В GITHUB:
 # Python:   wb_supply_documents.py
 # Workflow: .github/workflows/wb_supply_documents.yml
-# Файлы wb_supply_documents_v10.* — только версия для скачивания и замены содержимого.
+# Файлы wb_supply_documents_v11.* — только версия для скачивания и замены содержимого.
 
-run-name: Поставки и УПД TOPFACE V10 — ${{ github.event.inputs.supply_message_mode || 'changes_only' }}
+run-name: Поставки и УПД TOPFACE V11 — ${{ github.event.inputs.supply_message_mode || 'changes_only' }}
 
 on:
   schedule:
@@ -30,7 +30,7 @@ on:
           - message_only
 
       supply_message_mode:
-        description: "Какие поставки включить в сообщение"
+        description: "Какие готовые комплекты «акт приёмки + УПД» отправить"
         required: true
         default: "changes_only"
         type: choice
@@ -39,7 +39,7 @@ on:
           - selected_period
 
       supply_period:
-        description: "Период поставок для selected_period"
+        description: "Период готовых поставок для selected_period"
         required: true
         default: "7_days"
         type: choice
@@ -83,7 +83,7 @@ on:
         type: string
 
       force_notify:
-        description: "Повторно отправить текущие события по поставкам"
+        description: "Повторно отправить готовые комплекты «акт приёмки + УПД»"
         required: false
         default: false
         type: boolean
@@ -96,7 +96,7 @@ on:
 
 jobs:
   wb-supply-documents:
-    name: Контроль поставок, УПД и актов TOPFACE V10
+    name: Контроль поставок, УПД и актов TOPFACE V11
     runs-on: ubuntu-latest
     timeout-minutes: 120
     concurrency:
@@ -111,7 +111,7 @@ jobs:
 
       AWS_DEFAULT_REGION: ru-central1
       WB_SUPPLY_DOCS_ROOT: "Документы по поставкам/TOPFACE"
-      WB_NOTIFY_STATUS_IDS: "4,5,6"
+      WB_NOTIFY_STATUS_IDS: "4,5,6"  # совместимость; статусы не отправляются в Telegram
       WB_DEEP_LOOKBACK_DAYS: "21"
       WB_MAX_DEEP_SUPPLIES: "180"
       # 0 = скачать все новые документы, а не только первые 20.
@@ -141,7 +141,7 @@ jobs:
         run: |
           set -euo pipefail
           SCRIPT_PATH="./wb_supply_documents.py"
-          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V10_20260731"
+          EXPECTED_VERSION="WB_SUPPLY_DOCUMENTS_TOPFACE_V11_20260801"
 
           if [ ! -f "$SCRIPT_PATH" ]; then
             echo "::error::Не найден $SCRIPT_PATH. В GitHub файл всегда называется wb_supply_documents.py."
@@ -153,7 +153,7 @@ jobs:
           echo "Detected: $ACTUAL_VERSION"
 
           if ! grep -q "$EXPECTED_VERSION" "$SCRIPT_PATH"; then
-            echo "::error::В wb_supply_documents.py находится не версия $EXPECTED_VERSION. Замени содержимое кодом из wb_supply_documents_v10.py."
+            echo "::error::В wb_supply_documents.py находится не версия $EXPECTED_VERSION. Замени содержимое кодом из wb_supply_documents_v11.py."
             exit 1
           fi
 
@@ -245,7 +245,7 @@ jobs:
           fi
 
           echo "script=$WB_SUPPLY_DOCUMENTS_SCRIPT"
-          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V10_20260731"
+          echo "expected_version=WB_SUPPLY_DOCUMENTS_TOPFACE_V11_20260801"
           echo "upd_send_mode=$UPD_SEND_MODE"
           echo "telegram_min_supply_qty=$TELEGRAM_MIN_SUPPLY_QTY"
           echo "supply_message_mode=$SUPPLY_MESSAGE_UI supply_period=$SUPPLY_PERIOD custom=$SUPPLY_DATE_FROM..$SUPPLY_DATE_TO"
