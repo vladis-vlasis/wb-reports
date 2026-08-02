@@ -52,7 +52,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V9_PREMIUM_PRODUCT_QUERIES_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V10_LIMIT_BY_SKU15_PAGINATION_PROBE_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -896,8 +896,10 @@ class OzonFboCollector:
     def fetch_product_query_details(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         """Premium: детализация SKU × поисковый запрос.
 
-        Метод требует массив skus и page_size не более 100.
-        SKU передаются пакетами по 100, чтобы избежать ошибок валидации.
+        Ozon ограничивает limit_by_sku диапазоном 1..15.
+        Используем максимум 15 и отдельно проверяем, можно ли получить следующие
+        запросы через page/page_size. Полные ответы и метаданные пагинации
+        сохраняются в raw JSON.
         """
         endpoint = "/v1/analytics/product-queries/details"
         sku_values = sorted({int(x) for x in self.sku_ids if x not in (None, "", 0)})
@@ -907,9 +909,15 @@ class OzonFboCollector:
         all_items: List[Dict[str, Any]] = []
         raw: List[Any] = []
         page_size = 100
+        limit_by_sku = 15
 
+        # Меньшие пакеты упрощают проверку пагинации и снижают риск слишком
+        # большого ответа. 100 SKU × 15 запросов = до 1500 строк на пакет.
         for batch_no, sku_batch in enumerate(batched(sku_values, 100), start=1):
             page = 1
+            previous_signature = None
+            batch_rows_before = len(all_items)
+
             while page <= 1000:
                 payload = {
                     "date_from": to_ozon_datetime(self.period_from),
@@ -917,14 +925,10 @@ class OzonFboCollector:
                     "skus": sku_batch,
                     "page": page,
                     "page_size": page_size,
+                    "limit_by_sku": limit_by_sku,
                 }
                 data = self.client.post(endpoint, payload)
-                raw.append({
-                    "batch_no": batch_no,
-                    "page": page,
-                    "skus_count": len(sku_batch),
-                    "response": data,
-                })
+
                 items = extract_items(
                     data,
                     [
@@ -934,20 +938,96 @@ class OzonFboCollector:
                         ("rows",),
                     ],
                 )
+
+                # Сигнатура страницы нужна, чтобы понять, не возвращает ли API
+                # одну и ту же TOP-15 выборку на каждой странице.
+                signature_parts: List[str] = []
+                for item in items[:20]:
+                    if isinstance(item, Mapping):
+                        signature_parts.append(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
+                    else:
+                        signature_parts.append(str(item))
+                page_signature = "|".join(signature_parts)
+
+                pagination_meta = {
+                    "batch_no": batch_no,
+                    "page": page,
+                    "page_size": page_size,
+                    "limit_by_sku": limit_by_sku,
+                    "skus_count": len(sku_batch),
+                    "items_count": len(items),
+                    "same_as_previous_page": bool(previous_signature is not None and page_signature == previous_signature),
+                }
+
+                # Пытаемся сохранить серверные признаки пагинации, если они есть.
+                if isinstance(data, Mapping):
+                    for key in ("total", "total_count", "has_next", "next_page", "next_cursor", "cursor"):
+                        if key in data:
+                            pagination_meta[key] = data.get(key)
+                    result_obj = data.get("result")
+                    if isinstance(result_obj, Mapping):
+                        for key in ("total", "total_count", "has_next", "next_page", "next_cursor", "cursor"):
+                            if key in result_obj:
+                                pagination_meta[f"result.{key}"] = result_obj.get(key)
+
+                raw.append({
+                    "request": payload,
+                    "pagination": pagination_meta,
+                    "response": data,
+                })
+
                 for item in items:
-                    row = dict(item)
+                    row = dict(item) if isinstance(item, Mapping) else {"value": item}
                     row.setdefault("sku_batch_no", batch_no)
+                    row.setdefault("api_page", page)
+                    row.setdefault("limit_by_sku", limit_by_sku)
                     all_items.append(row)
 
-                if not items or len(items) < page_size:
+                # Защита от повторяющихся страниц.
+                if previous_signature is not None and page_signature == previous_signature:
+                    logging.warning(
+                        "Поисковые запросы: пакет %s, страница %s повторяет предыдущую. "
+                        "Похоже, API отдаёт только TOP-%s по SKU; пагинация остановлена.",
+                        batch_no, page, limit_by_sku,
+                    )
                     break
-                page += 1
+
+                previous_signature = page_signature
+
+                # Стандартные условия окончания пагинации.
+                has_next = None
+                next_page = None
+                total = None
+                if isinstance(data, Mapping):
+                    has_next = data.get("has_next")
+                    next_page = data.get("next_page")
+                    total = data.get("total", data.get("total_count"))
+                    result_obj = data.get("result")
+                    if isinstance(result_obj, Mapping):
+                        if has_next is None:
+                            has_next = result_obj.get("has_next")
+                        if next_page is None:
+                            next_page = result_obj.get("next_page")
+                        if total is None:
+                            total = result_obj.get("total", result_obj.get("total_count"))
+
+                if not items:
+                    break
+                if has_next is False:
+                    break
+                if isinstance(total, (int, float)) and len(all_items) - batch_rows_before >= int(total):
+                    break
+                if len(items) < page_size and has_next not in (True, 1, "true", "True"):
+                    break
+
+                page = int(next_page) if isinstance(next_page, int) and next_page > page else page + 1
                 time.sleep(0.12)
 
             logging.info(
-                "Поисковые запросы — детализация: пакет %s, SKU %s, строк накоплено %s",
+                "Поисковые запросы — детализация: пакет %s, SKU %s, добавлено строк %s, всего %s",
                 batch_no,
                 len(sku_batch),
+                len(all_items) - batch_rows_before,
                 len(all_items),
             )
             time.sleep(0.15)
@@ -957,9 +1037,9 @@ class OzonFboCollector:
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
             "Тип подписки": "Premium",
+            "Лимит запросов на SKU": limit_by_sku,
         })
 
-        # Удобные унифицированные колонки для будущего Ads Manager.
         aliases = {
             "Поисковый запрос": ["query", "search_query", "query_text", "text"],
             "Позиция": ["position", "avg_position", "average_position", "median_position"],
@@ -984,9 +1064,9 @@ class OzonFboCollector:
         ):
             search_users = pd.to_numeric(df["Пользователи поиска"], errors="coerce")
             view_users = pd.to_numeric(df["Просмотры карточки"], errors="coerce")
-            df["CTR-аналог, %"] = (
-                view_users.div(search_users.where(search_users.ne(0))).mul(100)
-            )
+            df["CTR-аналог, %"] = view_users.div(
+                search_users.where(search_users.ne(0))
+            ).mul(100)
 
         return df, raw, [endpoint]
 
