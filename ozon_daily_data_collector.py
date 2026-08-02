@@ -52,7 +52,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V10_LIMIT_BY_SKU15_PAGINATION_PROBE_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V11_SEARCH_PERIOD_PROBE_SUPPLY_FALLBACK_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -828,302 +828,552 @@ class OzonFboCollector:
         return df, raw, ["/v1/analytics/data"]
 
     # ------------------------- search -------------------------
-    def fetch_product_queries(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Premium: общая аналитика запросов по товарам.
+    def _search_period_candidates(self) -> List[Tuple[date, date]]:
+        """Периоды для Premium-поиска.
 
-        API требует непустой массив skus. Отправляем SKU пакетами до 1000.
+        Остальные отчёты сохраняют режим test/archive=1 день и daily=90 дней.
+        Только поисковая аналитика при отсутствии данных последовательно
+        проверяет 1, 7, 14 и 30 календарных дней, заканчивающихся target_date.
         """
+        candidates: List[Tuple[date, date]] = []
+        for days in (1, 7, 14, 30):
+            period_to = self.target_date
+            period_from = period_to - timedelta(days=days - 1)
+            pair = (period_from, period_to)
+            if pair not in candidates:
+                candidates.append(pair)
+        return candidates
+
+    @staticmethod
+    def _is_no_search_data_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "there is no data for the specified period" in message
+            or "getpremiumanalyticsperiod" in message
+        )
+
+    def fetch_product_queries(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Premium: сводная поисковая аналитика с подбором допустимого периода."""
         endpoint = "/v1/analytics/product-queries"
         sku_values = sorted({int(x) for x in self.sku_ids if x not in (None, "", 0)})
         if not sku_values:
             return pd.DataFrame(), {"warning": "sku_ids is empty"}, [endpoint]
 
-        all_items: List[Dict[str, Any]] = []
-        raw: List[Any] = []
-        page_size = 1000
+        attempts_raw: List[Any] = []
+        last_no_data_error: Optional[Exception] = None
 
-        for batch_no, sku_batch in enumerate(batched(sku_values, 1000), start=1):
-            page = 1
-            while page <= 500:
-                payload = {
-                    "date_from": to_ozon_datetime(self.period_from),
-                    "date_to": to_ozon_datetime(self.period_to, end=True),
-                    "skus": sku_batch,
-                    "page": page,
-                    "page_size": page_size,
-                }
-                data = self.client.post(endpoint, payload)
-                raw.append({
-                    "batch_no": batch_no,
-                    "page": page,
-                    "skus_count": len(sku_batch),
-                    "response": data,
-                })
-                items = extract_items(
-                    data,
-                    [
-                        ("items",),
-                        ("result", "items"),
-                        ("result", "rows"),
-                        ("rows",),
-                    ],
-                )
-                for item in items:
-                    row = dict(item)
-                    row.setdefault("sku_batch_no", batch_no)
-                    all_items.append(row)
-
-                if not items or len(items) < page_size:
-                    break
-                page += 1
-                time.sleep(0.12)
-
+        for search_from, search_to in self._search_period_candidates():
             logging.info(
-                "Поисковые запросы — сводная: пакет %s, SKU %s, строк накоплено %s",
-                batch_no,
-                len(sku_batch),
-                len(all_items),
+                "Поисковые запросы — сводная: пробуем период %s — %s",
+                search_from,
+                search_to,
             )
+            all_items: List[Dict[str, Any]] = []
+            period_raw: List[Any] = []
+            page_size = 1000
 
-        df = records_to_df(all_items, {
-            "Дата": self.target_date.isoformat(),
-            "Период с": self.period_from.isoformat(),
-            "Период по": self.period_to.isoformat(),
-            "Тип подписки": "Premium",
-        })
-        return df, raw, [endpoint]
+            try:
+                for batch_no, sku_batch in enumerate(batched(sku_values, 1000), start=1):
+                    page = 1
+                    while page <= 500:
+                        payload = {
+                            "date_from": to_ozon_datetime(search_from),
+                            "date_to": to_ozon_datetime(search_to, end=True),
+                            "skus": sku_batch,
+                            "page": page,
+                            "page_size": page_size,
+                        }
+                        data = self.client.post(endpoint, payload)
+                        period_raw.append({
+                            "request": payload,
+                            "response": data,
+                        })
+                        items = extract_items(
+                            data,
+                            [
+                                ("items",),
+                                ("result", "items"),
+                                ("result", "rows"),
+                                ("rows",),
+                            ],
+                        )
+                        for item in items:
+                            row = dict(item) if isinstance(item, Mapping) else {"value": item}
+                            row.setdefault("sku_batch_no", batch_no)
+                            row.setdefault("api_page", page)
+                            all_items.append(row)
+
+                        if not items or len(items) < page_size:
+                            break
+                        page += 1
+                        time.sleep(0.12)
+
+                attempts_raw.append({
+                    "period_from": search_from.isoformat(),
+                    "period_to": search_to.isoformat(),
+                    "status": "OK",
+                    "rows": len(all_items),
+                    "responses": period_raw,
+                })
+
+                # Даже пустой успешный ответ считаем валидным периодом.
+                df = records_to_df(all_items, {
+                    "Дата снимка": self.target_date.isoformat(),
+                    "Период с": search_from.isoformat(),
+                    "Период по": search_to.isoformat(),
+                    "Длина периода, дней": (search_to - search_from).days + 1,
+                    "Тип подписки": "Premium",
+                })
+                logging.info(
+                    "Поисковые запросы — сводная: выбран период %s — %s, строк %s",
+                    search_from,
+                    search_to,
+                    len(df),
+                )
+                return df, attempts_raw, [endpoint]
+
+            except OzonApiError as exc:
+                attempts_raw.append({
+                    "period_from": search_from.isoformat(),
+                    "period_to": search_to.isoformat(),
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "responses": period_raw,
+                })
+                if self._is_no_search_data_error(exc):
+                    last_no_data_error = exc
+                    logging.warning(
+                        "Поисковые запросы — сводная: данных за %s дней нет, пробуем больший период",
+                        (search_to - search_from).days + 1,
+                    )
+                    continue
+                raise
+
+        if last_no_data_error:
+            raise last_no_data_error
+        return pd.DataFrame(), attempts_raw, [endpoint]
 
     def fetch_product_query_details(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Premium: детализация SKU × поисковый запрос.
-
-        Ozon ограничивает limit_by_sku диапазоном 1..15.
-        Используем максимум 15 и отдельно проверяем, можно ли получить следующие
-        запросы через page/page_size. Полные ответы и метаданные пагинации
-        сохраняются в raw JSON.
-        """
+        """Premium: SKU × запрос с limit_by_sku=15 и подбором периода."""
         endpoint = "/v1/analytics/product-queries/details"
         sku_values = sorted({int(x) for x in self.sku_ids if x not in (None, "", 0)})
         if not sku_values:
             return pd.DataFrame(), {"warning": "sku_ids is empty"}, [endpoint]
 
-        all_items: List[Dict[str, Any]] = []
-        raw: List[Any] = []
         page_size = 100
         limit_by_sku = 15
+        attempts_raw: List[Any] = []
+        last_no_data_error: Optional[Exception] = None
 
-        # Меньшие пакеты упрощают проверку пагинации и снижают риск слишком
-        # большого ответа. 100 SKU × 15 запросов = до 1500 строк на пакет.
-        for batch_no, sku_batch in enumerate(batched(sku_values, 100), start=1):
-            page = 1
-            previous_signature = None
-            batch_rows_before = len(all_items)
+        for search_from, search_to in self._search_period_candidates():
+            logging.info(
+                "Поисковые запросы — детализация: пробуем период %s — %s",
+                search_from,
+                search_to,
+            )
+            all_items: List[Dict[str, Any]] = []
+            period_raw: List[Any] = []
 
-            while page <= 1000:
-                payload = {
-                    "date_from": to_ozon_datetime(self.period_from),
-                    "date_to": to_ozon_datetime(self.period_to, end=True),
-                    "skus": sku_batch,
-                    "page": page,
-                    "page_size": page_size,
-                    "limit_by_sku": limit_by_sku,
-                }
-                data = self.client.post(endpoint, payload)
+            try:
+                for batch_no, sku_batch in enumerate(batched(sku_values, 100), start=1):
+                    page = 1
+                    previous_signature: Optional[str] = None
+                    batch_rows_before = len(all_items)
 
-                items = extract_items(
-                    data,
-                    [
-                        ("items",),
-                        ("result", "items"),
-                        ("result", "rows"),
-                        ("rows",),
-                    ],
-                )
+                    while page <= 1000:
+                        payload = {
+                            "date_from": to_ozon_datetime(search_from),
+                            "date_to": to_ozon_datetime(search_to, end=True),
+                            "skus": sku_batch,
+                            "page": page,
+                            "page_size": page_size,
+                            "limit_by_sku": limit_by_sku,
+                        }
+                        data = self.client.post(endpoint, payload)
+                        items = extract_items(
+                            data,
+                            [
+                                ("items",),
+                                ("result", "items"),
+                                ("result", "rows"),
+                                ("rows",),
+                            ],
+                        )
 
-                # Сигнатура страницы нужна, чтобы понять, не возвращает ли API
-                # одну и ту же TOP-15 выборку на каждой странице.
-                signature_parts: List[str] = []
-                for item in items[:20]:
-                    if isinstance(item, Mapping):
-                        signature_parts.append(json.dumps(item, ensure_ascii=False, sort_keys=True, default=str))
-                    else:
-                        signature_parts.append(str(item))
-                page_signature = "|".join(signature_parts)
+                        signature_parts: List[str] = []
+                        for item in items[:20]:
+                            if isinstance(item, Mapping):
+                                signature_parts.append(
+                                    json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+                                )
+                            else:
+                                signature_parts.append(str(item))
+                        page_signature = "|".join(signature_parts)
 
-                pagination_meta = {
-                    "batch_no": batch_no,
-                    "page": page,
-                    "page_size": page_size,
-                    "limit_by_sku": limit_by_sku,
-                    "skus_count": len(sku_batch),
-                    "items_count": len(items),
-                    "same_as_previous_page": bool(previous_signature is not None and page_signature == previous_signature),
-                }
+                        pagination_meta: Dict[str, Any] = {
+                            "batch_no": batch_no,
+                            "page": page,
+                            "page_size": page_size,
+                            "limit_by_sku": limit_by_sku,
+                            "skus_count": len(sku_batch),
+                            "items_count": len(items),
+                            "same_as_previous_page": bool(
+                                previous_signature is not None
+                                and page_signature == previous_signature
+                            ),
+                        }
 
-                # Пытаемся сохранить серверные признаки пагинации, если они есть.
-                if isinstance(data, Mapping):
-                    for key in ("total", "total_count", "has_next", "next_page", "next_cursor", "cursor"):
-                        if key in data:
-                            pagination_meta[key] = data.get(key)
-                    result_obj = data.get("result")
-                    if isinstance(result_obj, Mapping):
-                        for key in ("total", "total_count", "has_next", "next_page", "next_cursor", "cursor"):
-                            if key in result_obj:
-                                pagination_meta[f"result.{key}"] = result_obj.get(key)
+                        if isinstance(data, Mapping):
+                            for key in (
+                                "total", "total_count", "has_next", "next_page",
+                                "next_cursor", "cursor"
+                            ):
+                                if key in data:
+                                    pagination_meta[key] = data.get(key)
+                            result_obj = data.get("result")
+                            if isinstance(result_obj, Mapping):
+                                for key in (
+                                    "total", "total_count", "has_next", "next_page",
+                                    "next_cursor", "cursor"
+                                ):
+                                    if key in result_obj:
+                                        pagination_meta[f"result.{key}"] = result_obj.get(key)
 
-                raw.append({
-                    "request": payload,
-                    "pagination": pagination_meta,
-                    "response": data,
+                        period_raw.append({
+                            "request": payload,
+                            "pagination": pagination_meta,
+                            "response": data,
+                        })
+
+                        for item in items:
+                            row = dict(item) if isinstance(item, Mapping) else {"value": item}
+                            row.setdefault("sku_batch_no", batch_no)
+                            row.setdefault("api_page", page)
+                            row.setdefault("limit_by_sku", limit_by_sku)
+                            all_items.append(row)
+
+                        if (
+                            previous_signature is not None
+                            and page_signature == previous_signature
+                        ):
+                            logging.warning(
+                                "Поисковые запросы: пакет %s, страница %s повторяет предыдущую; "
+                                "пагинация остановлена",
+                                batch_no,
+                                page,
+                            )
+                            break
+                        previous_signature = page_signature
+
+                        has_next = None
+                        next_page = None
+                        total = None
+                        if isinstance(data, Mapping):
+                            has_next = data.get("has_next")
+                            next_page = data.get("next_page")
+                            total = data.get("total", data.get("total_count"))
+                            result_obj = data.get("result")
+                            if isinstance(result_obj, Mapping):
+                                if has_next is None:
+                                    has_next = result_obj.get("has_next")
+                                if next_page is None:
+                                    next_page = result_obj.get("next_page")
+                                if total is None:
+                                    total = result_obj.get(
+                                        "total", result_obj.get("total_count")
+                                    )
+
+                        if not items:
+                            break
+                        if has_next is False:
+                            break
+                        if (
+                            isinstance(total, (int, float))
+                            and len(all_items) - batch_rows_before >= int(total)
+                        ):
+                            break
+                        if (
+                            len(items) < page_size
+                            and has_next not in (True, 1, "true", "True")
+                        ):
+                            break
+
+                        page = (
+                            int(next_page)
+                            if isinstance(next_page, int) and next_page > page
+                            else page + 1
+                        )
+                        time.sleep(0.12)
+
+                    logging.info(
+                        "Поисковые запросы — детализация: пакет %s, SKU %s, добавлено %s",
+                        batch_no,
+                        len(sku_batch),
+                        len(all_items) - batch_rows_before,
+                    )
+                    time.sleep(0.15)
+
+                attempts_raw.append({
+                    "period_from": search_from.isoformat(),
+                    "period_to": search_to.isoformat(),
+                    "status": "OK",
+                    "rows": len(all_items),
+                    "responses": period_raw,
                 })
 
-                for item in items:
-                    row = dict(item) if isinstance(item, Mapping) else {"value": item}
-                    row.setdefault("sku_batch_no", batch_no)
-                    row.setdefault("api_page", page)
-                    row.setdefault("limit_by_sku", limit_by_sku)
-                    all_items.append(row)
+                df = records_to_df(all_items, {
+                    "Дата снимка": self.target_date.isoformat(),
+                    "Период с": search_from.isoformat(),
+                    "Период по": search_to.isoformat(),
+                    "Длина периода, дней": (search_to - search_from).days + 1,
+                    "Тип подписки": "Premium",
+                    "Лимит запросов на SKU": limit_by_sku,
+                })
 
-                # Защита от повторяющихся страниц.
-                if previous_signature is not None and page_signature == previous_signature:
-                    logging.warning(
-                        "Поисковые запросы: пакет %s, страница %s повторяет предыдущую. "
-                        "Похоже, API отдаёт только TOP-%s по SKU; пагинация остановлена.",
-                        batch_no, page, limit_by_sku,
+                aliases = {
+                    "Поисковый запрос": ["query", "search_query", "query_text", "text"],
+                    "Позиция": [
+                        "position", "avg_position", "average_position", "median_position"
+                    ],
+                    "Пользователи поиска": [
+                        "unique_search_users", "search_users"
+                    ],
+                    "Просмотры карточки": [
+                        "unique_view_users", "view_users"
+                    ],
+                    "Конверсия в просмотр": [
+                        "view_conversion", "conversion"
+                    ],
+                    "Продажи по запросу, руб": [
+                        "gmv", "revenue", "order_sum"
+                    ],
+                    "Заказы по запросу, шт": [
+                        "orders", "orders_count", "ordered_units"
+                    ],
+                }
+                for target, candidates in aliases.items():
+                    if target in df.columns:
+                        continue
+                    for candidate in candidates:
+                        if candidate in df.columns:
+                            df[target] = df[candidate]
+                            break
+
+                if (
+                    "Пользователи поиска" in df.columns
+                    and "Просмотры карточки" in df.columns
+                    and "CTR-аналог, %" not in df.columns
+                ):
+                    search_users = pd.to_numeric(
+                        df["Пользователи поиска"], errors="coerce"
                     )
-                    break
+                    view_users = pd.to_numeric(
+                        df["Просмотры карточки"], errors="coerce"
+                    )
+                    df["CTR-аналог, %"] = view_users.div(
+                        search_users.where(search_users.ne(0))
+                    ).mul(100)
 
-                previous_signature = page_signature
+                logging.info(
+                    "Поисковые запросы — детализация: выбран период %s — %s, строк %s",
+                    search_from,
+                    search_to,
+                    len(df),
+                )
+                return df, attempts_raw, [endpoint]
 
-                # Стандартные условия окончания пагинации.
-                has_next = None
-                next_page = None
-                total = None
-                if isinstance(data, Mapping):
-                    has_next = data.get("has_next")
-                    next_page = data.get("next_page")
-                    total = data.get("total", data.get("total_count"))
-                    result_obj = data.get("result")
-                    if isinstance(result_obj, Mapping):
-                        if has_next is None:
-                            has_next = result_obj.get("has_next")
-                        if next_page is None:
-                            next_page = result_obj.get("next_page")
-                        if total is None:
-                            total = result_obj.get("total", result_obj.get("total_count"))
+            except OzonApiError as exc:
+                attempts_raw.append({
+                    "period_from": search_from.isoformat(),
+                    "period_to": search_to.isoformat(),
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "responses": period_raw,
+                })
+                if self._is_no_search_data_error(exc):
+                    last_no_data_error = exc
+                    logging.warning(
+                        "Поисковые запросы — детализация: данных за %s дней нет, пробуем больший период",
+                        (search_to - search_from).days + 1,
+                    )
+                    continue
+                raise
 
-                if not items:
-                    break
-                if has_next is False:
-                    break
-                if isinstance(total, (int, float)) and len(all_items) - batch_rows_before >= int(total):
-                    break
-                if len(items) < page_size and has_next not in (True, 1, "true", "True"):
-                    break
-
-                page = int(next_page) if isinstance(next_page, int) and next_page > page else page + 1
-                time.sleep(0.12)
-
-            logging.info(
-                "Поисковые запросы — детализация: пакет %s, SKU %s, добавлено строк %s, всего %s",
-                batch_no,
-                len(sku_batch),
-                len(all_items) - batch_rows_before,
-                len(all_items),
-            )
-            time.sleep(0.15)
-
-        df = records_to_df(all_items, {
-            "Дата": self.target_date.isoformat(),
-            "Период с": self.period_from.isoformat(),
-            "Период по": self.period_to.isoformat(),
-            "Тип подписки": "Premium",
-            "Лимит запросов на SKU": limit_by_sku,
-        })
-
-        aliases = {
-            "Поисковый запрос": ["query", "search_query", "query_text", "text"],
-            "Позиция": ["position", "avg_position", "average_position", "median_position"],
-            "Пользователи поиска": ["unique_search_users", "search_users"],
-            "Просмотры карточки": ["unique_view_users", "view_users"],
-            "Конверсия в просмотр": ["view_conversion", "conversion"],
-            "Продажи по запросу, руб": ["gmv", "revenue", "order_sum"],
-            "Заказы по запросу, шт": ["orders", "orders_count", "ordered_units"],
-        }
-        for target, candidates in aliases.items():
-            if target in df.columns:
-                continue
-            for candidate in candidates:
-                if candidate in df.columns:
-                    df[target] = df[candidate]
-                    break
-
-        if (
-            "Пользователи поиска" in df.columns
-            and "Просмотры карточки" in df.columns
-            and "CTR-аналог, %" not in df.columns
-        ):
-            search_users = pd.to_numeric(df["Пользователи поиска"], errors="coerce")
-            view_users = pd.to_numeric(df["Просмотры карточки"], errors="coerce")
-            df["CTR-аналог, %"] = view_users.div(
-                search_users.where(search_users.ne(0))
-            ).mul(100)
-
-        return df, raw, [endpoint]
+        if last_no_data_error:
+            raise last_no_data_error
+        return pd.DataFrame(), attempts_raw, [endpoint]
 
     # ------------------------- supplies/warehouses -------------------------
     def fetch_supply_orders(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        payload = {
-            "filter": {
-                "states": [],
-                "created_date_from": self.period_from.isoformat(),
-                "created_date_to": (self.period_to + timedelta(days=1)).isoformat(),
-            },
-            "limit": 100,
-            "last_id": "",
-            "sort_by": "CREATED_AT",
-            "sort_direction": "DESC",
+        """Поставки FBO с подбором совместимого варианта сортировки v3."""
+        endpoint_list = "/v3/supply-order/list"
+        base_filter = {
+            "states": [],
+            "created_date_from": self.period_from.isoformat(),
+            "created_date_to": (self.period_to + timedelta(days=1)).isoformat(),
         }
-        # list
-        items, raw_list = self.client.cursor_pages(
-            "/v3/supply-order/list", payload,
-            [("result", "items"), ("items",)], limit=100, cursor_field="last_id",
-        )
-        # get details, сохраняем по одной строке на товар поставки.
+
+        payload_variants: List[Dict[str, Any]] = [
+            {
+                "filter": base_filter,
+                "limit": 100,
+                "last_id": "",
+                "sort_by": "CREATION_DATE",
+                "sort_direction": "DESC",
+            },
+            {
+                "filter": base_filter,
+                "limit": 100,
+                "last_id": "",
+                "sort_by": "CREATED_AT",
+                "sort_direction": "DESC",
+            },
+            {
+                "filter": base_filter,
+                "limit": 100,
+                "last_id": "",
+                "sort_by": 1,
+                "sort_direction": 2,
+            },
+            {
+                "filter": base_filter,
+                "limit": 100,
+                "last_id": "",
+            },
+        ]
+
+        items: List[Dict[str, Any]] = []
+        raw_list: List[Any] = []
+        last_exc: Optional[Exception] = None
+        chosen_payload: Optional[Dict[str, Any]] = None
+
+        for variant_no, payload in enumerate(payload_variants, start=1):
+            try:
+                logging.info(
+                    "Поставки FBO: пробуем вариант payload %s: sort_by=%r, sort_direction=%r",
+                    variant_no,
+                    payload.get("sort_by"),
+                    payload.get("sort_direction"),
+                )
+                items, pages = self.client.cursor_pages(
+                    endpoint_list,
+                    payload,
+                    [("result", "items"), ("items",)],
+                    limit=100,
+                    cursor_field="last_id",
+                )
+                raw_list.append({
+                    "variant_no": variant_no,
+                    "request": payload,
+                    "status": "OK",
+                    "responses": pages,
+                })
+                chosen_payload = payload
+                break
+            except OzonApiError as exc:
+                last_exc = exc
+                raw_list.append({
+                    "variant_no": variant_no,
+                    "request": payload,
+                    "status": "ERROR",
+                    "error": str(exc),
+                })
+                message = str(exc).lower()
+                if exc.status == 400 and (
+                    "sortby" in message
+                    or "sort_by" in message
+                    or "sortdirection" in message
+                    or "sort_direction" in message
+                ):
+                    continue
+                raise
+
+        if chosen_payload is None:
+            if last_exc:
+                raise last_exc
+            return pd.DataFrame(), raw_list, [endpoint_list]
+
         rows: List[Dict[str, Any]] = []
         raw_details: List[Any] = []
+
         for i, item in enumerate(items, start=1):
-            order_id = item.get("order_id") or item.get("supply_order_id") or item.get("id")
+            order_id = (
+                item.get("order_id")
+                or item.get("supply_order_id")
+                or item.get("id")
+            )
             base = dict(item)
             if not order_id:
                 rows.append(base)
                 continue
+
             try:
-                detail = self.client.post("/v3/supply-order/get", {"order_id": order_id})
-                raw_details.append(detail)
-                root = detail.get("result", detail) if isinstance(detail, Mapping) else {}
-                products = []
+                detail = self.client.post(
+                    "/v3/supply-order/get",
+                    {"order_id": order_id},
+                )
+                raw_details.append({
+                    "order_id": order_id,
+                    "response": detail,
+                })
+                root = (
+                    detail.get("result", detail)
+                    if isinstance(detail, Mapping)
+                    else {}
+                )
+                products: Any = []
                 if isinstance(root, Mapping):
-                    products = root.get("items") or root.get("products") or root.get("supply_order_items") or []
+                    products = (
+                        root.get("items")
+                        or root.get("products")
+                        or root.get("supply_order_items")
+                        or []
+                    )
+
                 if isinstance(products, list) and products:
                     for product in products:
                         row = dict(base)
-                        row["detail"] = safe_json(root)
                         if isinstance(product, Mapping):
-                            row.update({f"product.{k}": v for k, v in product.items()})
+                            row.update({
+                                f"product.{k}": v
+                                for k, v in product.items()
+                            })
+                        row["detail"] = safe_json(root)
                         rows.append(row)
                 else:
                     row = dict(base)
                     row["detail"] = safe_json(root)
                     rows.append(row)
-            except OzonApiError as exc:
-                self.log_error("supply_get", str(order_id), exc, True)
+
+            except Exception as exc:
+                self.log_error(
+                    "supply_detail",
+                    f"order_id={order_id}",
+                    exc,
+                    optional=True,
+                )
+                base["detail_error"] = str(exc)
                 rows.append(base)
-            if i % 50 == 0:
-                logging.info("Поставки: детализация %s/%s", i, len(items))
-            time.sleep(0.15)
-        return records_to_df(rows, {"Дата обновления снимка": self.target_date.isoformat()}), {
-            "list": raw_list, "details": raw_details
-        }, ["/v3/supply-order/list", "/v3/supply-order/get"]
+
+            if i % 20 == 0:
+                logging.info(
+                    "Поставки FBO: обработано деталей %s/%s",
+                    i,
+                    len(items),
+                )
+            time.sleep(0.12)
+
+        raw = {
+            "chosen_list_payload": chosen_payload,
+            "list_attempts": raw_list,
+            "details": raw_details,
+        }
+        df = records_to_df(rows, {
+            "Дата снимка": self.target_date.isoformat(),
+            "Период с": self.period_from.isoformat(),
+            "Период по": self.period_to.isoformat(),
+        })
+        return df, raw, [endpoint_list, "/v3/supply-order/get"]
 
     def fetch_warehouses(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         """Старый /v1/warehouse/list отключён. Справочник строим из отчёта остатков по складам."""
