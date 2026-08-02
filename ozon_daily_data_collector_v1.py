@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v1
+Ozon FBO Daily Data Collector v2
 
 Назначение:
 - ежедневный read-only сбор максимально доступных нефинансовых данных Ozon Seller API;
@@ -18,7 +18,7 @@ Ozon FBO Daily Data Collector v1
 
 Важно:
 - финансовые методы намеренно не вызываются;
-- Performance API намеренно не вызывается в v1;
+- Performance API намеренно не вызывается в v2;
 - API Ozon меняется. Необязательные методы помечены optional: отсутствие права/метода
   фиксируется в диагностике и не ломает остальные отчёты.
 """
@@ -49,7 +49,7 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V1_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V2_CORRECT_NAMES_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
