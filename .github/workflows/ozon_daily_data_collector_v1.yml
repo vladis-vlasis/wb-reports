@@ -1,0 +1,81 @@
+name: Ozon FBO — сбор всех данных v1
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим: daily — обновить недельные отчёты; archive — ZIP всех отчётов за выбранный день"
+        required: true
+        type: choice
+        default: daily
+        options:
+          - daily
+          - archive
+      target_date:
+        description: "Дата YYYY-MM-DD. Пусто = автоматически: после 15:00 МСК вчера, до 15:00 МСК позавчера"
+        required: false
+        type: string
+      store:
+        description: "Магазин"
+        required: true
+        type: choice
+        default: TOPFACE
+        options:
+          - TOPFACE
+  schedule:
+    # 12:20 UTC = 15:20 МСК. К этому времени используем актуальную выгрузку за вчера.
+    - cron: "20 12 * * *"
+
+concurrency:
+  group: ozon-fbo-data-${{ github.event.inputs.store || 'TOPFACE' }}
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      OZON_MODE: ${{ github.event_name == 'schedule' && 'daily' || github.event.inputs.mode }}
+      OZON_TARGET_DATE: ${{ github.event.inputs.target_date }}
+      OZON_STORE: ${{ github.event.inputs.store || 'TOPFACE' }}
+      OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
+      OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
+      # Performance API предусмотрен в инфраструктуре, но v1 его не вызывает.
+      OZON_PERFORMANCE_CLIENT_ID_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_TOPFACE }}
+      OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE }}
+      OZON_YC_ACCESS_KEY_ID: ${{ secrets.OZON_YC_ACCESS_KEY_ID }}
+      OZON_YC_SECRET_ACCESS_KEY: ${{ secrets.OZON_YC_SECRET_ACCESS_KEY }}
+      OZON_YC_BUCKET: ozon-assist
+      OZON_YC_ENDPOINT_URL: https://storage.yandexcloud.net
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements_ozon_data_collector_v1.txt
+
+      - name: Run Ozon collector
+        run: |
+          python ozon_daily_data_collector_v1.py \
+            --mode "$OZON_MODE" \
+            --store "$OZON_STORE" \
+            ${OZON_TARGET_DATE:+--target-date "$OZON_TARGET_DATE"}
+
+      - name: Upload local diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozon-data-collector-failure-${{ github.run_id }}
+          path: output_ozon_v1/
+          if-no-files-found: ignore
+          retention-days: 7
