@@ -52,7 +52,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V12_PERFORMANCE_API_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V13_PERFORMANCE_BATCHES_OBJECTS_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 OZON_PERFORMANCE_API_BASE = "https://api-performance.ozon.ru"
@@ -1686,6 +1686,32 @@ class OzonFboCollector:
             return [dict(data)]
         return []
 
+    @staticmethod
+    def _find_object_lists(value: Any) -> List[Dict[str, Any]]:
+        """Ищет списки рекламных объектов в произвольной структуре ответа."""
+        found: List[Dict[str, Any]] = []
+
+        def walk(node: Any, path: str = "") -> None:
+            if isinstance(node, list):
+                for item in node:
+                    if isinstance(item, Mapping):
+                        keys = {str(k).lower() for k in item.keys()}
+                        if keys.intersection({
+                            "sku", "productid", "product_id", "offerid", "offer_id",
+                            "objectid", "object_id", "bid", "price", "status"
+                        }):
+                            row = dict(item)
+                            row.setdefault("_source_path", path)
+                            found.append(row)
+                        walk(item, path)
+            elif isinstance(node, Mapping):
+                for key, child in node.items():
+                    child_path = f"{path}.{key}" if path else str(key)
+                    walk(child, child_path)
+
+        walk(value)
+        return found
+
     def fetch_ad_campaigns(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         client = self._require_performance()
         data, meta = client.try_variants([
@@ -1722,104 +1748,159 @@ class OzonFboCollector:
         return sorted(set(ids))
 
     def fetch_ad_products_bids(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Получает товары и ставки по кампаниям.
+
+        В v13 ошибка одной кампании больше не прерывает весь отчёт. Сначала
+        читаем карточку кампании, затем пробуем актуальные object-endpoint'ы.
+        """
         client = self._require_performance()
         campaign_ids = self._campaign_ids_from_results()
         if not campaign_ids:
             return pd.DataFrame(), {"warning": "campaign_ids is empty"}, []
 
         rows: List[Dict[str, Any]] = []
+        diagnostics: List[Dict[str, Any]] = []
         raw: List[Any] = []
         used_paths: List[str] = []
 
         for index, campaign_id in enumerate(campaign_ids, start=1):
-            product_data, product_meta = client.try_variants([
-                (
-                    "GET",
-                    f"/api/client/campaign/{campaign_id}/products",
-                    None,
-                    None,
-                ),
-                (
-                    "GET",
-                    f"/api/client/campaign/{campaign_id}/product",
-                    None,
-                    None,
-                ),
-            ])
-            used_paths.append(product_meta["chosen_path"])
-            products = self._extract_performance_items(product_data)
+            campaign_rows: List[Dict[str, Any]] = []
+            campaign_raw: Dict[str, Any] = {"campaign_id": campaign_id}
 
+            # 1. Карточка кампании часто уже содержит objects/products.
+            try:
+                detail, detail_meta = client.try_variants([
+                    ("GET", f"/api/client/campaign/{campaign_id}", None, None),
+                ])
+                used_paths.append(detail_meta["chosen_path"])
+                campaign_raw["campaign_detail"] = detail
+                campaign_raw["campaign_detail_meta"] = detail_meta
+                campaign_rows.extend(self._find_object_lists(detail))
+            except Exception as exc:
+                campaign_raw["campaign_detail_error"] = str(exc)
+
+            # 2. Отдельные методы объектов.
+            object_data = None
+            object_meta = None
+            try:
+                object_data, object_meta = client.try_variants([
+                    ("GET", f"/api/client/campaign/{campaign_id}/objects", None, None),
+                    ("GET", f"/api/client/campaign/{campaign_id}/object", None, None),
+                    ("GET", f"/api/client/campaign/{campaign_id}/objects/info", None, None),
+                    ("GET", f"/api/client/campaign/{campaign_id}/products", None, None),
+                ])
+                used_paths.append(object_meta["chosen_path"])
+                campaign_raw["objects_response"] = object_data
+                campaign_raw["objects_meta"] = object_meta
+                extracted = self._extract_performance_items(object_data)
+                if not extracted:
+                    extracted = self._find_object_lists(object_data)
+                campaign_rows.extend(extracted)
+            except Exception as exc:
+                campaign_raw["objects_error"] = str(exc)
+
+            # 3. Конкурентные ставки — необязательны.
             competitive_data: Any = {}
-            competitive_meta: Dict[str, Any] = {}
+            competitive_items: List[Dict[str, Any]] = []
             try:
                 competitive_data, competitive_meta = client.try_variants([
-                    (
-                        "GET",
-                        f"/api/client/campaign/{campaign_id}/products/bids/competitive",
-                        None,
-                        None,
-                    ),
-                    (
-                        "GET",
-                        f"/api/client/campaign/{campaign_id}/bids/competitive",
-                        None,
-                        None,
-                    ),
+                    ("GET", f"/api/client/campaign/{campaign_id}/objects/bids/competitive", None, None),
+                    ("GET", f"/api/client/campaign/{campaign_id}/bids/competitive", None, None),
+                    ("GET", f"/api/client/campaign/{campaign_id}/competitive-bids", None, None),
                 ])
                 used_paths.append(competitive_meta["chosen_path"])
+                campaign_raw["competitive_response"] = competitive_data
+                campaign_raw["competitive_meta"] = competitive_meta
+                competitive_items = self._extract_performance_items(competitive_data)
+                if not competitive_items:
+                    competitive_items = self._find_object_lists(competitive_data)
             except Exception as exc:
-                competitive_data = {"error": str(exc)}
+                campaign_raw["competitive_error"] = str(exc)
 
-            competitive_items = self._extract_performance_items(competitive_data)
-            competitive_by_sku: Dict[str, Dict[str, Any]] = {}
-            for item in competitive_items:
-                key = (
+            # Дедупликация объектов внутри кампании.
+            seen: set[str] = set()
+            unique_rows: List[Dict[str, Any]] = []
+            for item in campaign_rows:
+                key_value = (
                     item.get("sku")
                     or item.get("productId")
                     or item.get("product_id")
                     or item.get("offerId")
+                    or item.get("offer_id")
+                    or item.get("objectId")
+                    or item.get("object_id")
                 )
-                if key is not None:
-                    competitive_by_sku[str(key)] = item
+                signature = f"{key_value}|{safe_json(item)}"
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                unique_rows.append(item)
 
-            for product in products:
-                row = {
+            competitive_by_key: Dict[str, Dict[str, Any]] = {}
+            for item in competitive_items:
+                key_value = (
+                    item.get("sku")
+                    or item.get("productId")
+                    or item.get("product_id")
+                    or item.get("offerId")
+                    or item.get("offer_id")
+                    or item.get("objectId")
+                    or item.get("object_id")
+                )
+                if key_value is not None:
+                    competitive_by_key[str(key_value)] = item
+
+            for item in unique_rows:
+                row: Dict[str, Any] = {
                     "Дата снимка": self.target_date.isoformat(),
                     "campaign_id": campaign_id,
                 }
-                row.update(product)
-                key = (
-                    product.get("sku")
-                    or product.get("productId")
-                    or product.get("product_id")
-                    or product.get("offerId")
+                row.update(item)
+                key_value = (
+                    item.get("sku")
+                    or item.get("productId")
+                    or item.get("product_id")
+                    or item.get("offerId")
+                    or item.get("offer_id")
+                    or item.get("objectId")
+                    or item.get("object_id")
                 )
-                competitive = competitive_by_sku.get(str(key), {})
-                for key_name, value in competitive.items():
-                    if key_name not in row:
-                        row[f"competitive.{key_name}"] = value
+                competitive = competitive_by_key.get(str(key_value), {})
+                for field, value in competitive.items():
+                    if field not in row:
+                        row[f"competitive.{field}"] = value
                 rows.append(row)
 
-            raw.append({
-                "campaign_id": campaign_id,
-                "products_meta": product_meta,
-                "products_response": product_data,
-                "competitive_meta": competitive_meta,
-                "competitive_response": competitive_data,
-            })
+            if not unique_rows:
+                diagnostics.append({
+                    "Дата снимка": self.target_date.isoformat(),
+                    "campaign_id": campaign_id,
+                    "status": "NO_OBJECTS",
+                    "campaign_detail_error": campaign_raw.get("campaign_detail_error", ""),
+                    "objects_error": campaign_raw.get("objects_error", ""),
+                    "competitive_error": campaign_raw.get("competitive_error", ""),
+                })
+
+            raw.append(campaign_raw)
 
             if index % 20 == 0:
                 logging.info(
-                    "Performance API: товары и ставки %s/%s кампаний",
+                    "Performance API: товары и ставки %s/%s кампаний, строк %s",
                     index,
                     len(campaign_ids),
+                    len(rows),
                 )
-            time.sleep(0.12)
+            time.sleep(0.10)
 
-        df = records_to_df(rows, {
-            "Дата снимка": self.target_date.isoformat(),
-        })
-        return df, raw, sorted(set(used_paths))
+        if rows:
+            df = records_to_df(rows, {"Дата снимка": self.target_date.isoformat()})
+        else:
+            # Не скрываем результат: сохраняем диагностический Excel.
+            df = records_to_df(diagnostics, {
+                "Дата снимка": self.target_date.isoformat(),
+            })
+
+        return df, {"campaigns": raw, "diagnostics": diagnostics}, sorted(set(used_paths))
 
     def _poll_statistics_report(
         self,
@@ -1881,106 +1962,175 @@ class OzonFboCollector:
         )
 
     def fetch_ad_statistics(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Дневная статистика Performance API пакетами кампаний.
+
+        Основная причина ошибки v12 — отправка всех 189 кампаний одним запросом.
+        В v13 кампании обрабатываются пакетами по 10, а ошибка одного пакета
+        не прерывает остальные.
+        """
         client = self._require_performance()
         campaign_ids = self._campaign_ids_from_results()
         if not campaign_ids:
             return pd.DataFrame(), {"warning": "campaign_ids is empty"}, []
 
-        # test/archive — выбранный день; daily — текущий рабочий период.
         date_from = self.period_from.isoformat()
         date_to = self.period_to.isoformat()
 
-        payload_variants = [
-            {
-                "campaigns": campaign_ids,
-                "dateFrom": date_from,
-                "dateTo": date_to,
-                "groupBy": "DATE",
-            },
-            {
-                "campaignIds": campaign_ids,
-                "dateFrom": date_from,
-                "dateTo": date_to,
-                "groupBy": ["DATE", "SKU"],
-            },
-            {
-                "campaigns": campaign_ids,
-                "from": date_from,
-                "to": date_to,
-                "groupBy": ["DATE", "SKU"],
-            },
-        ]
-
-        attempts: List[Any] = []
+        all_rows: List[Dict[str, Any]] = []
+        raw_batches: List[Any] = []
+        diagnostics: List[Dict[str, Any]] = []
         used_paths: List[str] = []
 
-        for payload in payload_variants:
-            try:
-                data, meta = client.try_variants([
-                    ("POST", "/api/client/statistics", payload, None),
-                    ("POST", "/api/client/statistics/json", payload, None),
-                    ("POST", "/api/client/statistics/campaign", payload, None),
-                ])
-                used_paths.append(meta["chosen_path"])
-                attempts.append({
-                    "request": payload,
-                    "meta": meta,
-                    "response": data,
-                })
+        for batch_no, campaign_batch in enumerate(batched(campaign_ids, 10), start=1):
+            # ID обычно числовые; готовим обе формы.
+            int_ids: List[Any] = []
+            for value in campaign_batch:
+                try:
+                    int_ids.append(int(value))
+                except Exception:
+                    int_ids.append(value)
 
-                direct_items = self._extract_performance_items(data)
-                if direct_items:
-                    df = records_to_df(direct_items, {
-                        "Дата выгрузки": self.target_date.isoformat(),
-                        "Период с": date_from,
-                        "Период по": date_to,
-                    })
-                    return df, attempts, sorted(set(used_paths))
+            payload_variants = [
+                {
+                    "campaigns": int_ids,
+                    "dateFrom": date_from,
+                    "dateTo": date_to,
+                    "groupBy": "DATE",
+                },
+                {
+                    "campaigns": [str(x) for x in campaign_batch],
+                    "dateFrom": date_from,
+                    "dateTo": date_to,
+                    "groupBy": "DATE",
+                },
+                {
+                    "campaignIds": int_ids,
+                    "dateFrom": date_from,
+                    "dateTo": date_to,
+                    "groupBy": "DATE",
+                },
+            ]
 
-                report_id = None
-                if isinstance(data, Mapping):
-                    report_id = (
-                        data.get("UUID")
-                        or data.get("uuid")
-                        or data.get("reportId")
-                        or data.get("report_id")
-                        or data.get("id")
-                    )
+            batch_success = False
+            batch_errors: List[Any] = []
 
-                if report_id:
+            for payload in payload_variants:
+                try:
+                    data, meta = client.try_variants([
+                        ("POST", "/api/client/statistics", payload, None),
+                        ("POST", "/api/client/statistics/json", payload, None),
+                    ])
+                    used_paths.append(meta["chosen_path"])
+
+                    direct_items = self._extract_performance_items(data)
+                    if direct_items:
+                        for item in direct_items:
+                            row = dict(item)
+                            row.setdefault("statistics_batch_no", batch_no)
+                            all_rows.append(row)
+                        raw_batches.append({
+                            "batch_no": batch_no,
+                            "campaigns": campaign_batch,
+                            "request": payload,
+                            "meta": meta,
+                            "response": data,
+                            "mode": "direct",
+                        })
+                        batch_success = True
+                        break
+
+                    report_id = None
+                    if isinstance(data, Mapping):
+                        report_id = (
+                            data.get("UUID")
+                            or data.get("uuid")
+                            or data.get("reportId")
+                            or data.get("report_id")
+                            or data.get("id")
+                        )
+
+                    if not report_id:
+                        batch_errors.append({
+                            "request": payload,
+                            "error": "Ответ без строк и без report_id",
+                            "response": data,
+                        })
+                        continue
+
                     final_data, poll_raw, poll_path = self._poll_statistics_report(
                         client,
                         str(report_id),
                     )
                     used_paths.append(poll_path)
-                    attempts.append({
+                    items = self._extract_performance_items(final_data)
+                    for item in items:
+                        row = dict(item)
+                        row.setdefault("statistics_batch_no", batch_no)
+                        row.setdefault("report_id", str(report_id))
+                        all_rows.append(row)
+
+                    raw_batches.append({
+                        "batch_no": batch_no,
+                        "campaigns": campaign_batch,
+                        "request": payload,
+                        "meta": meta,
+                        "create_response": data,
                         "report_id": report_id,
                         "poll": poll_raw,
+                        "final_response": final_data,
+                        "mode": "async",
                     })
-                    items = self._extract_performance_items(final_data)
-                    df = records_to_df(items, {
-                        "Дата выгрузки": self.target_date.isoformat(),
-                        "Период с": date_from,
-                        "Период по": date_to,
-                        "report_id": str(report_id),
-                    })
-                    return df, attempts, sorted(set(used_paths))
+                    batch_success = True
+                    break
 
-            except OzonApiError as exc:
-                attempts.append({
-                    "request": payload,
-                    "status": exc.status,
-                    "error": str(exc),
-                    "response_text": exc.response_text,
+                except Exception as exc:
+                    batch_errors.append({
+                        "request": payload,
+                        "error": str(exc),
+                    })
+
+            if not batch_success:
+                diagnostics.append({
+                    "Дата выгрузки": self.target_date.isoformat(),
+                    "batch_no": batch_no,
+                    "campaigns": ",".join(map(str, campaign_batch)),
+                    "status": "ERROR",
+                    "errors": safe_json(batch_errors),
                 })
-                if exc.status in {400, 404, 405, 422}:
-                    continue
-                raise
+                raw_batches.append({
+                    "batch_no": batch_no,
+                    "campaigns": campaign_batch,
+                    "status": "ERROR",
+                    "errors": batch_errors,
+                })
 
-        raise RuntimeError(
-            "Не удалось подобрать рабочую схему отчёта Performance API. "
-            "См. Служебные/Ошибки_API и raw JSON."
-        )
+            logging.info(
+                "Performance API: статистика пакет %s/%s, успех=%s, строк всего=%s",
+                batch_no,
+                (len(campaign_ids) + 9) // 10,
+                batch_success,
+                len(all_rows),
+            )
+            time.sleep(0.20)
+
+        if all_rows:
+            df = records_to_df(all_rows, {
+                "Дата выгрузки": self.target_date.isoformat(),
+                "Период с": date_from,
+                "Период по": date_to,
+            })
+        else:
+            # Сохраняем диагностический Excel вместо полного отсутствия папки.
+            df = records_to_df(diagnostics, {
+                "Дата выгрузки": self.target_date.isoformat(),
+                "Период с": date_from,
+                "Период по": date_to,
+            })
+
+        return df, {
+            "batches": raw_batches,
+            "diagnostics": diagnostics,
+        }, sorted(set(used_paths))
 
     # ------------------------- collect/save -------------------------
     def collect_all(self) -> None:
@@ -2030,7 +2180,7 @@ class OzonFboCollector:
                 self.fetch_ad_products_bids,
                 "Дата снимка",
                 ["Дата снимка", "campaign_id", "sku", "productId", "offerId"],
-                optional=True,
+                optional=False,
             )
             self._run(
                 "ad_statistics",
@@ -2039,8 +2189,8 @@ class OzonFboCollector:
                 "Реклама_статистика",
                 self.fetch_ad_statistics,
                 "Дата",
-                ["Дата", "date", "campaignId", "campaign_id", "sku"],
-                optional=True,
+                ["Дата", "date", "campaignId", "campaign_id", "sku", "batch_no"],
+                optional=False,
             )
         else:
             logging.warning(
