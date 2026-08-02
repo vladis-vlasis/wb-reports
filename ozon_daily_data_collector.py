@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v2
+Ozon FBO Daily Data Collector v3
 
 Назначение:
 - ежедневный read-only сбор максимально доступных нефинансовых данных Ozon Seller API;
@@ -49,7 +49,7 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V2_CORRECT_NAMES_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V4_CORRECT_DELIVERY_NAMES_20260802"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -69,7 +69,11 @@ def load_report_env() -> Dict[str, str]:
     loaded: Dict[str, str] = {}
     for line in raw.splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
             continue
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip().strip('"').strip("'")
