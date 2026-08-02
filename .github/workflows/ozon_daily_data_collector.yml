@@ -1,4 +1,4 @@
-name: Ozon FBO — сбор всех данных v1
+name: Ozon FBO — сбор всех данных v2
 
 on:
   workflow_dispatch:
@@ -23,8 +23,7 @@ on:
         options:
           - TOPFACE
   schedule:
-    # 12:20 UTC = 15:20 МСК. К этому времени используем актуальную выгрузку за вчера.
-    - cron: "20 12 * * *"
+    - cron: "20 12 * * *" # 15:20 МСК
 
 concurrency:
   group: ozon-fbo-data-${{ github.event.inputs.store || 'TOPFACE' }}
@@ -36,15 +35,18 @@ jobs:
     timeout-minutes: 180
     permissions:
       contents: read
+
     env:
       OZON_MODE: ${{ github.event_name == 'schedule' && 'daily' || github.event.inputs.mode }}
       OZON_TARGET_DATE: ${{ github.event.inputs.target_date }}
       OZON_STORE: ${{ github.event.inputs.store || 'TOPFACE' }}
+
       OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
       OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
-      # Performance API предусмотрен в инфраструктуре, но v1 его не вызывает.
+
       OZON_PERFORMANCE_CLIENT_ID_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_TOPFACE }}
       OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE }}
+
       OZON_YC_ACCESS_KEY_ID: ${{ secrets.OZON_YC_ACCESS_KEY_ID }}
       OZON_YC_SECRET_ACCESS_KEY: ${{ secrets.OZON_YC_SECRET_ACCESS_KEY }}
       OZON_YC_BUCKET: ozon-assist
@@ -59,23 +61,34 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements_ozon_data_collector_v1.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pandas openpyxl requests boto3
 
       - name: Run Ozon collector
+        shell: bash
         run: |
-          python ozon_daily_data_collector_v1.py \
-            --mode "$OZON_MODE" \
-            --store "$OZON_STORE" \
-            ${OZON_TARGET_DATE:+--target-date "$OZON_TARGET_DATE"}
+          set -euo pipefail
+          ARGS=(
+            --mode "$OZON_MODE"
+            --store "$OZON_STORE"
+          )
+          if [[ -n "${OZON_TARGET_DATE:-}" ]]; then
+            ARGS+=(--target-date "$OZON_TARGET_DATE")
+          fi
+          python ozon_daily_data_collector_v1.py "${ARGS[@]}"
 
       - name: Upload local diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-failure-${{ github.run_id }}
-          path: output_ozon_v1/
+          name: ozon-data-collector-v2-failure-${{ github.run_id }}
+          path: |
+            output_ozon_v1/
           if-no-files-found: ignore
           retention-days: 7
