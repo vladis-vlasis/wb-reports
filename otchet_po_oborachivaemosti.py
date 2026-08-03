@@ -28,9 +28,8 @@ ARTICLE_MAP_KEY = "Отчёты/Остатки/1С/Артикулы 1с.xlsx"
 STOCKS_1C_KEY = "Отчёты/Остатки/1С/Остатки 1С.xlsx"
 RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/РРЦ.xlsx"
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
-ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-08-03_v20_FIXED_WB_WAREHOUSE_EXCLUSIONS"
+SCRIPT_VERSION = "2026-08-03_v22_AUTO_WAREHOUSES_MANAGERS"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -116,18 +115,6 @@ MP_STOCK_FORMULA_WEIGHTS: dict[str, float] = {
     "Адресный склад": 1.0,
     'Оптовый склад Луганск- ООО "Хайлер"': 0.5,
     'Основной склад - ООО "Хайлер"': 0.5,
-}
-
-MANAGER_OVERRIDES_BY_ARTICLE_1C: dict[str, str] = {
-    "PT901.F25": "",
-    "PT901.F26": "",
-    "PT901.F27": "",
-    "PT901.F28": "",
-    "PT901.SET-1": "",
-    "PT810.001": "Игорь",
-    "PT811.001": "Игорь",
-    "PT554.007K": "Игорь",
-    "PT567.001K": "Юлия",
 }
 
 DEFAULT_REDISTRIBUTION_TEMPLATE_KEY = "Отчёты/Остатки/Перераспределение/Перераспределения.xlsx"
@@ -245,6 +232,7 @@ class Config:
     stop_articles_raw: str
     force_send: bool
     run_date: date
+    redistribution_enabled: bool
     redistribution_template_key: str
     redistribution_template_local: str
     send_redistribution_always: bool
@@ -470,6 +458,143 @@ def match_recovered_warehouse(value: object) -> tuple[str, str, str]:
     return "", "", ""
 
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = normalize_text(os.getenv(name, str(default)))
+    try:
+        value = int(float(raw.replace(",", ".")))
+    except Exception:
+        log(f"Некорректное значение {name}={raw!r}; использую {default}")
+        value = default
+    return max(value, minimum)
+
+
+def is_service_stock_location(value: object) -> bool:
+    """Отсекает технические строки WB, которые не являются складом продаж."""
+    marker = normalize_warehouse_marker(value)
+    service_markers = (
+        "ВПУТИ", "ВОЗВРАТ", "БРАК", "ОБЕЗЛИЧ", "ПРОВЕРК",
+        "СОРТИРОВОЧ", "УТИЛИЗ", "НЕДОСТАЧ", "ПОВРЕЖД",
+    )
+    return any(part in marker for part in service_markers)
+
+
+def adjust_excluded_warehouse_rules_by_activity(
+    base_rules: dict[str, dict[str, object]],
+    warehouse_stock_summary: pd.DataFrame,
+    warehouse_activity: pd.DataFrame,
+    run_date: date,
+) -> dict[str, dict[str, object]]:
+    """Автоматически актуализирует исключения по фактическим остаткам и заказам.
+
+    1. Если на исключённом складе появились неотменённые заказы за последние
+       два дня, склад возвращается в расчёт.
+    2. Если обычный склад держит значимый остаток, но не обслуживает заказы
+       два последних дня, он автоматически исключается до появления заказов.
+
+    Пороговые значения можно менять через environment без изменения кода:
+    WB_AUTO_WAREHOUSE_CONTROL, WB_AUTO_EXCLUDE_MIN_STOCK,
+    WB_AUTO_EXCLUDE_MIN_SKU, WB_AUTO_EXCLUDE_ZERO_DAYS,
+    WB_AUTO_RESTORE_MIN_ORDERS_2D.
+    """
+    if not parse_bool(os.getenv("WB_AUTO_WAREHOUSE_CONTROL", "true")):
+        log("Автоконтроль складов отключён: WB_AUTO_WAREHOUSE_CONTROL=false")
+        return {name: dict(rule) for name, rule in base_rules.items()}
+
+    rules = {name: dict(rule) for name, rule in base_rules.items()}
+    min_stock = _env_int("WB_AUTO_EXCLUDE_MIN_STOCK", 500, 1)
+    min_sku = _env_int("WB_AUTO_EXCLUDE_MIN_SKU", 10, 1)
+    zero_days = _env_int("WB_AUTO_EXCLUDE_ZERO_DAYS", 2, 1)
+    restore_orders = _env_int("WB_AUTO_RESTORE_MIN_ORDERS_2D", 1, 1)
+
+    stock = warehouse_stock_summary.copy()
+    activity = warehouse_activity.copy()
+    if stock.empty:
+        stock = pd.DataFrame(columns=["Склад WB", "Остаток WB, шт", "SKU с остатком, шт"])
+    if activity.empty:
+        activity = pd.DataFrame(columns=[
+            "Склад WB", "Заказы 7 дней, шт", "Заказы последние 2 дня, шт",
+            "Последний заказ", "Дней без заказов",
+        ])
+
+    all_warehouses = pd.concat(
+        [stock[["Склад WB"]], activity[["Склад WB"]]],
+        ignore_index=True,
+    ).drop_duplicates()
+    control = all_warehouses.merge(stock, on="Склад WB", how="left")
+    control = control.merge(activity, on="Склад WB", how="left")
+    for col in ["Остаток WB, шт", "SKU с остатком, шт", "Заказы 7 дней, шт", "Заказы последние 2 дня, шт"]:
+        control[col] = control[col].fillna(0).map(round_int)
+    control["Дней без заказов"] = pd.to_numeric(control.get("Дней без заказов"), errors="coerce")
+
+    # Сначала возвращаем в расчёт склады, где заказы реально возобновились.
+    restored_canonical: set[str] = set()
+    for _, row in control.iterrows():
+        warehouse = normalize_text(row.get("Склад WB"))
+        if not warehouse or is_service_stock_location(warehouse):
+            continue
+        canonical, _, status_date_text = match_excluded_warehouse(warehouse, rules)
+        last_order = pd.to_datetime(row.get("Последний заказ"), errors="coerce")
+        status_date = pd.to_datetime(status_date_text, dayfirst=True, errors="coerce")
+        order_after_stop = (
+            pd.notna(last_order)
+            and (pd.isna(status_date) or last_order.normalize() > status_date.normalize())
+        )
+        if (
+            canonical
+            and order_after_stop
+            and round_int(row.get("Заказы последние 2 дня, шт")) >= restore_orders
+        ):
+            restored_canonical.add(canonical)
+            log(
+                f"Автовосстановление склада: {warehouse}; "
+                f"последний заказ={last_order.strftime('%d.%m.%Y')}; "
+                f"заказов за последние 2 дня={round_int(row.get('Заказы последние 2 дня, шт'))}"
+            )
+    for canonical in restored_canonical:
+        rules.pop(canonical, None)
+
+    # Затем исключаем новые остановившиеся склады.
+    for _, row in control.iterrows():
+        warehouse = normalize_text(row.get("Склад WB"))
+        if not warehouse or is_service_stock_location(warehouse):
+            continue
+        if match_excluded_warehouse(warehouse, rules)[0]:
+            continue
+
+        stock_qty = round_int(row.get("Остаток WB, шт"))
+        sku_qty = round_int(row.get("SKU с остатком, шт"))
+        orders_7 = round_int(row.get("Заказы 7 дней, шт"))
+        orders_2 = round_int(row.get("Заказы последние 2 дня, шт"))
+        days_no_orders_raw = row.get("Дней без заказов")
+        days_no_orders = int(days_no_orders_raw) if pd.notna(days_no_orders_raw) else 999
+
+        stopped = (
+            stock_qty >= min_stock
+            and sku_qty >= min_sku
+            and orders_2 == 0
+            and (orders_7 == 0 or days_no_orders >= zero_days)
+        )
+        if not stopped:
+            continue
+
+        rules[warehouse] = {
+            "aliases": (warehouse,),
+            "reason": (
+                "Автоматически исключён по данным TOPFACE: "
+                f"остаток {stock_qty} шт на {sku_qty} SKU, "
+                f"заказов за последние 2 дня нет"
+            ),
+            "status_date": run_date.strftime("%d.%m.%Y"),
+            "auto_detected": True,
+        }
+        log(
+            f"Автоисключение склада: {warehouse}; остаток={stock_qty}; "
+            f"SKU={sku_qty}; заказы 7д={orders_7}; заказы 2д={orders_2}"
+        )
+
+    return rules
+
+
 def parse_iso_week_from_key(key: str) -> tuple[int, int]:
     m = re.search(r"_(\d{4})-W(\d{2})\.xlsx$", key, flags=re.IGNORECASE)
     if not m:
@@ -508,6 +633,9 @@ def get_config() -> Config:
         stop_articles_raw=os.getenv("WB_STOP_LIST_KEY", ""),
         force_send=(os.getenv("WB_FORCE_SEND", "false").strip().lower() == "true"),
         run_date=date.today(),
+        # Временно отключено по умолчанию. Для возврата расчёта и отправки
+        # перераспределения достаточно задать WB_ENABLE_REDISTRIBUTION=true.
+        redistribution_enabled=parse_bool(os.getenv("WB_ENABLE_REDISTRIBUTION", "false")),
         redistribution_template_key=(os.getenv("WB_REDISTRIBUTION_TEMPLATE_KEY") or DEFAULT_REDISTRIBUTION_TEMPLATE_KEY).strip(),
         redistribution_template_local=(os.getenv("WB_REDISTRIBUTION_TEMPLATE_LOCAL") or "").strip(),
         send_redistribution_always=(os.getenv("WB_SEND_REDISTRIBUTION_ALWAYS", "false").strip().lower() == "true"),
@@ -525,6 +653,8 @@ def should_send_report(cfg: Config) -> bool:
 
 
 def should_send_redistribution(cfg: Config) -> bool:
+    if not cfg.redistribution_enabled:
+        return False
     if cfg.force_send or cfg.send_redistribution_always:
         return True
     return cfg.run_date.weekday() == 0
@@ -541,6 +671,13 @@ def is_redistribution_only_mode() -> bool:
 
 
 def run_redistribution_only(storage: S3Storage, cfg: Config, article_map: dict[str, str]) -> Path:
+    if not cfg.redistribution_enabled:
+        log(
+            f"STORE={STORE_NAME}: перераспределение временно отключено "
+            "(WB_ENABLE_REDISTRIBUTION=false). Расчёт и отправка в Telegram не выполняются."
+        )
+        return Path(OUT_DIR)
+
     log(f"STORE={STORE_NAME}: режим только перераспределения. Отчёт по оборачиваемости/остаткам не формируется.")
     redistribution_calc_path, redistribution_template_path = create_redistribution_outputs(
         storage=storage,
@@ -668,29 +805,6 @@ def load_rrc(storage: S3Storage) -> pd.DataFrame:
     return temp.drop_duplicates(subset=["Артикул 1С"], keep="first")
 
 
-def load_abc_managers(storage: S3Storage) -> pd.DataFrame:
-    try:
-        keys = [k for k in storage.list_keys("") if k.lower().endswith(".xlsx") and ABC_NAME_FRAGMENT in os.path.basename(k).lower()]
-        if not keys:
-            return pd.DataFrame(columns=["Артикул WB", "Артикул WB продавца", "Менеджер"])
-        key = sorted(keys)[-1]
-        log(f"Берём ABC-отчёт: {key}")
-        df = storage.read_excel(key)
-        wb_col = choose_existing_column(df, ["Артикул WB"], "Артикул WB в ABC")
-        seller_col = choose_existing_column(df, ["Артикул продавца"], "Артикул продавца в ABC")
-        mgr_col = choose_existing_column(df, ["Ваша категория"], "Ваша категория в ABC")
-        temp = pd.DataFrame({
-            "Артикул WB": df[wb_col].map(normalize_key),
-            "Артикул WB продавца": df[seller_col].map(normalize_text),
-            "Менеджер": df[mgr_col].map(normalize_text),
-        })
-        temp = temp[temp["Менеджер"] != ""]
-        return temp.drop_duplicates(subset=["Артикул WB", "Артикул WB продавца"], keep="first")
-    except Exception as exc:
-        log(f"ABC-отчёт не загружен: {exc}")
-        return pd.DataFrame(columns=["Артикул WB", "Артикул WB продавца", "Менеджер"])
-
-
 def load_latest_wb_stocks(
     storage: S3Storage,
     excluded_rules: dict[str, dict[str, object]],
@@ -709,15 +823,24 @@ def load_latest_wb_stocks(
     seller_col = choose_existing_column(df, ["Артикул продавца"], "Артикул продавца")
     stock_col = choose_existing_column(df, ["Доступно для продажи", "Полное количество", "Количество", "Доступно", "Остаток", "Остатки"], "остатка WB")
     wh_col = try_choose_column(df, ["Склад", "warehouseName", "Название склада", "Склад WB"])
+    subject_col = try_choose_column(df, ["Предмет", "Предмет WB", "Категория товара", "subjectName", "Категория"])
 
     temp = pd.DataFrame({
         "Артикул WB": df[wb_col].map(normalize_key),
         "Артикул WB продавца": df[seller_col].map(normalize_text),
+        "Предмет WB": df[subject_col].map(normalize_text) if subject_col is not None else "",
         "Склад WB": df[wh_col].map(normalize_text) if wh_col is not None else "",
         "Остаток WB, шт": df[stock_col].map(round_int),
     })
     temp = temp[(temp["Артикул WB"] != "") | (temp["Артикул WB продавца"] != "")].copy()
     all_article_keys = temp[["Артикул WB", "Артикул WB продавца"]].drop_duplicates()
+    article_subjects = temp[["Артикул WB", "Артикул WB продавца", "Предмет WB"]].copy()
+    article_subjects["_has_subject"] = article_subjects["Предмет WB"].map(lambda x: 1 if normalize_text(x) else 0)
+    article_subjects = (
+        article_subjects.sort_values("_has_subject", ascending=False, kind="stable")
+        .drop_duplicates(["Артикул WB", "Артикул WB продавца"], keep="first")
+        .drop(columns=["_has_subject"])
+    )
 
     warehouse_stock_summary = (
         temp[temp["Склад WB"] != ""]
@@ -770,6 +893,12 @@ def load_latest_wb_stocks(
         on=["Артикул WB", "Артикул WB продавца"],
         how="left",
     )
+    included = included.merge(
+        article_subjects,
+        on=["Артикул WB", "Артикул WB продавца"],
+        how="left",
+    )
+    included["Предмет WB"] = included["Предмет WB"].fillna("").map(normalize_text)
     included["Остаток WB, шт"] = included["Остаток WB, шт"].fillna(0).map(round_int)
 
     excluded_qty = int(excluded["Не учтено, шт"].sum()) if not excluded.empty else 0
@@ -1199,75 +1328,44 @@ def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
     )
     return inbound_result
 
-def load_current_month_zero_days(
-    storage: S3Storage,
-    zero_articles: set[str],
-    avg7_map: dict[str, float],
-    run_date: date,
-    excluded_rules: dict[str, dict[str, object]],
-) -> dict[str, int]:
-    if not zero_articles:
-        return {}
-    month_start = run_date.replace(day=1)
-    rows: list[pd.DataFrame] = []
-    for key in sorted(storage.list_keys(WB_STOCKS_PREFIX), key=parse_iso_week_from_key):
-        if not key.lower().endswith(".xlsx"):
-            continue
-        try:
-            df = storage.read_excel(key)
-        except Exception:
-            continue
-        wb_col = choose_existing_column(df, ["Артикул WB", "nmId"], "Артикул WB")
-        stock_col = choose_existing_column(df, ["Доступно для продажи", "Полное количество"], "остаток WB")
-        sample_col = choose_existing_column(df, ["Дата сбора", "Дата запроса"], "дата среза")
-        wh_col = try_choose_column(df, ["Склад", "warehouseName", "Название склада", "Склад WB"])
-        temp = pd.DataFrame({
-            "Артикул WB": df[wb_col].map(normalize_key),
-            "stock_wb": df[stock_col].map(safe_float),
-            "sample_dt": pd.to_datetime(df[sample_col], errors="coerce").dt.normalize(),
-            "warehouse": df[wh_col].map(normalize_text) if wh_col is not None else "",
-        })
-        if wh_col is not None and excluded_rules:
-            temp = temp[
-                temp["warehouse"].map(lambda x: match_excluded_warehouse(x, excluded_rules)[0]) == ""
-            ].copy()
-        temp = temp[(temp["Артикул WB"].isin(zero_articles)) & temp["sample_dt"].notna()]
-        temp = temp[temp["sample_dt"].dt.date >= month_start]
-        if temp.empty:
-            continue
-        temp = temp.groupby(["Артикул WB", "sample_dt"], as_index=False)["stock_wb"].sum()
-        rows.append(temp)
-    if not rows:
-        return {}
-    month_df = pd.concat(rows, ignore_index=True)
-
-    def is_zero_like(row: pd.Series) -> bool:
-        threshold = 0.5 * float(avg7_map.get(row["Артикул WB"], 0.0) or 0.0)
-        return float(row["stock_wb"]) <= threshold
-
-    month_df["is_zero_like"] = month_df.apply(is_zero_like, axis=1)
-    return {k: int(v) for k, v in month_df.groupby("Артикул WB")["is_zero_like"].sum().to_dict().items()}
-
-
 def compute_coef_rrc(price: int, rrc: int) -> str:
     if rrc <= 0 or price <= 0:
         return ""
     return f"{price / rrc:.2f}".replace(".", ",") + "_РРЦ"
 
 
-def assign_manager_by_article_1c(article: object, current_manager: object = "") -> str:
-    """Жёсткие правила закрепления SKU за менеджерами поверх ABC-отчёта."""
-    current = normalize_text(current_manager)
+def assign_manager_by_product(subject: object, article: object) -> str:
+    """Распределяет менеджеров по товарной категории WB.
+
+    Влад: пудры и кисти.
+    Игорь: лаки, гели для бровей, подводки, туши и косметические карандаши.
+    Эмиль: весь остальной ассортимент.
+    """
+    subject_marker = normalize_warehouse_marker(subject)
+
+    if "КИСТ" in subject_marker or "ПУДР" in subject_marker:
+        return "Влад"
+
+    igor_markers = (
+        "ЛАК",
+        "ГЕЛЬДЛЯБРОВ", "ГЕЛИДЛЯБРОВ",
+        "ПОДВОДК",
+        "ТУШ",
+        "КАРАНДАШ",
+    )
+    if any(marker in subject_marker for marker in igor_markers):
+        return "Игорь"
+
+    # Резерв на случай, если WB временно не вернул колонку «Предмет».
     article_key = normalize_key(article).replace("Ё", "Е")
     compact = re.sub(r"[^0-9A-ZА-Я]+", ".", article_key).strip(".")
     match = re.match(r"^(?:PT)?(\d{3,4})(?:\.|$)", compact) or re.match(r"^(?:PT)?(\d{3,4})", article_key)
     code = match.group(1) if match else ""
-
-    if code in {"104", "110", "810", "811", "619"}:
-        return "Игорь"
     if code in {"901", "620", "922"}:
         return "Влад"
-    return current
+    if code in {"104", "110", "810", "811", "619"}:
+        return "Игорь"
+    return "Эмиль"
 
 
 def build_report_dataframe(
@@ -1278,8 +1376,6 @@ def build_report_dataframe(
     stop_articles: set[str],
     rrc_df: pd.DataFrame,
     inbound_df: pd.DataFrame,
-    zero_days_map: dict[str, int],
-    abc_df: pd.DataFrame,
 ) -> pd.DataFrame:
     df = wb_stocks.merge(sales, on=["Артикул WB", "Артикул WB продавца"], how="left")
     for col, default in {
@@ -1315,15 +1411,11 @@ def build_report_dataframe(
     df.loc[no_inbound_mask, "Ближайшее поступление, шт"] = 0
     df.loc[no_inbound_mask, "Партий в пути, шт"] = 0
 
-    df = df.merge(abc_df, on=["Артикул WB", "Артикул WB продавца"], how="left")
-    if "Менеджер" not in df.columns:
-        df["Менеджер"] = ""
-    df["Менеджер"] = df["Менеджер"].fillna("")
+    if "Предмет WB" not in df.columns:
+        df["Предмет WB"] = ""
+    df["Предмет WB"] = df["Предмет WB"].fillna("").map(normalize_text)
     df["Менеджер"] = df.apply(
-        lambda r: assign_manager_by_article_1c(
-            r.get("Артикул 1С"),
-            MANAGER_OVERRIDES_BY_ARTICLE_1C.get(normalize_text(r.get("Артикул 1С")), normalize_text(r.get("Менеджер"))),
-        ),
+        lambda r: assign_manager_by_product(r.get("Предмет WB"), r.get("Артикул 1С")),
         axis=1,
     )
 
@@ -1387,8 +1479,6 @@ def build_report_dataframe(
 
     df["Хватит на 60 дней"] = df.apply(cover_60_label, axis=1)
 
-    df["Дней без остатка WB в текущем месяце"] = df["Артикул WB"].map(zero_days_map).fillna(0).astype(int)
-    df.loc[df["Остаток WB, шт"] > 0, "Дней без остатка WB в текущем месяце"] = 0
     df["Delist"] = df["Артикул 1С"].map(lambda x: "Delist" if normalize_key(x) in stop_articles else "")
 
     df = df.merge(rrc_df, on="Артикул 1С", how="left")
@@ -1548,10 +1638,10 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
         axis=1,
     )
     critical = critical[[
-        "Артикул 1С", "Продажи 60 дней, шт", "WB хватит, дней", "Out of stock, days", "WB + Липецк, дней",
+        "Менеджер", "Артикул 1С", "Продажи 60 дней, шт", "WB хватит, дней", "Out of stock, days", "WB + Липецк, дней",
         "Товары в пути, шт", "Ближайшее поступление, шт", "Дней до поступления",
-        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Дней без остатка WB в текущем месяце",
-        "Комментарий", "Менеджер", "Delist",
+        "Остаток WB, шт", "Остатки МП (Липецк), шт",
+        "Комментарий", "Delist",
     ]].copy()
 
     # Мониторинг: убрали Out of stock и расчётные дни, которые раньше требовалось скрывать.
@@ -1559,7 +1649,7 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     monitor = monitor[[
         "Артикул 1С", "Продажи 60 дней, шт", "Хватит на 60 дней",
         "Товары в пути, шт", "Ближайшее поступление, шт", "Хватит до поступления",
-        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Дней без остатка WB в текущем месяце", "Менеджер",
+        "Остаток WB, шт", "Остатки МП (Липецк), шт", "Менеджер",
     ]].copy()
 
     # Dead_Stock_WB — только остатки на WB: Липецк и товары в пути не участвуют в расчёте.
@@ -1579,14 +1669,14 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     ]].copy()
 
     calc = report_df[[
-        "Артикул 1С", "Менеджер", "Артикул WB", "Артикул WB продавца", "Остаток WB, шт",
+        "Артикул 1С", "Менеджер", "Артикул WB", "Артикул WB продавца", "Предмет WB", "Остаток WB, шт",
         "Остатки МП (Липецк), шт", "Товары в пути, шт", "Ближайшее поступление, шт",
         "Дата поступления", "Дней до поступления", "Партий в пути, шт",
         "Продажи 7 дней, шт", "Продажи 60 дней, шт", "Среднесуточные продажи 7д", "Среднесуточные продажи 60д",
         "Расчётный спрос в день, шт", "WB хватит, дней", "WB + Липецк, дней",
         "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
         "Хватит до поступления", "Out of stock, days", "Хватит на 60 дней",
-        "Дней без остатка WB в текущем месяце", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
+        "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
     ]].copy()
 
     return critical, monitor, dead_wb, dead_all, calc
@@ -1605,6 +1695,7 @@ def auto_fit_columns(ws) -> None:
         "Менеджер": 16,
         "Артикул WB": 18,
         "Артикул WB продавца": 24,
+        "Предмет WB": 28,
         "Продажи 60 дней, шт": 20,
         "Продажи 7 дней, шт": 18,
         "WB хватит, дней": 22,
@@ -1618,7 +1709,6 @@ def auto_fit_columns(ws) -> None:
         "Дней до поступления": 20,
         "Остаток WB, шт": 18,
         "Остатки МП (Липецк), шт": 24,
-        "Дней без остатка WB в текущем месяце": 34,
         "Хватит на 60 дней": 22,
         "Хватит до поступления": 22,
         "Расчётный спрос в день, шт": 24,
@@ -1667,7 +1757,6 @@ def highlight_rows(ws) -> None:
     comment_idx = headers.index("Комментарий") + 1 if "Комментарий" in headers else None
     deficit_idx = headers.index("Хватит на 60 дней") + 1 if "Хватит на 60 дней" in headers else None
     sales60_idx = headers.index("Продажи 60 дней, шт") + 1 if "Продажи 60 дней, шт" in headers else None
-    zero_idx = headers.index("Дней без остатка WB в текущем месяце") + 1 if "Дней без остатка WB в текущем месяце" in headers else None
 
     for r in range(2, ws.max_row + 1):
         row_is_strawberry = False
@@ -1694,10 +1783,6 @@ def highlight_rows(ws) -> None:
                 cell.fill = FILL_STRAWBERRY
                 cell.font = Font(name=FONT_NAME, size=FONT_SIZE, color="FFFFFF", bold=(c == 1))
 
-        if zero_idx and safe_float(ws.cell(r, zero_idx).value) > 0:
-            cell = ws.cell(r, zero_idx)
-            cell.fill = FILL_STRAWBERRY
-            cell.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="FFFFFF")
 
 
 def style_sheet(ws) -> None:
@@ -2358,12 +2443,12 @@ def run() -> Path:
     cfg = get_config()
     storage = S3Storage(cfg)
     stop_articles = parse_stop_articles(cfg.stop_articles_raw)
-    excluded_rules = build_excluded_warehouse_rules(
+    base_excluded_rules = build_excluded_warehouse_rules(
         cfg.excluded_warehouses_raw, cfg.included_warehouses_raw
     )
     log(
-        "Склады, исключаемые из остатков WB: "
-        + (", ".join(excluded_rules.keys()) if excluded_rules else "нет")
+        "Базовый список исключений WB: "
+        + (", ".join(base_excluded_rules.keys()) if base_excluded_rules else "нет")
     )
 
     article_map = load_article_map(storage)
@@ -2371,22 +2456,30 @@ def run() -> Path:
     if is_redistribution_only_mode():
         return run_redistribution_only(storage=storage, cfg=cfg, article_map=article_map)
 
-    wb_stocks, excluded_wb_stocks_raw, warehouse_stock_summary, stock_source = load_latest_wb_stocks(storage, excluded_rules)
+    # Сначала читаем заказы и последний срез остатков. Затем корректируем список
+    # исключений по фактической активности и повторно фильтруем остатки, если нужно.
     sales_df, warehouse_activity, order_sources = load_orders_metrics(storage)
+    wb_stocks, excluded_wb_stocks_raw, warehouse_stock_summary, stock_source = load_latest_wb_stocks(
+        storage, base_excluded_rules
+    )
+    excluded_rules = adjust_excluded_warehouse_rules_by_activity(
+        base_rules=base_excluded_rules,
+        warehouse_stock_summary=warehouse_stock_summary,
+        warehouse_activity=warehouse_activity,
+        run_date=cfg.run_date,
+    )
+    if excluded_rules != base_excluded_rules:
+        wb_stocks, excluded_wb_stocks_raw, warehouse_stock_summary, stock_source = load_latest_wb_stocks(
+            storage, excluded_rules
+        )
+    log(
+        "Итоговый список складов, исключённых из оборачиваемости: "
+        + (", ".join(excluded_rules.keys()) if excluded_rules else "нет")
+    )
+
     stocks_1c = load_stocks_1c(storage)
     rrc_df = load_rrc(storage)
     inbound_df = load_inbound(storage, cfg.run_date)
-    abc_df = load_abc_managers(storage)
-
-    avg7_map: dict[str, float] = {}
-    for _, row in sales_df.iterrows():
-        wb_key = normalize_key(row.get("Артикул WB"))
-        avg7_map[wb_key] = safe_float(row.get("avg_daily_sales_7d"))
-
-    current_zero_articles = set(wb_stocks.loc[wb_stocks["Остаток WB, шт"] <= 0, "Артикул WB"].tolist())
-    zero_days_map = load_current_month_zero_days(
-        storage, current_zero_articles, avg7_map, cfg.run_date, excluded_rules
-    )
 
     report_df = build_report_dataframe(
         wb_stocks=wb_stocks,
@@ -2396,8 +2489,6 @@ def run() -> Path:
         stop_articles=stop_articles,
         rrc_df=rrc_df,
         inbound_df=inbound_df,
-        zero_days_map=zero_days_map,
-        abc_df=abc_df,
     )
 
     critical, monitor, dead_wb, dead_all, calc = split_sheets(report_df)
@@ -2411,25 +2502,34 @@ def run() -> Path:
     log(f"Источник остатков: {stock_source}")
     log(f"Источники заказов: {', '.join(order_sources)}")
 
-    redistribution_calc_path, redistribution_template_path = create_redistribution_outputs(
-        storage=storage,
-        cfg=cfg,
-        article_map=article_map,
-    )
+    redistribution_calc_path: Optional[Path] = None
+    redistribution_template_path: Optional[Path] = None
+    if cfg.redistribution_enabled:
+        redistribution_calc_path, redistribution_template_path = create_redistribution_outputs(
+            storage=storage,
+            cfg=cfg,
+            article_map=article_map,
+        )
+    else:
+        log(
+            "Перераспределение временно отключено: расчёт файлов и отправка шаблона "
+            "в Telegram пропущены. Для включения задайте WB_ENABLE_REDISTRIBUTION=true."
+        )
 
     if should_send_report(cfg):
         send_to_telegram(cfg, report_path, len(critical), len(dead_all))
     else:
         log("Отправка отчёта по дням остатка в Telegram пропущена по расписанию")
 
-    if should_send_redistribution(cfg):
+    if should_send_redistribution(cfg) and redistribution_template_path is not None:
         send_document_to_telegram(
             cfg,
             redistribution_template_path,
             f"🚚 Перераспределение WB {STORE_NAME}\nШаблон заполнен автоматически по расчёту за {cfg.redistribution_days} дней",
         )
-        log(f"Полный расчёт перераспределения в Telegram не отправляется: {redistribution_calc_path.name}")
-    else:
+        if redistribution_calc_path is not None:
+            log(f"Полный расчёт перераспределения в Telegram не отправляется: {redistribution_calc_path.name}")
+    elif cfg.redistribution_enabled:
         log("Отправка шаблона перераспределения в Telegram пропущена по расписанию")
 
     return report_path
