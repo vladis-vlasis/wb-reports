@@ -30,13 +30,15 @@ RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 ABC_NAME_FRAGMENT = "abc_report_goods"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-06-10_v17_TF_REPORT_MT_TF_REDISTRIBUTION_MIN4"
+SCRIPT_VERSION = "2026-08-03_v20_FIXED_WB_WAREHOUSE_EXCLUSIONS"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
 SHEET_DEAD_WB = "Dead_Stock_WB"
 SHEET_DEAD_ALL = "Dead_Stock_Все остатки+в пути"
 SHEET_MONITOR = "Мониторинг остатков"
+SHEET_EXCLUDED_WB = "Неучтённые остатки WB"
+SHEET_WAREHOUSE_CONTROL = "Контроль складов WB"
 
 FONT_NAME = "Calibri"
 FONT_SIZE = 14
@@ -131,6 +133,85 @@ MANAGER_OVERRIDES_BY_ARTICLE_1C: dict[str, str] = {
 DEFAULT_REDISTRIBUTION_TEMPLATE_KEY = "Отчёты/Остатки/Перераспределение/Перераспределения.xlsx"
 
 
+# Список складов, остатки которых по умолчанию не считаются доступными для продажи.
+# Статусы актуализированы на 03.08.2026 по официальному каналу WB Партнёры,
+# публичным сообщениям Wildberries и фактической динамике заказов/остатков TOPFACE.
+#
+# ВАЖНО:
+# - Котовск НЕ исключён: WB сообщил о возврате в стандартный режим с 23.07.2026,
+#   а в отчёте TOPFACE заказы идут ежедневно.
+# - Владимир исключён с 03.08.2026 после нового повреждения логистического комплекса.
+# - Рязань исключена: товары на объекте сняты с продажи; в данных TOPFACE заказы
+#   прекращаются после 29.07.2026 при сохранении крупного остатка.
+#
+# В V20 базовый список исключений применяется всегда.
+# WB_EXCLUDED_WAREHOUSES только ДОБАВЛЯЕТ новые склады к базовому списку,
+# например: WB_EXCLUDED_WAREHOUSES="Новый склад 1;Новый склад 2".
+# После подтверждённого восстановления конкретный склад можно вернуть в расчёт через
+# WB_INCLUDED_WAREHOUSES, например: WB_INCLUDED_WAREHOUSES="Рязань;Владимир".
+DEFAULT_EXCLUDED_WAREHOUSE_RULES: dict[str, dict[str, object]] = {
+    "Электросталь": {
+        "aliases": ("Электросталь",),
+        "reason": "Склад не работает; товары и остатки не считаем доступными для продажи",
+        "status_date": "03.08.2026",
+    },
+    "Краснодар": {
+        "aliases": ("Краснодар",),
+        "reason": "Работа склада приостановлена; в данных TOPFACE заказы отсутствуют, остаток не меняется",
+        "status_date": "22.07.2026",
+    },
+    "Невинномысск": {
+        "aliases": ("Невинномысск",),
+        "reason": "Работа склада приостановлена; в данных TOPFACE заказы отсутствуют, остаток не меняется",
+        "status_date": "22.07.2026",
+    },
+    "Шушары / Уткина Заводь": {
+        "aliases": (
+            "СПБ Шушары", "СЦ Шушары", "Шушары",
+            "Уткина Заводь", "Санкт-Петербург Уткина Заводь",
+            "Новосаратовка",
+        ),
+        "reason": "Работа объектов приостановлена; в данных TOPFACE заказы отсутствуют, остаток не меняется",
+        "status_date": "24.07.2026",
+    },
+    "Рязань": {
+        "aliases": ("Рязань (Тюшевское)", "Рязань: Тюшевское", "Рязань"),
+        "reason": "Склад временно не принимает поставки, товары сняты с продажи; заказы TOPFACE прекратились после 29.07",
+        "status_date": "29.07.2026",
+    },
+    "Пенза": {
+        "aliases": ("Пенза", "Пенза СГТ"),
+        "reason": "После повреждения поставки перенаправлены; заказы TOPFACE прекратились после 30.07",
+        "status_date": "30.07.2026",
+    },
+    "Сарапул": {
+        "aliases": ("Сарапул",),
+        "reason": "После повреждения поставки перенаправлены; заказы TOPFACE прекратились после 30.07",
+        "status_date": "30.07.2026",
+    },
+    "Новосемейкино": {
+        "aliases": ("Самара (Новосемейкино)", "Самара Новосемейкино", "Новосемейкино"),
+        "reason": "Логистический комплекс повреждён 02.08.2026; товарные потоки перенаправлены",
+        "status_date": "02.08.2026",
+    },
+    "Владимир": {
+        "aliases": ("Владимир", "Владимир Воршинское", "Владимир: Воршинское"),
+        "reason": "Логистический комплекс повреждён 03.08.2026; до подтверждения восстановления остатки не учитываем",
+        "status_date": "03.08.2026",
+    },
+}
+
+
+# Склады, которые ранее отключались, но сейчас не должны исключаться автоматически.
+RECOVERED_WAREHOUSE_NOTES: dict[str, dict[str, object]] = {
+    "Котовск": {
+        "aliases": ("Котовск",),
+        "note": "Возобновил работу в стандартном режиме с 23.07.2026; заказы TOPFACE идут ежедневно",
+        "status_date": "23.07.2026",
+    },
+}
+
+
 RU_MONTHS_GENITIVE: dict[int, str] = {
     1: "января",
     2: "февраля",
@@ -169,6 +250,8 @@ class Config:
     send_redistribution_always: bool
     redistribution_days: int
     redistribution_target_days: int
+    excluded_warehouses_raw: str
+    included_warehouses_raw: str
 
 
 class S3Storage:
@@ -237,6 +320,12 @@ def safe_float(value: object) -> float:
         return 0.0
 
 
+def parse_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return normalize_text(value).strip().lower() in {"1", "true", "yes", "y", "да"}
+
+
 def round_int(value: object) -> int:
     return int(round(safe_float(value)))
 
@@ -268,6 +357,117 @@ def parse_stop_articles(raw: str) -> set[str]:
         return set()
     text = raw.replace("\r", "\n").replace(";", "\n").replace(",", "\n")
     return {normalize_key(x) for x in text.split("\n") if normalize_text(x)}
+
+
+def normalize_warehouse_marker(value: object) -> str:
+    text = normalize_text(value).upper().replace("Ё", "Е")
+    return re.sub(r"[^0-9A-ZА-Я]+", "", text)
+
+
+def _parse_warehouse_env_list(raw: str) -> list[str]:
+    value = normalize_text(raw)
+    if not value or value.lower() in {"off", "none", "нет", "false", "0"}:
+        return []
+    return [
+        normalize_text(part)
+        for part in re.split(r"[;,\n\r]+", value)
+        if normalize_text(part)
+    ]
+
+
+def build_excluded_warehouse_rules(
+    raw: str,
+    included_raw: str = "",
+) -> dict[str, dict[str, object]]:
+    """Возвращает действующий список складов, чьи остатки нельзя учитывать.
+
+    Правила V20:
+    - подтверждённый базовый список всегда включён в код;
+    - WB_EXCLUDED_WAREHOUSES добавляет новые склады, но не заменяет базовый список;
+    - WB_INCLUDED_WAREHOUSES точечно возвращает восстановленные склады в расчёт.
+    """
+    rules: dict[str, dict[str, object]] = {
+        name: dict(rule) for name, rule in DEFAULT_EXCLUDED_WAREHOUSE_RULES.items()
+    }
+
+    # Точечное восстановление склада после подтверждения его нормальной работы.
+    included_markers = {
+        normalize_warehouse_marker(name)
+        for name in _parse_warehouse_env_list(included_raw)
+        if normalize_warehouse_marker(name)
+    }
+    if included_markers:
+        rules_to_remove: list[str] = []
+        for canonical, rule in rules.items():
+            candidate_markers = {normalize_warehouse_marker(canonical)}
+            aliases = rule.get("aliases", ())
+            for alias in aliases if isinstance(aliases, (tuple, list, set)) else (aliases,):
+                candidate_markers.add(normalize_warehouse_marker(alias))
+            if candidate_markers & included_markers:
+                rules_to_remove.append(canonical)
+        for canonical in rules_to_remove:
+            rules.pop(canonical, None)
+
+    # Дополнительные склады добавляются поверх фиксированного списка.
+    for name in _parse_warehouse_env_list(raw):
+        marker = normalize_warehouse_marker(name)
+        if not marker:
+            continue
+
+        already_present = False
+        for canonical, rule in rules.items():
+            aliases = rule.get("aliases", ())
+            candidates = [canonical] + list(aliases if isinstance(aliases, (tuple, list, set)) else (aliases,))
+            if any(normalize_warehouse_marker(candidate) == marker for candidate in candidates):
+                already_present = True
+                break
+        if already_present:
+            continue
+
+        rules[name] = {
+            "aliases": (name,),
+            "reason": "Дополнительно исключено через WB_EXCLUDED_WAREHOUSES",
+            "status_date": datetime.now().strftime("%d.%m.%Y"),
+        }
+
+    return rules
+
+
+def match_excluded_warehouse(
+    value: object,
+    rules: dict[str, dict[str, object]],
+) -> tuple[str, str, str]:
+    marker = normalize_warehouse_marker(value)
+    if not marker:
+        return "", "", ""
+    for canonical, rule in rules.items():
+        aliases = rule.get("aliases", ())
+        for alias in aliases if isinstance(aliases, (tuple, list, set)) else (aliases,):
+            alias_marker = normalize_warehouse_marker(alias)
+            if alias_marker and alias_marker == marker:
+                return (
+                    canonical,
+                    normalize_text(rule.get("reason")),
+                    normalize_text(rule.get("status_date")),
+                )
+    return "", "", ""
+
+
+def match_recovered_warehouse(value: object) -> tuple[str, str, str]:
+    marker = normalize_warehouse_marker(value)
+    if not marker:
+        return "", "", ""
+    for canonical, rule in RECOVERED_WAREHOUSE_NOTES.items():
+        aliases = rule.get("aliases", ())
+        for alias in aliases if isinstance(aliases, (tuple, list, set)) else (aliases,):
+            alias_marker = normalize_warehouse_marker(alias)
+            if alias_marker and alias_marker == marker:
+                return (
+                    canonical,
+                    normalize_text(rule.get("note")),
+                    normalize_text(rule.get("status_date")),
+                )
+    return "", "", ""
 
 
 def parse_iso_week_from_key(key: str) -> tuple[int, int]:
@@ -313,6 +513,8 @@ def get_config() -> Config:
         send_redistribution_always=(os.getenv("WB_SEND_REDISTRIBUTION_ALWAYS", "false").strip().lower() == "true"),
         redistribution_days=max(int(os.getenv("WB_REDISTRIBUTION_LOOKBACK_DAYS", "14") or 14), 1),
         redistribution_target_days=max(int(os.getenv("WB_REDISTRIBUTION_TARGET_DAYS", "21") or 21), 1),
+        excluded_warehouses_raw=(os.getenv("WB_EXCLUDED_WAREHOUSES") or "").strip(),
+        included_warehouses_raw=(os.getenv("WB_INCLUDED_WAREHOUSES") or "").strip(),
     )
 
 
@@ -489,7 +691,10 @@ def load_abc_managers(storage: S3Storage) -> pd.DataFrame:
         return pd.DataFrame(columns=["Артикул WB", "Артикул WB продавца", "Менеджер"])
 
 
-def load_latest_wb_stocks(storage: S3Storage) -> tuple[pd.DataFrame, str]:
+def load_latest_wb_stocks(
+    storage: S3Storage,
+    excluded_rules: dict[str, dict[str, object]],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
     latest_key = latest_weekly_key(storage.list_keys(WB_STOCKS_PREFIX))
     log(f"Берём остатки WB из файла: {latest_key}")
     df = storage.read_excel(latest_key)
@@ -503,18 +708,117 @@ def load_latest_wb_stocks(storage: S3Storage) -> tuple[pd.DataFrame, str]:
     wb_col = choose_existing_column(df, ["Артикул WB", "nmId"], "Артикул WB")
     seller_col = choose_existing_column(df, ["Артикул продавца"], "Артикул продавца")
     stock_col = choose_existing_column(df, ["Доступно для продажи", "Полное количество", "Количество", "Доступно", "Остаток", "Остатки"], "остатка WB")
+    wh_col = try_choose_column(df, ["Склад", "warehouseName", "Название склада", "Склад WB"])
 
     temp = pd.DataFrame({
         "Артикул WB": df[wb_col].map(normalize_key),
         "Артикул WB продавца": df[seller_col].map(normalize_text),
+        "Склад WB": df[wh_col].map(normalize_text) if wh_col is not None else "",
         "Остаток WB, шт": df[stock_col].map(round_int),
     })
-    temp = temp[(temp["Артикул WB"] != "") | (temp["Артикул WB продавца"] != "")]
-    temp = temp.groupby(["Артикул WB", "Артикул WB продавца"], as_index=False)["Остаток WB, шт"].sum()
-    return temp, latest_key
+    temp = temp[(temp["Артикул WB"] != "") | (temp["Артикул WB продавца"] != "")].copy()
+    all_article_keys = temp[["Артикул WB", "Артикул WB продавца"]].drop_duplicates()
+
+    warehouse_stock_summary = (
+        temp[temp["Склад WB"] != ""]
+        .groupby("Склад WB", as_index=False, dropna=False)
+        .agg(
+            **{
+                "Остаток WB, шт": ("Остаток WB, шт", "sum"),
+                "SKU с остатком, шт": ("Артикул WB", lambda s: s[temp.loc[s.index, "Остаток WB, шт"] > 0].nunique()),
+            }
+        )
+    )
+    if not warehouse_stock_summary.empty:
+        warehouse_stock_summary["Остаток WB, шт"] = warehouse_stock_summary["Остаток WB, шт"].map(round_int)
+        warehouse_stock_summary["SKU с остатком, шт"] = warehouse_stock_summary["SKU с остатком, шт"].map(round_int)
+
+    if wh_col is None and excluded_rules:
+        log(
+            "В файле остатков нет колонки склада — исключить неработающие склады невозможно. "
+            "Остатки будут рассчитаны без фильтра по складам."
+        )
+        excluded = pd.DataFrame(columns=[
+            "Артикул WB", "Артикул WB продавца", "Склад WB",
+            "Исключённый склад", "Причина исключения", "Дата статуса", "Не учтено, шт",
+        ])
+    else:
+        matches = temp["Склад WB"].map(lambda x: match_excluded_warehouse(x, excluded_rules))
+        temp["Исключённый склад"] = matches.map(lambda x: x[0])
+        temp["Причина исключения"] = matches.map(lambda x: x[1])
+        temp["Дата статуса"] = matches.map(lambda x: x[2])
+        excluded = temp[temp["Исключённый склад"] != ""].copy()
+        excluded = excluded.rename(columns={"Остаток WB, шт": "Не учтено, шт"})
+        excluded = excluded[excluded["Не учтено, шт"] > 0].copy()
+        if not excluded.empty:
+            excluded = excluded.groupby(
+                [
+                    "Артикул WB", "Артикул WB продавца", "Склад WB",
+                    "Исключённый склад", "Причина исключения", "Дата статуса",
+                ],
+                as_index=False,
+                dropna=False,
+            )["Не учтено, шт"].sum()
+        temp = temp[temp["Исключённый склад"] == ""].copy()
+
+    included_amounts = temp.groupby(
+        ["Артикул WB", "Артикул WB продавца"],
+        as_index=False,
+    )["Остаток WB, шт"].sum()
+    included = all_article_keys.merge(
+        included_amounts,
+        on=["Артикул WB", "Артикул WB продавца"],
+        how="left",
+    )
+    included["Остаток WB, шт"] = included["Остаток WB, шт"].fillna(0).map(round_int)
+
+    excluded_qty = int(excluded["Не учтено, шт"].sum()) if not excluded.empty else 0
+    excluded_sku = int(excluded["Артикул WB"].nunique()) if not excluded.empty else 0
+    log(
+        "Фильтр неработающих складов WB: "
+        f"правил={len(excluded_rules)}, исключено SKU={excluded_sku}, шт={excluded_qty}"
+    )
+    return included, excluded, warehouse_stock_summary, latest_key
 
 
-def load_orders_metrics(storage: S3Storage) -> tuple[pd.DataFrame, list[str]]:
+def build_excluded_stocks_sheet(
+    excluded_df: pd.DataFrame,
+    article_map: dict[str, str],
+) -> pd.DataFrame:
+    columns = [
+        "Артикул 1С", "Артикул WB", "Артикул WB продавца", "Склад WB",
+        "Не учтено, шт", "Исключённый склад", "Причина исключения", "Дата статуса",
+    ]
+    if excluded_df.empty:
+        return pd.DataFrame([{
+            "Артикул 1С": "ИТОГО",
+            "Артикул WB": "",
+            "Артикул WB продавца": "",
+            "Склад WB": "",
+            "Не учтено, шт": 0,
+            "Исключённый склад": "",
+            "Причина исключения": "Нет остатков на исключённых складах в последнем срезе",
+            "Дата статуса": "",
+        }], columns=columns)
+
+    result = excluded_df.copy()
+    result["Артикул 1С"] = result["Артикул WB"].map(article_map).fillna("").astype(object)
+    missing = result["Артикул 1С"].isna() | (result["Артикул 1С"].astype(str).str.strip() == "")
+    result.loc[missing, "Артикул 1С"] = result.loc[missing, "Артикул WB продавца"]
+    result["Артикул 1С"] = result["Артикул 1С"].map(normalize_text)
+    result = result[columns].sort_values(
+        ["Исключённый склад", "Артикул 1С", "Склад WB"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    total_row = {col: "" for col in columns}
+    total_row["Артикул 1С"] = "ИТОГО"
+    total_row["Не учтено, шт"] = int(result["Не учтено, шт"].sum())
+    total_row["Причина исключения"] = f"Строк: {len(result)}; SKU WB: {result['Артикул WB'].nunique()}"
+    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def load_orders_metrics(storage: S3Storage) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     keys = latest_n_weekly_keys(storage.list_keys(WB_ORDERS_PREFIX), 10)
     log(f"Берём заказы WB из файлов: {keys}")
     frames: list[pd.DataFrame] = []
@@ -523,19 +827,28 @@ def load_orders_metrics(storage: S3Storage) -> tuple[pd.DataFrame, list[str]]:
         frames.append(df)
     orders = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if orders.empty:
-        return pd.DataFrame(columns=[
+        empty_metrics = pd.DataFrame(columns=[
             "Артикул WB", "Артикул WB продавца", "Продажи 7 дней, шт", "Продажи 60 дней, шт",
             "Среднесуточные продажи 7д", "Среднесуточные продажи 60д", "Цена покупателя"
-        ]), keys
+        ])
+        empty_activity = pd.DataFrame(columns=[
+            "Склад WB", "Заказы 7 дней, шт", "Заказы последние 2 дня, шт",
+            "Последний заказ", "Дней без заказов",
+        ])
+        return empty_metrics, empty_activity, keys
 
     wb_col = choose_existing_column(orders, ["nmId", "Артикул WB"], "Артикул WB в заказах")
     seller_col = choose_existing_column(orders, ["supplierArticle", "Артикул продавца"], "Артикул продавца в заказах")
     date_col = choose_existing_column(orders, ["date", "Дата", "Дата заказа", "lastChangeDate", "Дата продажи"], "дата в заказах")
+    wh_col = try_choose_column(orders, ["warehouseName", "Склад", "Склад заказа"])
+    cancel_col = try_choose_column(orders, ["isCancel", "Отмена", "Отменён"])
 
     work = pd.DataFrame({
         "Артикул WB": orders[wb_col].map(normalize_key),
         "Артикул WB продавца": orders[seller_col].map(normalize_text),
         "dt": pd.to_datetime(orders[date_col], errors="coerce").dt.normalize(),
+        "Склад WB": orders[wh_col].map(normalize_text) if wh_col is not None else "",
+        "is_cancel": orders[cancel_col].map(parse_bool) if cancel_col is not None else False,
     })
     if "finishedPrice" in orders.columns:
         work["finishedPrice"] = orders["finishedPrice"].map(safe_float)
@@ -544,28 +857,66 @@ def load_orders_metrics(storage: S3Storage) -> tuple[pd.DataFrame, list[str]]:
 
     work = work[((work["Артикул WB"] != "") | (work["Артикул WB продавца"] != "")) & work["dt"].notna()].copy()
     if work.empty:
-        return pd.DataFrame(columns=[
+        empty_metrics = pd.DataFrame(columns=[
             "Артикул WB", "Артикул WB продавца", "Продажи 7 дней, шт", "Продажи 60 дней, шт",
             "Среднесуточные продажи 7д", "Среднесуточные продажи 60д", "Цена покупателя"
-        ]), keys
+        ])
+        empty_activity = pd.DataFrame(columns=[
+            "Склад WB", "Заказы 7 дней, шт", "Заказы последние 2 дня, шт",
+            "Последний заказ", "Дней без заказов",
+        ])
+        return empty_metrics, empty_activity, keys
 
     max_dt = work["dt"].max()
     start_7 = max_dt - pd.Timedelta(days=6)
     start_60 = max_dt - pd.Timedelta(days=59)
     group_cols = ["Артикул WB", "Артикул WB продавца"]
 
-    sales_7 = work[work["dt"] >= start_7].groupby(group_cols).size().rename("sales_7d")
-    sales_60 = work[work["dt"] >= start_60].groupby(group_cols).size().rename("sales_60d")
+    # Контроль активности складов и показатели оборачиваемости считаем
+    # только по неотменённым заказам.
+    activity_source = work[
+        (~work["is_cancel"])
+        & (work["Склад WB"] != "")
+        & (work["dt"] >= start_7)
+    ].copy()
+    all_order_warehouses = work.loc[work["Склад WB"] != "", ["Склад WB"]].drop_duplicates()
+    if activity_source.empty:
+        warehouse_activity = all_order_warehouses.copy()
+        warehouse_activity["Заказы 7 дней, шт"] = 0
+        warehouse_activity["Заказы последние 2 дня, шт"] = 0
+        warehouse_activity["Последний заказ"] = pd.NaT
+        warehouse_activity["Дней без заказов"] = pd.NA
+    else:
+        last_2_start = max_dt - pd.Timedelta(days=1)
+        activity_7 = activity_source.groupby("Склад WB").size().rename("Заказы 7 дней, шт")
+        activity_2 = (
+            activity_source[activity_source["dt"] >= last_2_start]
+            .groupby("Склад WB").size().rename("Заказы последние 2 дня, шт")
+        )
+        last_order = activity_source.groupby("Склад WB")["dt"].max().rename("Последний заказ")
+        warehouse_activity = pd.concat([activity_7, activity_2, last_order], axis=1).reset_index()
+        warehouse_activity = all_order_warehouses.merge(warehouse_activity, on="Склад WB", how="left")
+        warehouse_activity["Заказы 7 дней, шт"] = warehouse_activity["Заказы 7 дней, шт"].fillna(0).map(round_int)
+        warehouse_activity["Заказы последние 2 дня, шт"] = warehouse_activity["Заказы последние 2 дня, шт"].fillna(0).map(round_int)
+        warehouse_activity["Последний заказ"] = pd.to_datetime(warehouse_activity["Последний заказ"], errors="coerce")
+        warehouse_activity["Дней без заказов"] = warehouse_activity["Последний заказ"].map(
+            lambda x: int((max_dt - x).days) if pd.notna(x) else pd.NA
+        )
+
+    # Показатели оборачиваемости считаем только по неотменённым заказам.
+    metric_work = work[~work["is_cancel"]].copy()
+    sales_7 = metric_work[metric_work["dt"] >= start_7].groupby(group_cols).size().rename("sales_7d")
+    sales_60 = metric_work[metric_work["dt"] >= start_60].groupby(group_cols).size().rename("sales_60d")
     metrics = pd.concat([sales_7, sales_60], axis=1).fillna(0).reset_index()
     metrics["sales_7d"] = metrics["sales_7d"].astype(int)
     metrics["sales_60d"] = metrics["sales_60d"].astype(int)
     metrics["avg_daily_sales_7d"] = metrics["sales_7d"] / 7.0
     metrics["avg_daily_sales_60d"] = metrics["sales_60d"] / 60.0
 
-    price_last = work[work["dt"] == max_dt].groupby(group_cols)["finishedPrice"].mean().rename("Цена покупателя").reset_index()
+    price_last = metric_work[metric_work["dt"] == max_dt].groupby(group_cols)["finishedPrice"].mean().rename("Цена покупателя").reset_index()
     price_last["Цена покупателя"] = price_last["Цена покупателя"].map(round_int)
     metrics = metrics.merge(price_last, on=group_cols, how="left")
-    return metrics, keys
+    return metrics, warehouse_activity, keys
 
 
 def normalize_inbound_marker(value: object) -> str:
@@ -848,7 +1199,13 @@ def load_inbound(storage: S3Storage, run_date: date) -> pd.DataFrame:
     )
     return inbound_result
 
-def load_current_month_zero_days(storage: S3Storage, zero_articles: set[str], avg7_map: dict[str, float], run_date: date) -> dict[str, int]:
+def load_current_month_zero_days(
+    storage: S3Storage,
+    zero_articles: set[str],
+    avg7_map: dict[str, float],
+    run_date: date,
+    excluded_rules: dict[str, dict[str, object]],
+) -> dict[str, int]:
     if not zero_articles:
         return {}
     month_start = run_date.replace(day=1)
@@ -863,11 +1220,17 @@ def load_current_month_zero_days(storage: S3Storage, zero_articles: set[str], av
         wb_col = choose_existing_column(df, ["Артикул WB", "nmId"], "Артикул WB")
         stock_col = choose_existing_column(df, ["Доступно для продажи", "Полное количество"], "остаток WB")
         sample_col = choose_existing_column(df, ["Дата сбора", "Дата запроса"], "дата среза")
+        wh_col = try_choose_column(df, ["Склад", "warehouseName", "Название склада", "Склад WB"])
         temp = pd.DataFrame({
             "Артикул WB": df[wb_col].map(normalize_key),
             "stock_wb": df[stock_col].map(safe_float),
             "sample_dt": pd.to_datetime(df[sample_col], errors="coerce").dt.normalize(),
+            "warehouse": df[wh_col].map(normalize_text) if wh_col is not None else "",
         })
+        if wh_col is not None and excluded_rules:
+            temp = temp[
+                temp["warehouse"].map(lambda x: match_excluded_warehouse(x, excluded_rules)[0]) == ""
+            ].copy()
         temp = temp[(temp["Артикул WB"].isin(zero_articles)) & temp["sample_dt"].notna()]
         temp = temp[temp["sample_dt"].dt.date >= month_start]
         if temp.empty:
@@ -1077,6 +1440,91 @@ def build_report_dataframe(
     ).reset_index(drop=True)
 
 
+
+def build_warehouse_control_sheet(
+    warehouse_stock_summary: pd.DataFrame,
+    warehouse_activity: pd.DataFrame,
+    excluded_rules: dict[str, dict[str, object]],
+) -> pd.DataFrame:
+    columns = [
+        "Склад WB", "Остаток WB, шт", "SKU с остатком, шт",
+        "Заказы 7 дней, шт", "Заказы последние 2 дня, шт",
+        "Последний заказ", "Дней без заказов",
+        "Статус в расчёте", "Проверка данных",
+        "Причина / комментарий", "Дата статуса",
+    ]
+
+    stock = warehouse_stock_summary.copy()
+    activity = warehouse_activity.copy()
+    if stock.empty:
+        stock = pd.DataFrame(columns=["Склад WB", "Остаток WB, шт", "SKU с остатком, шт"])
+    if activity.empty:
+        activity = pd.DataFrame(columns=[
+            "Склад WB", "Заказы 7 дней, шт", "Заказы последние 2 дня, шт",
+            "Последний заказ", "Дней без заказов",
+        ])
+
+    all_warehouses = pd.concat(
+        [stock[["Склад WB"]], activity[["Склад WB"]]],
+        ignore_index=True,
+    ).drop_duplicates()
+    result = all_warehouses.merge(stock, on="Склад WB", how="left")
+    result = result.merge(activity, on="Склад WB", how="left")
+
+    for col in ["Остаток WB, шт", "SKU с остатком, шт", "Заказы 7 дней, шт", "Заказы последние 2 дня, шт"]:
+        result[col] = result[col].fillna(0).map(round_int)
+    result["Последний заказ"] = pd.to_datetime(result["Последний заказ"], errors="coerce")
+
+    excluded_matches = result["Склад WB"].map(lambda x: match_excluded_warehouse(x, excluded_rules))
+    recovered_matches = result["Склад WB"].map(match_recovered_warehouse)
+
+    result["_excluded_name"] = excluded_matches.map(lambda x: x[0])
+    result["_excluded_reason"] = excluded_matches.map(lambda x: x[1])
+    result["_excluded_date"] = excluded_matches.map(lambda x: x[2])
+    result["_recovered_name"] = recovered_matches.map(lambda x: x[0])
+    result["_recovered_note"] = recovered_matches.map(lambda x: x[1])
+    result["_recovered_date"] = recovered_matches.map(lambda x: x[2])
+
+    def anomaly_label(row: pd.Series) -> str:
+        stock_qty = round_int(row.get("Остаток WB, шт"))
+        orders_7 = round_int(row.get("Заказы 7 дней, шт"))
+        orders_2 = round_int(row.get("Заказы последние 2 дня, шт"))
+        if stock_qty >= 500 and orders_7 == 0:
+            return "КРИТИЧНО: большой остаток, заказов нет 7 дней"
+        if stock_qty >= 500 and orders_2 == 0:
+            return "ВНИМАНИЕ: большой остаток, заказов нет 2 последних дня"
+        return ""
+
+    result["Проверка данных"] = result.apply(anomaly_label, axis=1)
+    result["Статус в расчёте"] = result.apply(
+        lambda r: "Исключён"
+        if normalize_text(r.get("_excluded_name"))
+        else ("Проверить" if normalize_text(r.get("Проверка данных")) else "Учитывается"),
+        axis=1,
+    )
+    result["Причина / комментарий"] = result.apply(
+        lambda r: (
+            normalize_text(r.get("_excluded_reason"))
+            or normalize_text(r.get("_recovered_note"))
+            or normalize_text(r.get("Проверка данных"))
+        ),
+        axis=1,
+    )
+    result["Дата статуса"] = result.apply(
+        lambda r: normalize_text(r.get("_excluded_date")) or normalize_text(r.get("_recovered_date")),
+        axis=1,
+    )
+
+    priority = {"Исключён": 0, "Проверить": 1, "Учитывается": 2}
+    result["_priority"] = result["Статус в расчёте"].map(priority).fillna(9)
+    result = result.sort_values(
+        ["_priority", "Остаток WB, шт", "Склад WB"],
+        ascending=[True, False, True],
+        kind="stable",
+    )
+    return result[columns].reset_index(drop=True)
+
+
 def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     # 1-й лист — рабочий список риска по ходовым SKU.
     revenue_sku_mask = report_df["Продажи 60 дней, шт"] > 0
@@ -1178,6 +1626,21 @@ def auto_fit_columns(ws) -> None:
         "Цена покупателя": 18,
         "Коэффициент": 18,
         "Delist": 14,
+        "Склад WB": 27,
+        "SKU с остатком, шт": 20,
+        "Заказы 7 дней, шт": 20,
+        "Заказы последние 2 дня, шт": 26,
+        "Последний заказ": 18,
+        "Дней без заказов": 20,
+        "Статус в расчёте": 20,
+        "Проверка данных": 45,
+        "Причина / комментарий": 60,
+        "Дата статуса": 18,
+        "Склад WB": 26,
+        "Не учтено, шт": 18,
+        "Исключённый склад": 28,
+        "Причина исключения": 46,
+        "Дата статуса": 16,
     }
     headers = [c.value for c in ws[1]]
     for idx, width in widths.items():
@@ -1191,7 +1654,7 @@ def auto_fit_columns(ws) -> None:
 def format_date_columns(ws) -> None:
     headers = [c.value for c in ws[1]]
     for idx, header in enumerate(headers, start=1):
-        if header == "Дата поступления":
+        if header in {"Дата поступления", "Последний заказ"}:
             for r in range(2, ws.max_row + 1):
                 cell = ws.cell(r, idx)
                 cell.number_format = "yyyy-mm-dd"
@@ -1254,6 +1717,11 @@ def style_sheet(ws) -> None:
     for r in range(2, ws.max_row + 1):
         ws.row_dimensions[r].height = 24
         ws.cell(r, 1).alignment = ALIGN_LEFT
+        if normalize_text(ws.cell(r, 1).value).upper() == "ИТОГО":
+            for c in range(1, ws.max_column + 1):
+                cell = ws.cell(r, c)
+                cell.fill = FILL_ORANGE
+                cell.font = Font(name=FONT_NAME, size=FONT_SIZE, bold=True, color="000000")
 
     auto_fit_columns(ws)
     format_date_columns(ws)
@@ -1269,6 +1737,8 @@ def save_report(
     dead_wb: pd.DataFrame,
     dead_all: pd.DataFrame,
     calc: pd.DataFrame,
+    excluded_stocks: pd.DataFrame,
+    warehouse_control: pd.DataFrame,
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(report_path, engine="openpyxl") as writer:
@@ -1277,9 +1747,11 @@ def save_report(
         dead_wb.to_excel(writer, sheet_name=SHEET_DEAD_WB, index=False)
         dead_all.to_excel(writer, sheet_name=SHEET_DEAD_ALL, index=False)
         calc.to_excel(writer, sheet_name=SHEET_CALC, index=False)
+        excluded_stocks.to_excel(writer, sheet_name=SHEET_EXCLUDED_WB, index=False)
+        warehouse_control.to_excel(writer, sheet_name=SHEET_WAREHOUSE_CONTROL, index=False)
 
     wb = load_workbook(report_path)
-    for sheet_name in [SHEET_CRITICAL, SHEET_MONITOR, SHEET_DEAD_WB, SHEET_DEAD_ALL, SHEET_CALC]:
+    for sheet_name in [SHEET_CRITICAL, SHEET_MONITOR, SHEET_DEAD_WB, SHEET_DEAD_ALL, SHEET_CALC, SHEET_EXCLUDED_WB, SHEET_WAREHOUSE_CONTROL]:
         style_sheet(wb[sheet_name])
     wb.save(report_path)
 
@@ -1360,15 +1832,19 @@ def build_region_to_warehouse_group() -> dict[str, str]:
 REGION_TO_WAREHOUSE_GROUP = build_region_to_warehouse_group()
 
 
-def read_allowed_template_warehouses(template_path: Path) -> list[str]:
+def read_allowed_template_warehouses(
+    template_path: Path,
+    excluded_rules: dict[str, dict[str, object]],
+) -> list[str]:
     wb = load_workbook(template_path, data_only=False)
     if REDISTRIBUTION_WAREHOUSES_SHEET not in wb.sheetnames:
         raise KeyError(f"В шаблоне нет листа '{REDISTRIBUTION_WAREHOUSES_SHEET}'")
     ws = wb[REDISTRIBUTION_WAREHOUSES_SHEET]
     warehouses: list[str] = []
     for row in range(1, ws.max_row + 1):
-        value = normalize_warehouse_redist(ws.cell(row, 1).value)
-        if value:
+        raw_value = normalize_text(ws.cell(row, 1).value)
+        value = normalize_warehouse_redist(raw_value)
+        if value and match_excluded_warehouse(raw_value, excluded_rules)[0] == "":
             warehouses.append(value)
     wb.close()
     unique: list[str] = []
@@ -1451,7 +1927,11 @@ def load_orders_for_redistribution(storage: S3Storage, lookback_days: int) -> tu
     return work, keys
 
 
-def load_latest_warehouse_stocks_for_redistribution(storage: S3Storage, allowed_warehouses: Sequence[str]) -> tuple[pd.DataFrame, str]:
+def load_latest_warehouse_stocks_for_redistribution(
+    storage: S3Storage,
+    allowed_warehouses: Sequence[str],
+    excluded_rules: dict[str, dict[str, object]],
+) -> tuple[pd.DataFrame, str]:
     latest_key = latest_weekly_key(storage.list_keys(WB_STOCKS_PREFIX))
     df = storage.read_excel(latest_key)
     sample_col = choose_existing_column(df, ["Дата сбора", "Дата запроса"], "дата среза по складам")
@@ -1470,10 +1950,16 @@ def load_latest_warehouse_stocks_for_redistribution(storage: S3Storage, allowed_
     temp = pd.DataFrame({
         "Артикул WB": df[wb_col].map(normalize_key),
         "Артикул WB продавца": df[seller_col].map(normalize_text),
+        "_Склад исходный": df[wh_col].map(normalize_text),
         "Склад": df[wh_col].map(normalize_warehouse_redist),
         "Остаток склада, шт": df[qty_col].map(round_int),
     })
     temp = temp[(temp["Артикул WB"] != "") & (temp["Склад"] != "")]
+    if excluded_rules:
+        temp = temp[
+            temp["_Склад исходный"].map(lambda x: match_excluded_warehouse(x, excluded_rules)[0]) == ""
+        ].copy()
+    temp = temp.drop(columns=["_Склад исходный"], errors="ignore")
     if allowed_warehouses:
         temp = temp[temp["Склад"].isin(set(allowed_warehouses))].copy()
     temp = temp.groupby(["Артикул WB", "Артикул WB продавца", "Склад"], as_index=False)["Остаток склада, шт"].sum()
@@ -1821,12 +2307,15 @@ def save_redistribution_workbook(
 
 
 def create_redistribution_outputs(storage: S3Storage, cfg: Config, article_map: dict[str, str]) -> tuple[Path, Path]:
+    excluded_rules = build_excluded_warehouse_rules(
+        cfg.excluded_warehouses_raw, cfg.included_warehouses_raw
+    )
     template_path = resolve_redistribution_template(cfg, storage)
-    allowed_warehouses = read_allowed_template_warehouses(template_path)
+    allowed_warehouses = read_allowed_template_warehouses(template_path, excluded_rules)
     log(f"Разрешённые склады из шаблона: {', '.join(allowed_warehouses)}")
 
     orders_df, order_sources = load_orders_for_redistribution(storage, cfg.redistribution_days)
-    stocks_df, stock_source = load_latest_warehouse_stocks_for_redistribution(storage, allowed_warehouses)
+    stocks_df, stock_source = load_latest_warehouse_stocks_for_redistribution(storage, allowed_warehouses, excluded_rules)
     sales_by_wh_df, unmapped_regions_df = build_sales_by_warehouse(orders_df, cfg.redistribution_days, allowed_warehouses)
     balance_df = build_warehouse_balance(
         sales_df=sales_by_wh_df,
@@ -1869,14 +2358,21 @@ def run() -> Path:
     cfg = get_config()
     storage = S3Storage(cfg)
     stop_articles = parse_stop_articles(cfg.stop_articles_raw)
+    excluded_rules = build_excluded_warehouse_rules(
+        cfg.excluded_warehouses_raw, cfg.included_warehouses_raw
+    )
+    log(
+        "Склады, исключаемые из остатков WB: "
+        + (", ".join(excluded_rules.keys()) if excluded_rules else "нет")
+    )
 
     article_map = load_article_map(storage)
 
     if is_redistribution_only_mode():
         return run_redistribution_only(storage=storage, cfg=cfg, article_map=article_map)
 
-    wb_stocks, stock_source = load_latest_wb_stocks(storage)
-    sales_df, order_sources = load_orders_metrics(storage)
+    wb_stocks, excluded_wb_stocks_raw, warehouse_stock_summary, stock_source = load_latest_wb_stocks(storage, excluded_rules)
+    sales_df, warehouse_activity, order_sources = load_orders_metrics(storage)
     stocks_1c = load_stocks_1c(storage)
     rrc_df = load_rrc(storage)
     inbound_df = load_inbound(storage, cfg.run_date)
@@ -1888,7 +2384,9 @@ def run() -> Path:
         avg7_map[wb_key] = safe_float(row.get("avg_daily_sales_7d"))
 
     current_zero_articles = set(wb_stocks.loc[wb_stocks["Остаток WB, шт"] <= 0, "Артикул WB"].tolist())
-    zero_days_map = load_current_month_zero_days(storage, current_zero_articles, avg7_map, cfg.run_date)
+    zero_days_map = load_current_month_zero_days(
+        storage, current_zero_articles, avg7_map, cfg.run_date, excluded_rules
+    )
 
     report_df = build_report_dataframe(
         wb_stocks=wb_stocks,
@@ -1903,9 +2401,11 @@ def run() -> Path:
     )
 
     critical, monitor, dead_wb, dead_all, calc = split_sheets(report_df)
+    excluded_wb_stocks = build_excluded_stocks_sheet(excluded_wb_stocks_raw, article_map)
+    warehouse_control = build_warehouse_control_sheet(warehouse_stock_summary, warehouse_activity, excluded_rules)
     date_label = format_ru_date_for_filename(cfg.run_date)
     report_path = Path(OUT_DIR) / f"Отчёт Остатки и товары в пути_{STORE_NAME}_{date_label}.xlsx"
-    save_report(report_path, critical, monitor, dead_wb, dead_all, calc)
+    save_report(report_path, critical, monitor, dead_wb, dead_all, calc, excluded_wb_stocks, warehouse_control)
 
     log(f"Отчёт сохранён: {report_path}")
     log(f"Источник остатков: {stock_source}")
