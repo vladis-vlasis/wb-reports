@@ -29,7 +29,7 @@ STOCKS_1C_KEY = "Отчёты/Остатки/1С/Остатки 1С.xlsx"
 RRC_KEY = f"Отчёты/Финансовые показатели/{STORE_NAME}/РРЦ.xlsx"
 INBOUND_PREFIX = "Отчёты/Остатки/1С/"
 OUT_DIR = "output"
-SCRIPT_VERSION = "2026-08-03_v22_AUTO_WAREHOUSES_MANAGERS"
+SCRIPT_VERSION = "2026-08-03_v23_STOCK_RECONCILIATION"
 
 SHEET_CRITICAL = "Критично <14 дней"
 SHEET_CALC = "Расчёт"
@@ -1368,8 +1368,85 @@ def assign_manager_by_product(subject: object, article: object) -> str:
     return "Эмиль"
 
 
+def build_excluded_stock_totals(excluded_df: pd.DataFrame) -> pd.DataFrame:
+    """Агрегирует остатки исключённых складов до уровня SKU WB.
+
+    Эти остатки не участвуют в оборачиваемости, но сохраняются в листе
+    «Расчёт» для полной сверки с исходным срезом WB.
+    """
+    columns = [
+        "Артикул WB", "Артикул WB продавца",
+        "Остатки сгоревших/исключённых складов, шт",
+    ]
+    if excluded_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = excluded_df.copy()
+    for col in ["Артикул WB", "Артикул WB продавца"]:
+        if col not in work.columns:
+            work[col] = ""
+    if "Не учтено, шт" not in work.columns:
+        work["Не учтено, шт"] = 0
+
+    work["Артикул WB"] = work["Артикул WB"].map(normalize_key)
+    work["Артикул WB продавца"] = work["Артикул WB продавца"].map(normalize_text)
+    work["Не учтено, шт"] = work["Не учтено, шт"].map(round_int)
+    work = work[(work["Артикул WB"] != "") | (work["Артикул WB продавца"] != "")].copy()
+
+    result = (
+        work.groupby(["Артикул WB", "Артикул WB продавца"], as_index=False, dropna=False)["Не учтено, шт"]
+        .sum()
+        .rename(columns={"Не учтено, шт": "Остатки сгоревших/исключённых складов, шт"})
+    )
+    result["Остатки сгоревших/исключённых складов, шт"] = (
+        result["Остатки сгоревших/исключённых складов, шт"].map(round_int)
+    )
+    return result[columns]
+
+
+def validate_stock_reconciliation(
+    wb_stocks: pd.DataFrame,
+    excluded_stocks_raw: pd.DataFrame,
+    report_df: pd.DataFrame,
+) -> None:
+    """Не позволяет сформировать и отправить отчёт с потерянными остатками WB."""
+    source_active = int(wb_stocks.get("Остаток WB, шт", pd.Series(dtype=float)).map(round_int).sum())
+    source_excluded = int(
+        excluded_stocks_raw.get("Не учтено, шт", pd.Series(dtype=float)).map(round_int).sum()
+    )
+    report_active = int(report_df.get("Остаток WB, шт", pd.Series(dtype=float)).map(round_int).sum())
+    report_excluded = int(
+        report_df.get(
+            "Остатки сгоревших/исключённых складов, шт",
+            pd.Series(dtype=float),
+        ).map(round_int).sum()
+    )
+
+    source_total = source_active + source_excluded
+    report_total = report_active + report_excluded
+    log(
+        "Сверка остатков WB: "
+        f"рабочие={report_active}/{source_active}; "
+        f"исключённые={report_excluded}/{source_excluded}; "
+        f"всего={report_total}/{source_total}"
+    )
+
+    if (
+        report_active != source_active
+        or report_excluded != source_excluded
+        or report_total != source_total
+    ):
+        raise RuntimeError(
+            "Сверка остатков WB не пройдена. Отчёт не будет сохранён и отправлен: "
+            f"рабочие {report_active} вместо {source_active}; "
+            f"исключённые {report_excluded} вместо {source_excluded}; "
+            f"всего {report_total} вместо {source_total}."
+        )
+
+
 def build_report_dataframe(
     wb_stocks: pd.DataFrame,
+    excluded_stock_totals: pd.DataFrame,
     sales: pd.DataFrame,
     article_map: dict[str, str],
     stocks_1c: pd.DataFrame,
@@ -1377,7 +1454,22 @@ def build_report_dataframe(
     rrc_df: pd.DataFrame,
     inbound_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    df = wb_stocks.merge(sales, on=["Артикул WB", "Артикул WB продавца"], how="left")
+    df = wb_stocks.merge(
+        excluded_stock_totals,
+        on=["Артикул WB", "Артикул WB продавца"],
+        how="left",
+    )
+    if "Остатки сгоревших/исключённых складов, шт" not in df.columns:
+        df["Остатки сгоревших/исключённых складов, шт"] = 0
+    df["Остатки сгоревших/исключённых складов, шт"] = (
+        df["Остатки сгоревших/исключённых складов, шт"].fillna(0).map(round_int)
+    )
+    df["Остаток WB всего до исключения, шт"] = (
+        df["Остаток WB, шт"].map(round_int)
+        + df["Остатки сгоревших/исключённых складов, шт"]
+    )
+
+    df = df.merge(sales, on=["Артикул WB", "Артикул WB продавца"], how="left")
     for col, default in {
         "sales_7d": 0,
         "sales_60d": 0,
@@ -1393,7 +1485,12 @@ def build_report_dataframe(
     missing = df["Артикул 1С"].isna() | (df["Артикул 1С"].astype(str).str.strip() == "")
     df.loc[missing, "Артикул 1С"] = df.loc[missing, "Артикул WB продавца"]
     df["Артикул 1С"] = df["Артикул 1С"].map(normalize_text)
-    df = df[(df["Артикул 1С"] != "") & (~df["Артикул 1С"].map(normalize_key).str.startswith("CZ", na=False))].copy()
+    df = df[df["Артикул 1С"] != ""].copy()
+    # CZ сохраняем на листе «Расчёт» для полной сверки физических остатков,
+    # но не включаем в рабочие листы риска, мониторинга и Dead Stock.
+    df["Технический артикул CZ"] = df["Артикул 1С"].map(
+        lambda x: "Да" if normalize_key(x).startswith("CZ") else ""
+    )
 
     df = df.merge(stocks_1c, on="Артикул 1С", how="left")
     df["Остатки МП (Липецк), шт"] = df["Остатки МП (Липецк), шт"].fillna(0).map(ceil_int)
@@ -1494,12 +1591,14 @@ def build_report_dataframe(
     # Иначе ассортимент с остатком, но низкими/нулевыми продажами, исчезает из отчёта.
     before_filter_rows = len(df)
     before_filter_stock_rows = int((df["Остаток WB, шт"] > 0).sum())
+    before_filter_excluded_rows = int((df["Остатки сгоревших/исключённых складов, шт"] > 0).sum())
     before_filter_mp_rows = int((df["Остатки МП (Липецк), шт"] > 0).sum())
     before_filter_inbound_rows = int((df["Товары в пути, шт"] > 0).sum())
 
     df = df[
         (df["Продажи 60 дней, шт"] >= 20)
         | (df["Остаток WB, шт"] > 0)
+        | (df["Остатки сгоревших/исключённых складов, шт"] > 0)
         | (df["Остатки МП (Липецк), шт"] > 0)
         | (df["Товары в пути, шт"] > 0)
     ].copy()
@@ -1507,7 +1606,8 @@ def build_report_dataframe(
     log(
         "Фильтр итогового отчёта: "
         f"было строк={before_filter_rows}; "
-        f"с остатком WB>0={before_filter_stock_rows}; "
+        f"с рабочим остатком WB>0={before_filter_stock_rows}; "
+        f"с исключённым остатком WB>0={before_filter_excluded_rows}; "
         f"с остатком МП>0={before_filter_mp_rows}; "
         f"с товарами в пути>0={before_filter_inbound_rows}; "
         f"осталось строк={len(df)}"
@@ -1616,12 +1716,16 @@ def build_warehouse_control_sheet(
 
 
 def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    # Полный report_df сохраняется на листе «Расчёт» для сверки всех физических
+    # остатков. Технические CZ не попадают в рабочие листы.
+    operational_df = report_df[report_df["Технический артикул CZ"] != "Да"].copy()
+
     # 1-й лист — рабочий список риска по ходовым SKU.
-    revenue_sku_mask = report_df["Продажи 60 дней, шт"] > 0
+    revenue_sku_mask = operational_df["Продажи 60 дней, шт"] > 0
     stock_risk_mask = (
-        (report_df["Остаток WB, шт"] <= 0)
-        | (report_df["WB + Липецк, дней"] < 14)
-        | ((report_df["Товары в пути, шт"] > 0) & (report_df["Хватит до поступления"] == "Нет"))
+        (operational_df["Остаток WB, шт"] <= 0)
+        | (operational_df["WB + Липецк, дней"] < 14)
+        | ((operational_df["Товары в пути, шт"] > 0) & (operational_df["Хватит до поступления"] == "Нет"))
     )
     critical_before_sales_filter = int(stock_risk_mask.sum())
     critical_zero_sales_excluded = int((stock_risk_mask & ~revenue_sku_mask).sum())
@@ -1632,7 +1736,7 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
         f"исключено с продажами 60д=0: {critical_zero_sales_excluded}; "
         f"осталось={int(crit_mask.sum())}"
     )
-    critical = report_df[crit_mask].copy()
+    critical = operational_df[crit_mask].copy()
     critical["Комментарий"] = critical.apply(
         lambda r: "Не хватает до поставки" if (safe_float(r["Товары в пути, шт"]) > 0 and r["Хватит до поступления"] == "Нет") else "",
         axis=1,
@@ -1645,7 +1749,7 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     ]].copy()
 
     # Мониторинг: убрали Out of stock и расчётные дни, которые раньше требовалось скрывать.
-    monitor = report_df[report_df["Delist"] != "Delist"].copy()
+    monitor = operational_df[operational_df["Delist"] != "Delist"].copy()
     monitor = monitor[[
         "Артикул 1С", "Продажи 60 дней, шт", "Хватит на 60 дней",
         "Товары в пути, шт", "Ближайшее поступление, шт", "Хватит до поступления",
@@ -1653,14 +1757,14 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     ]].copy()
 
     # Dead_Stock_WB — только остатки на WB: Липецк и товары в пути не участвуют в расчёте.
-    dead_wb = report_df[report_df["WB хватит, дней"] > 120].copy()
+    dead_wb = operational_df[operational_df["WB хватит, дней"] > 120].copy()
     dead_wb = dead_wb[[
         "Артикул 1С", "Менеджер", "WB хватит, дней", "Остаток WB, шт",
         "Продажи 60 дней, шт", "Цена покупателя", "РРЦ", "Коэффициент", "Delist",
     ]].copy()
 
     # Dead_Stock_Все остатки+в пути — текущая логика: WB + Липецк + товары в пути.
-    dead_all = report_df[report_df["WB + Липецк + в пути, дней"] > 120].copy()
+    dead_all = operational_df[operational_df["WB + Липецк + в пути, дней"] > 120].copy()
     dead_all = dead_all[[
         "Артикул 1С", "Менеджер", "WB хватит, дней", "WB + Липецк, дней",
         "После ближайшего поступления, дней", "WB + Липецк + в пути, дней",
@@ -1669,7 +1773,9 @@ def split_sheets(report_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, p
     ]].copy()
 
     calc = report_df[[
-        "Артикул 1С", "Менеджер", "Артикул WB", "Артикул WB продавца", "Предмет WB", "Остаток WB, шт",
+        "Артикул 1С", "Менеджер", "Артикул WB", "Артикул WB продавца", "Предмет WB",
+        "Остаток WB, шт", "Остатки сгоревших/исключённых складов, шт",
+        "Остаток WB всего до исключения, шт", "Технический артикул CZ",
         "Остатки МП (Липецк), шт", "Товары в пути, шт", "Ближайшее поступление, шт",
         "Дата поступления", "Дней до поступления", "Партий в пути, шт",
         "Продажи 7 дней, шт", "Продажи 60 дней, шт", "Среднесуточные продажи 7д", "Среднесуточные продажи 60д",
@@ -1708,6 +1814,9 @@ def auto_fit_columns(ws) -> None:
         "Дата поступления": 18,
         "Дней до поступления": 20,
         "Остаток WB, шт": 18,
+        "Остатки сгоревших/исключённых складов, шт": 36,
+        "Остаток WB всего до исключения, шт": 31,
+        "Технический артикул CZ": 22,
         "Остатки МП (Липецк), шт": 24,
         "Хватит на 60 дней": 22,
         "Хватит до поступления": 22,
@@ -2481,14 +2590,22 @@ def run() -> Path:
     rrc_df = load_rrc(storage)
     inbound_df = load_inbound(storage, cfg.run_date)
 
+    excluded_stock_totals = build_excluded_stock_totals(excluded_wb_stocks_raw)
     report_df = build_report_dataframe(
         wb_stocks=wb_stocks,
+        excluded_stock_totals=excluded_stock_totals,
         sales=sales_df,
         article_map=article_map,
         stocks_1c=stocks_1c,
         stop_articles=stop_articles,
         rrc_df=rrc_df,
         inbound_df=inbound_df,
+    )
+
+    validate_stock_reconciliation(
+        wb_stocks=wb_stocks,
+        excluded_stocks_raw=excluded_wb_stocks_raw,
+        report_df=report_df,
     )
 
     critical, monitor, dead_wb, dead_all, calc = split_sheets(report_df)
