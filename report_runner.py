@@ -18,6 +18,8 @@
 # FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: localization pool coverage by snapshot date; stale stock snapshots are not carried indefinitely
 # FIX66_REPORT_QUALITY_CORE_PRODUCTS_MANAGERS_20260713: CORE demand=orders80 last90, fixed conversions, all products in category lists, 620/622 included, manager overrides
 # FIX67_VLAD_TARGET_MANAGER_REALLOCATION_20260713: Vlad PDF excludes Помады/Блески; Telegram forces Pomades->Юля and Glosses->Эмиль by subject/product/article before aggregation
+# FIX70_MANAGEMENT_DATA_QUALITY_20260730: latest available report date, no VAT subtraction in GP cards, 2-category Vlad PDF, unavailable warehouse localization, month summary from same contour
+# FIX71_GEO_LOCALIZATION_NEWS_BLACKLIST_20260730: localization by order geography clusters; affected WB warehouses default blacklist from current news + manual override
 # FIX68_CORRECT_MAIN_REPORT_FILE_GUARD_20260713: verified this is the management report_runner, not ads manager CLI that requires --ads
 # FIX59_WEEKLY_PDF_LOCALIZATION_DYNAMIC_20260624: PDF weekly windows ignore daily strict/current_week_only; localization uses weekly stock_day dynamics
 # FIX60_MSK_TARGET_WINDOW_NO_CANCEL_20260626: scheduled/manual daily runs never cancel by time; 00:00-18:59 MSK => D-2, 19:00-23:59 MSK => D-1
@@ -79,39 +81,56 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# FIX67: this PDF/report file is Влад's operational contour.
-# Помады now belong to Юля, Блески to Эмиль, so they must not be included
-# in Влад's PDF totals, category pages, plan/fact, or product drill-downs.
-# They remain in VALID_PRODUCT_CATEGORY_REFERENCE for all-manager Telegram allocation.
+# FIX72: this PDF/report file is Влад's operational contour after the 2026-08-04
+# ABC manager reshuffle. Current Vlad scope is only brushes + powders.
+# Cosmetic pencils moved to Igor; pomades/glosses moved to Emile.
 TARGET_SUBJECTS = [
     "Кисти косметические",
-    "Косметические карандаши",
+    "Пудры",
 ]
 
-# Global approved product -> category mapping for all operational reports.
-# This prevents liquid eyeliners / liners (405/406/552) and service/stock-only
-# products from leaking into "Косметические карандаши" through nmId dictionary joins.
-# 158 is a lipstick family and must stay in "Помады".
+# Global approved product -> category mapping aligned with latest ABC "Ваша категория".
+# The PDF keeps only TARGET_SUBJECTS, but Telegram/manager allocation can use the broader
+# reference when another source lacks a fresh manager column.
 VALID_PRODUCT_CATEGORY_REFERENCE: Dict[str, str] = {
+    # Влад
     "901": "Кисти косметические",
-    "605": "Косметические карандаши",
-    "611": "Косметические карандаши",
-    "613": "Косметические карандаши",
-    "614": "Косметические карандаши",
-    "617": "Косметические карандаши",
-    "618": "Косметические карандаши",
-    "620": "Косметические карандаши",
-    "622": "Косметические карандаши",
-    "154": "Помады",
-    "155": "Помады",
-    "156": "Помады",
-    "157": "Помады",
-    "158": "Помады",
-    "206": "Помады",
-    "207": "Блески",
-    "209": "Блески",
-    "210": "Блески",
-    "211": "Блески",
+    "255": "Пудры", "261": "Пудры", "263": "Пудры", "265": "Пудры", "269": "Пудры",
+
+    # Игорь
+    "605": "Косметические карандаши", "611": "Косметические карандаши",
+    "613": "Косметические карандаши", "614": "Косметические карандаши",
+    "617": "Косметические карандаши", "618": "Косметические карандаши",
+    "620": "Косметические карандаши", "622": "Косметические карандаши",
+    "104": "Лаки для ногтей", "110": "Лаки для ногтей",
+    "310": "Гели для бровей", "551": "Гели для бровей", "803": "Гели для бровей",
+    "810": "Гели для бровей", "811": "Гели для бровей",
+    "405": "Жидкие подводки", "406": "Жидкие подводки", "552": "Жидкие подводки",
+    "554": "Жидкие подводки", "615": "Жидкие подводки", "619": "Жидкие подводки",
+    "303": "Туши", "311": "Туши", "314": "Туши", "316": "Туши",
+    "501": "Тени", "512": "Тени",
+
+    # Эмиль
+    "154": "Помады", "155": "Помады", "156": "Помады", "157": "Помады",
+    "158": "Помады", "206": "Помады",
+    "207": "Блески", "209": "Блески", "210": "Блески", "211": "Блески",
+    "458": "Тональные кремы", "462": "Тональные кремы", "463": "Тональные кремы",
+    "464": "Тональные кремы", "465": "Тональные кремы", "468": "Тональные кремы",
+    "473": "Тональные кремы", "475": "Тональные кремы", "477": "Тональные кремы",
+    "461": "Корректоры", "466": "Корректоры", "471": "Корректоры",
+    "474": "Корректоры", "562": "Корректоры", "563": "Корректоры",
+    "КОРРЕКТОР": "Корректоры",
+    "353": "Румяна", "354": "Румяна", "355": "Румяна", "356": "Румяна",
+    "357": "Румяна", "703": "Румяна",
+    "262": "Хайлайтеры", "268": "Хайлайтеры", "271": "Хайлайтеры",
+    "560": "Хайлайтеры", "702": "Хайлайтеры", "706": "Хайлайтеры",
+    "472": "CC-кремы",
+    "573": "Фиксаторы макияжа", "574": "Фиксаторы макияжа",
+    "215": "Тинты для губ",
+    "902": "Спонжи",
+    "805": "Сыворотки",
+    "470": "Основы под макияж",
+    "806": "Кремы",
 }
 VALID_PRODUCT_CODES = set(VALID_PRODUCT_CATEGORY_REFERENCE)
 
@@ -158,6 +177,7 @@ ALIASES: Dict[str, Sequence[str]] = {
     "manager": ["Ваша категория", "Менеджер", "manager", "owner", "Ответственный"],
     "title": ["Название", "Название товара", "Товар", "Наименование"],
     "warehouse": ["Склад", "warehouseName", "warehouse"],
+    "order_region": ["Регион заказа", "Регион покупателя", "Регион доставки", "Регион", "Область", "Федеральный округ", "regionName", "oblast", "oblastOkrugName", "buyerRegion", "buyer_region", "orderRegion", "deliveryRegion", "С какого региона товар заказан"],
     "orders": ["Заказы", "orders", "ordersCount", "Количество заказов", "Кол-во заказов", "Заказали товаров, шт", "Заказали, шт", "Заказали"],
     "order_sum": ["Сумма заказов", "ordersSumRub", "ordersSum", "Сумма заказов, руб", "Сумма заказов со скидкой", "Сумма заказов (со скидкой)", "Заказали на сумму", "Заказали, руб", "Сумма", "Итого"],
     "is_cancel": ["isCancel", "is_cancel", "Отменен", "Отменён", "Отмена", "Отменено", "Заказ отменен", "Заказ отменён"],
@@ -241,9 +261,31 @@ def norm_key(value: Any) -> str:
 
 SUBJECT_CANON_MAP = {
     "кисти косметические": "Кисти косметические",
+    "кисти": "Кисти косметические",
+    "пудры": "Пудры",
+    "пудра": "Пудры",
+    "косметические карандаши": "Косметические карандаши",
+    "карандаши": "Косметические карандаши",
+    "лаки для ногтей": "Лаки для ногтей",
+    "гель лаки": "Гель-лаки",
+    "гели для бровей": "Гели для бровей",
+    "жидкие подводки": "Жидкие подводки",
+    "подводки": "Жидкие подводки",
+    "туши": "Туши",
+    "тени": "Тени",
     "помады": "Помады",
     "блески": "Блески",
-    "косметические карандаши": "Косметические карандаши",
+    "тональные кремы": "Тональные кремы",
+    "корректоры": "Корректоры",
+    "румяна": "Румяна",
+    "хайлайтеры": "Хайлайтеры",
+    "cc кремы": "CC-кремы",
+    "фиксаторы макияжа": "Фиксаторы макияжа",
+    "тинты для губ": "Тинты для губ",
+    "спонжи": "Спонжи",
+    "сыворотки": "Сыворотки",
+    "основы под макияж": "Основы под макияж",
+    "кремы": "Кремы",
 }
 
 
@@ -772,6 +814,90 @@ WAREHOUSE_EXCLUDE_KEYWORDS = (
     "ДАЛЬНЕГОРСК", "МАХАЧКАЛА ВИРТ", "ВИРТУАЛЬНЫЙ",
 )
 
+# Warehouses that are operationally unavailable for localization calculations.
+# Their historical demand weight remains in the denominator, but their stock and
+# regional replacement pool stock are not allowed to cover that demand.
+# FIX71 default includes current affected/suspended WB facilities from July 2026 news
+# plus Kотовск as manual cautious override until seller stock status is confirmed.
+# Override in workflow through WB_UNAVAILABLE_WAREHOUSES="..." if WB officially restores a site.
+DEFAULT_UNAVAILABLE_WAREHOUSES = (
+    "Электросталь",
+    "Котовск",
+    "Рязань",
+    "Пенза",
+    "Сарапул",
+    "Краснодар",
+    "Невинномысск",
+    "СПБ Шушары",
+    "Шушары",
+    "Уткина Заводь",
+    "Уткин",
+    "Симферополь",
+)
+
+# География спроса: в заказах WB есть регион покупателя/доставки.
+# Локализация должна отвечать на вопрос: "есть ли товар в складском кластере,
+# который обслуживает регион покупателя", а не "есть ли остаток на том складе,
+# который WB записал в строке заказа".
+REGION_CLUSTER_RULES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("Центр", (
+        "МОСК", "МОСКВА", "МОСКОВСК", "БЕЛГОРОД", "БРЯН", "ВЛАДИМИР", "ВОРОНЕЖ",
+        "ИВАНОВ", "КАЛУЖ", "КОСТРОМ", "КУРСК", "ЛИПЕЦК", "ОРЛ", "РЯЗАН",
+        "СМОЛЕН", "ТАМБОВ", "ТВЕР", "ТУЛ", "ЯРОСЛ",
+    )),
+    ("Юг", (
+        "КРАСНОДАР", "АДЫГ", "РОСТОВ", "ВОЛГОГРАД", "АСТРАХАН", "КАЛМЫК",
+        "СТАВРОП", "НЕВИННОМ", "ДАГЕСТАН", "ЧЕЧ", "ИНГУШ", "КАБАРД", "БАЛКАР",
+        "ОСЕТ", "КАРАЧ", "ЧЕРК", "КРЫМ", "СЕВАСТОП",
+    )),
+    ("Поволжье", (
+        "ТАТАРСТАН", "КАЗАН", "БАШК", "УФА", "УДМУР", "САРАПУЛ", "МАРИЙ",
+        "МОРДОВ", "ЧУВАШ", "НИЖЕГОРОД", "НИЖНИЙ", "КИРОВ", "ПЕНЗ", "САМАР",
+        "НОВОСЕМЕЙК", "САРАТОВ", "УЛЬЯНОВ", "ОРЕНБУРГ", "ПЕРМ",
+    )),
+    ("Северо-Запад", (
+        "САНКТ", "ПЕТЕРБ", "ЛЕНИНГРАД", "ШУШАР", "УТКИН", "КАРЕЛ", "КОМИ",
+        "АРХАНГ", "НЕНЕЦ", "ВОЛОГ", "КАЛИНИНГ", "МУРМАН", "НОВГОРОД", "ПСКОВ",
+    )),
+    ("Урал", (
+        "СВЕРДЛ", "ЕКАТЕРИНБ", "ЧЕЛЯБ", "КУРГАН", "ТЮМЕН", "ХАНТ", "ЯМАЛ",
+    )),
+    ("Сибирь", (
+        "НОВОСИБ", "КРАСНОЯР", "КЕМЕРОВ", "КУЗБАСС", "АЛТАЙ", "ТОМСК",
+        "ОМСК", "ИРКУТ", "БУРЯТ", "ТЫВА", "ХАКАС", "ЗАБАЙК",
+    )),
+    ("Дальний Восток", (
+        "ХАБАР", "ПРИМОР", "ВЛАДИВОСТ", "АМУР", "САХАЛ", "КАМЧАТ", "МАГАДАН",
+        "ЯКУТ", "САХА", "ЧУКОТ", "ЕВРЕЙ", "БИРОБИД",
+    )),
+)
+
+WAREHOUSE_POOL_TO_ORDER_CLUSTER = {
+    "ЦФО": "Центр",
+    "ЮГ": "Юг",
+    "ПОВОЛЖЬЕ": "Поволжье",
+    "СЗФО": "Северо-Запад",
+    "УРАЛ": "Урал",
+    "СИБИРЬ": "Сибирь",
+}
+
+
+def order_region_cluster(value: Any) -> str:
+    text = clean_warehouse_name(value)
+    if not text:
+        return ""
+    for cluster, keys in REGION_CLUSTER_RULES:
+        if any(k in text for k in keys):
+            return cluster
+    return "Другие"
+
+
+def warehouse_service_cluster(value: Any) -> str:
+    pool = warehouse_pool(value)
+    if pool in WAREHOUSE_POOL_TO_ORDER_CLUSTER:
+        return WAREHOUSE_POOL_TO_ORDER_CLUSTER[pool]
+    return "Другие"
+
 
 def is_excluded_article(value: Any) -> bool:
     t = article_upper(value)
@@ -819,6 +945,19 @@ def is_relevant_warehouse(name: Any) -> bool:
     if any(k in n for k in WAREHOUSE_EXCLUDE_KEYWORDS):
         return False
     return True
+
+
+def is_unavailable_warehouse(name: Any) -> bool:
+    """Operational blacklist for localization only.
+
+    These warehouses are not removed from demand weights: if customers ordered
+    from them in the last 90 days, that demand still counts as uncovered.
+    Their stock is zeroed and they cannot be covered by the replacement pool.
+    """
+    raw = os.getenv("WB_UNAVAILABLE_WAREHOUSES", ",".join(DEFAULT_UNAVAILABLE_WAREHOUSES))
+    keys = [clean_warehouse_name(x) for x in re.split(r"[,;|\n]+", raw) if clean_warehouse_name(x)]
+    n = clean_warehouse_name(name)
+    return bool(n and any(k in n for k in keys))
 
 
 def classify_entry_channel(section: Any, point: Any = "") -> str:
@@ -1382,6 +1521,7 @@ class Loader:
                     "supplier_article": get_col(df_active, "supplier_article").map(clean_article),
                     "subject": get_col(df_active, "subject").map(canonical_subject),
                     "warehouse": get_col(df_active, "warehouse").map(normalize_text),
+                    "order_region": get_col(df_active, "order_region").map(normalize_text),
                     "orders": orders_series,
                     "order_sum": order_sum_series,
                     "finished_price": finished_price_series,
@@ -2561,49 +2701,95 @@ class AnalyticsBuilder:
         if stock.empty or orders.empty:
             return pd.DataFrame(), pd.DataFrame()
         orders = orders[(orders["day"] >= self.cutoff_90) & (orders["day"] <= self.latest_day)].copy()
-        orders["warehouse"] = orders["warehouse"].map(canonical_warehouse_name)
-        orders = orders[orders["warehouse"].map(is_relevant_warehouse)].copy()
         stock["warehouse"] = stock["warehouse"].map(canonical_warehouse_name)
         stock = stock[stock["warehouse"].map(is_relevant_warehouse)].copy()
+        if not stock.empty:
+            stock["_warehouse_unavailable"] = stock["warehouse"].map(is_unavailable_warehouse)
+            if bool(stock["_warehouse_unavailable"].any()):
+                bad = "; ".join(sorted(stock.loc[stock["_warehouse_unavailable"], "warehouse"].astype(str).unique())[:20])
+                log(f"localization FIX71: unavailable warehouses stock is zeroed and excluded from geography coverage: {bad}")
+            if "stock" in stock.columns:
+                stock["stock"] = np.where(stock["_warehouse_unavailable"], 0.0, pd.to_numeric(stock["stock"], errors="coerce").fillna(0.0))
         if stock.empty or orders.empty:
             return pd.DataFrame(), pd.DataFrame()
-        weights = orders.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).agg(orders_90=("orders", "sum"))
+
+        # FIX71: primary localization mode is demand geography.
+        # Demand denominator = buyer/order region from weekly WB Orders, mapped to macro-cluster.
+        # Coverage numerator = available stock in warehouses assigned to that macro-cluster,
+        # excluding operationally unavailable warehouses.
+        order_region_col_available = "order_region" in orders.columns and orders["order_region"].map(normalize_text).ne("").any()
+        if order_region_col_available:
+            orders["order_region"] = orders["order_region"].map(normalize_text)
+            orders["warehouse_pool"] = orders["order_region"].map(order_region_cluster)
+            orders = orders[orders["warehouse_pool"].ne("")].copy()
+            if orders.empty:
+                return pd.DataFrame(), pd.DataFrame()
+            weights = orders.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse_pool"], dropna=False, as_index=False).agg(orders_90=("orders", "sum"))
+            weights["warehouse"] = weights["warehouse_pool"]
+            log("localization FIX71: using order_region geography clusters from WB Orders for demand weights")
+        else:
+            # Backward compatible fallback for old Orders exports without buyer region.
+            # This is less correct and is logged explicitly in diagnostics/report logs.
+            orders["warehouse"] = orders["warehouse"].map(canonical_warehouse_name)
+            orders = orders[orders["warehouse"].map(is_relevant_warehouse)].copy()
+            weights = orders.groupby(["subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).agg(orders_90=("orders", "sum"))
+            weights["warehouse_pool"] = weights["warehouse"].map(warehouse_service_cluster)
+            self.diag.add("WARN", "localization", "В Orders не найден регион покупателя/доставки", "локализация посчитана старым fallback по складу заказа; нужен столбец Регион заказа")
+            log("localization FIX71 WARN: no order_region column/value in Orders; fallback to order warehouse weights")
+
         totals = weights.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False)["orders_90"].sum().rename("orders_total").reset_index()
         weights = weights.merge(totals, on=["subject", "product", "supplier_article", "nm_id"], how="left")
         weights["warehouse_weight_pct"] = np.where(weights["orders_total"] > 0, weights["orders_90"] / weights["orders_total"] * 100, 0)
-        # Оставляем ключевые склады, которые суммарно дают 97% заказов артикула.
+        # Оставляем ключевые гео-кластеры/склады, которые суммарно дают 97% заказов артикула.
         weights = weights.sort_values(["subject", "product", "supplier_article", "nm_id", "warehouse_weight_pct"], ascending=[True, True, True, True, False])
         weights["cum_weight_pct"] = weights.groupby(["subject", "product", "supplier_article", "nm_id"], dropna=False)["warehouse_weight_pct"].cumsum()
         weights = weights[(weights["cum_weight_pct"] <= 97) | (weights["warehouse_weight_pct"] >= 0.5)].copy()
         weights["avg_daily_orders_wh"] = weights["orders_90"] / 90.0
         weights["needed_stock_2d"] = weights["avg_daily_orders_wh"] * 2
-        weights["warehouse_pool"] = weights["warehouse"].map(warehouse_pool)
-        # FIX52: keep localization history by stock snapshot date.
-        # Previously the code kept only the last stock snapshot and merged it to every day,
-        # so weekly dynamics was always 0. Now every stock date can produce its own localization.
+
         stock = stock[stock["day"].notna()].copy()
-        st = stock.groupby(["day", "subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).agg(stock_qty=("stock", "sum"))
-        st = st.rename(columns={"day": "stock_day"})
-        stock_days = st[["stock_day"]].drop_duplicates().copy()
-        try:
-            base_grid = weights.merge(stock_days, how="cross")
-        except TypeError:
-            weights["_tmp_cross"] = 1; stock_days["_tmp_cross"] = 1
-            base_grid = weights.merge(stock_days, on="_tmp_cross", how="outer").drop(columns=["_tmp_cross"])
-        detail = base_grid.merge(st, on=["stock_day", "subject", "product", "supplier_article", "nm_id", "warehouse"], how="left")
-        detail["stock_qty"] = detail["stock_qty"].fillna(0)
-        detail["is_direct_covered"] = detail["stock_qty"] >= detail["needed_stock_2d"]
-        # Replacement: same regional pool has enough stock in aggregate FOR THE SAME STOCK SNAPSHOT.
-        # FIX58: the previous code grouped pool_stock/pool_need without stock_day, so it summed
-        # leftovers across all historical stock dates and almost always made localization_with_replacements
-        # look like ~99-100%. That was the reason localization dynamics looked frozen/over-optimistic.
-        pool_keys = ["stock_day", "subject", "product", "supplier_article", "nm_id", "warehouse_pool"]
-        pool_stock = detail.groupby(pool_keys, dropna=False)["stock_qty"].sum().rename("pool_stock_qty").reset_index()
-        pool_need = detail.groupby(pool_keys, dropna=False)["needed_stock_2d"].sum().rename("pool_need_qty").reset_index()
-        detail = detail.merge(pool_stock, on=pool_keys, how="left").merge(pool_need, on=pool_keys, how="left")
-        # Pool replacement covers a warehouse only if the whole regional pool has enough stock
-        # for the whole pool demand, not merely enough for one individual warehouse.
-        detail["is_covered_with_replacement"] = detail["is_direct_covered"] | (detail["pool_stock_qty"] >= detail["pool_need_qty"])
+        stock["warehouse_pool"] = stock["warehouse"].map(warehouse_service_cluster)
+
+        if order_region_col_available:
+            # In geography mode, stock is pooled by the macro-cluster that serves the buyer region.
+            st = stock.groupby(["day", "subject", "product", "supplier_article", "nm_id", "warehouse_pool"], dropna=False, as_index=False).agg(stock_qty=("stock", "sum"))
+            st = st.rename(columns={"day": "stock_day"})
+            stock_days = st[["stock_day"]].drop_duplicates().copy()
+            try:
+                base_grid = weights.merge(stock_days, how="cross")
+            except TypeError:
+                weights["_tmp_cross"] = 1; stock_days["_tmp_cross"] = 1
+                base_grid = weights.merge(stock_days, on="_tmp_cross", how="outer").drop(columns=["_tmp_cross"])
+            detail = base_grid.merge(st, on=["stock_day", "subject", "product", "supplier_article", "nm_id", "warehouse_pool"], how="left")
+            detail["stock_qty"] = pd.to_numeric(detail["stock_qty"], errors="coerce").fillna(0.0)
+            detail["warehouse_unavailable"] = False
+            detail["is_direct_covered"] = detail["stock_qty"] >= detail["needed_stock_2d"]
+            detail["pool_stock_qty"] = detail["stock_qty"]
+            detail["pool_need_qty"] = detail["needed_stock_2d"]
+            detail["is_covered_with_replacement"] = detail["is_direct_covered"]
+            # Keep the old column name for Excel/PDF compatibility, but value is cluster name.
+            detail["warehouse"] = detail["warehouse"].fillna(detail["warehouse_pool"])
+        else:
+            # Legacy warehouse mode.
+            st = stock.groupby(["day", "subject", "product", "supplier_article", "nm_id", "warehouse"], dropna=False, as_index=False).agg(stock_qty=("stock", "sum"))
+            st = st.rename(columns={"day": "stock_day"})
+            stock_days = st[["stock_day"]].drop_duplicates().copy()
+            try:
+                base_grid = weights.merge(stock_days, how="cross")
+            except TypeError:
+                weights["_tmp_cross"] = 1; stock_days["_tmp_cross"] = 1
+                base_grid = weights.merge(stock_days, on="_tmp_cross", how="outer").drop(columns=["_tmp_cross"])
+            detail = base_grid.merge(st, on=["stock_day", "subject", "product", "supplier_article", "nm_id", "warehouse"], how="left")
+            detail["stock_qty"] = detail["stock_qty"].fillna(0)
+            detail["warehouse_unavailable"] = detail["warehouse"].map(is_unavailable_warehouse)
+            detail["stock_qty"] = np.where(detail["warehouse_unavailable"], 0.0, pd.to_numeric(detail["stock_qty"], errors="coerce").fillna(0.0))
+            detail["is_direct_covered"] = (~detail["warehouse_unavailable"]) & (detail["stock_qty"] >= detail["needed_stock_2d"])
+            pool_keys = ["stock_day", "subject", "product", "supplier_article", "nm_id", "warehouse_pool"]
+            pool_stock = detail.groupby(pool_keys, dropna=False)["stock_qty"].sum().rename("pool_stock_qty").reset_index()
+            pool_need = detail.groupby(pool_keys, dropna=False)["needed_stock_2d"].sum().rename("pool_need_qty").reset_index()
+            detail = detail.merge(pool_stock, on=pool_keys, how="left").merge(pool_need, on=pool_keys, how="left")
+            detail["is_covered_with_replacement"] = (~detail["warehouse_unavailable"]) & (detail["is_direct_covered"] | (detail["pool_stock_qty"] >= detail["pool_need_qty"]))
+
         detail["direct_coverage_weight_pct"] = np.where(detail["is_direct_covered"], detail["warehouse_weight_pct"], 0)
         detail["replacement_coverage_weight_pct"] = np.where(detail["is_covered_with_replacement"], detail["warehouse_weight_pct"], 0)
         summary = detail.groupby(["stock_day", "subject", "product", "supplier_article", "nm_id"], dropna=False, as_index=False).agg(
@@ -3398,12 +3584,16 @@ REPORT_MONTH_GENITIVE_RU = {
 
 def _max_report_day_from_outputs(outputs: Dict[str, Any]) -> pd.Timestamp:
     """Return the report date represented in outputs for PDF naming/caption."""
-    # FIX60: when the daily target is locked by the MSK window, the file name and
-    # Telegram caption must use that target date, not a newer cached row.
+    # FIX70: use an explicit manual date only when the user intentionally locks it.
+    # The MSK window can be conservative, but if fresher complete data is already
+    # loaded, the PDF name/caption must follow the actual report day.
     try:
-        forced = _env_date("REPORT_AS_OF_DATE")
+        manual = _env_date("REPORT_MANUAL_TARGET_DATE")
+        forced = _env_date("REPORT_AS_OF_DATE") if _env_flag("REPORT_KEEP_EXPLICIT_DATE", False) else None
     except Exception:
-        forced = None
+        manual = None; forced = None
+    if manual is not None:
+        return pd.Timestamp(manual).normalize()
     if forced is not None:
         return pd.Timestamp(forced).normalize()
     max_day = pd.NaT
@@ -3590,7 +3780,14 @@ def _active_days_from_source(df: pd.DataFrame, activity_columns: Optional[Sequen
 
 
 def _report_anchor_day_from_daily(daily: pd.DataFrame) -> pd.Timestamp:
-    forced = _env_date("REPORT_AS_OF_DATE")
+    # FIX70: REPORT_AS_OF_DATE created by the automatic MSK window is only a
+    # conservative candidate. It must not freeze the PDF on D-2 when D-1 data is
+    # already present. Only REPORT_MANUAL_TARGET_DATE or REPORT_KEEP_EXPLICIT_DATE=1
+    # makes the date hard.
+    manual = _env_date("REPORT_MANUAL_TARGET_DATE")
+    if manual is not None:
+        return manual
+    forced = _env_date("REPORT_AS_OF_DATE") if _env_flag("REPORT_KEEP_EXPLICIT_DATE", False) else None
     if forced is not None:
         return forced
     days = _active_days_from_daily(daily)
@@ -4664,13 +4861,13 @@ PDF_EXCLUDED_PRODUCT_REASONS: Dict[str, str] = {
 # Defaults reflect the current management rule: low-tail products 206/207/209/210/211
 # are not detailed objects in the PDF. Override with PDF_FORCE_EXCLUDE_PRODUCTS if needed.
 PDF_FORCE_EXCLUDE_DETAIL_PRODUCTS = set(
-    p.strip() for p in os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "206,207,209,210,211").split(",") if p.strip()
+    p.strip() for p in os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "605,611,613,614,617,618,620,622,154,155,156,157,158,206,207,209,210,211").split(",") if p.strip()
 )
 
 # Products that must appear in the detailed PDF when they have current-week sales/GP.
 # This prevents useful pencil groups 605/611/613 from disappearing due to global 90% trimming.
 PDF_FORCE_INCLUDE_DETAIL_PRODUCTS = set(
-    p.strip() for p in os.getenv("PDF_FORCE_INCLUDE_PRODUCTS", "901,605,611,613,614,617,618,154,155,156,157").split(",") if p.strip()
+    p.strip() for p in os.getenv("PDF_FORCE_INCLUDE_PRODUCTS", "901,255,261,263,265,269").split(",") if p.strip()
 )
 
 
@@ -4699,7 +4896,10 @@ def _pdf_resolve_product_category(article: Any = "", product: Any = "") -> Tuple
     if not code:
         return "", "", False, "Не удалось распознать товар по артикулу/товару"
     if code in PDF_PRODUCT_CATEGORY_REFERENCE:
-        return PDF_PRODUCT_CATEGORY_REFERENCE[code], code, True, ""
+        resolved_subject = PDF_PRODUCT_CATEGORY_REFERENCE[code]
+        if resolved_subject not in TARGET_SUBJECTS:
+            return "", code, False, f"Товар относится к {resolved_subject} и вне текущего контура PDF Влада"
+        return resolved_subject, code, True, ""
     if code in PDF_EXCLUDED_PRODUCT_REASONS:
         return "", code, False, PDF_EXCLUDED_PRODUCT_REASONS[code]
     return "", code, False, "Товар отсутствует в утвержденном справочнике PDF"
@@ -4917,8 +5117,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     # Day table.
     headers = ["Категория", "Пн\n"+cur_monday.strftime("%d.%m"), "Вт\n"+(cur_monday+pd.Timedelta(days=1)).strftime("%d.%m"), "Ср\n"+(cur_monday+pd.Timedelta(days=2)).strftime("%d.%m"), "Чт\n"+(cur_monday+pd.Timedelta(days=3)).strftime("%d.%m"), "Пт\n"+(cur_monday+pd.Timedelta(days=4)).strftime("%d.%m"), "Сб\n"+(cur_monday+pd.Timedelta(days=5)).strftime("%d.%m"), "Вс\n"+(cur_monday+pd.Timedelta(days=6)).strftime("%d.%m"), "План/день"]
     rows=[]
-    cats = ["Кисти косметические", "Косметические карандаши", "Помады", "Блески"]
-    cat_short = {"Кисти косметические":"Кисти", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
+    cats = list(TARGET_SUBJECTS)
+    cat_short = {"Кисти косметические":"Кисти", "Пудры":"Пудры", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
     day_agg = _agg_daily_for_bridge(daily, cur_monday, cur_week_end, ["day", "subject"])
     for cat in cats:
         left = f"{cat_short.get(cat,cat)}\nСумма\nВП\nРасх. РК\nДРР"
@@ -4931,7 +5131,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             else:
                 rr=p.iloc[0]
                 vals.append(f"{_fmt_rub(rr.get('order_sum',0), True)}\n{_fmt_rub(rr.get('gross_profit_model',0), True)}\n{_fmt_rub(rr.get('ad_spend_total',0), True)}\n{_fmt_pct_pdf(rr.get('drr_pct',0))}")
-        vals.append(f"{_fmt_rub(plan_day/4, True)}\n-\n-\n-")
+        vals.append(f"{_fmt_rub(plan_day/max(1, len(cats)), True)}\n-\n-\n-")
         rows.append(vals)
     table_box(70, 80, 1460, 470, headers, rows, col_widths=[190]+[145]*7+[255], font_size=12, row_h=92)
     c.showPage()
@@ -5970,9 +6170,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     c = canvas.Canvas(str(path), pagesize=(W, H))
     bookmarks: Dict[str, str] = {}
     page_num = 0
-    cat_short = {"Кисти косметические":"Кисти", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
-    cats = ["Кисти косметические", "Косметические карандаши", "Помады", "Блески"]
-    cat_code = {"Кисти косметические": "brushes", "Косметические карандаши": "pencils", "Помады": "lipsticks", "Блески": "glosses"}
+    cat_short = {"Кисти косметические":"Кисти", "Пудры":"Пудры", "Косметические карандаши":"Карандаши", "Помады":"Помады", "Блески":"Блески"}
+    cats = list(TARGET_SUBJECTS)
+    cat_code = {"Кисти косметические": "brushes", "Пудры": "powders",
+        "Косметические карандаши": "pencils", "Помады": "lipsticks", "Блески": "glosses"}
     def cat_bookmark(subject_value: Any) -> str:
         return "cat_" + cat_code.get(str(subject_value), re.sub(r"[^A-Za-z0-9]+", "_", str(subject_value)))
     def product_bookmark(subject_value: Any, product_value: Any) -> str:
@@ -6615,6 +6816,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     SUBJECT_DISPLAY = {
         "Кисти косметические": "Кисти",
         "Кисти": "Кисти",
+        "Пудры": "Пудры",
         "Косметические карандаши": "Карандаши",
         "Карандаши": "Карандаши",
         "Помады": "Помады",
@@ -6622,18 +6824,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
     }
     DISPLAY_TO_CANON = {
         "Кисти": "Кисти косметические",
+        "Пудры": "Пудры",
         "Карандаши": "Косметические карандаши",
         "Помады": "Помады",
         "Блески": "Блески",
     }
-    CATEGORY_ORDER = ["Кисти", "Карандаши", "Помады", "Блески"]
+    CATEGORY_ORDER = ["Кисти", "Пудры"]
     PRODUCT_ORDER = {
         "Кисти": ["901"],
-        "Карандаши": ["605", "611", "613", "614", "617", "618", "620", "622"],
-        "Помады": ["154", "155", "156", "157", "206"],
-        "Блески": ["207", "209", "210", "211"],
+        "Пудры": ["255", "261", "263", "265", "269"],
     }
-    DETAIL_EXCLUDE = set(os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "206,207,209,210,211").split(","))
+    DETAIL_EXCLUDE = set(os.getenv("PDF_FORCE_EXCLUDE_PRODUCTS", "605,611,613,614,617,618,620,622,154,155,156,157,158,206,207,209,210,211").split(","))
     DETAIL_EXCLUDE = {x.strip() for x in DETAIL_EXCLUDE if x.strip()}
 
     def _num(x, default=0.0):
@@ -7352,7 +7553,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if "order_from_open_conv" not in g.columns or pd.to_numeric(g["order_from_open_conv"], errors="coerce").notna().sum() == 0:
             g["order_from_open_conv"] = np.where(g["opens"] > 0, g["orders"] / g["opens"] * 100, np.nan)
         for _cc in ["cart_conv", "order_conv", "order_from_open_conv"]:
-            g[_cc] = pd.to_numeric(g[_cc], errors="coerce").clip(lower=0, upper=100).fillna(0.0)
+            # Missing funnel data is not 0% conversion. Keep NaN so PDF shows "—".
+            g[_cc] = pd.to_numeric(g[_cc], errors="coerce").clip(lower=0, upper=100)
         return g
 
     def _metrics_period(start: pd.Timestamp, end: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
@@ -8171,7 +8373,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # - накопительные ABC 01.MM-факт день не используем;
         # - заказы и сумму заказов берём из Orders;
         # - расход РК — из отчетов по рекламе;
-        # - план = ВП прошлого месяца минус расчетный НДС 7% с учетом СПП.
+        # - план = ВП прошлого месяца в той же методологии; НДС не вычитаем скрыто,
+        #   чтобы верхняя карточка не расходилась с недельной таблицей и WB Dynamics.
         month_start = cur_start.replace(day=1)
 
         title_end = pd.Timestamp(cur_actual_end).normalize()
@@ -8281,26 +8484,16 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             out["allocated_from_overlap"] = True
             return out
 
-        extra_note = "; ВП ABC = недели + дневные без MTD"
-        _start("Текущий месяц", f"{month_start:%d.%m}-{title_end:%d.%m.%Y} / факт и план после НДС 7% с учетом СПП{extra_note}", "Текущий месяц", key="current_month", top_menu=True)
+        extra_note = "; ВП = недели + дневные без MTD"
+        _start("Текущий месяц", f"{month_start:%d.%m}-{title_end:%d.%m.%Y} / факт и план ВП в одной методологии{extra_note}", "Текущий месяц", key="current_month", top_menu=True)
 
         month_days = calendar.monthrange(month_start.year, month_start.month)[1]
         prev_month_df = _metrics_period(closed_start, closed_end, closed_prev_start, closed_prev_end, ["subject_disp"])
 
-        # Base plan before VAT: fact GP of the previous closed month.
+        # Plan is previous closed month GP in the same methodology as current fact.
+        # Do not subtract VAT here: it made the top card negative while weekly rows were positive.
         plan_gp_before_vat = max(0.0, _num(prev_month_df["gp_use"].sum()) if prev_month_df is not None and not prev_month_df.empty else 0.0)
-        prev_month_revenue = max(0.0, _num(prev_month_df["sum_use"].sum()) if prev_month_df is not None and not prev_month_df.empty and "sum_use" in prev_month_df.columns else 0.0)
-
-        # Estimate VAT base using current-month SPP from Orders up to the same cutoff.
-        # If current month has no Orders yet, fallback to previous closed month Orders.
-        spp_rate_for_plan = _orders_spp_rate(month_start, month_fact_end)
-        if pd.isna(spp_rate_for_plan):
-            spp_rate_for_plan = _orders_spp_rate(closed_start, closed_end)
-        if pd.isna(spp_rate_for_plan):
-            spp_rate_for_plan = 0.0
-        vat_base_for_plan = prev_month_revenue * (1.0 - float(spp_rate_for_plan))
-        vat_amount_for_plan = vat_base_for_plan * 7.0 / 107.0 if vat_base_for_plan > 0 else 0.0
-        month_plan = max(0.0, plan_gp_before_vat - vat_amount_for_plan)
+        month_plan = plan_gp_before_vat
 
         elapsed = min((title_end - month_start).days + 1, month_days)
         plan_to_date = month_plan / month_days * elapsed if month_days else 0.0
@@ -8347,17 +8540,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             return total_gp if has_any else 0.0
 
         mtd_gp = _current_month_gp_weekly_daily_total(month_start, title_end)
-        # Compare like with like: plan is after VAT, so fact GP must also be after VAT.
-        # ABC gross profit itself stays pre-VAT; VAT is deducted using Orders buyer amount
-        # (priceWithDisc - SPP = finishedPrice).
-        mtd_vat_amount = _orders_vat_amount(month_start, month_fact_end)
-        mtd_gp_after_vat = mtd_gp - mtd_vat_amount
-        pct_plan = mtd_gp_after_vat / plan_to_date * 100 if plan_to_date else np.nan
+        # Current fact and plan are now shown in one GP methodology.
+        mtd_gp_fact = mtd_gp
+        pct_plan = mtd_gp_fact / plan_to_date * 100 if plan_to_date else np.nan
 
         cards = [
-            (_fmt_money(mtd_gp_after_vat), "ВП после НДС", None, "ВП", ""),
+            (_fmt_money(mtd_gp_fact), "ВП", None, "ВП", ""),
             (_fmt_pct(pct_plan), "% плана на дату", None, "% плана", ""),
-            (_fmt_money(month_plan), "План мес. после НДС", None, "План", ""),
+            (_fmt_money(month_plan), "План мес. ВП", None, "План", ""),
             (_fmt_num(mtd_orders_qty), "Заказы, шт", None, "Заказы", ""),
             (_fmt_money(mtd_order_sum), "Сумма заказов", None, "Сумма", ""),
         ]
@@ -8434,42 +8624,50 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         _draw_table(85, 230, W-170, ["Неделя", "ВП ABC", "Заказы", "Сумма заказов", "Расход РК"], [210,300,190,310,270], rows, row_h=58, font_size=16, max_rows=8)
 
     def _summary_page():
-        _start("Помесячная динамика", f"{closed_start.year} год / итого по 4 категориям", "Годовая динамика", key="summary", top_menu=True)
+        _start("Помесячная динамика", f"{closed_start.year} год / Кисти + Пудры", "Годовая динамика", key="summary", top_menu=True)
+        rows = []
+        month_starts = set()
+        # Use the same PDF contour source as the closed/current month pages, not abc_monthly only.
+        if daily is not None and not daily.empty and "day" in daily.columns:
+            dd = pd.to_datetime(daily["day"], errors="coerce").dropna()
+            for d0 in dd:
+                if int(pd.Timestamp(d0).year) == int(closed_start.year):
+                    month_starts.add(pd.Timestamp(d0).replace(day=1).normalize())
         src = outputs.get("abc_monthly", pd.DataFrame()).copy()
-        rows=[]
         if src is not None and not src.empty and "period_start" in src.columns:
-            src["period_start"] = pd.to_datetime(src["period_start"], errors="coerce").dt.normalize()
-            src = src[src["period_start"].dt.year.eq(int(closed_start.year))].copy()
-            src["subject_disp"] = src.get("subject", "").map(_subject_disp) if "subject" in src.columns else ""
-            src = src[src["subject_disp"].isin(CATEGORY_ORDER)].copy()
-            for col in ["gross_revenue", "gross_profit", "abc_drr_pct"]:
-                if col not in src.columns:
-                    src[col] = 0
-                src[col] = pd.to_numeric(src[col], errors="coerce").fillna(0)
-            src["_ad"] = src["gross_revenue"] * src["abc_drr_pct"] / 100.0
-            # Page 5 is an executive month-over-month summary.
-            # It must show one row per month, without category split.
-            mon = src.groupby(["period_start"], as_index=False).agg(
-                sum_use=("gross_revenue", "sum"),
-                gp_use=("gross_profit", "sum"),
-                ad_spend=("_ad", "sum"),
-            )
-            mon = mon.sort_values("period_start")
-            mon["sum_prev"] = mon["sum_use"].shift(1)
-            mon["gp_prev"] = mon["gp_use"].shift(1)
-            mon["ad_prev"] = mon["ad_spend"].shift(1)
-            mon = mon.sort_values("period_start", ascending=False)
-            for _, r in mon.iterrows():
-                month_name = MONTH_RU.get(int(r["period_start"].month), str(r["period_start"].month)).lower()
-                rows.append({"cells":[
-                    month_name,
-                    (_fmt_money(r.get("sum_use")), _delta_abs(r.get("sum_use"), r.get("sum_prev")), "Сумма"),
-                    (_fmt_money(r.get("gp_use")), _delta_abs(r.get("gp_use"), r.get("gp_prev")), "ВП"),
-                    (_fmt_money(r.get("ad_spend")), _delta_abs(r.get("ad_spend"), r.get("ad_prev")), "Расход РК"),
-                ]})
+            ps = pd.to_datetime(src["period_start"], errors="coerce").dropna()
+            for d0 in ps:
+                if int(pd.Timestamp(d0).year) == int(closed_start.year):
+                    month_starts.add(pd.Timestamp(d0).replace(day=1).normalize())
+        for ms in sorted(month_starts, reverse=True):
+            me = pd.Timestamp(ms).replace(day=calendar.monthrange(ms.year, ms.month)[1]).normalize()
+            if ms.year == cur_actual_end.year and ms.month == cur_actual_end.month:
+                me = min(me, pd.Timestamp(cur_actual_end).normalize())
+            prev_me = ms - pd.Timedelta(days=1)
+            prev_ms = pd.Timestamp(prev_me).replace(day=1).normalize()
+            mon_df = _metrics_period(ms, me, prev_ms, prev_me, ["subject_disp"])
+            if mon_df is None or mon_df.empty:
+                continue
+            sum_use = _num(mon_df.get("sum_use", pd.Series(dtype=float)).sum())
+            gp_use = _num(mon_df.get("gp_use", pd.Series(dtype=float)).sum())
+            ad_spend = _num(mon_df.get("ad_spend", pd.Series(dtype=float)).sum())
+            sum_prev = _num(mon_df.get("sum_prev_use", pd.Series(dtype=float)).sum()) if "sum_prev_use" in mon_df.columns else np.nan
+            gp_prev = _num(mon_df.get("gp_prev_use", pd.Series(dtype=float)).sum()) if "gp_prev_use" in mon_df.columns else np.nan
+            ad_prev = _num(mon_df.get("ad_spend_prev", pd.Series(dtype=float)).sum()) if "ad_spend_prev" in mon_df.columns else np.nan
+            if abs(sum_use) < 1e-9 and abs(gp_use) < 1e-9 and abs(ad_spend) < 1e-9:
+                continue
+            month_name = MONTH_RU.get(int(ms.month), str(ms.month)).lower()
+            if ms.year == cur_actual_end.year and ms.month == cur_actual_end.month:
+                month_name += " (тек.)"
+            rows.append({"cells":[
+                month_name,
+                (_fmt_money(sum_use), _delta_abs(sum_use, sum_prev), "Сумма"),
+                (_fmt_money(gp_use), _delta_abs(gp_use, gp_prev), "ВП"),
+                (_fmt_money(ad_spend), _delta_abs(ad_spend, ad_prev), "Расход РК"),
+            ]})
         if not rows:
             rows=[{"cells":["—","—","—","—"]}]
-        _draw_table(95, 150, W-190, ["Месяц", "Сумма заказов", "ВП", "Расход РК"], [220,390,390,390], rows, row_h=56, font_size=16, max_rows=12)
+        _draw_table(95, 130, W-190, ["Месяц", "Сумма заказов", "ВП", "Расход РК"], [220,390,390,390], rows, row_h=56, font_size=16, max_rows=12)
 
     def _children_for_category(contour: str, cat: str) -> pd.DataFrame:
         info = contours[contour]
@@ -9586,9 +9784,11 @@ def _tg_subject_disp(value: Any) -> str:
     subj = canonical_subject(value)
     mp = {
         "Кисти косметические": "Кисти",
+        "Пудры": "Пудры",
         "Косметические карандаши": "Карандаши",
         "Карандаши": "Карандаши",
         "Кисти": "Кисти",
+        "Пудры": "Пудры",
         "Помады": "Помады",
         "Блески": "Блески",
     }
@@ -9708,6 +9908,7 @@ def _tg_prepare_ads_truth(outputs: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
         if "subject" not in by_subject.columns:
             by_subject["subject"] = by_subject["subject_disp"].map({
                 "Кисти": "Кисти косметические",
+                "Пудры": "Пудры",
                 "Карандаши": "Косметические карандаши",
                 "Помады": "Помады",
                 "Блески": "Блески",
@@ -9781,7 +9982,7 @@ def _tg_prepare_unique_demand(outputs: Dict[str, Any]) -> pd.DataFrame:
         x["subject_disp"] = x["subject"].map(_tg_subject_disp)
     else:
         x["subject_disp"] = ""
-    x = x[x["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+    x = x[x["subject_disp"].isin([_tg_subject_disp(s) for s in TARGET_SUBJECTS])].copy()
     if "unique_search_frequency" not in x.columns:
         x["unique_search_frequency"] = 0.0
     x["unique_search_frequency"] = pd.to_numeric(x["unique_search_frequency"], errors="coerce").fillna(0.0)
@@ -9866,7 +10067,7 @@ def _tg_daily_abc_gross_profit(outputs: Dict[str, Any], day: pd.Timestamp) -> fl
             continue
         if "subject" in x.columns:
             x["subject_disp"] = x["subject"].map(_tg_subject_disp)
-            x = x[x["subject_disp"].isin(["Кисти", "Карандаши", "Помады", "Блески"])].copy()
+            x = x[x["subject_disp"].isin([_tg_subject_disp(s) for s in TARGET_SUBJECTS])].copy()
         frames.append(x)
     if not frames:
         return 0.0
@@ -9878,17 +10079,53 @@ def _tg_daily_abc_gross_profit(outputs: Dict[str, Any], day: pd.Timestamp) -> fl
 
 TELEGRAM_MANAGER_ORDER = ["Влад", "Игорь", "Эмиль", "Юля"]
 
-# FIX66: operational manager ownership overrides. ABC files may still contain old values;
-# Telegram/report manager allocation must use the current business ownership.
+# FIX72: manager ownership is now derived from the latest ABC "Ваша категория".
+# Hard overrides are kept only to protect sources that do not carry manager columns.
 TELEGRAM_MANAGER_OVERRIDE_BY_SUBJECT = {
+    "кисти косметические": "Влад",
+    "кисти": "Влад",
+    "пудры": "Влад",
+    "пудра": "Влад",
+
+    "косметические карандаши": "Игорь",
+    "карандаши": "Игорь",
+    "лаки для ногтей": "Игорь",
+    "гели для бровей": "Игорь",
+    "жидкие подводки": "Игорь",
+    "подводки": "Игорь",
+    "туши": "Игорь",
+    "тени": "Игорь",
+
+    "помады": "Эмиль",
     "блески": "Эмиль",
-    "помады": "Юля",
-    "Блески": "Эмиль",
-    "Помады": "Юля",
+    "тональные кремы": "Эмиль",
+    "корректоры": "Эмиль",
+    "румяна": "Эмиль",
+    "хайлайтеры": "Эмиль",
+    "cc кремы": "Эмиль",
+    "фиксаторы макияжа": "Эмиль",
+    "тинты для губ": "Эмиль",
+    "спонжи": "Эмиль",
+    "сыворотки": "Эмиль",
+    "основы под макияж": "Эмиль",
+    "кремы": "Эмиль",
 }
 TELEGRAM_MANAGER_OVERRIDE_BY_PRODUCT = {
+    # Влад
+    "901": "Влад", "255": "Влад", "261": "Влад", "263": "Влад", "265": "Влад", "269": "Влад",
+    # Игорь
+    "605": "Игорь", "611": "Игорь", "613": "Игорь", "614": "Игорь", "617": "Игорь", "618": "Игорь", "620": "Игорь", "622": "Игорь",
+    "104": "Игорь", "110": "Игорь", "310": "Игорь", "551": "Игорь", "803": "Игорь", "810": "Игорь", "811": "Игорь",
+    "405": "Игорь", "406": "Игорь", "552": "Игорь", "554": "Игорь", "615": "Игорь", "619": "Игорь",
+    "303": "Игорь", "311": "Игорь", "314": "Игорь", "316": "Игорь", "501": "Игорь", "512": "Игорь",
+    # Эмиль
+    "154": "Эмиль", "155": "Эмиль", "156": "Эмиль", "157": "Эмиль", "158": "Эмиль", "206": "Эмиль",
     "207": "Эмиль", "209": "Эмиль", "210": "Эмиль", "211": "Эмиль",
-    "154": "Юля", "155": "Юля", "156": "Юля", "157": "Юля", "158": "Юля", "206": "Юля",
+    "458": "Эмиль", "462": "Эмиль", "463": "Эмиль", "464": "Эмиль", "465": "Эмиль", "468": "Эмиль", "473": "Эмиль", "475": "Эмиль", "477": "Эмиль",
+    "461": "Эмиль", "466": "Эмиль", "471": "Эмиль", "474": "Эмиль", "562": "Эмиль", "563": "Эмиль", "КОРРЕКТОР": "Эмиль",
+    "353": "Эмиль", "354": "Эмиль", "355": "Эмиль", "356": "Эмиль", "357": "Эмиль", "703": "Эмиль",
+    "262": "Эмиль", "268": "Эмиль", "271": "Эмиль", "560": "Эмиль", "702": "Эмиль", "706": "Эмиль",
+    "472": "Эмиль", "573": "Эмиль", "574": "Эмиль", "215": "Эмиль", "902": "Эмиль", "805": "Эмиль", "470": "Эмиль", "806": "Эмиль",
 }
 
 def _tg_product_from_row_columns(frame: pd.DataFrame) -> pd.Series:
@@ -9927,12 +10164,16 @@ def _tg_apply_manager_overrides(df: pd.DataFrame) -> pd.DataFrame:
 
     if "subject" in out.columns:
         subj_key = out["subject"].map(norm_key)
-        # Exact and substring protection: source may contain canonical subject, lower-case
-        # subject, or already-short display value.
-        gloss_mask = subj_key.eq("блески") | subj_key.str.contains(r"\bблеск", na=False)
-        lipstick_mask = subj_key.eq("помады") | subj_key.str.contains(r"\bпомад", na=False)
-        forced.loc[gloss_mask] = "Эмиль"
-        forced.loc[lipstick_mask] = "Юля"
+        for subj_key_value, mgr in TELEGRAM_MANAGER_OVERRIDE_BY_SUBJECT.items():
+            key_norm = norm_key(subj_key_value)
+            if key_norm:
+                forced.loc[subj_key.eq(key_norm)] = mgr
+        # substring protection for common shortened names
+        forced.loc[subj_key.str.contains(r"\bкист", na=False) & forced.eq("")] = "Влад"
+        forced.loc[subj_key.str.contains(r"\bпудр", na=False) & forced.eq("")] = "Влад"
+        forced.loc[subj_key.str.contains(r"\bкарандаш", na=False) & forced.eq("")] = "Игорь"
+        forced.loc[subj_key.str.contains(r"\bпомад", na=False) & forced.eq("")] = "Эмиль"
+        forced.loc[subj_key.str.contains(r"\bблеск", na=False) & forced.eq("")] = "Эмиль"
 
     prod_key = _tg_product_from_row_columns(out)
     if not prod_key.empty:
@@ -10453,11 +10694,10 @@ def build_telegram_manager_daily_summary(outputs: Dict[str, Any]) -> str:
                 mx = active["day"].dropna().max()
                 if pd.notna(mx):
                     day_candidates.append(pd.Timestamp(mx).normalize())
-    target_day = _env_date("REPORT_AS_OF_DATE") or _env_date("REPORT_REQUIRE_DATA_DATE") or _env_date("WB_DAILY_TARGET_DATE")
+    target_day = _env_date("REPORT_MANUAL_TARGET_DATE")
+    if target_day is None and _env_flag("REPORT_KEEP_EXPLICIT_DATE", False):
+        target_day = _env_date("REPORT_AS_OF_DATE") or _env_date("REPORT_REQUIRE_DATA_DATE") or _env_date("WB_DAILY_TARGET_DATE")
     if target_day is not None:
-        # FIX50: Telegram must obey the requested daily date.
-        # Never downgrade from 15.06 to 14.06 just because ABC/search/ads for 15.06
-        # are missing. Missing sources are validated earlier by _require_report_data_available.
         latest = pd.Timestamp(target_day).normalize()
     else:
         if not day_candidates:
@@ -10786,7 +11026,7 @@ def run_smoke_test(root: str = ".") -> None:
 
     # Unique demand for all levels and all days: this prevents strict demand crashes.
     demand_rows = []
-    subj_disp_map = {"Кисти косметические": "Кисти", "Косметические карандаши": "Карандаши", "Помады": "Помады", "Блески": "Блески"}
+    subj_disp_map = {"Кисти косметические": "Кисти", "Пудры": "Пудры", "Косметические карандаши": "Карандаши", "Помады": "Помады", "Блески": "Блески"}
     for _, r in daily.iterrows():
         sf = float(r["search_frequency"])
         common = {"day": r["day"], "subject": r["subject"], "subject_disp": subj_disp_map[r["subject"]], "unique_search_frequency": sf, "unique_search_queries": 3, "duplicate_query_rows_removed": 1, "raw_query_rows": 4}
