@@ -27,6 +27,7 @@
 # FIX64_REPORT_ENV_LOADER_20260626: load credentials from multiline REPORT_ENV before storage init
 # FIX65_TELEGRAM_PREFLIGHT_ALIAS_20260626: normalize Telegram aliases from REPORT_ENV and fail before heavy calculations if --send-telegram cannot send
 
+# FIX73_WEEK_GP_QUALITY_GUARD_20260804: reject incomplete ABC periods; weekly GP never equals one day; missing funnel/search shows dash, not zero
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -7307,6 +7308,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         g["abc_acceptance_per_unit"] = np.where(qty > 0, g["abc_acceptance_amount"] / qty, np.nan)
         g["abc_cost_per_unit"] = np.where(qty > 0, g["abc_cost_amount"] / qty, np.nan)
         g["abc_other_per_unit"] = np.where(qty > 0, g["abc_external_costs_amount"] / qty, np.nan)
+        g = _apply_abc_completeness_guard(g, start, end, keys, "abc_exact")
         return g
 
     def _level_for_keys(keys: List[str]) -> str:
@@ -7318,6 +7320,58 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         if k == ["subject_disp", "product_code", "supplier_article", "nm_id"]:
             return "article"
         return ""
+
+    def _raw_order_sum_by_keys(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
+        """Orders revenue by PDF keys from article_day_fact, used only as an ABC completeness guard."""
+        x = daily[(daily["day"] >= pd.Timestamp(start).normalize()) & (daily["day"] <= pd.Timestamp(end).normalize())].copy()
+        if x.empty:
+            return pd.DataFrame(columns=keys + ["__orders_revenue_guard", "__orders_qty_guard"])
+        for k in keys:
+            if k not in x.columns:
+                x[k] = ""
+        x = _normalize_pdf_merge_keys(x, keys)
+        x["__order_sum_guard_src"] = pd.to_numeric(x.get("order_sum", 0), errors="coerce").fillna(0.0)
+        x["__orders_guard_src"] = pd.to_numeric(x.get("orders", 0), errors="coerce").fillna(0.0)
+        return x.groupby(keys, dropna=False, as_index=False).agg(
+            __orders_revenue_guard=("__order_sum_guard_src", "sum"),
+            __orders_qty_guard=("__orders_guard_src", "sum"),
+        )
+
+    def _apply_abc_completeness_guard(abc_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, keys: List[str], context: str) -> pd.DataFrame:
+        """Reject partial ABC rows for a multi-day period.
+
+        We had a failure where a 7-day PDF block used only Monday ABC rows; the page then
+        showed week/order totals but gross profit from one day. For management reporting
+        this is worse than a model fallback, so if ABC revenue covers too little of Orders
+        revenue for the same key/period, we drop ABC for that key.
+        """
+        if abc_df is None or abc_df.empty:
+            return abc_df
+        start_n = pd.Timestamp(start).normalize(); end_n = pd.Timestamp(end).normalize()
+        period_days = int((end_n - start_n).days) + 1
+        if period_days <= 1:
+            return abc_df
+        min_cov = float(os.getenv("PDF_ABC_MIN_REVENUE_COVERAGE", "0.50"))
+        if min_cov <= 0:
+            return abc_df
+        orders_guard = _raw_order_sum_by_keys(start_n, end_n, keys)
+        if orders_guard is None or orders_guard.empty:
+            return abc_df
+        out = _normalize_pdf_merge_keys(abc_df.copy(), keys)
+        orders_guard = _normalize_pdf_merge_keys(orders_guard, keys)
+        out = out.merge(orders_guard, on=keys, how="left")
+        abc_rev = pd.to_numeric(out.get("revenue_abc", 0), errors="coerce").fillna(0.0).abs()
+        ord_rev = pd.to_numeric(out.get("__orders_revenue_guard", 0), errors="coerce").fillna(0.0).abs()
+        cov = np.where(ord_rev > 0, abc_rev / ord_rev, 1.0)
+        out["__abc_revenue_coverage"] = cov
+        # If orders exist and ABC covers less than threshold, this ABC period is partial/stale.
+        bad = (ord_rev > 0) & (abc_rev > 0) & (out["__abc_revenue_coverage"] < min_cov)
+        if bad.any():
+            bad_count = int(bad.sum())
+            bad_cov = float(pd.to_numeric(out.loc[bad, "__abc_revenue_coverage"], errors="coerce").fillna(0).min())
+            log(f"PDF ABC guard FIX73: rejected {bad_count} partial ABC rows for {context} {start_n.date()}..{end_n.date()}, min_coverage={bad_cov:.2%}, threshold={min_cov:.0%}")
+        out = out.loc[~bad].drop(columns=["__orders_revenue_guard", "__orders_qty_guard", "__abc_revenue_coverage"], errors="ignore")
+        return out
 
     def _unique_demand_period(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
         if search_unique_demand is None or search_unique_demand.empty:
@@ -7536,7 +7590,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 log(msg)
                 g["demand"] = np.nan
         # % поиска = все открытия карточки / Спрос WB.
-        g["search_share"] = np.where(g["demand"] > 0, g["opens"] / g["demand"] * 100, np.nan)
+        # If there are orders but opens are zero, the funnel source is missing, not true zero.
+        _opens_for_share = pd.to_numeric(g.get("opens", 0), errors="coerce").fillna(0.0)
+        _orders_for_share = pd.to_numeric(g.get("orders", 0), errors="coerce").fillna(0.0)
+        _opens_for_share = _opens_for_share.where(~((_orders_for_share > 0) & (_opens_for_share.abs() < 1e-9)), np.nan)
+        g["search_share"] = np.where(g["demand"] > 0, _opens_for_share / g["demand"] * 100, np.nan)
         g["drr_model"] = np.where(g["order_sum"] > 0, g["ad_spend"] / g["order_sum"] * 100, 0.0)
         g["cpc"] = np.where(g["clicks"] > 0, g["ad_spend"] / g["clicks"], np.nan)
         # CTR РК = все клики рекламных кампаний / все показы рекламных кампаний.
@@ -7552,9 +7610,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # Управленческая конверсия в заказ: источник WB funnel, fallback только при отсутствии ставки в воронке.
         if "order_from_open_conv" not in g.columns or pd.to_numeric(g["order_from_open_conv"], errors="coerce").notna().sum() == 0:
             g["order_from_open_conv"] = np.where(g["opens"] > 0, g["orders"] / g["opens"] * 100, np.nan)
+        _orders_for_conv = pd.to_numeric(g.get("orders", 0), errors="coerce").fillna(0.0)
+        _opens_for_conv = pd.to_numeric(g.get("opens", 0), errors="coerce").fillna(0.0)
+        _missing_funnel_mask = (_orders_for_conv > 0) & (_opens_for_conv.abs() < 1e-9)
         for _cc in ["cart_conv", "order_conv", "order_from_open_conv"]:
             # Missing funnel data is not 0% conversion. Keep NaN so PDF shows "—".
             g[_cc] = pd.to_numeric(g[_cc], errors="coerce").clip(lower=0, upper=100)
+            g.loc[_missing_funnel_mask, _cc] = np.nan
         return g
 
     def _metrics_period(start: pd.Timestamp, end: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
@@ -7843,7 +7905,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 x[k] = ""
         x = _normalize_pdf_merge_keys(x, keys)
         x["_abc_ad"] = np.where(x["gross_revenue"] > 0, x["gross_revenue"] * x["abc_drr_pct"] / 100.0, 0.0)
-        return x.groupby(keys, dropna=False, as_index=False).agg(
+        _abc_out = x.groupby(keys, dropna=False, as_index=False).agg(
             gp_abc=("gross_profit", "sum"),
             revenue_abc=("gross_revenue", "sum"),
             abc_ad_spend=("_abc_ad", "sum"),
@@ -7851,6 +7913,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             abc_period_start=("period_start", "min"),
             abc_period_end=("period_end", "max"),
         )
+        _abc_out = _apply_abc_completeness_guard(_abc_out, start_n, end_n, keys, "abc_periods_inside")
+        return _abc_out
 
     cur_cat = _current_week_prev_avg_comparison(
         _metrics_period(cur_start, cur_actual_end, prev_start, prev_start + (cur_actual_end-cur_start), ["subject_disp"]),
@@ -8265,14 +8329,17 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             log(f"PDF WARN: truth daily totals fallback for {pd.Timestamp(start_dt):%d.%m.%Y}-{pd.Timestamp(end_dt):%d.%m.%Y}: {exc}")
             ag = _agg_daily(pd.Timestamp(start_dt), pd.Timestamp(end_dt), ["subject_disp"])
             if ag is None or ag.empty:
-                return {"order_sum": 0.0, "orders": 0.0, "ad_spend": 0.0, "clicks": 0.0, "impressions": 0.0, "demand": 0.0, "opens": 0.0, "drr": 0.0, "cpc": np.nan, "ad_ctr": np.nan, "search_share": np.nan, "source": "fallback"}
+                return {"order_sum": 0.0, "orders": 0.0, "gross_profit_model": 0.0, "ad_spend": 0.0, "clicks": 0.0, "impressions": 0.0, "demand": 0.0, "opens": 0.0, "drr": 0.0, "cpc": np.nan, "ad_ctr": np.nan, "search_share": np.nan, "source": "fallback"}
             order_sum = _num(ag.get("order_sum", pd.Series(dtype=float)).sum())
+            orders_sum = _num(ag.get("orders", pd.Series(dtype=float)).sum())
+            gp_model = _num(ag.get("gp_model", pd.Series(dtype=float)).sum())
             ad_spend = _num(ag.get("ad_spend", pd.Series(dtype=float)).sum())
             clicks = _num(ag.get("clicks", pd.Series(dtype=float)).sum())
             impressions = _num(ag.get("impressions", pd.Series(dtype=float)).sum())
             demand = _num(ag.get("demand", pd.Series(dtype=float)).sum())
             opens = _num(ag.get("opens", pd.Series(dtype=float)).sum())
-            return {"order_sum": order_sum, "orders": _num(ag.get("orders", pd.Series(dtype=float)).sum()), "ad_spend": ad_spend, "clicks": clicks, "impressions": impressions, "demand": demand, "opens": opens, "drr": ad_spend/order_sum*100 if order_sum else 0.0, "cpc": ad_spend/clicks if clicks else np.nan, "ad_ctr": clicks/impressions*100 if impressions else np.nan, "search_share": opens/demand*100 if demand else np.nan, "source": "fallback"}
+            opens_for_share = np.nan if orders_sum > 0 and abs(opens) < 1e-9 else opens
+            return {"order_sum": order_sum, "orders": orders_sum, "gross_profit_model": gp_model, "ad_spend": ad_spend, "clicks": clicks, "impressions": impressions, "demand": demand, "opens": opens, "drr": ad_spend/order_sum*100 if order_sum else 0.0, "cpc": ad_spend/clicks if clicks else np.nan, "ad_ctr": clicks/impressions*100 if impressions else np.nan, "search_share": opens_for_share/demand*100 if demand and not pd.isna(opens_for_share) else np.nan, "source": "fallback"}
     def _current_week_overview():
         top_start = pd.Timestamp(cur_start).normalize()
         top_end = pd.Timestamp(cur_actual_end).normalize()
@@ -8347,7 +8414,7 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             ss = opens/ddemand*100 if demand_known and ddemand else np.nan
             d = ad/osum*100 if osum and ad_known else np.nan
             day_abc = _abc_periods_inside(dt, dt, ["day", "subject_disp"])
-            day_gp = _num(day_abc["gp_abc"].sum()) if day_abc is not None and not day_abc.empty else 0.0
+            day_gp = _num(day_abc["gp_abc"].sum()) if day_abc is not None and not day_abc.empty else _num(cur.get("gross_profit_model"), 0.0)
             # Будущие/пустые дни не показываем как падение на 100%.
             if dt > cur_actual_end or (abs(osum) < 1e-9 and (not ad_known or abs(_num(ad)) < 1e-9) and (not demand_known or abs(_num(ddemand)) < 1e-9) and abs(day_gp) < 1e-9):
                 rows.append({"cells": [dt.strftime("%a %d.%m"), "—", "—", "—", "—", "—", "—"]})
@@ -8533,6 +8600,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     _overlap_gp = _num(_overlap_abc["gp_abc"].sum()) if _overlap_abc is not None and not _overlap_abc.empty else np.nan
                     if not pd.isna(_overlap_gp) and abs(_overlap_gp) > 0.5:
                         _seg_gp = _overlap_gp
+                if pd.isna(_seg_gp) or abs(_seg_gp) <= 0.5:
+                    _seg_gp = _num(_pdf_truth_sum_period(_ws, _we).get("gross_profit_model"), np.nan)
                 if not pd.isna(_seg_gp):
                     total_gp += float(_seg_gp)
                     has_any = True
@@ -8588,6 +8657,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 if not pd.isna(overlap_gp) and abs(overlap_gp) > 0.5:
                     exact_gp = overlap_gp
                     source_note = "overlap"
+            if pd.isna(exact_gp):
+                # Last-resort operational model: better than showing a one-day ABC as the whole week.
+                exact_gp = _num(_pdf_truth_sum_period(ws, we).get("gross_profit_model"), np.nan)
+                source_note = "model" if not pd.isna(exact_gp) else source_note
             wk_orders_qty = _num(wk_orders["orders"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
             wk_sum = _num(wk_orders["order_sum"].sum()) if wk_orders is not None and not wk_orders.empty else 0.0
             wk_ad = _num(_pdf_truth_sum_period(ws, we).get("ad_spend", 0.0))
@@ -8616,6 +8689,8 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     gp_label = "ВПд"
                 elif p.get("source_note") == "overlap":
                     gp_label = "ВП~"
+                elif p.get("source_note") == "model":
+                    gp_label = "ВПм"
                 else:
                     gp_label = "ВП"
                 gp_cell = (_fmt_money(wk_gp_val), _delta_abs(wk_gp_val, prev_week_gp), gp_label)
@@ -9996,6 +10071,7 @@ def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFra
     q = demand_df[(demand_df["day"] >= start) & (demand_df["day"] <= end)].copy() if not demand_df.empty else pd.DataFrame()
     order_sum = float(pd.to_numeric(d.get("order_sum", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
     orders = float(pd.to_numeric(d.get("orders", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
+    gross_profit_model = float(pd.to_numeric(d.get("gross_profit_model", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
     opens = float(pd.to_numeric(d.get("open_cards", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
 
     # Если отдельный truth-source есть, но в нем нет нужной даты, это не 0,
@@ -10031,10 +10107,17 @@ def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFra
         clicks = float(pd.to_numeric(d.get("ad_clicks_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
         impressions = float(pd.to_numeric(d.get("ad_impressions_total", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not d.empty else 0.0
 
+    # If there are orders but funnel openings are zero, it is normally missing funnel data,
+    # not real 0% search capture/conversion. Keep it blank in Telegram/PDF.
+    if orders > 0 and abs(opens) < 1e-9:
+        opens_for_share = np.nan
+    else:
+        opens_for_share = opens
     drr = spend / order_sum * 100.0 if order_sum and not pd.isna(spend) else np.nan
     return {
         "order_sum": order_sum,
         "orders": orders,
+        "gross_profit_model": gross_profit_model,
         "ad_spend": spend,
         "clicks": clicks,
         "impressions": impressions,
@@ -10043,7 +10126,7 @@ def _tg_sum_period(daily: pd.DataFrame, ads: pd.DataFrame, demand_df: pd.DataFra
         "drr": drr,
         "cpc": spend / clicks if clicks and not pd.isna(spend) and not pd.isna(clicks) else np.nan,
         "ad_ctr": clicks / impressions * 100.0 if impressions and not pd.isna(clicks) and not pd.isna(impressions) else np.nan,
-        "search_share": opens / demand * 100.0 if demand and not pd.isna(demand) else np.nan,
+        "search_share": opens_for_share / demand * 100.0 if demand and not pd.isna(demand) and not pd.isna(opens_for_share) else np.nan,
         "ads_missing": ads_missing,
         "demand_missing": demand_missing,
     }
