@@ -17,7 +17,7 @@
 # FIX57_AUTO_WINDOW_MANUAL_BYPASS_20260623: auto schedule window only; manual workflow_dispatch bypasses time guard
 # FIX58_LOCALIZATION_POOL_BY_STOCK_DAY_20260623: localization pool coverage by snapshot date; stale stock snapshots are not carried indefinitely
 # FIX66_REPORT_QUALITY_CORE_PRODUCTS_MANAGERS_20260713: CORE demand=orders80 last90, fixed conversions, all products in category lists, 620/622 included, manager overrides
-# FIX67_VLAD_TARGET_MANAGER_REALLOCATION_20260713: Vlad PDF excludes Помады/Блески; Telegram forces Pomades->Юля and Glosses->Эмиль by subject/product/article before aggregation
+# FIX67_VLAD_TARGET_MANAGER_REALLOCATION_20260713: Vlad PDF excludes Помады/Блески; later FIX74 removes Юля from all manager reports
 # FIX70_MANAGEMENT_DATA_QUALITY_20260730: latest available report date, no VAT subtraction in GP cards, 2-category Vlad PDF, unavailable warehouse localization, month summary from same contour
 # FIX71_GEO_LOCALIZATION_NEWS_BLACKLIST_20260730: localization by order geography clusters; affected WB warehouses default blacklist from current news + manual override
 # FIX68_CORRECT_MAIN_REPORT_FILE_GUARD_20260713: verified this is the management report_runner, not ads manager CLI that requires --ads
@@ -28,6 +28,8 @@
 # FIX65_TELEGRAM_PREFLIGHT_ALIAS_20260626: normalize Telegram aliases from REPORT_ENV and fail before heavy calculations if --send-telegram cannot send
 
 # FIX73_WEEK_GP_QUALITY_GUARD_20260804: reject incomplete ABC periods; weekly GP never equals one day; missing funnel/search shows dash, not zero
+# FIX74_REMOVE_YULIA_FROM_REPORTS_20260804: remove Юлия/Юля from all manager report totals and manager blocks
+# FIX75_OPERATIONAL_FINANCE_NO_ABC_MIX_20260804: PDF finance uses operational article_day_fact by default; ABC no longer overrides current week/month and does not create zero cost cards
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -2885,7 +2887,7 @@ class AnalyticsBuilder:
                 # FIX58: do not carry an old stock snapshot indefinitely.
                 # If the last localization snapshot is stale, PDF should show missing localization
                 # instead of repeating the old percentage and creating fake 0.0% dynamics.
-                max_stale_days = int(os.getenv("WB_LOCALIZATION_MAX_STALE_DAYS", "2"))
+                max_stale_days = int(os.getenv("WB_LOCALIZATION_MAX_STALE_DAYS", "14"))
                 out = pd.merge_asof(
                     out.sort_values("day"),
                     loc.sort_values("day"),
@@ -7048,10 +7050,24 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             "Запусти полный пересчет источников или временно поставь PDF_ALLOW_DEMAND_FALLBACK=1 только для диагностики."
         )
 
-    for col in ["order_sum", "orders", "gross_profit_model", "open_cards", "add_to_cart", "search_frequency", "search_traffic_capture_pct", "direct_localization_pct", "localization_with_replacements_pct", "rating_reviews", "finished_price", "price_with_disc", "spp", "commission_%", "acquiring_%", "logistics_direct", "storage", "other_costs", "cost", "cart_conv_pct", "order_conv_pct"]:
+    # FIX76: do not turn missing ratio/state fields into real zeros.
+    # Localization, funnel conversions and unit economics may be absent for a period;
+    # PDF must render them as blank/diagnostic, not as 0% localization or 0% conversion.
+    _daily_zero_cols = ["order_sum", "orders", "gross_profit_model", "open_cards", "add_to_cart", "search_frequency"]
+    _daily_nullable_cols = [
+        "search_traffic_capture_pct", "direct_localization_pct", "localization_with_replacements_pct",
+        "rating_reviews", "finished_price", "price_with_disc", "spp",
+        "commission_%", "acquiring_%", "logistics_direct", "storage", "other_costs", "cost",
+        "cart_conv_pct", "order_conv_pct", "card_to_order_pct",
+    ]
+    for col in _daily_zero_cols:
         if col not in daily.columns:
             daily[col] = 0.0
-        daily[col] = pd.to_numeric(daily[col], errors="coerce").fillna(0)
+        daily[col] = pd.to_numeric(daily[col], errors="coerce").fillna(0.0)
+    for col in _daily_nullable_cols:
+        if col not in daily.columns:
+            daily[col] = np.nan
+        daily[col] = pd.to_numeric(daily[col], errors="coerce")
     if "ad_spend_total" not in daily.columns:
         daily["ad_spend_total"] = 0.0
         for col in ["manual_spend", "unified_spend", "unknown_spend", "ad_spend_model"]:
@@ -7395,6 +7411,41 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         )
         return g
 
+    def _is_relevant_core_query(query: Any, subject_value: Any = "") -> bool:
+        """FIX75: CORE must be business-relevant, not any query that accidentally got an order.
+
+        WB search exports sometimes attribute orders to unrelated/high-frequency queries
+        (numeric nmIds, underwear/school clothes, unrelated makeup categories). Those rows
+        distort demand, average CORE position and traffic share. We keep only queries that
+        are semantically relevant to the PDF category.
+        """
+        q = normalize_text(query)
+        if not q:
+            return False
+        if re.fullmatch(r"\d{5,}", q):
+            return False
+        bad_tokens = [
+            "трусы", "шорты", "поло", "купальник", "костюм", "сумка", "телефон", "чехол",
+            "школ", "девоч", "массажер", "микроток", "shu", "art-visage", "летуаль",
+            "карандаш для губ", "карандаш коричневый", "точилка", "спонж для макияжа",
+            "румяна для лица", "консилер art", "тени shu",
+        ]
+        if any(t in q for t in bad_tokens):
+            return False
+        subj = _subject_disp(subject_value)
+        if subj == "Кисти":
+            brush_terms = [
+                "кист", "кисточ", "бочонок", "растуш", "контуринг", "скульптор",
+                "тональн", "консилер", "хайлайтер", "румян", "бров", "тен", "подводк",
+                "веерн", "скошенн", "макияж глаз",
+            ]
+            return any(t in q for t in brush_terms)
+        if subj == "Пудры":
+            powder_terms = ["пудр", "powder", "рассыпчат", "компактн", "матир", "banana", "банан"]
+            return any(t in q for t in powder_terms)
+        # For other manager categories keep general cleaning only.
+        return True
+
     def _search_gp80_position_period(start: pd.Timestamp, end: pd.Timestamp, keys: List[str]) -> pd.DataFrame:
         if search_query_gp_position is None or search_query_gp_position.empty:
             return pd.DataFrame()
@@ -7424,8 +7475,12 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 transitions=("transitions", "sum"),
                 avg_position=("avg_position", lambda s: weighted_mean(s, part.loc[s.index, "orders"].fillna(0) + part.loc[s.index, "frequency"].fillna(0) / 1000)),
             )
+            # FIX75: category CORE position also uses only relevant queries with orders.
+            subj_for_group = rec_subject = keyvals[0] if len(keyvals) > 0 else ""
+            q = q[q["search_query"].map(lambda v: _is_relevant_core_query(v, subj_for_group))].copy()
             for _c in ["orders", "frequency", "transitions", "query_gp_est"]:
                 q[_c] = pd.to_numeric(q[_c], errors="coerce").fillna(0.0)
+            q = q[q["orders"] > 0].copy()
             q = q.sort_values(["orders", "frequency", "transitions"], ascending=[False, False, False]).copy()
             total_orders = float(q["orders"].sum())
             if total_orders > 0:
@@ -7539,6 +7594,23 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             other_per_unit=("other_costs", _safe_mean),
             cost_per_unit=("cost", _safe_mean),
         )
+        # FIX76: localization is a stock-state metric, not a daily additive KPI.
+        # For a week/month card use the latest available stock localization inside the period
+        # after as-of carry. Averaging daily rows or replacing missing values by zero
+        # produced false 0% localization.
+        for _src_loc, _dst_loc in [("direct_localization_pct", "localization_direct"), ("localization_with_replacements_pct", "localization")]:
+            if _src_loc in x.columns:
+                _loc = x[keys + ["day", _src_loc]].copy()
+                _loc[_src_loc] = pd.to_numeric(_loc[_src_loc], errors="coerce")
+                _loc = _loc[_loc[_src_loc].notna()].copy()
+                if not _loc.empty:
+                    _loc = _normalize_pdf_merge_keys(_loc.sort_values("day"), keys)
+                    _loc_last = _loc.groupby(keys, dropna=False, as_index=False).tail(1)[keys + [_src_loc]]
+                    _loc_last = _loc_last.rename(columns={_src_loc: f"__latest_{_dst_loc}"})
+                    g = _normalize_pdf_merge_keys(g, keys).merge(_loc_last, on=keys, how="left")
+                    g[_dst_loc] = pd.to_numeric(g[f"__latest_{_dst_loc}"], errors="coerce").combine_first(pd.to_numeric(g.get(_dst_loc), errors="coerce"))
+                    g = g.drop(columns=[f"__latest_{_dst_loc}"], errors="ignore")
+
         g["buyer_price"] = np.where(g["_finished_price_den"] > 0, g["_finished_price_num"] / g["_finished_price_den"], np.nan)
         g["price_with_disc_avg"] = np.where(g["_price_with_disc_den"] > 0, g["_price_with_disc_num"] / g["_price_with_disc_den"], np.nan)
         g["spp"] = np.where(g["_spp_den"] > 0, g["_spp_num"] / g["_spp_den"], np.nan)
@@ -7547,6 +7619,18 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         g["cart_conv"] = np.where(g["_cart_conv_den"] > 0, g["_cart_conv_num"] / g["_cart_conv_den"], np.nan)
         g["order_conv"] = np.where(g["_order_conv_den"] > 0, g["_order_conv_num"] / g["_order_conv_den"], np.nan)
         g["order_from_open_conv"] = np.where(g["_card_to_order_den"] > 0, g["_card_to_order_num"] / g["_card_to_order_den"], np.nan)
+        # FIX76: row-level fallback. Some WB funnel exports provide openings/carts/orders
+        # but leave conversion-rate columns blank or zero. In that case calculate the rate
+        # from the same funnel denominators. Only real absence of the funnel stays NaN.
+        _opens0 = pd.to_numeric(g.get("opens", 0), errors="coerce").fillna(0.0)
+        _carts0 = pd.to_numeric(g.get("carts", 0), errors="coerce").fillna(0.0)
+        _orders0 = pd.to_numeric(g.get("orders", 0), errors="coerce").fillna(0.0)
+        _cart_fb = np.where(_opens0 > 0, _carts0 / _opens0 * 100.0, np.nan)
+        _order_fb = np.where(_carts0 > 0, _orders0 / _carts0 * 100.0, np.nan)
+        _open_order_fb = np.where(_opens0 > 0, _orders0 / _opens0 * 100.0, np.nan)
+        g["cart_conv"] = np.where((pd.to_numeric(g["cart_conv"], errors="coerce").isna() | ((pd.to_numeric(g["cart_conv"], errors="coerce") <= 0) & (_carts0 > 0))) & pd.notna(_cart_fb), _cart_fb, g["cart_conv"])
+        g["order_conv"] = np.where((pd.to_numeric(g["order_conv"], errors="coerce").isna() | ((pd.to_numeric(g["order_conv"], errors="coerce") <= 0) & (_orders0 > 0))) & pd.notna(_order_fb), _order_fb, g["order_conv"])
+        g["order_from_open_conv"] = np.where((pd.to_numeric(g["order_from_open_conv"], errors="coerce").isna() | ((pd.to_numeric(g["order_from_open_conv"], errors="coerce") <= 0) & (_orders0 > 0))) & pd.notna(_open_order_fb), _open_order_fb, g["order_from_open_conv"])
         for _cc in ["cart_conv", "order_conv", "order_from_open_conv"]:
             g[_cc] = pd.to_numeric(g[_cc], errors="coerce").clip(lower=0, upper=100)
         g = g.drop(columns=[c for c in g.columns if c.startswith("_")], errors="ignore")
@@ -7636,11 +7720,30 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         abc_prev = abc_prev.rename(columns={c: c + "_prev_abc" for c in abc_prev.columns if c not in keys})
         out = _normalize_pdf_merge_keys(out, keys).merge(_normalize_pdf_merge_keys(abc_prev, keys), on=keys, how="left")
         # fill numeric values
-        for col in ["order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions", "ad_ctr", "opens", "carts", "demand", "demand_daily_sum", "search_share", "localization_direct", "localization", "rating", "price_sale", "buyer_price", "price_with_disc_avg", "spp", "search_gp80_avg_position", "search_gp80_queries", "search_gp80_gp_share", "search_gp80_gp_est", "commission_pct_model", "acquiring_pct_model", "logistics_per_unit", "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc", "cart_conv", "order_conv", "order_from_open_conv"]:
+        # FIX76: additive fields can default to zero; ratios/state metrics must preserve NaN.
+        # Otherwise missing localization/funnel data is shown as real 0%.
+        _additive_cols = [
+            "order_sum", "orders", "gp_model", "ad_spend", "clicks", "impressions",
+            "opens", "carts", "demand", "demand_daily_sum", "search_gp80_queries", "search_gp80_gp_est",
+        ]
+        _nullable_metric_cols = [
+            "ad_ctr", "search_share", "localization_direct", "localization", "rating",
+            "price_sale", "buyer_price", "price_with_disc_avg", "spp",
+            "search_gp80_avg_position", "search_gp80_gp_share",
+            "commission_pct_model", "acquiring_pct_model", "logistics_per_unit",
+            "storage_per_unit", "other_per_unit", "cost_per_unit", "drr_model", "cpc",
+            "cart_conv", "order_conv", "order_from_open_conv",
+        ]
+        for col in _additive_cols:
             if col not in out.columns: out[col] = 0.0
             if col + "_prev" not in out.columns: out[col + "_prev"] = 0.0
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
             out[col + "_prev"] = pd.to_numeric(out[col + "_prev"], errors="coerce").fillna(0.0)
+        for col in _nullable_metric_cols:
+            if col not in out.columns: out[col] = np.nan
+            if col + "_prev" not in out.columns: out[col + "_prev"] = np.nan
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+            out[col + "_prev"] = pd.to_numeric(out[col + "_prev"], errors="coerce")
         # ABC is source of truth for closed periods when exact ABC exists.
         out["sum_use"] = np.where(pd.to_numeric(out.get("revenue_abc", 0), errors="coerce").fillna(0) > 0, pd.to_numeric(out.get("revenue_abc", 0), errors="coerce").fillna(0), out["order_sum"])
         out["sum_prev_use"] = np.where(pd.to_numeric(out.get("revenue_abc_prev_abc", 0), errors="coerce").fillna(0) > 0, pd.to_numeric(out.get("revenue_abc_prev_abc", 0), errors="coerce").fillna(0), out["order_sum_prev"])
@@ -7656,6 +7759,16 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         out["acquiring_pct_prev"] = np.where(pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", np.nan), errors="coerce").notna(), pd.to_numeric(out.get("abc_acquiring_pct_prev_abc", 0), errors="coerce"), out["acquiring_pct_model_prev"])
         out["has_abc"] = pd.to_numeric(out.get("abc_rows", 0), errors="coerce").fillna(0) > 0
         out["has_abc_prev"] = pd.to_numeric(out.get("abc_rows_prev_abc", 0), errors="coerce").fillna(0) > 0
+
+        # FIX75: управленческий PDF больше не смешивает ABC с оперативным контуром.
+        # ABC в наших выгрузках может быть неполным/MTD/без детализации расходов — из-за этого
+        # на страницах появлялись нули по комиссии/эквайрингу и ВП разных блоков не сходилась.
+        # По умолчанию финансы PDF берутся из article_day_fact/gross_profit_model за тот же период.
+        # Для аварийной сверки старую ABC-логику можно вернуть переменной PDF_USE_ABC_FINANCE=1.
+        _pdf_use_abc_finance = str(os.getenv("PDF_USE_ABC_FINANCE", "0")).strip().lower() in {"1", "true", "yes", "y", "on", "abc"}
+        if not _pdf_use_abc_finance:
+            out["has_abc"] = False
+            out["has_abc_prev"] = False
 
         # ВАЖНО: если есть exact ABC за закрытый период, весь финансовый контур
         # берём из ABC, а не смешиваем ABC-ВП/ДРР с оперативными заказами/рекламой.
@@ -7728,7 +7841,10 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             out[f"{_target}_prev"] = np.where(out["has_abc_prev"] & _prev_val.notna(), _prev_val, pd.to_numeric(out.get(f"{_target}_prev", 0), errors="coerce").fillna(0.0))
 
         for _c in ["commission_pct", "commission_pct_prev", "acquiring_pct", "acquiring_pct_prev", "logistics_per_unit", "logistics_per_unit_prev", "storage_per_unit", "storage_per_unit_prev", "cost_per_unit", "cost_per_unit_prev", "other_per_unit", "other_per_unit_prev"]:
-            out[_c] = pd.to_numeric(out[_c], errors="coerce").fillna(0.0)
+            # FIX76: do not convert absent economics into real 0%.
+            if _c not in out.columns:
+                out[_c] = np.nan
+            out[_c] = pd.to_numeric(out[_c], errors="coerce")
         return out
 
     def _current_week_prev_avg_comparison(current_df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
@@ -8370,11 +8486,16 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                 return None
             return _delta_abs(cur_v, prev_v) if money else _delta(cur_v, prev_v)
 
-        # Weekly gross profit comes from ABC for the exact/contained week; fallback to model only if ABC is absent.
-        week_abc = _abc_periods_inside(top_start, top_end, ["subject_disp"])
-        prev_week_abc = _abc_periods_inside(top_prev_start, top_prev_end, ["subject_disp"])
-        week_gp = _num(week_abc["gp_abc"].sum()) if week_abc is not None and not week_abc.empty else _num(cur_week.get("gross_profit_model"), 0.0)
-        prev_week_gp = _num(prev_week_abc["gp_abc"].sum()) if prev_week_abc is not None and not prev_week_abc.empty else 0.0
+        # FIX75: верхняя карточка ВП должна совпадать с недельным operational contour,
+        # а не с частичным ABC/MTD. Иначе дневная таблица и категория расходятся.
+        if str(os.getenv("PDF_USE_ABC_FINANCE", "0")).strip().lower() in {"1", "true", "yes", "y", "on", "abc"}:
+            week_abc = _abc_periods_inside(top_start, top_end, ["subject_disp"])
+            prev_week_abc = _abc_periods_inside(top_prev_start, top_prev_end, ["subject_disp"])
+            week_gp = _num(week_abc["gp_abc"].sum()) if week_abc is not None and not week_abc.empty else _num(cur_week.get("gross_profit_model"), 0.0)
+            prev_week_gp = _num(prev_week_abc["gp_abc"].sum()) if prev_week_abc is not None and not prev_week_abc.empty else _num(prev_week.get("gross_profit_model"), 0.0)
+        else:
+            week_gp = _num(cur_week.get("gross_profit_model"), 0.0)
+            prev_week_gp = _num(prev_week.get("gross_profit_model"), 0.0)
 
         ads_sub = "нет данных РК" if cur_week.get("ads_missing") else ""
         demand_sub = "нет данных" if cur_week.get("demand_missing") else ""
@@ -8413,8 +8534,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             opens = _num(cur.get("opens"))
             ss = opens/ddemand*100 if demand_known and ddemand else np.nan
             d = ad/osum*100 if osum and ad_known else np.nan
-            day_abc = _abc_periods_inside(dt, dt, ["day", "subject_disp"])
-            day_gp = _num(day_abc["gp_abc"].sum()) if day_abc is not None and not day_abc.empty else _num(cur.get("gross_profit_model"), 0.0)
+            if str(os.getenv("PDF_USE_ABC_FINANCE", "0")).strip().lower() in {"1", "true", "yes", "y", "on", "abc"}:
+                day_abc = _abc_periods_inside(dt, dt, ["day", "subject_disp"])
+                day_gp = _num(day_abc["gp_abc"].sum()) if day_abc is not None and not day_abc.empty else _num(cur.get("gross_profit_model"), 0.0)
+            else:
+                day_gp = _num(cur.get("gross_profit_model"), 0.0)
             # Будущие/пустые дни не показываем как падение на 100%.
             if dt > cur_actual_end or (abs(osum) < 1e-9 and (not ad_known or abs(_num(ad)) < 1e-9) and (not demand_known or abs(_num(ddemand)) < 1e-9) and abs(day_gp) < 1e-9):
                 rows.append({"cells": [dt.strftime("%a %d.%m"), "—", "—", "—", "—", "—", "—"]})
@@ -8574,6 +8698,11 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         # Gross profit from ABC only, but never from cumulative MTD files.
         # Current month = exact weekly ABC + daily ABC for an incomplete week.
         def _current_month_gp_weekly_daily_total(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> float:
+            # FIX75: для текущего месяца используем тот же operational contour, что и
+            # страница текущей недели/category/detail. Нельзя складывать ABC за часть недель
+            # и модель за остальные — это давало разные ВП в разных блоках PDF.
+            if not (str(os.getenv("PDF_USE_ABC_FINANCE", "0")).strip().lower() in {"1", "true", "yes", "y", "on", "abc"}):
+                return _num(_pdf_truth_sum_period(pd.Timestamp(start_dt).normalize(), pd.Timestamp(end_dt).normalize()).get("gross_profit_model"), 0.0)
             total_gp = 0.0
             has_any = False
             _ws = pd.Timestamp(start_dt).normalize()
@@ -8633,10 +8762,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         while ws <= title_end:
             we = min(ws + pd.Timedelta(days=6-int(ws.weekday())), title_end)
             wk_orders = _agg_daily(ws, we, ["subject_disp"])
-            wk_abc = _abc_periods_inside(ws, we, ["subject_disp"], sources=["abc_weekly"])
-            exact_gp = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
-            source_note = "exact" if not pd.isna(exact_gp) else ""
-            if pd.isna(exact_gp):
+            if not (str(os.getenv("PDF_USE_ABC_FINANCE", "0")).strip().lower() in {"1", "true", "yes", "y", "on", "abc"}):
+                exact_gp = _num(_pdf_truth_sum_period(ws, we).get("gross_profit_model"), np.nan)
+                source_note = "operational"
+            else:
+                wk_abc = _abc_periods_inside(ws, we, ["subject_disp"], sources=["abc_weekly"])
+                exact_gp = _num(wk_abc["gp_abc"].sum()) if wk_abc is not None and not wk_abc.empty else np.nan
+                source_note = "exact" if not pd.isna(exact_gp) else ""
+            if str(os.getenv("PDF_USE_ABC_FINANCE", "0")).strip().lower() in {"1", "true", "yes", "y", "on", "abc"} and pd.isna(exact_gp):
                 # Daily ABC fallback for a week that is not closed/uploaded yet.
                 day_frames = []
                 _d = ws
@@ -8691,12 +8824,14 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
                     gp_label = "ВП~"
                 elif p.get("source_note") == "model":
                     gp_label = "ВПм"
+                elif p.get("source_note") == "operational":
+                    gp_label = "ВП"
                 else:
                     gp_label = "ВП"
                 gp_cell = (_fmt_money(wk_gp_val), _delta_abs(wk_gp_val, prev_week_gp), gp_label)
                 prev_week_gp = wk_gp_val
             rows.append({"cells": [f"{ws:%d.%m}-{we:%d.%m}", gp_cell, _fmt_num(p["orders_qty"]), _fmt_money(p["sum"]), _fmt_money(p["ad"])]})
-        _draw_table(85, 230, W-170, ["Неделя", "ВП ABC", "Заказы", "Сумма заказов", "Расход РК"], [210,300,190,310,270], rows, row_h=58, font_size=16, max_rows=8)
+        _draw_table(85, 230, W-170, ["Неделя", "ВП", "Заказы", "Сумма заказов", "Расход РК"], [210,300,190,310,270], rows, row_h=58, font_size=16, max_rows=8)
 
     def _summary_page():
         _start("Помесячная динамика", f"{closed_start.year} год / Кисти + Пудры", "Годовая динамика", key="summary", top_menu=True)
@@ -9182,6 +9317,9 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         x = src[(src["day"] >= pd.Timestamp(start_dt).normalize()) & (src["day"] <= pd.Timestamp(end_dt).normalize())].copy()
         if x.empty:
             return pd.DataFrame(columns=cols)
+        x = x[x["search_query"].map(lambda v: _is_relevant_core_query(v, row.get("subject_disp", row.get("subject", ""))))].copy()
+        if x.empty:
+            return pd.DataFrame(columns=cols)
         for _c in ["frequency", "transitions", "orders", "order_sum", "visibility_pct", "avg_position", "median_position"]:
             if _c not in x.columns:
                 x[_c] = np.nan
@@ -9229,18 +9367,16 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
             frequency=("frequency", "sum"),
             transitions=("transitions", "sum"),
         )
-        q = q[q["search_query"].map(normalize_text).ne("")].copy()
+        q = q[q["search_query"].map(lambda v: normalize_text(v) != "" and _is_relevant_core_query(v, row.get("subject_disp", row.get("subject", ""))))].copy()
         if q.empty:
             return set()
         total_orders = float(q["orders"].sum())
-        if total_orders > 0:
-            q = q.sort_values(["orders", "frequency", "transitions"], ascending=[False, False, False]).copy()
-            q["_cum_before"] = q["orders"].cumsum() - q["orders"]
-            q["_cum_share_before"] = q["_cum_before"] / total_orders * 100.0
-            core = q[q["_cum_share_before"] < 80.0].copy()
-        else:
-            top_n = int(os.getenv("WB_CORE_FALLBACK_TOP_N", "10") or "10")
-            core = q.sort_values(["frequency", "transitions"], ascending=[False, False]).head(top_n).copy()
+        if total_orders <= 0:
+            return set()
+        q = q.sort_values(["orders", "frequency", "transitions"], ascending=[False, False, False]).copy()
+        q["_cum_before"] = q["orders"].cumsum() - q["orders"]
+        q["_cum_share_before"] = q["_cum_before"] / total_orders * 100.0
+        core = q[q["_cum_share_before"] < 80.0].copy()
         return set(core["search_query"].map(normalize_text))
 
     def _search_query_rows_for_article(row: pd.Series, start_dt: pd.Timestamp, end_dt: pd.Timestamp, prev_s: pd.Timestamp, prev_e: pd.Timestamp, max_items: int = 12) -> List[Dict[str, Any]]:
@@ -9253,12 +9389,13 @@ def generate_management_pdf(outputs: Dict[str, pd.DataFrame], path: Path) -> Opt
         cur = _search_query_agg_for_article(row, start_dt, end_dt, aov=aov)
         prev = _search_query_agg_for_article(row, prev_s, prev_e, aov=prev_aov)
         core_names = _core_query_names_for_article(row, end_dt)
-        if core_names:
-            if not cur.empty:
-                cur = cur[cur["search_query"].map(normalize_text).isin(core_names)].copy()
-            if not prev.empty:
-                prev = prev[prev["search_query"].map(normalize_text).isin(core_names)].copy()
         empty_cells = ["Нет данных по CORE-запросам за период", "—", "—", "—", "—", "—", "—", "—", "—"]
+        if not core_names:
+            return [{"cells": empty_cells}]
+        if not cur.empty:
+            cur = cur[cur["search_query"].map(normalize_text).isin(core_names)].copy()
+        if not prev.empty:
+            prev = prev[prev["search_query"].map(normalize_text).isin(core_names)].copy()
         if cur.empty and prev.empty:
             return [{"cells": empty_cells}]
         q = cur.merge(prev, on="search_query", how="left", suffixes=("", "_prev")) if not cur.empty else pd.DataFrame()
@@ -10160,7 +10297,7 @@ def _tg_daily_abc_gross_profit(outputs: Dict[str, Any], day: pd.Timestamp) -> fl
 
 
 
-TELEGRAM_MANAGER_ORDER = ["Влад", "Игорь", "Эмиль", "Юля"]
+TELEGRAM_MANAGER_ORDER = ["Влад", "Игорь", "Эмиль"]
 
 # FIX72: manager ownership is now derived from the latest ABC "Ваша категория".
 # Hard overrides are kept only to protect sources that do not carry manager columns.
@@ -10285,7 +10422,11 @@ def _tg_normalize_manager(value: Any) -> str:
     if low.startswith("эмил"):
         return "Эмиль"
     if low.startswith("юл"):
-        return "Юля"
+        # FIX74: Юлия/Юля полностью исключена из управленческих отчетов.
+        # Старые строки ABC с таким владельцем не должны попадать ни в персональный блок,
+        # ни в общий TOPFACE итог Telegram; их надо перераспределить через актуальные
+        # subject/product overrides или отбросить как вне текущего контура.
+        return ""
     return ""
 
 
