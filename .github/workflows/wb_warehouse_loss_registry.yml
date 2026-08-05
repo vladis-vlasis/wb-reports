@@ -1,6 +1,6 @@
-# Workflow version: TOPFACE_V3_JSON_FIX_20260805_1225
-# Runs: wb_warehouse_loss_registry_TOPFACE_V3_20260805.py
-name: WB Warehouse Loss Registry TOPFACE V3 JSON FIX
+# Workflow version: TOPFACE_V4_TELEGRAM_FIX_20260805_1330
+# Runs: wb_warehouse_loss_registry_TOPFACE_V4_TELEGRAM_FIX_20260805_1330.py
+name: WB Warehouse Loss Registry TOPFACE V4 Telegram Fix
 
 on:
   workflow_dispatch:
@@ -25,6 +25,11 @@ on:
         required: false
         default: "{}"
         type: string
+      resend_current_only:
+        description: "Только повторно отправить готовый Текущий_реестр.xlsx без пересчёта"
+        required: true
+        default: false
+        type: boolean
       send_telegram:
         description: "Отправить Excel в Telegram"
         required: true
@@ -36,7 +41,7 @@ on:
     - cron: "30 16 * * 1"
 
 concurrency:
-  group: wb-warehouse-loss-registry-topface-v3-json-fix
+  group: wb-warehouse-loss-registry-topface-v4-telegram-fix
   cancel-in-progress: false
 
 permissions:
@@ -89,16 +94,17 @@ jobs:
 
       - name: Validate script
         run: |
-          python -m py_compile wb_warehouse_loss_registry_TOPFACE_V3_20260805.py
-          python wb_warehouse_loss_registry_TOPFACE_V3_20260805.py --self-test
+          python -m py_compile wb_warehouse_loss_registry_TOPFACE_V4_TELEGRAM_FIX_20260805_1330.py
+          python wb_warehouse_loss_registry_TOPFACE_V4_TELEGRAM_FIX_20260805_1330.py --self-test
 
-      - name: Build registry and send to Telegram
+      - name: Build registry or resend current file
         shell: bash
         env:
           INPUT_DATE_FROM: ${{ inputs.date_from }}
           INPUT_DATE_TO: ${{ inputs.date_to }}
           INPUT_AGING_THRESHOLD: ${{ inputs.aging_threshold_days }}
           INPUT_INCIDENT_DATES_JSON: ${{ inputs.incident_dates_json }}
+          INPUT_RESEND_CURRENT_ONLY: ${{ inputs.resend_current_only }}
           INPUT_SEND_TELEGRAM: ${{ inputs.send_telegram }}
         run: |
           set -euo pipefail
@@ -107,22 +113,26 @@ jobs:
           DATE_TO="${INPUT_DATE_TO:-}"
           AGING_THRESHOLD="${INPUT_AGING_THRESHOLD:-120}"
           INCIDENT_DATES_JSON="${INPUT_INCIDENT_DATES_JSON:-}"
+          RESEND_CURRENT_ONLY="${INPUT_RESEND_CURRENT_ONLY:-false}"
           SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
 
-          ARGS=(
-            --store TOPFACE
-            --date-from "$DATE_FROM"
-            --aging-threshold-days "$AGING_THRESHOLD"
-          )
+          ARGS=(--store TOPFACE)
 
-          if [[ -n "$DATE_TO" ]]; then
-            ARGS+=(--date-to "$DATE_TO")
-          fi
+          if [[ "$RESEND_CURRENT_ONLY" == "true" ]]; then
+            ARGS+=(--send-current-only)
+          else
+            ARGS+=(
+              --date-from "$DATE_FROM"
+              --aging-threshold-days "$AGING_THRESHOLD"
+            )
 
-          # Пустое значение и {} означают полностью автоматическое определение складов.
-          # Пользовательский JSON передаётся без bash-подстановки с фигурными скобками.
-          if [[ -n "${INCIDENT_DATES_JSON//[[:space:]]/}" && "$INCIDENT_DATES_JSON" != "{}" ]]; then
-            ARGS+=(--incident-dates-json "$INCIDENT_DATES_JSON")
+            if [[ -n "$DATE_TO" ]]; then
+              ARGS+=(--date-to "$DATE_TO")
+            fi
+
+            if [[ -n "${INCIDENT_DATES_JSON//[[:space:]]/}" && "$INCIDENT_DATES_JSON" != "{}" ]]; then
+              ARGS+=(--incident-dates-json "$INCIDENT_DATES_JSON")
+            fi
           fi
 
           if [[ "$SEND_TELEGRAM" != "true" ]]; then
@@ -130,7 +140,7 @@ jobs:
           fi
 
           printf 'Запуск команды:'
-          printf ' %q' python wb_warehouse_loss_registry_TOPFACE_V3_20260805.py "${ARGS[@]}"
+          printf ' %q' python wb_warehouse_loss_registry_TOPFACE_V4_TELEGRAM_FIX_20260805_1330.py "${ARGS[@]}"
           printf '\n'
 
-          python wb_warehouse_loss_registry_TOPFACE_V3_20260805.py "${ARGS[@]}"
+          python wb_warehouse_loss_registry_TOPFACE_V4_TELEGRAM_FIX_20260805_1330.py "${ARGS[@]}"
