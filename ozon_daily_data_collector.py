@@ -52,7 +52,9 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V13_PERFORMANCE_BATCHES_OBJECTS_20260802"
+SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V14_MULTI_STORE_TOPFACE_FINICK_20260805"
+
+ALLOWED_STORES = {"TOPFACE", "FINICK"}
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 OZON_PERFORMANCE_API_BASE = "https://api-performance.ozon.ru"
