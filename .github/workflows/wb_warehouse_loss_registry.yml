@@ -1,0 +1,128 @@
+name: WB Warehouse Loss Registry
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Начало периода, YYYY-MM-DD"
+        required: true
+        default: "2026-01-01"
+        type: string
+      date_to:
+        description: "Конец периода, YYYY-MM-DD. Пусто = текущая дата"
+        required: false
+        default: ""
+        type: string
+      aging_threshold_days:
+        description: "Порог залежалой непроданной партии, дней"
+        required: true
+        default: "120"
+        type: string
+      incident_warehouses:
+        description: "Проблемные склады через запятую"
+        required: true
+        default: "Владимир,Рязань,Котовск,Электросталь"
+        type: string
+      incident_dates_json:
+        description: 'Даты инцидентов JSON, например {"Рязань":"2026-07-30"}'
+        required: false
+        default: "{}"
+        type: string
+      send_telegram:
+        description: "Отправить Excel в Telegram"
+        required: true
+        default: true
+        type: boolean
+
+  # Каждый понедельник в 19:30 МСК = 16:30 UTC.
+  schedule:
+    - cron: "30 16 * * 1"
+
+concurrency:
+  group: wb-warehouse-loss-registry-topface
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-send-registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      TZ: Europe/Moscow
+      WB_STORE: TOPFACE
+
+      WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      WB_FINANCE_KEY_TOPFACE: ${{ secrets.WB_FINANCE_KEY_TOPFACE }}
+
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+
+      # Дополнительный общий секрет KEY=VALUE, если он уже используется в репозитории.
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 pandas openpyxl requests
+
+      - name: Validate script
+        run: |
+          python -m py_compile wb_warehouse_loss_registry_TOPFACE_V2_20260805.py
+          python wb_warehouse_loss_registry_TOPFACE_V2_20260805.py --self-test
+
+      - name: Build registry and send to Telegram
+        shell: bash
+        env:
+          INPUT_DATE_FROM: ${{ inputs.date_from }}
+          INPUT_DATE_TO: ${{ inputs.date_to }}
+          INPUT_AGING_THRESHOLD: ${{ inputs.aging_threshold_days }}
+          INPUT_INCIDENT_WAREHOUSES: ${{ inputs.incident_warehouses }}
+          INPUT_INCIDENT_DATES_JSON: ${{ inputs.incident_dates_json }}
+          INPUT_SEND_TELEGRAM: ${{ inputs.send_telegram }}
+        run: |
+          set -euo pipefail
+
+          DATE_FROM="${INPUT_DATE_FROM:-2026-01-01}"
+          DATE_TO="${INPUT_DATE_TO:-}"
+          AGING_THRESHOLD="${INPUT_AGING_THRESHOLD:-120}"
+          INCIDENT_WAREHOUSES="${INPUT_INCIDENT_WAREHOUSES:-Владимир,Рязань,Котовск,Электросталь}"
+          INCIDENT_DATES_JSON="${INPUT_INCIDENT_DATES_JSON:-{}}"
+          SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
+
+          export WB_INCIDENT_WAREHOUSES="$INCIDENT_WAREHOUSES"
+
+          ARGS=(
+            --store TOPFACE
+            --date-from "$DATE_FROM"
+            --aging-threshold-days "$AGING_THRESHOLD"
+            --incident-dates-json "$INCIDENT_DATES_JSON"
+          )
+
+          if [[ -n "$DATE_TO" ]]; then
+            ARGS+=(--date-to "$DATE_TO")
+          fi
+
+          if [[ "$SEND_TELEGRAM" != "true" ]]; then
+            ARGS+=(--no-telegram)
+          fi
+
+          python wb_warehouse_loss_registry_TOPFACE_V2_20260805.py "${ARGS[@]}"
