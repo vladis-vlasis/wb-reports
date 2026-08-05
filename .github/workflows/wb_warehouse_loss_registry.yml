@@ -1,4 +1,6 @@
-name: WB Warehouse Loss Registry
+# Workflow version: TOPFACE_V3_20260805_1218
+# Runs: wb_warehouse_loss_registry_TOPFACE_V3_20260805.py
+name: WB Warehouse Loss Registry TOPFACE V3
 
 on:
   workflow_dispatch:
@@ -18,13 +20,8 @@ on:
         required: true
         default: "120"
         type: string
-      incident_warehouses:
-        description: "Проблемные склады через запятую"
-        required: true
-        default: "Владимир,Рязань,Котовск,Электросталь"
-        type: string
       incident_dates_json:
-        description: 'Даты инцидентов JSON, например {"Рязань":"2026-07-30"}'
+        description: 'Ручная корректировка дат, необязательно. Например {"Рязань":"2026-07-30"}'
         required: false
         default: "{}"
         type: string
@@ -39,7 +36,7 @@ on:
     - cron: "30 16 * * 1"
 
 concurrency:
-  group: wb-warehouse-loss-registry-topface
+  group: wb-warehouse-loss-registry-topface-v3
   cancel-in-progress: false
 
 permissions:
@@ -66,8 +63,15 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
 
-      # Дополнительный общий секрет KEY=VALUE, если он уже используется в репозитории.
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
+
+      # Пороговые значения автоматического поиска остановившихся складов.
+      WB_SHUTDOWN_CONFIRM_DAYS: "3"
+      WB_MIN_ACTIVE_ORDER_DAYS: "2"
+      WB_MIN_ACTIVE_ORDERS: "5"
+      WB_INCIDENT_DETECTION_LOOKBACK_DAYS: "14"
+      WB_MIN_ACTIVE_BARCODES: "3"
+      WB_MIN_STOCK_AT_STOP: "10"
 
     steps:
       - name: Checkout repository
@@ -86,8 +90,8 @@ jobs:
 
       - name: Validate script
         run: |
-          python -m py_compile wb_warehouse_loss_registry_TOPFACE_V2_20260805.py
-          python wb_warehouse_loss_registry_TOPFACE_V2_20260805.py --self-test
+          python -m py_compile wb_warehouse_loss_registry_TOPFACE_V3_20260805.py
+          python wb_warehouse_loss_registry_TOPFACE_V3_20260805.py --self-test
 
       - name: Build registry and send to Telegram
         shell: bash
@@ -95,7 +99,6 @@ jobs:
           INPUT_DATE_FROM: ${{ inputs.date_from }}
           INPUT_DATE_TO: ${{ inputs.date_to }}
           INPUT_AGING_THRESHOLD: ${{ inputs.aging_threshold_days }}
-          INPUT_INCIDENT_WAREHOUSES: ${{ inputs.incident_warehouses }}
           INPUT_INCIDENT_DATES_JSON: ${{ inputs.incident_dates_json }}
           INPUT_SEND_TELEGRAM: ${{ inputs.send_telegram }}
         run: |
@@ -104,11 +107,8 @@ jobs:
           DATE_FROM="${INPUT_DATE_FROM:-2026-01-01}"
           DATE_TO="${INPUT_DATE_TO:-}"
           AGING_THRESHOLD="${INPUT_AGING_THRESHOLD:-120}"
-          INCIDENT_WAREHOUSES="${INPUT_INCIDENT_WAREHOUSES:-Владимир,Рязань,Котовск,Электросталь}"
           INCIDENT_DATES_JSON="${INPUT_INCIDENT_DATES_JSON:-{}}"
           SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
-
-          export WB_INCIDENT_WAREHOUSES="$INCIDENT_WAREHOUSES"
 
           ARGS=(
             --store TOPFACE
@@ -125,4 +125,4 @@ jobs:
             ARGS+=(--no-telegram)
           fi
 
-          python wb_warehouse_loss_registry_TOPFACE_V2_20260805.py "${ARGS[@]}"
+          python wb_warehouse_loss_registry_TOPFACE_V3_20260805.py "${ARGS[@]}"
