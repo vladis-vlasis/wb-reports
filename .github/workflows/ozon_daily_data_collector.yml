@@ -1,41 +1,98 @@
-name: Ozon FBO — сбор данных v14 Multi Store Performance
+name: Ozon FBO — сбор данных v15 Multi Store
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "test — 1 день; daily — последние 90 дней; archive — ZIP строго 1 выбранного дня"
+        description: "test — 1 день; daily — вчера + ремонт; history — дозагрузка 60 дней; archive — ZIP за 1 день"
         required: true
         type: choice
         default: test
         options:
           - test
           - daily
+          - history
           - archive
       target_date:
-        description: "YYYY-MM-DD. Пусто: после 15:00 МСК вчера, до 15:00 МСК позавчера"
+        description: "YYYY-MM-DD. Пусто — всегда предыдущий календарный день по Москве"
         required: false
         type: string
       store:
         description: "Магазин"
         required: true
         type: choice
-        default: TOPFACE
+        default: FINICK
         options:
           - TOPFACE
           - FINICK
+          - ALL
+      repair_days_per_run:
+        description: "Сколько старых пропущенных дней догружать в daily"
+        required: false
+        type: string
+        default: "5"
 
   schedule:
-    - cron: "20 12 * * *" # ежедневно 15:20 МСК; режим daily
-
-concurrency:
-  group: ozon-fbo-data-${{ github.event.inputs.store || 'TOPFACE' }}
-  cancel-in-progress: false
+    # 01:20 МСК — предварительный EARLY-снимок за вчера.
+    - cron: "20 22 * * *"
+    # 15:20 МСК — повторный FINAL-снимок за тот же вчерашний день.
+    - cron: "20 12 * * *"
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      stores: ${{ steps.matrix.outputs.stores }}
+      mode: ${{ steps.matrix.outputs.mode }}
+      target_date: ${{ steps.matrix.outputs.target_date }}
+      repair_days: ${{ steps.matrix.outputs.repair_days }}
+    steps:
+      - name: Prepare matrix
+        id: matrix
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_STORE: ${{ github.event.inputs.store }}
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+          INPUT_TARGET_DATE: ${{ github.event.inputs.target_date }}
+          INPUT_REPAIR_DAYS: ${{ github.event.inputs.repair_days_per_run }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+
+          event_name = os.getenv("EVENT_NAME", "")
+          selected_store = (os.getenv("INPUT_STORE", "") or "ALL").upper()
+          mode = os.getenv("INPUT_MODE", "") or "daily"
+          target_date = os.getenv("INPUT_TARGET_DATE", "") or ""
+          repair_days = os.getenv("INPUT_REPAIR_DAYS", "") or "5"
+
+          if event_name == "schedule" or selected_store == "ALL":
+              stores = ["TOPFACE", "FINICK"]
+          else:
+              stores = [selected_store]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write("stores=" + json.dumps(stores, ensure_ascii=False) + "\n")
+              fh.write(f"mode={mode}\n")
+              fh.write(f"target_date={target_date}\n")
+              fh.write(f"repair_days={repair_days}\n")
+          PY
+
   collect:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        store: ${{ fromJSON(needs.prepare.outputs.stores) }}
+
     runs-on: ubuntu-latest
     timeout-minutes: 240
+
+    concurrency:
+      group: ozon-fbo-data-v15-${{ matrix.store }}
+      cancel-in-progress: false
 
     env:
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
@@ -44,18 +101,20 @@ jobs:
       YC_BUCKET_NAME: ozon-assist
       YC_ENDPOINT_URL: https://storage.yandexcloud.net
 
-      OZON_MODE: ${{ github.event_name == 'schedule' && 'daily' || github.event.inputs.mode }}
-      OZON_TARGET_DATE: ${{ github.event.inputs.target_date }}
-      OZON_STORE: ${{ github.event.inputs.store || 'TOPFACE' }}
+      OZON_MODE: ${{ needs.prepare.outputs.mode }}
+      OZON_TARGET_DATE: ${{ needs.prepare.outputs.target_date }}
+      OZON_REPAIR_DAYS_PER_RUN: ${{ needs.prepare.outputs.repair_days }}
+      OZON_STORE: ${{ matrix.store }}
 
       OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
       OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
       OZON_CLIENT_ID_FINICK: ${{ secrets.OZON_CLIENT_ID_FINICK }}
       OZON_API_KEY_FINICK: ${{ secrets.OZON_API_KEY_FINICK }}
-      OZON_PERFORMANCE_CLIENT_ID_FINICK: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_FINICK }}
-      OZON_PERFORMANCE_CLIENT_SECRET_FINICK: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_FINICK }}
+
       OZON_PERFORMANCE_CLIENT_ID_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_TOPFACE }}
       OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE }}
+      OZON_PERFORMANCE_CLIENT_ID_FINICK: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_FINICK }}
+      OZON_PERFORMANCE_CLIENT_SECRET_FINICK: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_FINICK }}
 
       PYTHONUNBUFFERED: "1"
       TZ: "Europe/Moscow"
@@ -81,11 +140,15 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import os
+
           allowed = {
               "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY",
               "OZON_CLIENT_ID_TOPFACE", "OZON_API_KEY_TOPFACE",
+              "OZON_CLIENT_ID_FINICK", "OZON_API_KEY_FINICK",
               "OZON_PERFORMANCE_CLIENT_ID_TOPFACE",
               "OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE",
+              "OZON_PERFORMANCE_CLIENT_ID_FINICK",
+              "OZON_PERFORMANCE_CLIENT_SECRET_FINICK",
           }
           parsed = {}
           for raw in (os.getenv("REPORT_ENV", "") or "").splitlines():
@@ -101,26 +164,38 @@ jobs:
               value = value.strip().strip('"').strip("'")
               if key in allowed and value:
                   parsed[key] = value
+
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
-              for key in allowed:
+              for key in sorted(allowed):
                   value = os.getenv(key) or parsed.get(key)
                   if value:
                       fh.write(f"{key}={value}\n")
           PY
 
-      - name: Verify secrets
+      - name: Verify secrets for selected store
         run: |
           set -euo pipefail
           python - <<'PY'
           import os
+
+          store = os.environ["OZON_STORE"]
           required = [
-              "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY",
-              "OZON_CLIENT_ID_TOPFACE", "OZON_API_KEY_TOPFACE",
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              f"OZON_CLIENT_ID_{store}",
+              f"OZON_API_KEY_{store}",
           ]
-          missing = [x for x in required if not os.getenv(x)]
+          missing = [name for name in required if not os.getenv(name)]
           if missing:
               raise SystemExit("Missing secrets: " + ", ".join(missing))
-          print("Required secrets are present")
+
+          perf_id = os.getenv(f"OZON_PERFORMANCE_CLIENT_ID_{store}")
+          perf_secret = os.getenv(f"OZON_PERFORMANCE_CLIENT_SECRET_{store}")
+          if bool(perf_id) != bool(perf_secret):
+              raise SystemExit(
+                  "Performance secrets must be set as a pair for " + store
+              )
+          print("Required secrets are present for", store)
           PY
 
       - name: Validate code
@@ -129,7 +204,11 @@ jobs:
       - name: Run collector
         run: |
           set -euo pipefail
-          ARGS=(--mode "$OZON_MODE" --store "$OZON_STORE")
+          ARGS=(
+            --mode "$OZON_MODE"
+            --store "$OZON_STORE"
+            --repair-days-per-run "$OZON_REPAIR_DAYS_PER_RUN"
+          )
           if [[ -n "${OZON_TARGET_DATE:-}" ]]; then
             ARGS+=(--target-date "$OZON_TARGET_DATE")
           fi
@@ -139,7 +218,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-v14-failure-${{ github.run_id }}
-          path: output_ozon_v1/
+          name: ozon-data-collector-v15-failure-${{ matrix.store }}-${{ github.run_id }}
+          path: output_ozon_v15/
           if-no-files-found: ignore
           retention-days: 7
