@@ -1,6 +1,6 @@
-# Workflow version: TOPFACE_V3_20260805_1218
+# Workflow version: TOPFACE_V3_JSON_FIX_20260805_1225
 # Runs: wb_warehouse_loss_registry_TOPFACE_V3_20260805.py
-name: WB Warehouse Loss Registry TOPFACE V3
+name: WB Warehouse Loss Registry TOPFACE V3 JSON FIX
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ on:
         default: "120"
         type: string
       incident_dates_json:
-        description: 'Ручная корректировка дат, необязательно. Например {"Рязань":"2026-07-30"}'
+        description: 'Необязательная ручная корректировка дат. Обычно оставить {}'
         required: false
         default: "{}"
         type: string
@@ -36,7 +36,7 @@ on:
     - cron: "30 16 * * 1"
 
 concurrency:
-  group: wb-warehouse-loss-registry-topface-v3
+  group: wb-warehouse-loss-registry-topface-v3-json-fix
   cancel-in-progress: false
 
 permissions:
@@ -65,7 +65,6 @@ jobs:
 
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
 
-      # Пороговые значения автоматического поиска остановившихся складов.
       WB_SHUTDOWN_CONFIRM_DAYS: "3"
       WB_MIN_ACTIVE_ORDER_DAYS: "2"
       WB_MIN_ACTIVE_ORDERS: "5"
@@ -107,22 +106,31 @@ jobs:
           DATE_FROM="${INPUT_DATE_FROM:-2026-01-01}"
           DATE_TO="${INPUT_DATE_TO:-}"
           AGING_THRESHOLD="${INPUT_AGING_THRESHOLD:-120}"
-          INCIDENT_DATES_JSON="${INPUT_INCIDENT_DATES_JSON:-{}}"
+          INCIDENT_DATES_JSON="${INPUT_INCIDENT_DATES_JSON:-}"
           SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
 
           ARGS=(
             --store TOPFACE
             --date-from "$DATE_FROM"
             --aging-threshold-days "$AGING_THRESHOLD"
-            --incident-dates-json "$INCIDENT_DATES_JSON"
           )
 
           if [[ -n "$DATE_TO" ]]; then
             ARGS+=(--date-to "$DATE_TO")
           fi
 
+          # Пустое значение и {} означают полностью автоматическое определение складов.
+          # Пользовательский JSON передаётся без bash-подстановки с фигурными скобками.
+          if [[ -n "${INCIDENT_DATES_JSON//[[:space:]]/}" && "$INCIDENT_DATES_JSON" != "{}" ]]; then
+            ARGS+=(--incident-dates-json "$INCIDENT_DATES_JSON")
+          fi
+
           if [[ "$SEND_TELEGRAM" != "true" ]]; then
             ARGS+=(--no-telegram)
           fi
+
+          printf 'Запуск команды:'
+          printf ' %q' python wb_warehouse_loss_registry_TOPFACE_V3_20260805.py "${ARGS[@]}"
+          printf '\n'
 
           python wb_warehouse_loss_registry_TOPFACE_V3_20260805.py "${ARGS[@]}"
