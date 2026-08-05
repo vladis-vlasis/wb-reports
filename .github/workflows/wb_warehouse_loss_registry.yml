@@ -1,6 +1,6 @@
-# Workflow version: TOPFACE_V4_TELEGRAM_FIX_20260805_1330
+# Workflow version: TOPFACE_V4_TG_ALWAYS_ON_20260805_1455
 # Runs: wb_warehouse_loss_registry_TOPFACE_V4_TELEGRAM_FIX_20260805_1330.py
-name: WB Warehouse Loss Registry TOPFACE V4 Telegram Fix
+name: WB Warehouse Loss Registry TOPFACE V4 TG Always On
 
 on:
   workflow_dispatch:
@@ -30,18 +30,13 @@ on:
         required: true
         default: false
         type: boolean
-      send_telegram:
-        description: "Отправить Excel в Telegram"
-        required: true
-        default: true
-        type: boolean
 
   # Каждый понедельник в 19:30 МСК = 16:30 UTC.
   schedule:
     - cron: "30 16 * * 1"
 
 concurrency:
-  group: wb-warehouse-loss-registry-topface-v4-telegram-fix
+  group: wb-warehouse-loss-registry-topface-v4-tg-always-on
   cancel-in-progress: false
 
 permissions:
@@ -105,7 +100,6 @@ jobs:
           INPUT_AGING_THRESHOLD: ${{ inputs.aging_threshold_days }}
           INPUT_INCIDENT_DATES_JSON: ${{ inputs.incident_dates_json }}
           INPUT_RESEND_CURRENT_ONLY: ${{ inputs.resend_current_only }}
-          INPUT_SEND_TELEGRAM: ${{ inputs.send_telegram }}
         run: |
           set -euo pipefail
 
@@ -114,7 +108,6 @@ jobs:
           AGING_THRESHOLD="${INPUT_AGING_THRESHOLD:-120}"
           INCIDENT_DATES_JSON="${INPUT_INCIDENT_DATES_JSON:-}"
           RESEND_CURRENT_ONLY="${INPUT_RESEND_CURRENT_ONLY:-false}"
-          SEND_TELEGRAM="${INPUT_SEND_TELEGRAM:-true}"
 
           ARGS=(--store TOPFACE)
 
@@ -135,10 +128,7 @@ jobs:
             fi
           fi
 
-          if [[ "$SEND_TELEGRAM" != "true" ]]; then
-            ARGS+=(--no-telegram)
-          fi
-
+          # Telegram всегда включён: --no-telegram намеренно не используется.
           printf 'Запуск команды:'
           printf ' %q' python wb_warehouse_loss_registry_TOPFACE_V4_TELEGRAM_FIX_20260805_1330.py "${ARGS[@]}"
           printf '\n'
