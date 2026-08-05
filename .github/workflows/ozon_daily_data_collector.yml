@@ -1,4 +1,4 @@
-name: Ozon FBO — сбор данных v13 Performance batches
+name: Ozon FBO — сбор данных v14 Multi Store Performance
 
 on:
   workflow_dispatch:
@@ -23,6 +23,7 @@ on:
         default: TOPFACE
         options:
           - TOPFACE
+          - FINICK
 
   schedule:
     - cron: "20 12 * * *" # ежедневно 15:20 МСК; режим daily
@@ -49,6 +50,10 @@ jobs:
 
       OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
       OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
+      OZON_CLIENT_ID_FINICK: ${{ secrets.OZON_CLIENT_ID_FINICK }}
+      OZON_API_KEY_FINICK: ${{ secrets.OZON_API_KEY_FINICK }}
+      OZON_PERFORMANCE_CLIENT_ID_FINICK: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_FINICK }}
+      OZON_PERFORMANCE_CLIENT_SECRET_FINICK: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_FINICK }}
       OZON_PERFORMANCE_CLIENT_ID_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_ID_TOPFACE }}
       OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE: ${{ secrets.OZON_PERFORMANCE_CLIENT_SECRET_TOPFACE }}
 
@@ -134,7 +139,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-v13-failure-${{ github.run_id }}
+          name: ozon-data-collector-v14-failure-${{ github.run_id }}
           path: output_ozon_v1/
           if-no-files-found: ignore
           retention-days: 7
