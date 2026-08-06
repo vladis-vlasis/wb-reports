@@ -1,10 +1,10 @@
-name: Ozon FBO — сбор данных v16 Basic Premium
+name: Ozon FBO — сбор данных v17 Integrity Repair
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "test — 1 день; daily — вчера + ремонт; history — дозагрузка 60 дней; archive — ZIP за 1 день; archive_all — один ZIP со всеми накопленными файлами"
+        description: "test — 1 день; daily — вчера + ремонт; history — пересборка изменённых схем и дозагрузка 60 дней; archive — ZIP за 1 день; archive_all — один ZIP со всеми накопленными файлами"
         required: true
         type: choice
         default: test
@@ -94,7 +94,7 @@ jobs:
     timeout-minutes: 240
 
     concurrency:
-      group: ozon-fbo-data-v16-${{ matrix.store }}
+      group: ozon-fbo-data-v17-${{ matrix.store }}
       cancel-in-progress: false
 
     env:
@@ -221,7 +221,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ozon-reports-archive-${{ matrix.store }}-${{ github.run_id }}
-          path: output_ozon_v16/**/*.zip
+          path: output_ozon_v17/**/*.zip
           if-no-files-found: error
           retention-days: 14
 
@@ -229,7 +229,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-v16-failure-${{ matrix.store }}-${{ github.run_id }}
-          path: output_ozon_v16/
+          name: ozon-data-collector-v17-failure-${{ matrix.store }}-${{ github.run_id }}
+          path: output_ozon_v17/
           if-no-files-found: ignore
           retention-days: 7
