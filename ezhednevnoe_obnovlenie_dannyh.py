@@ -11,7 +11,7 @@
 Поисковые запросы: загружается целевая дата по правилу времени запуска.
 Реклама: в ежедневном режиме получает статистику только за целевую дату и объединяет её с существующей историей.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
-Для TOPFACE/MISSTAIS используются основные WB-токены, для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS.
+Для TOPFACE/MISSTAIS используются основные WB-токены, для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB.
 """
 
 import os
@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-07-27_v35_RETRY_AFTER_15_MARKER_TARGET_DATE"
+SCRIPT_VERSION = "2026-08-06_v36_FINICK"
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -2178,6 +2178,7 @@ class WildberriesDailyUpdater:
 STORE_SECRET_ENV = {
     'TOPFACE': 'WB_PROMO_KEY_TOPFACE',
     'MISSTAIS': 'WB_KEY_MISSTAIS',
+    'FINICK': 'FINICK_API_WB',
 }
 
 # Новый финансовый API с 15 июля требует токен категории Finance.
@@ -2185,6 +2186,7 @@ STORE_SECRET_ENV = {
 STORE_FINANCE_SECRET_ENV = {
     'TOPFACE': 'WB_FINANCE_KEY_TOPFACE',
     'MISSTAIS': 'WB_FINANCE_KEY_MISSTAIS',
+    'FINICK': 'FINICK_API_WB',
 }
 
 STORE_ALIASES = {
@@ -2195,6 +2197,7 @@ STORE_ALIASES = {
     'MISS_TAIS': 'MISSTAIS',
     'MISS-TAIS': 'MISSTAIS',
     'MT': 'MISSTAIS',
+    'FINICK': 'FINICK',
     'ALL': 'ALL',
 }
 
@@ -2236,7 +2239,10 @@ def build_api_keys_for_stores(stores: List[str]) -> Dict[str, Dict[str, str]]:
         finance_secret_env = STORE_FINANCE_SECRET_ENV.get(store)
         finance_key_value = os.environ.get(finance_secret_env or '', '').strip() if finance_secret_env else ''
         if finance_key_value:
-            print(f"✅ Для {store} используется отдельный finance-token: {finance_secret_env}")
+            if finance_secret_env == secret_env:
+                print(f"✅ Для {store} основной токен {secret_env} используется для всех отчётов, включая Finance")
+            else:
+                print(f"✅ Для {store} используется отдельный finance-token: {finance_secret_env}")
         else:
             finance_key_value = key_value
             print(f"⚠️ Для {store} отдельный finance-token не задан, используем основной токен {secret_env}. "
@@ -2302,17 +2308,17 @@ def run_specific_report(updater: WildberriesDailyUpdater, store: str):
             print("Ошибка: введите число.")
 
 def main():
-    """Основная функция запуска с поддержкой меню и магазинов TOPFACE/MISSTAIS/ALL."""
+    """Основная функция запуска с поддержкой меню и магазинов TOPFACE/MISSTAIS/FINICK/ALL."""
     parser = argparse.ArgumentParser(description='Wildberries Daily Updater')
     parser.add_argument('--full', action='store_true', help='Полное ежедневное обновление (все отчёты)')
     parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords'],
                         help='Обновить конкретный отчёт')
-    parser.add_argument('--store', type=str, default='TOPFACE', help='Магазин: TOPFACE, MISSTAIS или ALL')
+    parser.add_argument('--store', type=str, default='TOPFACE', help='Магазин: TOPFACE, MISSTAIS, FINICK или ALL')
 
     args = parser.parse_args()
 
     store_arg = normalize_store_name(args.store)
-    stores = ['TOPFACE', 'MISSTAIS'] if store_arg == 'ALL' else [store_arg]
+    stores = list(STORE_SECRET_ENV.keys()) if store_arg == 'ALL' else [store_arg]
 
     required_env = [
         'YC_ACCESS_KEY_ID',
