@@ -1,10 +1,10 @@
-name: Ozon FBO — сбор данных v15 Multi Store
+name: Ozon FBO — сбор данных v16 Basic Premium
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "test — 1 день; daily — вчера + ремонт; history — дозагрузка 60 дней; archive — ZIP за 1 день"
+        description: "test — 1 день; daily — вчера + ремонт; history — дозагрузка 60 дней; archive — ZIP за 1 день; archive_all — один ZIP со всеми накопленными файлами"
         required: true
         type: choice
         default: test
@@ -13,6 +13,7 @@ on:
           - daily
           - history
           - archive
+          - archive_all
       target_date:
         description: "YYYY-MM-DD. Пусто — всегда предыдущий календарный день по Москве"
         required: false
@@ -68,7 +69,9 @@ jobs:
           target_date = os.getenv("INPUT_TARGET_DATE", "") or ""
           repair_days = os.getenv("INPUT_REPAIR_DAYS", "") or "5"
 
-          if event_name == "schedule" or selected_store == "ALL":
+          if mode == "archive_all":
+              stores = ["ALL" if selected_store == "ALL" else selected_store]
+          elif event_name == "schedule" or selected_store == "ALL":
               stores = ["TOPFACE", "FINICK"]
           else:
               stores = [selected_store]
@@ -91,7 +94,7 @@ jobs:
     timeout-minutes: 240
 
     concurrency:
-      group: ozon-fbo-data-v15-${{ matrix.store }}
+      group: ozon-fbo-data-v16-${{ matrix.store }}
       cancel-in-progress: false
 
     env:
@@ -179,23 +182,22 @@ jobs:
           import os
 
           store = os.environ["OZON_STORE"]
-          required = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              f"OZON_CLIENT_ID_{store}",
-              f"OZON_API_KEY_{store}",
-          ]
+          mode = os.environ["OZON_MODE"]
+          required = ["YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY"]
+          if mode != "archive_all":
+              required.extend([f"OZON_CLIENT_ID_{store}", f"OZON_API_KEY_{store}"])
           missing = [name for name in required if not os.getenv(name)]
           if missing:
               raise SystemExit("Missing secrets: " + ", ".join(missing))
 
-          perf_id = os.getenv(f"OZON_PERFORMANCE_CLIENT_ID_{store}")
-          perf_secret = os.getenv(f"OZON_PERFORMANCE_CLIENT_SECRET_{store}")
-          if bool(perf_id) != bool(perf_secret):
-              raise SystemExit(
-                  "Performance secrets must be set as a pair for " + store
-              )
-          print("Required secrets are present for", store)
+          if mode != "archive_all":
+              perf_id = os.getenv(f"OZON_PERFORMANCE_CLIENT_ID_{store}")
+              perf_secret = os.getenv(f"OZON_PERFORMANCE_CLIENT_SECRET_{store}")
+              if bool(perf_id) != bool(perf_secret):
+                  raise SystemExit(
+                      "Performance secrets must be set as a pair for " + store
+                  )
+          print("Required secrets are present for", store, "mode", mode)
           PY
 
       - name: Validate code
@@ -214,11 +216,20 @@ jobs:
           fi
           python ozon_daily_data_collector.py "${ARGS[@]}"
 
+      - name: Upload generated archive
+        if: ${{ needs.prepare.outputs.mode == 'archive_all' || needs.prepare.outputs.mode == 'archive' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ozon-reports-archive-${{ matrix.store }}-${{ github.run_id }}
+          path: output_ozon_v16/**/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload local diagnostics on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ozon-data-collector-v15-failure-${{ matrix.store }}-${{ github.run_id }}
-          path: output_ozon_v15/
+          name: ozon-data-collector-v16-failure-${{ matrix.store }}-${{ github.run_id }}
+          path: output_ozon_v16/
           if-no-files-found: ignore
           retention-days: 7
