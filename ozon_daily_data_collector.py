@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v15
+Ozon FBO Daily Data Collector v16
 
 Назначение:
 - поддержка магазинов TOPFACE и FINICK;
@@ -25,7 +25,8 @@ Ozon FBO Daily Data Collector v15
 - test: один день без ремонта 60-дневной истории;
 - daily: вчера + ограниченная дозагрузка пропусков;
 - history: все доступные пропуски последних 60 дней с контролем времени;
-- archive: ZIP строго за одну выбранную дату.
+- archive: ZIP отчётов строго за одну выбранную дату;
+- archive_all: один ZIP со всеми накопленными пользовательскими и служебными файлами выбранного магазина или сразу обоих магазинов.
 
 Необязательные методы не останавливают базовые выгрузки. Все ответы и ошибки
 фиксируются в служебных файлах.
@@ -58,7 +59,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_ALL_DATA_V15_HISTORY_ADS_REVIEWS_20260805"
+SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_MANAGEMENT_V16_20260806"
 
 ALLOWED_STORES = {"TOPFACE", "FINICK"}
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -73,6 +74,35 @@ AD_LAG_DAYS = 14
 REVIEWS_FROM_DATE = date(2026, 1, 1)
 MAX_RUNTIME_MINUTES = 220
 API_PAUSE_SECONDS = 0.18
+
+# Версии схемы заставляют history повторно загрузить дни после изменения логики разбора.
+REPORT_SCHEMA_VERSIONS: Dict[str, int] = {
+    "orders": 2,              # financial_data + продуктовый финансовый разрез
+    "returns": 1,
+    "funnel": 2,             # каждая метрика запрашивается и подписывается независимо
+    "finance_accruals": 1,
+    "ad_statistics": 2,      # исправленный ключ дата + campaign_id
+    "ad_product_statistics": 1,
+    "ad_orders": 1,
+    "product_queries": 1,
+    "product_query_details": 1,
+}
+
+FUNNEL_METRICS: List[str] = [
+    "hits_view_search",
+    "hits_view_pdp",
+    "hits_tocart",
+    "ordered_units",
+    "revenue",
+    "cancellations",
+    "delivered_units",
+    "returns",
+    "session_view",
+    "conv_tocart",
+    "conv_tocart_from_search",
+    "conv_order",
+    "position_category",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +209,29 @@ def scalarize(value: Any) -> Any:
     if isinstance(value, (dict, list, tuple)):
         return safe_json(value)
     return value
+
+
+def to_number(value: Any) -> Optional[float]:
+    """Безопасно переводит денежные и числовые значения API в float."""
+    if value in (None, "", "null"):
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        cleaned = str(value).replace("\xa0", "").replace(" ", "").replace(",", ".")
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_ratio(numerator: Any, denominator: Any, multiplier: float = 100.0) -> Optional[float]:
+    n = to_number(numerator)
+    d = to_number(denominator)
+    if n is None or d in (None, 0):
+        return None
+    return n / d * multiplier
 
 
 def flatten_record(record: Mapping[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -361,14 +414,23 @@ class S3Storage:
                           "application/json")
 
     def list_keys(self, prefix: str) -> List[str]:
-        out: List[str] = []
+        return [obj["Key"] for obj in self.list_objects(prefix)]
+
+    def list_objects(self, prefix: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
         token: Optional[str] = None
         while True:
             kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
             if token:
                 kwargs["ContinuationToken"] = token
             resp = self.client.list_objects_v2(**kwargs)
-            out.extend([x["Key"] for x in resp.get("Contents", [])])
+            for item in resp.get("Contents", []):
+                out.append({
+                    "Key": item.get("Key", ""),
+                    "Size": int(item.get("Size", 0) or 0),
+                    "LastModified": item.get("LastModified"),
+                    "ETag": str(item.get("ETag", "") or "").strip('"'),
+                })
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
@@ -440,6 +502,42 @@ class OzonSellerClient:
             raise OzonApiError("POST", path, resp.status_code, str(msg), text)
 
         raise OzonApiError("POST", path, 0, last_error or "Неизвестная ошибка")
+
+    def get(self, path: str, params: Optional[Mapping[str, Any]] = None, retries: int = 6) -> Dict[str, Any]:
+        url = self.base + path
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            try:
+                resp = self.session.get(url, params=dict(params or {}), timeout=self.timeout)
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                if attempt == retries:
+                    raise OzonApiError("GET", path, 0, last_error) from exc
+                time.sleep(min(60, 2 ** attempt))
+                continue
+
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except Exception as exc:
+                    raise OzonApiError("GET", path, 200, "Ответ не является JSON", resp.text[:2000]) from exc
+
+            text = resp.text[:6000]
+            if resp.status_code in {429, 500, 502, 503, 504} and attempt < retries:
+                wait = resp.headers.get("Retry-After")
+                try:
+                    seconds = max(1, int(float(wait))) if wait else min(90, 2 ** attempt)
+                except Exception:
+                    seconds = min(90, 2 ** attempt)
+                time.sleep(seconds)
+                continue
+            try:
+                body = resp.json()
+                msg = body.get("message") or body.get("error") or body.get("code") or text
+            except Exception:
+                msg = text
+            raise OzonApiError("GET", path, resp.status_code, str(msg), text)
+        raise OzonApiError("GET", path, 0, last_error or "Неизвестная ошибка")
 
     def cursor_pages(
         self,
@@ -941,54 +1039,47 @@ class OzonFboCollector:
             raw = [data]
         return records_to_df(items, {"Дата снимка": self.target_date.isoformat()}), raw, ["/v1/analytics/turnover/stocks"]
     def fetch_analytics_stocks(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Дополнительная аналитика остатков FBO.
-
-        Метод необязательный: в отдельных кабинетах может быть недоступен или
-        требовать другой набор фильтров. Запрос выполняется снимком на дату.
-        """
+        """Дополнительная аналитика остатков FBO по SKU, пакетами до 100."""
         endpoint = "/v1/analytics/stocks"
-        variants: List[Dict[str, Any]] = [
-            {"limit": 1000, "offset": 0, "warehouse_type": "ALL"},
-            {"limit": 1000, "offset": 0},
-        ]
+        skus = [int(x) for x in self.sku_ids if str(x).isdigit()]
+        if not skus:
+            return pd.DataFrame(), {"status": "NO_SKUS"}, [endpoint]
+
+        rows: List[Dict[str, Any]] = []
         raw: List[Any] = []
         last_exc: Optional[Exception] = None
-        for payload in variants:
-            try:
-                items, pages = self.client.offset_pages(
-                    endpoint,
-                    payload,
-                    [
-                        ("result", "rows"),
-                        ("rows",),
-                        ("result", "items"),
-                        ("items",),
-                    ],
-                    limit=1000,
-                    max_pages=500,
-                )
-                raw.append({"request": payload, "responses": pages})
-                return records_to_df(
-                    items,
-                    {"Дата снимка": self.target_date.isoformat()},
-                ), raw, [endpoint]
-            except OzonApiError as exc:
-                last_exc = exc
-                raw.append({
-                    "request": payload,
-                    "status": "ERROR",
-                    "error": str(exc),
-                })
-                if exc.status in {400, 404, 422}:
-                    continue
-                raise
-        if last_exc:
-            raise last_exc
-        return pd.DataFrame(), raw, [endpoint]
+        for sku_batch in batched(sorted(set(skus)), 100):
+            variants = [
+                {"skus": sku_batch, "limit": 1000, "offset": 0},
+                {"skus": [str(x) for x in sku_batch], "limit": 1000, "offset": 0},
+            ]
+            batch_ok = False
+            for payload in variants:
+                try:
+                    items, pages = self.client.offset_pages(
+                        endpoint, payload,
+                        [("result", "rows"), ("rows",), ("result", "items"), ("items",)],
+                        limit=1000, max_pages=100,
+                    )
+                    raw.append({"request": payload, "responses": pages})
+                    rows.extend(items)
+                    batch_ok = True
+                    break
+                except OzonApiError as exc:
+                    last_exc = exc
+                    raw.append({"request": payload, "status": "ERROR", "error": str(exc)})
+                    if exc.status in {400, 404, 422}:
+                        continue
+                    raise
+            if not batch_ok and last_exc:
+                raise last_exc
+            time.sleep(API_PAUSE_SECONDS)
+
+        return records_to_df(rows, {"Дата снимка": self.target_date.isoformat()}), raw, [endpoint]
 
     # ------------------------- orders/returns -------------------------
     def fetch_fbo_postings(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """FBO-заказы. Диапазон режется по дням, чтобы не получить MAX_OFFSET_EXCEEDED."""
+        """FBO-заказы с полным financial_data и продуктовым финансовым разрезом."""
         all_postings: List[Dict[str, Any]] = []
         raw_all: List[Any] = []
         for day_from, day_to in iter_date_chunks(self.period_from, self.period_to, chunk_days=1):
@@ -1004,7 +1095,7 @@ class OzonFboCollector:
                     "limit": 1000,
                     "offset": 0,
                     "translit": True,
-                    "with": {"analytics_data": True, "financial_data": False},
+                    "with": {"analytics_data": True, "financial_data": True},
                 },
                 [("result",), ("result", "postings"), ("postings",)],
                 max_pages=100,
@@ -1013,20 +1104,73 @@ class OzonFboCollector:
             all_postings.extend(items)
             logging.info("Заказы FBO: получен день %s, отправлений %s", day_from, len(items))
 
+        def product_signature(value: Mapping[str, Any]) -> Tuple[str, str, str]:
+            return (
+                str(value.get("sku") or value.get("product_id") or ""),
+                str(value.get("offer_id") or value.get("offerId") or ""),
+                str(value.get("name") or ""),
+            )
+
         rows: List[Dict[str, Any]] = []
         for posting in all_postings:
-            base = {k: v for k, v in posting.items() if k != "products"}
+            base = {k: v for k, v in posting.items() if k not in {"products", "financial_data"}}
+            financial_data = posting.get("financial_data") if isinstance(posting.get("financial_data"), Mapping) else {}
+            financial_products = financial_data.get("products") if isinstance(financial_data, Mapping) else []
+            if not isinstance(financial_products, list):
+                financial_products = []
+            financial_base = {k: v for k, v in financial_data.items() if k != "products"} if isinstance(financial_data, Mapping) else {}
+
             products = posting.get("products")
-            if isinstance(products, list) and products:
-                for product in products:
-                    row = dict(base)
-                    if isinstance(product, Mapping):
-                        row.update({f"product.{k}": v for k, v in product.items()})
-                    else:
-                        row["product"] = product
-                    rows.append(row)
-            else:
-                rows.append(posting)
+            if not isinstance(products, list) or not products:
+                products = [{}]
+
+            used_fin: set[int] = set()
+            for idx, product in enumerate(products):
+                product = product if isinstance(product, Mapping) else {"value": product}
+                row = dict(base)
+                row.update({f"product.{k}": v for k, v in product.items()})
+                row.update({f"financial_data.{k}": v for k, v in financial_base.items()})
+
+                matched: Optional[Mapping[str, Any]] = None
+                sig = product_signature(product)
+                for fin_idx, fin in enumerate(financial_products):
+                    if fin_idx in used_fin or not isinstance(fin, Mapping):
+                        continue
+                    if any(sig) and product_signature(fin) == sig:
+                        matched = fin
+                        used_fin.add(fin_idx)
+                        break
+                if matched is None and idx < len(financial_products) and isinstance(financial_products[idx], Mapping):
+                    matched = financial_products[idx]
+                    used_fin.add(idx)
+                if matched is not None:
+                    row.update({f"financial_product.{k}": v for k, v in matched.items()})
+
+                seller_price = to_number(
+                    product.get("price")
+                    or (matched or {}).get("price")
+                    or (matched or {}).get("seller_price")
+                )
+                buyer_price = to_number(
+                    (matched or {}).get("client_price")
+                    or (matched or {}).get("customer_price")
+                    or (matched or {}).get("buyer_price")
+                )
+                quantity = to_number(product.get("quantity") or (matched or {}).get("quantity")) or 1.0
+                row["Цена продажи, ₽"] = seller_price
+                row["Цена покупателя, ₽"] = buyer_price
+                row["Количество, шт."] = quantity
+                if seller_price is not None and buyer_price is not None:
+                    support = seller_price - buyer_price
+                    row["Поддержка скидки Ozon, ₽"] = support
+                    row["Поддержка скидки Ozon, %"] = safe_ratio(support, seller_price)
+                row["Комиссия Ozon, ₽"] = to_number((matched or {}).get("commission_amount"))
+                row["Комиссия Ozon, %"] = to_number((matched or {}).get("commission_percent"))
+                row["Выплата продавцу, ₽"] = to_number((matched or {}).get("payout"))
+                row["Финансовые услуги"] = safe_json((matched or {}).get("item_services", {}))
+                row["Акции и скидки заказа"] = safe_json((matched or {}).get("actions", []))
+                rows.append(row)
+
         df = records_to_df(rows, {
             "Дата обновления снимка": self.target_date.isoformat(),
             "Период с": self.period_from.isoformat(),
@@ -1076,67 +1220,126 @@ class OzonFboCollector:
 
     # ------------------------- analytics funnel -------------------------
     def fetch_funnel(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Максимум доступных метрик /v1/analytics/data без ложной подписи.
+
+        Каждая метрика запрашивается отдельно. Поэтому даже если базовый Premium
+        отдаёт только заказы и выручку, они не будут ошибочно названы показами.
+        """
+        endpoint = "/v1/analytics/data"
         dimensions = ["day", "sku"]
-        metrics = [
-            "hits_view_search", "hits_view_pdp", "hits_tocart", "ordered_units", "revenue",
-            "cancellations", "delivered_units", "returns", "session_view", "conv_tocart",
-            "conv_tocart_from_search", "conv_order", "position_category",
-        ]
-        payload = {
-            "date_from": self.period_from.isoformat(),
-            "date_to": self.period_to.isoformat(),
-            "dimension": dimensions,
-            "metrics": metrics,
-            "filters": [],
-            "sort": [{"key": "ordered_units", "order": "DESC"}],
-            "limit": 1000,
-            "offset": 0,
-        }
-        try:
-            items, raw = self.client.offset_pages(
-                "/v1/analytics/data", payload,
-                [("result", "data"), ("data",), ("result", "rows"), ("rows",)],
-            )
-        except OzonApiError as exc:
-            # Метрики могут меняться. Повтор с консервативным ядром.
-            if exc.status not in {400, 422}:
+        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        raw: List[Any] = []
+        successful_metrics: List[str] = []
+        last_exc: Optional[Exception] = None
+
+        for metric in FUNNEL_METRICS:
+            payload = {
+                "date_from": self.period_from.isoformat(),
+                "date_to": self.period_to.isoformat(),
+                "dimension": dimensions,
+                "metrics": [metric],
+                "filters": [],
+                "sort": [{"key": metric, "order": "DESC"}],
+                "limit": 1000,
+                "offset": 0,
+            }
+            try:
+                items, pages = self.client.offset_pages(
+                    endpoint, payload,
+                    [("result", "data"), ("data",), ("result", "rows"), ("rows",)],
+                    max_pages=100,
+                )
+                raw.append({"metric": metric, "request": payload, "responses": pages})
+                successful_metrics.append(metric)
+            except OzonApiError as exc:
+                last_exc = exc
+                raw.append({"metric": metric, "request": payload, "status": "ERROR", "error": str(exc)})
+                if exc.status in {400, 403, 404, 422}:
+                    continue
                 raise
-            logging.warning("Расширенная воронка отклонена, повторяем с базовыми метриками")
-            payload["metrics"] = ["hits_view_search", "hits_view_pdp", "hits_tocart", "ordered_units", "revenue"]
-            items, raw = self.client.offset_pages(
-                "/v1/analytics/data", payload,
-                [("result", "data"), ("data",), ("result", "rows"), ("rows",)],
-            )
-        rows: List[Dict[str, Any]] = []
-        for item in items:
-            row: Dict[str, Any] = {}
-            dims = item.get("dimensions") or item.get("dimension")
-            mets = item.get("metrics")
-            if isinstance(dims, list):
-                for i, val in enumerate(dims):
-                    key = dimensions[i] if i < len(dimensions) else f"dimension_{i}"
-                    if isinstance(val, Mapping):
-                        row[key] = val.get("name") or val.get("id") or safe_json(val)
-                        row[f"{key}_raw"] = safe_json(val)
-                    else:
-                        row[key] = val
-            if isinstance(mets, list):
-                for i, val in enumerate(mets):
-                    key = payload["metrics"][i] if i < len(payload["metrics"]) else f"metric_{i}"
-                    row[key] = scalarize(val)
-            for k, v in item.items():
-                if k not in {"dimensions", "dimension", "metrics"}:
-                    row[k] = scalarize(v)
-            rows.append(row)
+
+            for item in items:
+                dims = item.get("dimensions") or item.get("dimension") or []
+                day_value = self.target_date.isoformat()
+                sku_value = ""
+                sku_name = ""
+                if isinstance(dims, list):
+                    if len(dims) > 0:
+                        d = dims[0]
+                        if isinstance(d, Mapping):
+                            day_value = str(d.get("id") or d.get("name") or day_value)[:10]
+                        else:
+                            day_value = str(d)[:10]
+                    if len(dims) > 1:
+                        s = dims[1]
+                        if isinstance(s, Mapping):
+                            sku_value = str(s.get("id") or s.get("value") or "")
+                            sku_name = str(s.get("name") or "")
+                        else:
+                            sku_value = str(s)
+                values = item.get("metrics")
+                metric_value: Any = None
+                if isinstance(values, list) and values:
+                    metric_value = scalarize(values[0])
+                elif metric in item:
+                    metric_value = scalarize(item.get(metric))
+                key = (day_value, sku_value)
+                row = merged.setdefault(key, {"Дата": day_value, "sku": sku_value})
+                if sku_name:
+                    row.setdefault("Название товара", sku_name)
+                row[metric] = metric_value
+            time.sleep(API_PAUSE_SECONDS)
+
+        if not successful_metrics and last_exc:
+            raise last_exc
+
+        rows = list(merged.values())
         df = records_to_df(rows, {
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
+            "Доступные метрики API": ", ".join(successful_metrics),
         })
-        if "day" in df.columns and "Дата" not in df.columns:
-            df["Дата"] = df["day"].astype(str).str[:10]
-        elif "Дата" not in df.columns:
-            df["Дата"] = self.target_date.isoformat()
-        return df, raw, ["/v1/analytics/data"]
+
+        aliases = {
+            "hits_view_search": "Показы/просмотры в поиске",
+            "hits_view_pdp": "Просмотры карточки",
+            "hits_tocart": "Добавления в корзину",
+            "ordered_units": "Заказы, шт.",
+            "revenue": "Сумма заказов, ₽",
+            "cancellations": "Отмены, шт.",
+            "delivered_units": "Доставлено, шт.",
+            "returns": "Возвраты, шт.",
+            "session_view": "Сессии просмотра",
+            "conv_tocart": "Конверсия в корзину Ozon, %",
+            "conv_tocart_from_search": "Конверсия из поиска в корзину Ozon, %",
+            "conv_order": "Конверсия в заказ Ozon, %",
+            "position_category": "Позиция в категории",
+        }
+        for source, target_name in aliases.items():
+            if source in df.columns:
+                df[target_name] = df[source]
+
+        def add_calc(target_name: str, numerator: str, denominator: str) -> None:
+            if numerator in df.columns and denominator in df.columns:
+                df[target_name] = [safe_ratio(n, d) for n, d in zip(df[numerator], df[denominator])]
+
+        add_calc("Конверсия карточка → корзина, %", "hits_tocart", "hits_view_pdp")
+        add_calc("Конверсия карточка → заказ, %", "ordered_units", "hits_view_pdp")
+        add_calc("Конверсия корзина → заказ, %", "ordered_units", "hits_tocart")
+        add_calc("Конверсия поиск → карточка, %", "hits_view_pdp", "hits_view_search")
+        add_calc("Процент доставки, %", "delivered_units", "ordered_units")
+        if "delivered_units" in df.columns and "returns" in df.columns and "ordered_units" in df.columns:
+            net = []
+            pct = []
+            for delivered, returned, ordered in zip(df["delivered_units"], df["returns"], df["ordered_units"]):
+                d = to_number(delivered) or 0.0
+                r = to_number(returned) or 0.0
+                value = d - r
+                net.append(value)
+                pct.append(safe_ratio(value, ordered))
+            df["Чисто выкуплено, шт."] = net
+            df["Процент выкупа, %"] = pct
+        return df, raw, [endpoint]
 
     # ------------------------- search -------------------------
     def _search_period_candidates(self) -> List[Tuple[date, date]]:
@@ -1566,26 +1769,14 @@ class OzonFboCollector:
                 "created_date_from": created_from,
                 "created_date_to": created_to,
             }
+            # В protobuf-версии v3 строковые enum могут преобразовываться в 0,
+            # который API запрещает. Поэтому сначала пробуем допустимые числовые enum.
             variants = [
-                {
-                    "filter": base_filter,
-                    "limit": 100,
-                    "last_id": "",
-                    "sort_by": "CREATION_DATE",
-                    "sort_direction": "DESC",
-                },
-                {
-                    "filter": base_filter,
-                    "limit": 100,
-                    "last_id": "",
-                    "sort_by": "CREATED_AT",
-                    "sort_direction": "DESC",
-                },
-                {
-                    "filter": base_filter,
-                    "limit": 100,
-                    "last_id": "",
-                },
+                {"filter": base_filter, "limit": 100, "last_id": "", "sort_by": 1, "sort_direction": 2},
+                {"filter": base_filter, "limit": 100, "last_id": "", "sort_by": 1, "sort_direction": 1},
+                {"filter": base_filter, "limit": 100, "last_id": "", "sort_by": 2, "sort_direction": 2},
+                {"filter": base_filter, "limit": 100, "last_id": "", "sort_by": "CREATION_DATE", "sort_direction": "DESC"},
+                {"filter": base_filter, "limit": 100, "last_id": "", "sort_by": "CREATED_AT", "sort_direction": "DESC"},
             ]
             local_last: Optional[Exception] = None
             for payload in variants:
@@ -1874,7 +2065,7 @@ class OzonFboCollector:
         """Доступные акции и товары в них — снимок на дату запуска."""
         actions_endpoint = "/v1/actions"
         products_endpoint = "/v1/actions/products"
-        actions_data = self.client.post(actions_endpoint, {})
+        actions_data = self.client.get(actions_endpoint)
         actions = extract_items(
             actions_data,
             [
@@ -3015,7 +3206,7 @@ class OzonFboCollector:
                 "ad_statistics", "Реклама — дневная статистика",
                 "Реклама/Статистика", "Реклама_статистика",
                 self.fetch_ad_statistics, "Дата",
-                ["Дата", "date", "campaignId", "campaign_id", "sku"],
+                ["Дата", "date", "campaignId", "campaign_id"],
                 optional=True,
             )
             self._run(
@@ -3316,6 +3507,18 @@ EVENT_REPORT_CODES = [
     "product_query_details",
 ]
 
+EVENT_REPORT_LOCATIONS: Dict[str, Tuple[str, str]] = {
+    "orders": ("Заказы", "Заказы"),
+    "returns": ("Возвраты", "Возвраты"),
+    "funnel": ("Воронка продаж", "Воронка_продаж"),
+    "finance_accruals": ("Финансовые начисления", "Финансовые_начисления"),
+    "ad_statistics": ("Реклама/Статистика", "Реклама_статистика"),
+    "ad_product_statistics": ("Реклама/По товарам", "Реклама_по_товарам"),
+    "ad_orders": ("Реклама/Заказы", "Рекламные_заказы"),
+    "product_queries": ("Поисковые запросы", "Поисковые_запросы_сводная"),
+    "product_query_details": ("Поисковые запросы по товарам", "Поисковые_запросы_по_товарам"),
+}
+
 
 class CoverageTracker:
     """Служебный индекс полноты посуточных данных за последние 60 дней."""
@@ -3344,7 +3547,23 @@ class CoverageTracker:
         entry = self._entry(code, day)
         if not entry:
             return False
-        return str(entry.get("status", "")).lower() in {
+        expected_schema = int(REPORT_SCHEMA_VERSIONS.get(code, 1))
+        actual_schema = int(entry.get("schema_version", 1) or 1)
+        if actual_schema < expected_schema:
+            return False
+        status = str(entry.get("status", "")).lower()
+        if status == "complete":
+            location = EVENT_REPORT_LOCATIONS.get(code)
+            if location:
+                folder, prefix = location
+                expected_key = (
+                    f"Отчёты/{folder}/{self.store}/Недельные/"
+                    f"{week_filename(prefix, day)}"
+                )
+                if not self.storage.exists(expected_key):
+                    logging.warning("Покрытие отмечено complete, но файл отсутствует: %s", expected_key)
+                    return False
+        return status in {
             "complete",
             "empty",
             "unavailable",
@@ -3388,6 +3607,7 @@ class CoverageTracker:
             "message": result.message,
             "methods": list(result.method_paths),
             "updated_at": datetime.now(MOSCOW_TZ).isoformat(),
+            "schema_version": int(REPORT_SCHEMA_VERSIONS.get(code, 1)),
         }
 
     def mark_missing_reports(
@@ -3409,6 +3629,7 @@ class CoverageTracker:
                 "message": "Метод отключён для текущей конфигурации",
                 "methods": [],
                 "updated_at": datetime.now(MOSCOW_TZ).isoformat(),
+                "schema_version": int(REPORT_SCHEMA_VERSIONS.get(code, 1)),
             }
 
     def dates_to_process(
@@ -3472,6 +3693,99 @@ def copy_reference_context(
     target.sku_ids = list(source.sku_ids)
     target.campaign_ids_override = campaign_ids_from_collector(source)
 
+def create_archive_all(
+    storage: S3Storage,
+    stores: Sequence[str],
+    target_date: date,
+    workdir: Path,
+) -> Dict[str, Any]:
+    """Создаёт один ZIP со всеми накопленными файлами выбранных магазинов.
+
+    Не включает прошлые ZIP и тяжёлые сырые ответы, чтобы архив не рос рекурсивно.
+    Пользовательские отчёты, недельные служебные файлы, покрытие и последние
+    запуски включаются.
+    """
+    selected = {str(s).upper() for s in stores}
+    objects = storage.list_objects("Отчёты/")
+    included: List[Dict[str, Any]] = []
+
+    def belongs(key: str) -> bool:
+        if key.startswith("Отчёты/Архив/") or key.startswith("Отчёты/Архивы/"):
+            return False
+        if "/Сырые ответы/" in key or key.lower().endswith(".zip"):
+            return False
+        if not key.lower().endswith((".xlsx", ".json", ".csv")):
+            return False
+        for store in selected:
+            if f"/{store}/" in key:
+                return True
+        return False
+
+    candidates = [obj for obj in objects if belongs(str(obj.get("Key", "")))]
+    candidates.sort(key=lambda x: str(x.get("Key", "")))
+    workdir.mkdir(parents=True, exist_ok=True)
+    stores_label = "ALL" if selected == ALLOWED_STORES else "_".join(sorted(selected))
+    run_id = datetime.now(MOSCOW_TZ).strftime("%Y%m%d_%H%M%S")
+    zip_name = f"Архив_всех_отчётов_{stores_label}_{target_date.isoformat()}_{run_id}.zip"
+    zip_path = workdir / zip_name
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        for index, obj in enumerate(candidates, start=1):
+            key = str(obj["Key"])
+            try:
+                data = storage.read_bytes(key)
+            except Exception as exc:
+                included.append({
+                    "Ключ": key, "Статус": "ERROR", "Ошибка": str(exc),
+                    "Размер, байт": int(obj.get("Size", 0) or 0),
+                })
+                continue
+            archive_name = key[len("Отчёты/"):] if key.startswith("Отчёты/") else key
+            zf.writestr(archive_name, data)
+            included.append({
+                "Ключ": key,
+                "Файл в архиве": archive_name,
+                "Статус": "OK",
+                "Размер, байт": len(data),
+                "Изменён": str(obj.get("LastModified") or ""),
+            })
+            if index % 25 == 0:
+                logging.info("Архивировано %s/%s файлов", index, len(candidates))
+
+        manifest_df = pd.DataFrame(included)
+        manifest_bytes = io.BytesIO()
+        with pd.ExcelWriter(manifest_bytes, engine="openpyxl") as writer:
+            manifest_df.to_excel(writer, index=False, sheet_name="Файлы")
+            summary_df = pd.DataFrame([{
+                "Магазины": ", ".join(sorted(selected)),
+                "Дата создания": datetime.now(MOSCOW_TZ).isoformat(),
+                "Файлов найдено": len(candidates),
+                "Файлов добавлено": sum(1 for x in included if x.get("Статус") == "OK"),
+                "Ошибок": sum(1 for x in included if x.get("Статус") == "ERROR"),
+                "Сырые ответы исключены": True,
+                "Предыдущие архивы исключены": True,
+            }])
+            summary_df.to_excel(writer, index=False, sheet_name="Сводка")
+        zf.writestr("Манифест_архива.xlsx", manifest_bytes.getvalue())
+
+    archive_key = f"Отчёты/Архивы/{stores_label}/{target_date:%Y/%m}/{zip_name}"
+    storage.upload_file(str(zip_path), archive_key)
+    latest_key = f"Отчёты/Архивы/{stores_label}/Последний_архив.json"
+    result = {
+        "status": "OK",
+        "stores": sorted(selected),
+        "files_found": len(candidates),
+        "files_added": sum(1 for x in included if x.get("Статус") == "OK"),
+        "errors": [x for x in included if x.get("Статус") == "ERROR"],
+        "local_path": str(zip_path),
+        "s3_key": archive_key,
+        "created_at": datetime.now(MOSCOW_TZ).isoformat(),
+    }
+    storage.upload_json(latest_key, result)
+    logging.info("Общий архив сохранён: s3://%s/%s", storage.bucket, archive_key)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -3488,13 +3802,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Ozon FBO: ежедневный сбор продаж, аналитики и рекламы")
     p.add_argument(
         "--mode",
-        choices=["test", "daily", "history", "archive"],
+        choices=["test", "daily", "history", "archive", "archive_all"],
         default=env_first("OZON_MODE", default="test"),
     )
     p.add_argument("--target-date", default=env_first("OZON_TARGET_DATE"))
     p.add_argument("--store", default=env_first("OZON_STORE", "STORE", default=DEFAULT_STORE))
     p.add_argument("--bucket", default=env_first("OZON_YC_BUCKET", "YC_BUCKET_NAME", default=DEFAULT_BUCKET))
-    p.add_argument("--workdir", default="output_ozon_v15")
+    p.add_argument("--workdir", default="output_ozon_v16")
     p.add_argument(
         "--repair-days-per-run",
         type=int,
@@ -3515,21 +3829,8 @@ def main() -> int:
     logging.info("VERSION: %s", SCRIPT_VERSION)
 
     store = str(args.store).upper().strip() or DEFAULT_STORE
-    if store not in ALLOWED_STORES:
-        raise RuntimeError(f"Неизвестный магазин: {store}. Допустимо: {sorted(ALLOWED_STORES)}")
-
-    client_id = env_first(f"OZON_CLIENT_ID_{store}", "OZON_CLIENT_ID")
-    api_key = env_first(f"OZON_API_KEY_{store}", "OZON_API_KEY")
-    performance_client_id = env_first(
-        f"OZON_PERFORMANCE_CLIENT_ID_{store}",
-        "OZON_PERFORMANCE_CLIENT_ID",
-    )
-    performance_client_secret = env_first(
-        f"OZON_PERFORMANCE_CLIENT_SECRET_{store}",
-        "OZON_PERFORMANCE_CLIENT_SECRET",
-    )
-    if not client_id or not api_key:
-        raise RuntimeError(f"Не заданы OZON_CLIENT_ID_{store} и/или OZON_API_KEY_{store}")
+    if store not in ALLOWED_STORES and not (args.mode == "archive_all" and store == "ALL"):
+        raise RuntimeError(f"Неизвестный магазин: {store}. Допустимо: {sorted(ALLOWED_STORES)} или ALL для archive_all")
 
     access_key = env_first("OZON_YC_ACCESS_KEY_ID", "YC_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
     secret_key = env_first("OZON_YC_SECRET_ACCESS_KEY", "YC_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
@@ -3548,6 +3849,27 @@ def main() -> int:
 
     storage = S3Storage(access_key, secret_key, args.bucket, endpoint)
     storage.ensure_bucket()
+
+    workdir = Path(args.workdir) / store
+    workdir.mkdir(parents=True, exist_ok=True)
+    if args.mode == "archive_all":
+        selected_stores = sorted(ALLOWED_STORES) if store == "ALL" else [store]
+        info = create_archive_all(storage, selected_stores, target, workdir)
+        print(json.dumps(info, ensure_ascii=False, indent=2, default=str))
+        return 0
+
+    client_id = env_first(f"OZON_CLIENT_ID_{store}", "OZON_CLIENT_ID")
+    api_key = env_first(f"OZON_API_KEY_{store}", "OZON_API_KEY")
+    performance_client_id = env_first(
+        f"OZON_PERFORMANCE_CLIENT_ID_{store}",
+        "OZON_PERFORMANCE_CLIENT_ID",
+    )
+    performance_client_secret = env_first(
+        f"OZON_PERFORMANCE_CLIENT_SECRET_{store}",
+        "OZON_PERFORMANCE_CLIENT_SECRET",
+    )
+    if not client_id or not api_key:
+        raise RuntimeError(f"Не заданы OZON_CLIENT_ID_{store} и/или OZON_API_KEY_{store}")
     seller_client = OzonSellerClient(client_id, api_key)
 
     performance_client: Optional[OzonPerformanceClient] = None
@@ -3561,8 +3883,6 @@ def main() -> int:
         logging.warning("Performance API: ключи не найдены, рекламные отчёты пропущены")
 
     started_monotonic = time.monotonic()
-    workdir = Path(args.workdir) / store
-    workdir.mkdir(parents=True, exist_ok=True)
 
     # Архив — один единый проход строго за выбранный день.
     if args.mode == "archive":
