@@ -34,7 +34,7 @@ jobs:
 
       - name: Collect Ozon data
         env:
-          OZON_AUTH_JSON: ${{ secrets.OZON_AUTH_JSON }}
+          OZON_AUTH_JSON: ${{ secrets.SECRET_OZON_AUTH_JSON }}
         run: python ozon_daily.py
 
       - name: Commit data
