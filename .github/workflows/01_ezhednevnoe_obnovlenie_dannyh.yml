@@ -1,4 +1,4 @@
-# version: v35_retry_after_15_marker_target_date
+# version: v36_finick
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -16,6 +16,7 @@ on:
           - ALL
           - TOPFACE
           - MISSTAIS
+          - FINICK
       target_date:
         description: "Целевая дата выгрузки YYYY-MM-DD. Пусто = авто-правило: 00:00-14:59 МСК позавчера, 15:00-23:59 МСК вчера."
         required: false
@@ -60,6 +61,7 @@ jobs:
       YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       WB_KEY_MISSTAIS: ${{ secrets.WB_KEY_MISSTAIS }}
+      FINICK_API_WB: ${{ secrets.FINICK_API_WB }}
       WB_FINANCE_KEY_TOPFACE: ${{ secrets.WB_FINANCE_KEY_TOPFACE }}
       WB_FINANCE_KEY_MISSTAIS: ${{ secrets.WB_FINANCE_KEY_MISSTAIS }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -74,7 +76,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "YML_VERSION=v35_retry_after_15_marker_target_date"
+          echo "YML_VERSION=v36_finick"
           echo "github.event_name=${{ github.event_name }}"
           echo "github.event.schedule=${{ github.event.schedule }}"
           echo "STORE_INPUT=${STORE_INPUT}"
@@ -100,6 +102,7 @@ jobs:
               "YC_ENDPOINT_URL",
               "WB_PROMO_KEY_TOPFACE",
               "WB_KEY_MISSTAIS",
+              "FINICK_API_WB",
               "WB_FINANCE_KEY_TOPFACE",
               "WB_FINANCE_KEY_MISSTAIS",
               "TELEGRAM_BOT_TOKEN",
@@ -153,6 +156,8 @@ jobs:
               required.append("WB_PROMO_KEY_TOPFACE")
           if store in {"ALL", "MISSTAIS", "MT"}:
               required.append("WB_KEY_MISSTAIS")
+          if store in {"ALL", "FINICK"}:
+              required.append("FINICK_API_WB")
 
           missing = [x for x in required if not (os.getenv(x) or "").strip()]
           if missing:
@@ -287,7 +292,7 @@ jobs:
 
           key = os.environ["SCHEDULE_LOCK_KEY"]
           payload = {
-              "workflow_version": "v35_retry_after_15_marker_target_date",
+              "workflow_version": "v36_finick",
               "target_date": os.environ.get("WB_TARGET_DATE"),
               "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
               "store_input": os.environ.get("STORE_INPUT"),
