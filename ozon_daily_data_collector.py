@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v16
+Ozon FBO Daily Data Collector v17
 
 Назначение:
 - поддержка магазинов TOPFACE и FINICK;
@@ -59,7 +59,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_MANAGEMENT_V16_20260806"
+SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_INTEGRITY_V17_20260806"
 
 ALLOWED_STORES = {"TOPFACE", "FINICK"}
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -77,13 +77,13 @@ API_PAUSE_SECONDS = 0.18
 
 # Версии схемы заставляют history повторно загрузить дни после изменения логики разбора.
 REPORT_SCHEMA_VERSIONS: Dict[str, int] = {
-    "orders": 2,              # financial_data + продуктовый финансовый разрез
-    "returns": 1,
-    "funnel": 2,             # каждая метрика запрашивается и подписывается независимо
+    "orders": 3,              # фактическая дата строки + financial_data
+    "returns": 2,             # фактическая дата возврата
+    "funnel": 3,              # проверка названия метрики, без позиционного присвоения
     "finance_accruals": 1,
-    "ad_statistics": 2,      # исправленный ключ дата + campaign_id
-    "ad_product_statistics": 1,
-    "ad_orders": 1,
+    "ad_statistics": 3,       # campaign_id нормализован, контроль сохранения всех кампаний
+    "ad_product_statistics": 2,
+    "ad_orders": 2,
     "product_queries": 1,
     "product_query_details": 1,
 }
@@ -103,6 +103,24 @@ FUNNEL_METRICS: List[str] = [
     "conv_order",
     "position_category",
 ]
+
+# Приоритет фактической даты строки. Техническая дата запуска используется только
+# для снимков состояния и никогда не должна распределять события по неделям.
+REPORT_DATE_CANDIDATES: Dict[str, List[str]] = {
+    "orders": ["Дата", "created_at", "in_process_at"],
+    "returns": ["Дата", "logistic.return_date", "return_date", "logistic.final_moment"],
+    "funnel": ["Дата", "day"],
+    "finance_accruals": ["Дата", "date", "operation_date", "accrual_date"],
+    "ad_statistics": ["Дата", "date", "day", "statDate"],
+    "ad_product_statistics": ["Дата", "date", "day", "statDate"],
+    "ad_orders": ["Дата", "date", "day", "statDate"],
+    "product_queries": ["Дата", "date", "day"],
+    "product_query_details": ["Дата", "date", "day"],
+}
+
+# Метрики, которые базовая аналитика Ozon стабильно возвращает и название которых
+# можно считать подтверждённым даже без метаданных колонок в ответе.
+FUNNEL_ALWAYS_CONFIRMED = {"ordered_units", "revenue"}
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +317,24 @@ def dedupe_merge(old: pd.DataFrame, new: pd.DataFrame, keys: Sequence[str]) -> p
     else:
         combined = combined.drop_duplicates(keep="last")
     return combined.reset_index(drop=True)
+
+
+def dataframe_unique_count(df: pd.DataFrame, keys: Sequence[str]) -> int:
+    if df is None or df.empty:
+        return 0
+    valid = [k for k in keys if k in df.columns]
+    if not valid:
+        return int(len(df.drop_duplicates()))
+    return int(len(df.drop_duplicates(subset=valid)))
+
+
+def normalize_identifier(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
 
 
 def extract_items(data: Any, paths: Sequence[Sequence[str]]) -> List[Dict[str, Any]]:
@@ -841,6 +877,7 @@ class ReportResult:
     s3_key: str = ""
     local_path: str = ""
     skip_standard_save: bool = False
+    save_audit: Dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +936,65 @@ class OzonFboCollector:
         level = logging.WARNING if optional else logging.ERROR
         logging.log(level, "%s: %s", code, exc)
 
+
+    def _postprocess_report_df(self, code: str, df: pd.DataFrame) -> pd.DataFrame:
+        df = normalize_columns(df if df is not None else pd.DataFrame())
+        if df.empty:
+            return df
+
+        if code == "orders" and "created_at" in df.columns:
+            parsed = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+            df["Дата"] = parsed.dt.strftime("%Y-%m-%d")
+        elif code == "returns":
+            for col in ("logistic.return_date", "return_date", "logistic.final_moment"):
+                if col in df.columns:
+                    parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
+                    if parsed.notna().any():
+                        df["Дата"] = parsed.dt.strftime("%Y-%m-%d")
+                        break
+        elif code in {"ad_statistics", "ad_product_statistics", "ad_orders"}:
+            if "Дата" not in df.columns:
+                for col in ("date", "day", "statDate"):
+                    if col in df.columns:
+                        df["Дата"] = df[col].astype(str).str[:10]
+                        break
+            if "campaign_id" not in df.columns:
+                for col in ("campaignId", "campaign", "id"):
+                    if col in df.columns:
+                        df["campaign_id"] = df[col].map(normalize_identifier)
+                        break
+            else:
+                df["campaign_id"] = df["campaign_id"].map(normalize_identifier)
+            if "status" in df.columns:
+                df = df[df["status"].astype(str).str.upper() != "ERROR"].copy()
+            if "Дата" in df.columns and "campaign_id" in df.columns:
+                df = df[
+                    df["Дата"].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}$", na=False)
+                    & df["campaign_id"].astype(str).str.len().gt(0)
+                ].copy()
+
+            if code == "ad_statistics" and not df.empty:
+                source_map = {
+                    "Показы": "views", "Клики": "clicks", "Расход, ₽": "moneySpent",
+                    "Рекламные заказы, шт.": "orders", "Рекламная выручка, ₽": "ordersMoney",
+                }
+                for target, source in source_map.items():
+                    if source in df.columns:
+                        df[target] = df[source].map(to_number)
+                if {"Показы", "Клики"}.issubset(df.columns):
+                    df["CTR, %"] = [safe_ratio(c, v) for c, v in zip(df["Клики"], df["Показы"])]
+                if {"Расход, ₽", "Клики"}.issubset(df.columns):
+                    df["CPC, ₽"] = [safe_ratio(s, c, multiplier=1.0) for s, c in zip(df["Расход, ₽"], df["Клики"])]
+                if {"Рекламные заказы, шт.", "Клики"}.issubset(df.columns):
+                    df["CR клик → заказ, %"] = [safe_ratio(o, c) for o, c in zip(df["Рекламные заказы, шт."], df["Клики"])]
+                if {"Расход, ₽", "Рекламные заказы, шт."}.issubset(df.columns):
+                    df["CPO, ₽"] = [safe_ratio(s, o, multiplier=1.0) for s, o in zip(df["Расход, ₽"], df["Рекламные заказы, шт."])]
+                if {"Расход, ₽", "Рекламная выручка, ₽"}.issubset(df.columns):
+                    df["ДРР, %"] = [safe_ratio(s, r) for s, r in zip(df["Расход, ₽"], df["Рекламная выручка, ₽"])]
+
+        df["_schema_version"] = int(REPORT_SCHEMA_VERSIONS.get(code, 1))
+        return df.reset_index(drop=True)
+
     def _run(self, code: str, title: str, folder: str, filename_prefix: str, fn,
              date_column: str, keys: Sequence[str], snapshot: bool = False,
              optional: bool = False) -> ReportResult:
@@ -908,7 +1004,7 @@ class OzonFboCollector:
                               keys=list(keys), snapshot=snapshot, optional=optional)
         try:
             df, raw, methods = fn()
-            result.df = normalize_columns(df if df is not None else pd.DataFrame())
+            result.df = self._postprocess_report_df(code, df)
             result.raw = raw
             result.method_paths = list(methods)
             if result.df.empty:
@@ -922,7 +1018,6 @@ class OzonFboCollector:
         self.results.append(result)
         return result
 
-    # ------------------------- products -------------------------
     def fetch_product_catalog(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         items, raw = self.client.cursor_pages(
             "/v3/product/list",
@@ -1219,18 +1314,84 @@ class OzonFboCollector:
         return records_to_df(rows, {"Дата обновления снимка": self.target_date.isoformat()}), raw, ["/v1/returns/list"]
 
     # ------------------------- analytics funnel -------------------------
-    def fetch_funnel(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Максимум доступных метрик /v1/analytics/data без ложной подписи.
 
-        Каждая метрика запрашивается отдельно. Поэтому даже если базовый Premium
-        отдаёт только заказы и выручку, они не будут ошибочно названы показами.
+    def fetch_funnel(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Получает максимум доступных метрик без ложного присвоения названий.
+
+        Ozon может вернуть сокращённый набор значений без явных названий колонок.
+        Поэтому каждая метрика запрашивается отдельно, затем проверяется:
+        - явно объявлена ли она в метаданных ответа;
+        - не совпадает ли её вектор значений с другой подтверждённой метрикой.
+        Неподтверждённые значения остаются только в сыром служебном JSON.
         """
         endpoint = "/v1/analytics/data"
         dimensions = ["day", "sku"]
-        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
         raw: List[Any] = []
-        successful_metrics: List[str] = []
         last_exc: Optional[Exception] = None
+        candidates: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+        declared_by_metric: Dict[str, set[str]] = {}
+
+        def declared_metric_names(value: Any) -> set[str]:
+            found: set[str] = set()
+            def walk(obj: Any, parent_key: str = "") -> None:
+                if isinstance(obj, Mapping):
+                    for key, child in obj.items():
+                        key_l = str(key).lower()
+                        if key_l in {"metric_names", "metrics_names", "columns", "headers", "fields"}:
+                            if isinstance(child, list):
+                                for item in child:
+                                    if isinstance(item, str) and item in FUNNEL_METRICS:
+                                        found.add(item)
+                                    elif isinstance(item, Mapping):
+                                        for field in ("name", "key", "id", "metric"):
+                                            candidate = item.get(field)
+                                            if isinstance(candidate, str) and candidate in FUNNEL_METRICS:
+                                                found.add(candidate)
+                        elif key_l in {"metric", "metric_name"} and isinstance(child, str):
+                            if child in FUNNEL_METRICS:
+                                found.add(child)
+                        walk(child, key_l)
+                elif isinstance(obj, list):
+                    for child in obj:
+                        walk(child, parent_key)
+            walk(value)
+            return found
+
+        def parse_metric_items(items: Sequence[Mapping[str, Any]], metric: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+            out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for item in items:
+                dims = item.get("dimensions") or item.get("dimension") or []
+                day_value = self.target_date.isoformat()
+                sku_value = ""
+                sku_name = ""
+                if isinstance(dims, list):
+                    if len(dims) > 0:
+                        d = dims[0]
+                        if isinstance(d, Mapping):
+                            day_value = str(d.get("id") or d.get("name") or day_value)[:10]
+                        else:
+                            day_value = str(d)[:10]
+                    if len(dims) > 1:
+                        s = dims[1]
+                        if isinstance(s, Mapping):
+                            sku_value = normalize_identifier(s.get("id") or s.get("value"))
+                            sku_name = str(s.get("name") or "")
+                        else:
+                            sku_value = normalize_identifier(s)
+                values = item.get("metrics")
+                metric_value: Any = None
+                if isinstance(values, list) and values:
+                    metric_value = scalarize(values[0])
+                elif metric in item:
+                    metric_value = scalarize(item.get(metric))
+                key = (day_value, sku_value)
+                out[key] = {
+                    "Дата": day_value,
+                    "sku": sku_value,
+                    "Название товара": sku_name,
+                    "value": metric_value,
+                }
+            return out
 
         for metric in FUNNEL_METRICS:
             payload = {
@@ -1249,55 +1410,85 @@ class OzonFboCollector:
                     [("result", "data"), ("data",), ("result", "rows"), ("rows",)],
                     max_pages=100,
                 )
-                raw.append({"metric": metric, "request": payload, "responses": pages})
-                successful_metrics.append(metric)
+                declared: set[str] = set()
+                for page in pages:
+                    declared.update(declared_metric_names(page))
+                declared_by_metric[metric] = declared
+                parsed = parse_metric_items(items, metric)
+                candidates[metric] = parsed
+                raw.append({
+                    "metric": metric,
+                    "request": payload,
+                    "declared_metrics": sorted(declared),
+                    "rows": len(parsed),
+                    "responses": pages,
+                })
             except OzonApiError as exc:
                 last_exc = exc
                 raw.append({"metric": metric, "request": payload, "status": "ERROR", "error": str(exc)})
                 if exc.status in {400, 403, 404, 422}:
                     continue
                 raise
-
-            for item in items:
-                dims = item.get("dimensions") or item.get("dimension") or []
-                day_value = self.target_date.isoformat()
-                sku_value = ""
-                sku_name = ""
-                if isinstance(dims, list):
-                    if len(dims) > 0:
-                        d = dims[0]
-                        if isinstance(d, Mapping):
-                            day_value = str(d.get("id") or d.get("name") or day_value)[:10]
-                        else:
-                            day_value = str(d)[:10]
-                    if len(dims) > 1:
-                        s = dims[1]
-                        if isinstance(s, Mapping):
-                            sku_value = str(s.get("id") or s.get("value") or "")
-                            sku_name = str(s.get("name") or "")
-                        else:
-                            sku_value = str(s)
-                values = item.get("metrics")
-                metric_value: Any = None
-                if isinstance(values, list) and values:
-                    metric_value = scalarize(values[0])
-                elif metric in item:
-                    metric_value = scalarize(item.get(metric))
-                key = (day_value, sku_value)
-                row = merged.setdefault(key, {"Дата": day_value, "sku": sku_value})
-                if sku_name:
-                    row.setdefault("Название товара", sku_name)
-                row[metric] = metric_value
             time.sleep(API_PAUSE_SECONDS)
 
-        if not successful_metrics and last_exc:
+        if not candidates and last_exc:
             raise last_exc
+
+        def signature(values: Dict[Tuple[str, str], Dict[str, Any]]) -> Tuple[Tuple[str, str, str], ...]:
+            rows: List[Tuple[str, str, str]] = []
+            for (day_value, sku_value), row in sorted(values.items()):
+                rows.append((day_value, sku_value, str(to_number(row.get("value")) if to_number(row.get("value")) is not None else row.get("value"))))
+            return tuple(rows)
+
+        signatures = {metric: signature(values) for metric, values in candidates.items() if values}
+        confirmed: List[str] = []
+        rejected: Dict[str, str] = {}
+        confirmed_signatures: Dict[str, Tuple[Tuple[str, str, str], ...]] = {}
+
+        # Сначала базовые метрики, затем остальные — это позволяет распознать
+        # тихую подмену hits_view_* на ordered_units/revenue.
+        ordered_metrics = list(FUNNEL_ALWAYS_CONFIRMED) + [m for m in FUNNEL_METRICS if m not in FUNNEL_ALWAYS_CONFIRMED]
+        for metric in ordered_metrics:
+            values = candidates.get(metric, {})
+            if not values:
+                continue
+            sig = signatures.get(metric, ())
+            declared = declared_by_metric.get(metric, set())
+            if metric in FUNNEL_ALWAYS_CONFIRMED or metric in declared:
+                confirmed.append(metric)
+                confirmed_signatures[metric] = sig
+                continue
+            alias_of = next((name for name, known_sig in confirmed_signatures.items() if sig and sig == known_sig), "")
+            if alias_of:
+                rejected[metric] = f"Ответ совпал с метрикой {alias_of}; название не подтверждено"
+                continue
+            # Один отдельный запрос и уникальный вектор считаем условно подтверждённым.
+            # В итоговом файле сохраняем уровень подтверждения.
+            confirmed.append(metric)
+            confirmed_signatures[metric] = sig
+
+        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        verification: Dict[str, str] = {}
+        for metric in confirmed:
+            declared = declared_by_metric.get(metric, set())
+            verification[metric] = (
+                "explicit_response_metadata" if metric in declared
+                else "stable_basic_metric" if metric in FUNNEL_ALWAYS_CONFIRMED
+                else "single_metric_distinct_response"
+            )
+            for key, item in candidates.get(metric, {}).items():
+                row = merged.setdefault(key, {"Дата": key[0], "sku": key[1]})
+                if item.get("Название товара"):
+                    row["Название товара"] = item["Название товара"]
+                row[metric] = item.get("value")
 
         rows = list(merged.values())
         df = records_to_df(rows, {
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
-            "Доступные метрики API": ", ".join(successful_metrics),
+            "Доступные метрики API": ", ".join(confirmed),
+            "Проверка метрик": safe_json(verification),
+            "Отклонённые метрики": safe_json(rejected),
         })
 
         aliases = {
@@ -1339,9 +1530,8 @@ class OzonFboCollector:
                 pct.append(safe_ratio(value, ordered))
             df["Чисто выкуплено, шт."] = net
             df["Процент выкупа, %"] = pct
-        return df, raw, [endpoint]
+        return df, {"requests": raw, "confirmed": confirmed, "rejected": rejected}, [endpoint]
 
-    # ------------------------- search -------------------------
     def _search_period_candidates(self) -> List[Tuple[date, date]]:
         """Периоды для Premium-поиска.
 
@@ -2701,60 +2891,60 @@ class OzonFboCollector:
             f"Performance report {report_id} не готов после {max_attempts} проверок"
         )
 
-    def fetch_ad_statistics(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Дневная статистика Performance API за текущий self.period_from..period_to.
 
-        Сначала используется прямой JSON-метод дневной статистики. Если кабинет
-        его не поддерживает, используется пакетная генерация отчёта до 10 кампаний.
-        Период одного вызова в рабочем контуре не превышает 14 дней, что заведомо
-        укладывается в обнаруженный лимит 62 дня.
+    def fetch_ad_statistics(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Дневная статистика рекламы с обязательным campaign_id.
+
+        Диагностические ошибки сохраняются только в raw JSON. В пользовательский
+        Excel попадают исключительно строки кампаний, поэтому ERROR-строки больше
+        не могут смешиваться со статистикой и ломать дедупликацию.
         """
         client = self._require_performance()
         campaign_ids = self._campaign_ids_from_results()
         date_from = self.period_from.isoformat()
         date_to = self.period_to.isoformat()
-
         raw: List[Any] = []
         used_paths: List[str] = []
 
-        # 1. Прямая дневная статистика по всем кампаниям.
+        def normalize_items(items: Sequence[Mapping[str, Any]], extra: Optional[Mapping[str, Any]] = None) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for item in items:
+                row = dict(item)
+                if extra:
+                    for key, value in extra.items():
+                        row.setdefault(key, value)
+                campaign_id = (
+                    row.get("campaign_id") or row.get("campaignId") or
+                    row.get("campaign") or row.get("id")
+                )
+                day_value = row.get("Дата") or row.get("date") or row.get("day") or row.get("statDate")
+                campaign_id = normalize_identifier(campaign_id)
+                day_value = str(day_value or "")[:10]
+                if not campaign_id or not day_value:
+                    continue
+                row["campaign_id"] = campaign_id
+                row["Дата"] = day_value
+                rows.append(row)
+            return rows
+
         direct_variants = [
-            (
-                "GET",
-                "/api/client/statistics/daily/json",
-                None,
-                {"dateFrom": date_from, "dateTo": date_to},
-            ),
-            (
-                "GET",
-                "/api/client/statistics/daily",
-                None,
-                {"dateFrom": date_from, "dateTo": date_to},
-            ),
+            ("GET", "/api/client/statistics/daily/json", None, {"dateFrom": date_from, "dateTo": date_to}),
+            ("GET", "/api/client/statistics/daily", None, {"dateFrom": date_from, "dateTo": date_to}),
         ]
         try:
             data, meta = client.try_variants(direct_variants)
             items = self._extract_performance_items(data)
             if not items and isinstance(data, Mapping):
                 items = self._find_object_lists(data)
-            raw.append({"mode": "daily_direct", "meta": meta, "response": data})
+            rows = normalize_items(items)
+            raw.append({"mode": "daily_direct", "meta": meta, "response": data, "normalized_rows": len(rows)})
             used_paths.append(meta["chosen_path"])
-            if items:
-                rows: List[Dict[str, Any]] = []
-                for item in items:
-                    row = dict(item)
-                    if "Дата" not in row:
-                        for candidate in ("date", "day", "statDate"):
-                            if candidate in row:
-                                row["Дата"] = str(row[candidate])[:10]
-                                break
-                    rows.append(row)
-                df = records_to_df(rows, {
+            if rows:
+                return records_to_df(rows, {
                     "Дата запроса": datetime.now(MOSCOW_TZ).isoformat(),
                     "Период с": date_from,
                     "Период по": date_to,
-                })
-                return df, raw, sorted(set(used_paths))
+                }), raw, sorted(set(used_paths))
         except Exception as exc:
             raw.append({"mode": "daily_direct", "status": "ERROR", "error": str(exc)})
             logging.warning("Performance daily/json недоступен: %s", exc)
@@ -2762,11 +2952,8 @@ class OzonFboCollector:
         if not campaign_ids:
             return pd.DataFrame(), {"warning": "campaign_ids is empty", "attempts": raw}, used_paths
 
-        # 2. Пакетная статистика по кампаниям.
         all_rows: List[Dict[str, Any]] = []
-        diagnostics: List[Dict[str, Any]] = []
         raw_batches: List[Any] = []
-
         for batch_no, campaign_batch in enumerate(batched(campaign_ids, 10), start=1):
             int_ids: List[Any] = []
             for value in campaign_batch:
@@ -2774,24 +2961,12 @@ class OzonFboCollector:
                     int_ids.append(int(value))
                 except Exception:
                     int_ids.append(value)
-
             payload_variants = [
-                {
-                    "campaigns": int_ids,
-                    "dateFrom": date_from,
-                    "dateTo": date_to,
-                    "groupBy": "DATE",
-                },
-                {
-                    "campaigns": [str(x) for x in campaign_batch],
-                    "dateFrom": date_from,
-                    "dateTo": date_to,
-                    "groupBy": "DATE",
-                },
+                {"campaigns": int_ids, "dateFrom": date_from, "dateTo": date_to, "groupBy": "DATE"},
+                {"campaigns": [str(x) for x in campaign_batch], "dateFrom": date_from, "dateTo": date_to, "groupBy": "DATE"},
             ]
-            success = False
             batch_errors: List[Any] = []
-
+            success = False
             for payload in payload_variants:
                 try:
                     data, meta = client.try_variants([
@@ -2799,114 +2974,50 @@ class OzonFboCollector:
                         ("POST", "/api/client/statistics", payload, None),
                     ])
                     used_paths.append(meta["chosen_path"])
-                    direct_items = self._extract_performance_items(data)
-                    if direct_items:
-                        for item in direct_items:
-                            row = dict(item)
-                            row.setdefault("statistics_batch_no", batch_no)
-                            all_rows.append(row)
-                        raw_batches.append({
-                            "batch_no": batch_no,
-                            "request": payload,
-                            "meta": meta,
-                            "response": data,
-                            "mode": "direct",
-                        })
+                    items = self._extract_performance_items(data)
+                    if items:
+                        rows = normalize_items(items, {"statistics_batch_no": batch_no})
+                        all_rows.extend(rows)
+                        raw_batches.append({"batch_no": batch_no, "request": payload, "meta": meta, "response": data, "mode": "direct", "normalized_rows": len(rows)})
                         success = True
                         break
-
                     report_id = None
                     if isinstance(data, Mapping):
-                        report_id = (
-                            data.get("UUID")
-                            or data.get("uuid")
-                            or data.get("reportId")
-                            or data.get("report_id")
-                            or data.get("id")
-                        )
+                        report_id = data.get("UUID") or data.get("uuid") or data.get("reportId") or data.get("report_id") or data.get("id")
                     if not report_id:
-                        batch_errors.append({
-                            "request": payload,
-                            "error": "Ответ без строк и без report_id",
-                            "response": data,
-                        })
+                        batch_errors.append({"request": payload, "error": "Ответ без строк и без report_id", "response": data})
                         continue
-
-                    final_data, poll_raw, poll_path = self._poll_statistics_report(
-                        client, str(report_id)
-                    )
+                    final_data, poll_raw, poll_path = self._poll_statistics_report(client, str(report_id))
                     used_paths.append(poll_path)
-                    items = self._extract_performance_items(final_data)
-                    for item in items:
-                        row = dict(item)
-                        row.setdefault("statistics_batch_no", batch_no)
-                        row.setdefault("report_id", str(report_id))
-                        all_rows.append(row)
+                    rows = normalize_items(self._extract_performance_items(final_data), {
+                        "statistics_batch_no": batch_no,
+                        "report_id": str(report_id),
+                    })
+                    all_rows.extend(rows)
                     raw_batches.append({
-                        "batch_no": batch_no,
-                        "request": payload,
-                        "meta": meta,
-                        "create_response": data,
-                        "report_id": report_id,
-                        "poll": poll_raw,
-                        "final_response": final_data,
-                        "mode": "async",
+                        "batch_no": batch_no, "request": payload, "meta": meta,
+                        "create_response": data, "report_id": report_id,
+                        "poll": poll_raw, "final_response": final_data,
+                        "mode": "async", "normalized_rows": len(rows),
                     })
                     success = True
                     break
                 except Exception as exc:
                     batch_errors.append({"request": payload, "error": str(exc)})
-
             if not success:
-                diagnostics.append({
-                    "Дата выгрузки": self.target_date.isoformat(),
-                    "batch_no": batch_no,
-                    "campaigns": ",".join(map(str, campaign_batch)),
-                    "status": "ERROR",
-                    "errors": safe_json(batch_errors),
-                })
-                raw_batches.append({
-                    "batch_no": batch_no,
-                    "status": "ERROR",
-                    "errors": batch_errors,
-                })
-
-            logging.info(
-                "Performance API: статистика пакет %s/%s, успех=%s, строк всего=%s",
-                batch_no,
-                (len(campaign_ids) + 9) // 10,
-                success,
-                len(all_rows),
-            )
+                raw_batches.append({"batch_no": batch_no, "status": "ERROR", "errors": batch_errors})
+            logging.info("Performance API: пакет %s, успех=%s, строк всего=%s", batch_no, success, len(all_rows))
             time.sleep(API_PAUSE_SECONDS)
 
-        if all_rows:
-            rows = []
-            for item in all_rows:
-                row = dict(item)
-                if "Дата" not in row:
-                    for candidate in ("date", "day", "statDate"):
-                        if candidate in row:
-                            row["Дата"] = str(row[candidate])[:10]
-                            break
-                rows.append(row)
-            df = records_to_df(rows, {
-                "Дата запроса": datetime.now(MOSCOW_TZ).isoformat(),
-                "Период с": date_from,
-                "Период по": date_to,
-            })
-        else:
-            df = records_to_df(diagnostics, {
-                "Дата запроса": datetime.now(MOSCOW_TZ).isoformat(),
-                "Период с": date_from,
-                "Период по": date_to,
-            })
-
         raw.extend(raw_batches)
-        return df, {
-            "attempts": raw,
-            "diagnostics": diagnostics,
-        }, sorted(set(used_paths))
+        if not all_rows:
+            return pd.DataFrame(), {"attempts": raw, "message": "Строк кампаний не получено"}, sorted(set(used_paths))
+        df = records_to_df(all_rows, {
+            "Дата запроса": datetime.now(MOSCOW_TZ).isoformat(),
+            "Период с": date_from,
+            "Период по": date_to,
+        })
+        return df, {"attempts": raw}, sorted(set(used_paths))
 
     def fetch_ad_product_statistics(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         """Статистика рекламы на уровне кампания × товар за один день."""
@@ -3179,13 +3290,13 @@ class OzonFboCollector:
 
         self._run(
             "orders", "Заказы FBO", "Заказы", "Заказы",
-            self.fetch_fbo_postings, "Дата обновления снимка",
+            self.fetch_fbo_postings, "created_at",
             ["posting_number", "product.sku", "product.offer_id", "product.name"],
         )
         self._run(
             "returns", "Возвраты", "Возвраты", "Возвраты",
-            self.fetch_returns, "Дата обновления снимка",
-            ["id", "return_id", "posting_number", "sku"],
+            self.fetch_returns, "logistic.return_date",
+            ["id"],
             optional=True,
         )
         self._run(
@@ -3206,21 +3317,21 @@ class OzonFboCollector:
                 "ad_statistics", "Реклама — дневная статистика",
                 "Реклама/Статистика", "Реклама_статистика",
                 self.fetch_ad_statistics, "Дата",
-                ["Дата", "date", "campaignId", "campaign_id"],
+                ["Дата", "campaign_id"],
                 optional=True,
             )
             self._run(
                 "ad_product_statistics", "Реклама — статистика по товарам",
                 "Реклама/По товарам", "Реклама_по_товарам",
                 self.fetch_ad_product_statistics, "Дата",
-                ["Дата", "date", "campaign_id", "campaignId", "sku", "productId", "product_id"],
+                ["Дата", "campaign_id", "sku", "productId", "product_id"],
                 optional=True,
             )
             self._run(
                 "ad_orders", "Реклама — заказы",
                 "Реклама/Заказы", "Рекламные_заказы",
                 self.build_ad_orders_report, "Дата",
-                ["Дата", "date", "campaign_id", "campaignId", "sku", "productId", "product_id"],
+                ["Дата", "campaign_id", "sku", "productId", "product_id"],
                 optional=True,
             )
 
@@ -3310,22 +3421,71 @@ class OzonFboCollector:
                 ws.column_dimensions[get_column_letter(col_idx)].width = min(60, max(10, max(sample, default=10) + 2))
         return buffer.getvalue()
 
-    def _detect_row_date_column(self, df: pd.DataFrame, preferred: str) -> Optional[str]:
-        candidates = [
+
+    def _date_candidates_for_result(self, result: ReportResult) -> List[str]:
+        candidates = list(REPORT_DATE_CANDIDATES.get(result.code, []))
+        candidates.extend([
+            result.date_column, "Дата", "day", "created_at", "in_process_at",
+            "shipment_date", "logistic.return_date", "return_date", "posting_date",
+            "Дата заказа", "Дата создания", "Дата события", "Дата снимка",
+        ])
+        return list(dict.fromkeys([c for c in candidates if c]))
+
+    def _detect_row_date_column(self, df: pd.DataFrame, preferred: str = "", code: str = "") -> Optional[str]:
+        candidates = list(REPORT_DATE_CANDIDATES.get(code, []))
+        candidates.extend([
             preferred, "Дата", "day", "created_at", "in_process_at", "shipment_date",
-            "logistic_return_date", "return_date", "posting_date", "Дата заказа",
-            "Дата создания", "Дата события",
-        ]
-        for col in candidates:
-            if col and col in df.columns:
+            "logistic.return_date", "return_date", "posting_date", "Дата заказа",
+            "Дата создания", "Дата события", "Дата снимка",
+        ])
+        for col in dict.fromkeys(c for c in candidates if c):
+            if col in df.columns:
                 parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
                 if parsed.notna().any():
                     return col
         return None
 
+    def _filter_existing_to_partition_week(
+        self, result: ReportResult, old: pd.DataFrame, partition_date: date
+    ) -> pd.DataFrame:
+        if old is None or old.empty:
+            return pd.DataFrame()
+        old = normalize_columns(old)
+
+        # Старую воронку до v17 нельзя сохранять: именно в ней ordered_units/revenue
+        # были ошибочно подписаны как hits_view_*. History пересоберёт её за 60 дней.
+        if result.code == "funnel":
+            if "_schema_version" not in old.columns:
+                return pd.DataFrame()
+            versions = pd.to_numeric(old["_schema_version"], errors="coerce")
+            if not versions.ge(REPORT_SCHEMA_VERSIONS["funnel"]).any():
+                return pd.DataFrame()
+
+        old = self._postprocess_report_df(result.code, old)
+        date_col = self._detect_row_date_column(old, result.date_column, result.code)
+        if not date_col:
+            return pd.DataFrame()
+        parsed = pd.to_datetime(old[date_col], errors="coerce", utc=True)
+        iso = partition_date.isocalendar()
+        mask = parsed.map(
+            lambda x: bool(pd.notna(x) and x.date().isocalendar()[:2] == iso[:2])
+        )
+        filtered = old[mask].copy()
+        return filtered.reset_index(drop=True)
+
+    def _slice_for_dates(self, result: ReportResult, df: pd.DataFrame, dates: set[date]) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        date_col = self._detect_row_date_column(df, result.date_column, result.code)
+        if not date_col:
+            return pd.DataFrame()
+        parsed = pd.to_datetime(df[date_col], errors="coerce", utc=True).dt.date
+        return df[parsed.isin(dates)].copy()
+
     def _save_weekly_partitioned(self, result: ReportResult, df: pd.DataFrame) -> None:
-        """Разносит посуточные данные по ISO-неделям; строки без даты идут в неделю target."""
-        date_col = self._detect_row_date_column(df, result.date_column)
+        """Разносит строки по фактической дате и проверяет целостность записи."""
+        df = self._postprocess_report_df(result.code, df)
+        date_col = self._detect_row_date_column(df, result.date_column, result.code)
         if not date_col:
             partitions = [(self.target_date, df)]
         else:
@@ -3334,7 +3494,7 @@ class OzonFboCollector:
             work["_partition_date"] = parsed.dt.date
             valid = work[work["_partition_date"].notna()].copy()
             invalid = work[work["_partition_date"].isna()].drop(columns=["_partition_date"], errors="ignore")
-            partitions = []
+            partitions: List[Tuple[date, pd.DataFrame]] = []
             if not valid.empty:
                 valid["_week_key"] = valid["_partition_date"].map(lambda d: iso_week(d))
                 for _, part in valid.groupby("_week_key", dropna=False):
@@ -3343,19 +3503,53 @@ class OzonFboCollector:
             if not invalid.empty:
                 partitions.append((self.target_date, invalid))
 
-        written_keys = []
+        written_keys: List[str] = []
+        audit_parts: List[Dict[str, Any]] = []
         for partition_date, part_df in partitions:
             filename = week_filename(result.filename_prefix, partition_date)
             key = f"{self.base_prefix}/{result.folder}/{self.store}/Недельные/{filename}"
-            old = self.storage.read_excel(key)
+            old_raw = self.storage.read_excel(key)
+            old = self._filter_existing_to_partition_week(result, old_raw, partition_date)
+            part_df = self._postprocess_report_df(result.code, part_df)
             merged = dedupe_merge(old, part_df, result.keys)
+
+            part_dates: set[date] = set()
+            part_date_col = self._detect_row_date_column(part_df, result.date_column, result.code)
+            if part_date_col:
+                part_dates = set(pd.to_datetime(part_df[part_date_col], errors="coerce", utc=True).dropna().dt.date)
+            if not part_dates:
+                part_dates = {partition_date}
+            expected_unique = dataframe_unique_count(part_df, result.keys)
+            saved_slice = self._slice_for_dates(result, merged, part_dates)
+            saved_unique = dataframe_unique_count(saved_slice, result.keys)
+            integrity = expected_unique == saved_unique
+
             self.storage.upload_bytes(
                 key, self._excel_bytes(merged, result.title),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             written_keys.append(key)
+            audit_parts.append({
+                "key": key,
+                "dates": sorted(d.isoformat() for d in part_dates),
+                "rows_received": int(len(part_df)),
+                "unique_received": expected_unique,
+                "rows_in_week_after_save": int(len(merged)),
+                "unique_saved_for_dates": saved_unique,
+                "integrity": integrity,
+            })
+            if not integrity:
+                logging.error(
+                    "Нарушение целостности %s: получено unique=%s, сохранено unique=%s, key=%s",
+                    result.code, expected_unique, saved_unique, key,
+                )
             logging.info("Сохранено: s3://%s/%s (%s строк)", self.storage.bucket, key, len(merged))
+
         result.s3_key = "; ".join(written_keys)
+        result.save_audit = {
+            "integrity": all(p["integrity"] for p in audit_parts) if audit_parts else True,
+            "partitions": audit_parts,
+        }
 
     def save_results(self) -> None:
         archive_local_files: List[Tuple[str, str]] = []
@@ -3461,6 +3655,7 @@ class OzonFboCollector:
                     "methods": r.method_paths,
                     "s3_key": r.s3_key,
                     "message": r.message,
+                    "save_audit": r.save_audit,
                 } for r in self.results
             ],
             "errors_count": len(self.errors),
@@ -3553,6 +3748,8 @@ class CoverageTracker:
             return False
         status = str(entry.get("status", "")).lower()
         if status == "complete":
+            if entry.get("save_integrity") is False:
+                return False
             location = EVENT_REPORT_LOCATIONS.get(code)
             if location:
                 folder, prefix = location
@@ -3578,8 +3775,11 @@ class CoverageTracker:
         report = reports.setdefault(code, {})
         status = "error"
 
-        if result.status == "OK":
+        save_integrity = bool(result.save_audit.get("integrity", True))
+        if result.status == "OK" and save_integrity:
             status = "complete"
+        elif result.status == "OK" and not save_integrity:
+            status = "corrupted"
         elif result.status == "EMPTY":
             status = "empty"
         elif result.status == "SKIPPED_OPTIONAL":
@@ -3608,6 +3808,8 @@ class CoverageTracker:
             "methods": list(result.method_paths),
             "updated_at": datetime.now(MOSCOW_TZ).isoformat(),
             "schema_version": int(REPORT_SCHEMA_VERSIONS.get(code, 1)),
+            "save_integrity": save_integrity,
+            "save_audit": result.save_audit,
         }
 
     def mark_missing_reports(
@@ -3674,6 +3876,7 @@ def collector_result_summary(results: Sequence[ReportResult]) -> List[Dict[str, 
             "methods": list(r.method_paths),
             "s3_key": r.s3_key,
             "message": r.message,
+            "save_audit": r.save_audit,
         }
         for r in results
     ]
@@ -3693,35 +3896,77 @@ def copy_reference_context(
     target.sku_ids = list(source.sku_ids)
     target.campaign_ids_override = campaign_ids_from_collector(source)
 
+
 def create_archive_all(
     storage: S3Storage,
     stores: Sequence[str],
     target_date: date,
     workdir: Path,
 ) -> Dict[str, Any]:
-    """Создаёт один ZIP со всеми накопленными файлами выбранных магазинов.
+    """ZIP только из канонических файлов текущего 60-дневного контура.
 
-    Не включает прошлые ZIP и тяжёлые сырые ответы, чтобы архив не рос рекурсивно.
-    Пользовательские отчёты, недельные служебные файлы, покрытие и последние
-    запуски включаются.
+    Исключает legacy-файлы без папки «Недельные», старые ошибочные недели за
+    пределами 60 дней, сырые ответы и предыдущие архивы.
     """
     selected = {str(s).upper() for s in stores}
     objects = storage.list_objects("Отчёты/")
     included: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
+    period_start = history_start(target_date)
 
-    def belongs(key: str) -> bool:
+    event_prefixes = {
+        "Возвраты", "Воронка продаж", "Заказы", "Финансовые начисления",
+        "Реклама/Статистика", "Реклама/По товарам", "Реклама/Заказы",
+        "Поисковые запросы", "Поисковые запросы по товарам",
+    }
+
+    def parse_week_from_key(key: str) -> Optional[date]:
+        match = re.search(r"_(\d{4})-W(\d{2})\.xlsx$", key)
+        if not match:
+            return None
+        year, week = int(match.group(1)), int(match.group(2))
+        try:
+            return date.fromisocalendar(year, week, 1)
+        except ValueError:
+            return None
+
+    def belongs(key: str) -> Tuple[bool, str]:
         if key.startswith("Отчёты/Архив/") or key.startswith("Отчёты/Архивы/"):
-            return False
+            return False, "previous_archive"
         if "/Сырые ответы/" in key or key.lower().endswith(".zip"):
-            return False
+            return False, "raw_or_zip"
         if not key.lower().endswith((".xlsx", ".json", ".csv")):
-            return False
-        for store in selected:
-            if f"/{store}/" in key:
-                return True
-        return False
+            return False, "unsupported_extension"
+        if not any(f"/{store}/" in key for store in selected):
+            return False, "other_store"
 
-    candidates = [obj for obj in objects if belongs(str(obj.get("Key", "")))]
+        relative = key[len("Отчёты/"):] if key.startswith("Отчёты/") else key
+        is_service = relative.startswith("Служебные/")
+        is_weekly = "/Недельные/" in key
+        if not is_service and not is_weekly:
+            return False, "legacy_non_weekly"
+
+        if is_weekly:
+            week_monday = parse_week_from_key(key)
+            first_section = relative.split("/", 1)[0]
+            # Для вложенной рекламы восстанавливаем два сегмента.
+            if relative.startswith("Реклама/"):
+                first_section = "/".join(relative.split("/")[:2])
+            if first_section in event_prefixes and week_monday is not None:
+                week_sunday = week_monday + timedelta(days=6)
+                if week_sunday < period_start or week_monday > target_date:
+                    return False, "outside_60_days"
+        return True, ""
+
+    candidates: List[Dict[str, Any]] = []
+    for obj in objects:
+        key = str(obj.get("Key", ""))
+        ok, reason = belongs(key)
+        if ok:
+            candidates.append(obj)
+        elif reason not in {"other_store", "unsupported_extension", "previous_archive", "raw_or_zip"}:
+            excluded.append({"Ключ": key, "Причина": reason})
+
     candidates.sort(key=lambda x: str(x.get("Key", "")))
     workdir.mkdir(parents=True, exist_ok=True)
     stores_label = "ALL" if selected == ALLOWED_STORES else "_".join(sorted(selected))
@@ -3735,56 +3980,50 @@ def create_archive_all(
             try:
                 data = storage.read_bytes(key)
             except Exception as exc:
-                included.append({
-                    "Ключ": key, "Статус": "ERROR", "Ошибка": str(exc),
-                    "Размер, байт": int(obj.get("Size", 0) or 0),
-                })
+                included.append({"Ключ": key, "Статус": "ERROR", "Ошибка": str(exc), "Размер, байт": int(obj.get("Size", 0) or 0)})
                 continue
             archive_name = key[len("Отчёты/"):] if key.startswith("Отчёты/") else key
             zf.writestr(archive_name, data)
             included.append({
-                "Ключ": key,
-                "Файл в архиве": archive_name,
-                "Статус": "OK",
-                "Размер, байт": len(data),
-                "Изменён": str(obj.get("LastModified") or ""),
+                "Ключ": key, "Файл в архиве": archive_name, "Статус": "OK",
+                "Размер, байт": len(data), "Изменён": str(obj.get("LastModified") or ""),
             })
             if index % 25 == 0:
                 logging.info("Архивировано %s/%s файлов", index, len(candidates))
 
-        manifest_df = pd.DataFrame(included)
         manifest_bytes = io.BytesIO()
         with pd.ExcelWriter(manifest_bytes, engine="openpyxl") as writer:
-            manifest_df.to_excel(writer, index=False, sheet_name="Файлы")
-            summary_df = pd.DataFrame([{
+            pd.DataFrame(included).to_excel(writer, index=False, sheet_name="Файлы")
+            pd.DataFrame(excluded).to_excel(writer, index=False, sheet_name="Исключено")
+            pd.DataFrame([{
                 "Магазины": ", ".join(sorted(selected)),
                 "Дата создания": datetime.now(MOSCOW_TZ).isoformat(),
+                "Период данных с": period_start.isoformat(),
+                "Период данных по": target_date.isoformat(),
                 "Файлов найдено": len(candidates),
                 "Файлов добавлено": sum(1 for x in included if x.get("Статус") == "OK"),
                 "Ошибок": sum(1 for x in included if x.get("Статус") == "ERROR"),
+                "Legacy исключено": len(excluded),
                 "Сырые ответы исключены": True,
                 "Предыдущие архивы исключены": True,
-            }])
-            summary_df.to_excel(writer, index=False, sheet_name="Сводка")
+            }]).to_excel(writer, index=False, sheet_name="Сводка")
         zf.writestr("Манифест_архива.xlsx", manifest_bytes.getvalue())
 
     archive_key = f"Отчёты/Архивы/{stores_label}/{target_date:%Y/%m}/{zip_name}"
     storage.upload_file(str(zip_path), archive_key)
     latest_key = f"Отчёты/Архивы/{stores_label}/Последний_архив.json"
     result = {
-        "status": "OK",
-        "stores": sorted(selected),
-        "files_found": len(candidates),
+        "status": "OK", "stores": sorted(selected), "period_from": period_start.isoformat(),
+        "period_to": target_date.isoformat(), "files_found": len(candidates),
         "files_added": sum(1 for x in included if x.get("Статус") == "OK"),
+        "legacy_excluded": len(excluded),
         "errors": [x for x in included if x.get("Статус") == "ERROR"],
-        "local_path": str(zip_path),
-        "s3_key": archive_key,
+        "local_path": str(zip_path), "s3_key": archive_key,
         "created_at": datetime.now(MOSCOW_TZ).isoformat(),
     }
     storage.upload_json(latest_key, result)
     logging.info("Общий архив сохранён: s3://%s/%s", storage.bucket, archive_key)
     return result
-
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -3808,7 +4047,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-date", default=env_first("OZON_TARGET_DATE"))
     p.add_argument("--store", default=env_first("OZON_STORE", "STORE", default=DEFAULT_STORE))
     p.add_argument("--bucket", default=env_first("OZON_YC_BUCKET", "YC_BUCKET_NAME", default=DEFAULT_BUCKET))
-    p.add_argument("--workdir", default="output_ozon_v16")
+    p.add_argument("--workdir", default="output_ozon_v17")
     p.add_argument(
         "--repair-days-per-run",
         type=int,
