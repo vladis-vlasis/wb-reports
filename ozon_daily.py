@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import BrowserContext, Page, sync_playwright
+from playwright.sync_api import BrowserContext, sync_playwright
 
 ANALYTICS_URL = "https://seller.ozon.ru/app/analytics"
 CATEGORY_NAME = "Миски для животных"
@@ -38,18 +37,18 @@ API_URLS = {
 def load_auth() -> dict[str, Any]:
     raw = os.getenv("OZON_AUTH_JSON", "").strip()
     if not raw:
-        raise RuntimeError("В GitHub не задан Secret OZON_AUTH_JSON")
+        raise RuntimeError("В GitHub не задан Secret SECRET_OZON_AUTH_JSON")
 
     try:
         auth = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("OZON_AUTH_JSON содержит некорректный JSON") from exc
+        raise RuntimeError("Секрет содержит некорректный JSON") from exc
 
     if not auth.get("company_id"):
-        raise RuntimeError("В OZON_AUTH_JSON отсутствует company_id")
+        raise RuntimeError("В секрете отсутствует company_id")
 
     if not isinstance(auth.get("cookies"), dict) or not auth["cookies"]:
-        raise RuntimeError("В OZON_AUTH_JSON отсутствует объект cookies")
+        raise RuntimeError("В секрете отсутствует объект cookies")
 
     return auth
 
@@ -75,25 +74,6 @@ def add_cookies(context: BrowserContext, cookies_map: dict[str, str]) -> None:
     context.add_cookies(cookies)
 
 
-def choose_category(page: Page) -> None:
-    category_control = page.get_by_text(re.compile(r"^Категория"))
-    if category_control.count() == 0:
-        category_control = page.get_by_role(
-            "button",
-            name=re.compile("Категория", re.IGNORECASE),
-        )
-
-    category_control.first.click(timeout=30_000)
-    page.wait_for_timeout(700)
-
-    option = page.get_by_text(CATEGORY_NAME, exact=True)
-    if option.count() == 0:
-        raise RuntimeError(f"Категория не найдена: {CATEGORY_NAME}")
-
-    option.last.click(timeout=30_000)
-    page.wait_for_timeout(4_000)
-
-
 def post_json(
     context: BrowserContext,
     url: str,
@@ -110,7 +90,7 @@ def post_json(
     if not response.ok:
         body = response.text()
         raise RuntimeError(
-            f"Ozon API вернул {response.status}: {body[:500]}"
+            f"Ozon API {url} вернул {response.status}: {body[:500]}"
         )
 
     return response.json()
@@ -128,6 +108,7 @@ def main() -> int:
 
     headers = {
         "accept": "application/json, text/plain, */*",
+        "accept-language": "ru",
         "content-type": "application/json",
         "origin": "https://seller.ozon.ru",
         "referer": ANALYTICS_URL,
@@ -144,32 +125,10 @@ def main() -> int:
             locale="ru-RU",
         )
         add_cookies(context, auth["cookies"])
-        page = context.new_page()
 
         try:
-            page.goto(
-                ANALYTICS_URL,
-                wait_until="domcontentloaded",
-                timeout=120_000,
-            )
-            page.wait_for_timeout(6_000)
-
-            if "login" in page.url.lower():
-                raise RuntimeError(
-                    "Сессия Ozon истекла. Обновите OZON_AUTH_JSON."
-                )
-
-            choose_category(page)
-
-            screenshot_path = (
-                SCREENSHOT_DIR
-                / f"ozon_sales_funnel_{stamp}.png"
-            )
-            page.screenshot(
-                path=str(screenshot_path),
-                full_page=True,
-            )
-
+            # Категорию через интерфейс больше не выбираем.
+            # Сразу передаём её ID в запросы Ozon.
             result = {
                 "collected_at_utc": now.isoformat(),
                 "category": CATEGORY_NAME,
@@ -212,20 +171,11 @@ def main() -> int:
 
             history_path = DATA_DIR / "ozon_sales_funnel_history.jsonl"
             with history_path.open("a", encoding="utf-8") as file:
-                file.write(
-                    json.dumps(result, ensure_ascii=False) + "\n"
-                )
+                file.write(json.dumps(result, ensure_ascii=False) + "\n")
 
             print(f"Готово: {daily_path}")
-            print(f"Скриншот: {screenshot_path}")
 
         except Exception as exc:
-            error_path = SCREENSHOT_DIR / f"error_{stamp}.png"
-            try:
-                page.screenshot(path=str(error_path), full_page=True)
-            except Exception:
-                pass
-
             print(f"Ошибка: {exc}", file=sys.stderr)
             return 1
 
