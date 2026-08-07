@@ -1,4 +1,4 @@
-# version: v40_fbs_adverts_lag14
+# version: v41_fbs_adverts_lag14
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -78,7 +78,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "YML_VERSION=v40_fbs_adverts_lag14"
+          echo "YML_VERSION=v41_fbs_adverts_lag14"
           echo "github.event_name=${{ github.event_name }}"
           echo "github.event.schedule=${{ github.event.schedule }}"
           echo "STORE_INPUT=${STORE_INPUT}"
@@ -296,7 +296,7 @@ jobs:
 
           key = os.environ["SCHEDULE_LOCK_KEY"]
           payload = {
-              "workflow_version": "v40_fbs_adverts_lag14",
+              "workflow_version": "v41_fbs_adverts_lag14",
               "target_date": os.environ.get("WB_TARGET_DATE"),
               "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
               "store_input": os.environ.get("STORE_INPUT"),
