@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-08-07_v38_FINICK_RESUME_FUNNEL"
+SCRIPT_VERSION = "2026-08-07_v40_FBS_ADVERTS_LAG14"
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -187,6 +187,24 @@ class WildberriesDailyUpdater:
                 'api_method': 'GET',
                 'key_type': 'promo',
             },
+            'fbs_orders': {
+                'name': 'Заказы FBS',
+                'folder': 'Заказы',
+                'date_column': 'Дата заказа',
+                'id_columns': ['ID заказа FBS'],
+                'api_url': 'https://marketplace-api.wildberries.ru/api/v3/orders',
+                'api_method': 'GET',
+                'key_type': 'marketplace',
+            },
+            'fbs_stocks': {
+                'name': 'Остатки FBS',
+                'folder': 'Остатки',
+                'date_column': 'Дата запроса',
+                'id_columns': ['Дата запроса', 'ID склада продавца', 'chrtId'],
+                'api_url': 'https://marketplace-api.wildberries.ru/api/v3/stocks',
+                'api_method': 'POST',
+                'key_type': 'marketplace',
+            },
             'finance': {
                 'name': 'Финансовые показатели',
                 'folder': 'Финансовые показатели',
@@ -240,6 +258,8 @@ class WildberriesDailyUpdater:
         self.delays = {
             'orders': 65,
             'stocks': 65,
+            'fbs_orders': 1,
+            'fbs_stocks': 1,
             'finance': 65,
             'keywords': 90,
             'funnel': 30,
@@ -1917,13 +1937,18 @@ class WildberriesDailyUpdater:
     # ---------- Реклама (получение данных напрямую из API) ----------
     def update_adverts(self, store_name: str) -> bool:
         """
-        Обновление данных по рекламным кампаниям понедельно.
-        Получает список кампаний напрямую из API Wildberries.
-        Сохраняет несколько листов в недельный файл:
-        - Статистика_Ежедневно
-        - Статистика_Итого
-        - Список_кампаний
-        Также ведёт историческую таблицу за последние 14 дней с датой запроса.
+        Обновление рекламы с rolling-refresh последних 14 дат статистики.
+
+        Правило v40:
+        - каждый ежедневный запуск заново запрашивает target_date и 13 предыдущих дат;
+        - поэтому одна дата статистики получает до 14 последовательных снимков
+          (снимок №1, №2, ... №14) в разные дни запуска;
+        - недельные файлы и Анализ рекламы.xlsx хранят ПОСЛЕДНЕЕ актуальное значение WB;
+        - История_рекламы_14дней.xlsx хранит ВСЕ 14 снимков и позволяет измерять лаг/пересчёты WB.
+
+        Для FINICK первоначальная догрузка 7 завершённых недель сохраняется,
+        но лаг-история записывает только снимки №1..14, чтобы backfill не выдавать
+        за реальные ежедневные наблюдения.
         """
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
@@ -1953,53 +1978,32 @@ class WildberriesDailyUpdater:
             else:
                 self.log("✅ FINICK: недельные файлы рекламы за 7 завершённых недель уже есть")
 
-        # Проверяем актуальность и полноту аналитического файла
+        # v40: рекламу НИКОГДА не пропускаем только потому, что файл уже актуален.
+        # WB пересчитывает исторические показатели, поэтому один и тот же день
+        # нужно повторно получать 14 ежедневных запусков подряд.
         analytics_key = f"Отчёты/{config['folder']}/{store_name}/Анализ рекламы.xlsx"
-        required_sheets = ['Статистика_Ежедневно', 'Статистика_Итого', 'Список_кампаний', 'Отчет_по_Категории', 'Отчет_по_Категории_Итог']
-
+        history_key = f"Отчёты/{config['folder']}/{store_name}/История_рекламы_14дней.xlsx"
         if self.s3.file_exists(analytics_key):
-            try:
-                sheets_present = True
-                all_sheets_non_empty = True
-                latest_date_ok = False
-
-                for sheet in required_sheets:
-                    df = self.s3.read_excel(analytics_key, sheet_name=sheet)
-                    if df.empty:
-                        all_sheets_non_empty = False
-                        self.log(f"⚠️ Лист '{sheet}' в аналитическом файле пуст, требуется обновление")
-                        sheets_present = False
-                        break
-
-                if sheets_present and all_sheets_non_empty:
-                    daily_df = self.s3.read_excel(analytics_key, sheet_name='Статистика_Ежедневно')
-                    if 'Дата' in daily_df.columns:
-                        max_date = pd.to_datetime(daily_df['Дата']).max().date()
-                        target_date = self.target_date
-                        if max_date >= target_date:
-                            latest_date_ok = True
-                        else:
-                            self.log(f"⚠️ Данные в аналитическом файле устарели: последняя дата {max_date}, требуется обновление до {target_date}")
-
-                if sheets_present and all_sheets_non_empty and latest_date_ok:
-                    if store_name == "FINICK" and finick_missing_week_ranges:
-                        self.log("📚 Текущая реклама FINICK актуальна, но не хватает исторических недель — продолжаем backfill")
-                    else:
-                        self.log("✅ Данные рекламы актуальны и полны. Пропускаем обновление.")
-                        return True
-            except Exception as e:
-                self.log(f"⚠️ Ошибка при проверке аналитического файла: {e}, продолжаем обновление")
+            self.log(
+                "🔄 Анализ рекламы уже существует, но rolling-refresh обязателен: "
+                "повторно запрашиваем последние 14 дат, чтобы поймать пересчёты WB"
+            )
         else:
             self.log("⚠️ Аналитический файл не найден, будет создан")
+        if self.s3.file_exists(history_key):
+            self.log("📚 История_рекламы_14дней.xlsx найдена — добавим очередной ежедневный снимок")
+        else:
+            self.log("📚 История_рекламы_14дней.xlsx не найдена — создадим и начнём накопление 14 снимков")
 
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
 
         # 1. Получаем список кампаний.
-        # Для FINICK добавляем статус 7 (завершённые), иначе историческая реклама будет неполной.
+        # v40: статус 7 (завершённые) нужен ВСЕМ магазинам: кампания могла завершиться
+        # вчера, но её показатели за последние 14 дней WB ещё может пересчитывать.
         self.log("📋 Запрос списка рекламных кампаний...")
         all_adverts = []
-        statuses = "7,9,11" if store_name == "FINICK" else "9,11"
+        statuses = "7,9,11"
         for payment_type in ['cpm', 'cpc']:
             url = f"{config['api_url']}?statuses={statuses}&payment_type={payment_type}"
             try:
@@ -2083,13 +2087,34 @@ class WildberriesDailyUpdater:
 
         # 3. Определяем периоды статистики.
         explicit_adverts_backfill = _parse_optional_date_env("WB_ADVERTS_BACKFILL_FROM")
-        if store_name == "FINICK" and explicit_adverts_backfill is None:
-            requested_periods: List[Tuple[datetime.date, datetime.date]] = list(finick_missing_week_ranges)
-            # Текущую неделю не добавляем в исторический backfill. Берём только target_date.
-            requested_periods.append((self.target_date, self.target_date))
+        if explicit_adverts_backfill is not None:
+            # Ручной backfill оставляем отдельным режимом. Он обновляет актуальные значения,
+            # но старые даты с номером снимка >14 не попадут в лаг-историю.
+            backfill_start = min(explicit_adverts_backfill, self.target_date)
+            requested_periods = self._split_date_range(backfill_start, self.target_date, 31)
+            self.log(
+                f"📚 Реклама: ручной backfill {backfill_start:%Y-%m-%d} — "
+                f"{self.target_date:%Y-%m-%d}"
+            )
         else:
-            start_date, end_date = self._get_daily_or_backfill_range("WB_ADVERTS_BACKFILL_FROM")
-            requested_periods = self._split_date_range(start_date, end_date, 31)
+            # Главная логика v40: на каждом ежедневном запуске обновляем ровно 14 дат
+            # статистики: target_date и 13 предыдущих.
+            rolling_end = self.target_date
+            rolling_start = rolling_end - timedelta(days=13)
+            requested_periods = []
+
+            # FINICK по-прежнему может в первый раз восстановить 7 завершённых недель.
+            # Эти периоды нужны для основного Анализа рекламы, но не создают фальшивую
+            # историческую "лестницу" — _update_adverts_history оставит только снимки 1..14.
+            if store_name == "FINICK" and finick_missing_week_ranges:
+                requested_periods.extend(finick_missing_week_ranges)
+
+            requested_periods.append((rolling_start, rolling_end))
+            self.log(
+                f"🔁 Rolling 14 дней рекламы: {rolling_start:%Y-%m-%d} — "
+                f"{rolling_end:%Y-%m-%d}. Каждая дата будет перечитываться "
+                f"один раз в день до снимка №14."
+            )
 
         # adv/v3/fullstats принимает максимум 31 день за запрос.
         safe_periods: List[Tuple[datetime.date, datetime.date]] = []
@@ -2264,10 +2289,20 @@ class WildberriesDailyUpdater:
             return False
 
         daily_df = pd.DataFrame(daily_rows)
+        # FINICK backfill и rolling-окно могут пересекаться по датам. Для актуального слоя
+        # одна кампания + одна дата должны существовать только один раз.
+        if not daily_df.empty:
+            daily_df['Дата'] = pd.to_datetime(daily_df['Дата'], errors='coerce').dt.strftime('%Y-%m-%d')
+            daily_df = daily_df.drop_duplicates(subset=['ID кампании', 'Дата'], keep='last')
+            daily_df = daily_df.sort_values(['Дата', 'ID кампании']).reset_index(drop=True)
+
         summary_df = pd.DataFrame(summary_rows)
         campaigns_df = pd.DataFrame(campaigns_list_rows)
 
-        self.log(f"📊 Сформировано {len(daily_df)} ежедневных записей, {len(summary_df)} итоговых записей по кампаниям")
+        self.log(
+            f"📊 Сформировано {len(daily_df)} уникальных ежедневных записей; "
+            f"сырых итоговых записей по кампаниям/периодам: {len(summary_df)}"
+        )
 
         # 6. Группируем только реально запрошенные даты по неделям.
         weeks = defaultdict(list)
@@ -2441,44 +2476,222 @@ class WildberriesDailyUpdater:
         return True
 
     def _update_adverts_history(self, store_name: str, new_daily_df: pd.DataFrame):
-        """
-        Ведёт историческую таблицу рекламных данных за последние 14 дней с датой запроса.
-        Файл: Отчёты/Реклама/{store_name}/История_рекламы_14дней.xlsx
-        При каждом запуске добавляет новые строки с текущей датой запроса.
+        """История лага рекламной статистики WB.
+
+        Для каждой даты статистики сохраняем до 14 последовательных ежедневных снимков.
+        Пример при target_date=2026-08-06:
+        - 07.08 получаем снимок №1 для статистики 06.08;
+        - 08.08 — снимок №2 той же статистики;
+        - ...;
+        - 20.08 — снимок №14.
+
+        История не является "последними 14 календарными днями хранения".
+        14 — это число наблюдений за КАЖДОЙ датой статистики. Для анализа во времени
+        оставляем до 90 дней дат статистики, каждая из которых может иметь 14 снимков.
+
+        Файл:
+        Отчёты/Реклама/{store_name}/История_рекламы_14дней.xlsx
+
+        Листы:
+        - История: сырые снимки кампаний;
+        - Сводка_лага: суммы показателей по дате статистики и номеру снимка;
+        - Контроль_14_снимков: сколько снимков уже накоплено для каждой даты.
         """
         config = self.reports_config['adverts']
         history_key = f"Отчёты/{config['folder']}/{store_name}/История_рекламы_14дней.xlsx"
-        request_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Загружаем существующую историю
+        if new_daily_df is None or new_daily_df.empty:
+            self.log("ℹ️ История рекламы: новых строк для снимка нет")
+            return
+
+        now_msk = datetime.now(pytz.timezone('Europe/Moscow'))
+        request_ts = now_msk.strftime('%Y-%m-%d %H:%M:%S')
+        snapshot_date = now_msk.date()
+
+        # Новый снимок.
+        new_rows = new_daily_df.copy()
+        new_rows['Дата'] = pd.to_datetime(new_rows['Дата'], errors='coerce').dt.date
+        new_rows = new_rows[new_rows['Дата'].notna()].copy()
+
+        new_rows['Дата снимка'] = snapshot_date.strftime('%Y-%m-%d')
+        new_rows['Дата целевой выгрузки'] = self.target_date.strftime('%Y-%m-%d')
+        new_rows['Дата запроса'] = request_ts
+        new_rows['Лаг, дней'] = new_rows['Дата'].apply(
+            lambda d: (snapshot_date - d).days if d else None
+        )
+        # Снимок № — это именно фактический лаг в календарных днях.
+        # 06.08, запрошенный 07.08 = снимок №1; 08.08 = №2; ...; 20.08 = №14.
+        new_rows['Снимок №'] = new_rows['Лаг, дней']
+
+        # В лаг-историю берём только реальные наблюдения на 1..14 день после даты статистики.
+        # Исторический backfill нужен для Анализа рекламы, но не должен притворяться
+        # своевременным ежедневным наблюдением.
+        before_filter = len(new_rows)
+        new_rows = new_rows[
+            new_rows['Лаг, дней'].apply(lambda x: pd.notna(x) and 1 <= int(x) <= 14)
+        ].copy()
+        skipped_backfill = before_filter - len(new_rows)
+        if skipped_backfill:
+            self.log(
+                f"ℹ️ История рекламы: {skipped_backfill} строк backfill не записаны в лаг-историю "
+                f"(снимок вне диапазона 1..14)"
+            )
+
+        if new_rows.empty:
+            self.log("ℹ️ История рекламы: в этом запуске нет строк для снимков №1..14")
+            return
+
+        # Возвращаем дату статистики к строковому виду перед объединением/Excel.
+        new_rows['Дата'] = new_rows['Дата'].astype(str)
+
+        # Загружаем существующую историю. Поддерживаем старый одно-листовый файл.
         if self.s3.file_exists(history_key):
             try:
-                df_history = self.s3.read_excel(history_key, sheet_name=0)
-            except:
-                df_history = pd.DataFrame()
+                df_history = self.s3.read_excel(history_key, sheet_name='История')
+                if df_history.empty:
+                    df_history = self.s3.read_excel(history_key, sheet_name=0)
+            except Exception:
+                try:
+                    df_history = self.s3.read_excel(history_key, sheet_name=0)
+                except Exception:
+                    df_history = pd.DataFrame()
         else:
             df_history = pd.DataFrame()
 
-        # Добавляем столбец с датой запроса к новым данным
-        new_rows = new_daily_df.copy()
-        new_rows['Дата запроса'] = request_date
-
-        # Объединяем
+        # Миграция существующего файла v39: добавляем лаговые поля из Даты запроса.
         if not df_history.empty:
-            combined = pd.concat([df_history, new_rows], ignore_index=True)
+            if 'Дата' in df_history.columns:
+                old_stat_dates = pd.to_datetime(df_history['Дата'], errors='coerce')
+            else:
+                old_stat_dates = pd.Series(pd.NaT, index=df_history.index)
+
+            if 'Дата снимка' not in df_history.columns:
+                if 'Дата запроса' in df_history.columns:
+                    old_request_dates = pd.to_datetime(df_history['Дата запроса'], errors='coerce')
+                    df_history['Дата снимка'] = old_request_dates.dt.strftime('%Y-%m-%d')
+                else:
+                    df_history['Дата снимка'] = ''
+
+            old_snapshot_dates = pd.to_datetime(df_history['Дата снимка'], errors='coerce')
+
+            if 'Лаг, дней' not in df_history.columns:
+                df_history['Лаг, дней'] = (
+                    old_snapshot_dates.dt.normalize() - old_stat_dates.dt.normalize()
+                ).dt.days
+
+            if 'Снимок №' not in df_history.columns:
+                # Для старой истории ближайшее корректное приближение — фактический лаг.
+                df_history['Снимок №'] = pd.to_numeric(df_history['Лаг, дней'], errors='coerce')
+
+            if 'Дата целевой выгрузки' not in df_history.columns:
+                # Для старых строк точного target_date не было в файле.
+                # Восстанавливаем его из даты статистики + номер снимка - 1.
+                snap_num = pd.to_numeric(df_history['Снимок №'], errors='coerce')
+                restored_target = old_stat_dates + pd.to_timedelta(snap_num.fillna(1) - 1, unit='D')
+                df_history['Дата целевой выгрузки'] = restored_target.dt.strftime('%Y-%m-%d')
+
+        if not df_history.empty:
+            combined = pd.concat([df_history, new_rows], ignore_index=True, sort=False)
         else:
-            combined = new_rows
+            combined = new_rows.copy()
 
-        # Оставляем только последние 14 дней по дате статистики (поле 'Дата')
-        cutoff_date = (datetime.now() - timedelta(days=14)).date()
-        combined['Дата'] = pd.to_datetime(combined['Дата']).dt.date
-        combined = combined[combined['Дата'] >= cutoff_date]
-        # Возвращаем строковый формат даты
-        combined['Дата'] = combined['Дата'].astype(str)
+        # Нормализация типов.
+        combined['Дата'] = pd.to_datetime(combined['Дата'], errors='coerce').dt.strftime('%Y-%m-%d')
+        combined['Дата снимка'] = pd.to_datetime(combined['Дата снимка'], errors='coerce').dt.strftime('%Y-%m-%d')
+        combined['Снимок №'] = pd.to_numeric(combined['Снимок №'], errors='coerce')
+        combined['Лаг, дней'] = pd.to_numeric(combined['Лаг, дней'], errors='coerce')
 
-        # Сохраняем
-        self.s3.write_excel(history_key, combined, sheet_name='История')
-        self.log(f"📊 История рекламы за 14 дней обновлена, всего записей: {len(combined)}")
+        # В истории держим только реальные лаги/снимки 1..14.
+        combined = combined[
+            combined['Лаг, дней'].apply(lambda x: pd.notna(x) and 1 <= int(x) <= 14)
+        ].copy()
+        combined['Снимок №'] = combined['Лаг, дней']
+
+        # Повторный запуск с тем же target_date обновляет тот же номер снимка, а не создаёт дубль.
+        history_key_cols = [c for c in ['ID кампании', 'Дата', 'Снимок №'] if c in combined.columns]
+        if len(history_key_cols) == 3:
+            combined = combined.drop_duplicates(subset=history_key_cols, keep='last')
+
+        # Не даём Excel-файлу расти бесконечно: храним 90 последних дат статистики,
+        # но для каждой такой даты сохраняем все её снимки №1..14.
+        cutoff_stat_date = self.target_date - timedelta(days=89)
+        stat_dates = pd.to_datetime(combined['Дата'], errors='coerce').dt.date
+        combined = combined.loc[stat_dates >= cutoff_stat_date].copy()
+
+        sort_cols = [c for c in ['Дата', 'Снимок №', 'ID кампании'] if c in combined.columns]
+        if sort_cols:
+            combined = combined.sort_values(sort_cols).reset_index(drop=True)
+
+        # Сводка лага — удобно сравнивать, как одна и та же дата менялась от снимка 1 к 14.
+        metric_cols = [
+            c for c in [
+                'Показы', 'Клики', 'Заказы', 'Расход', 'ATBS', 'SHKS',
+                'Сумма заказов', 'Отменено'
+            ] if c in combined.columns
+        ]
+        agg_map = {c: 'sum' for c in metric_cols}
+        if 'ID кампании' in combined.columns:
+            agg_map['ID кампании'] = 'nunique'
+
+        summary = combined.groupby(
+            ['Дата', 'Снимок №'], dropna=False
+        ).agg(agg_map).reset_index() if agg_map else pd.DataFrame()
+
+        if not summary.empty:
+            if 'ID кампании' in summary.columns:
+                summary = summary.rename(columns={'ID кампании': 'Кампаний'})
+
+            # Дата фактического снимка / запроса — берём последнюю для этого шага.
+            snapshot_meta = combined.groupby(['Дата', 'Снимок №'], dropna=False).agg({
+                'Дата снимка': 'max',
+                'Дата запроса': 'max',
+                'Лаг, дней': 'max',
+            }).reset_index()
+            summary = summary.merge(snapshot_meta, on=['Дата', 'Снимок №'], how='left')
+
+            # Изменение к предыдущему снимку той же даты.
+            summary = summary.sort_values(['Дата', 'Снимок №']).reset_index(drop=True)
+            for metric in metric_cols:
+                summary[f'Δ {metric} к пред. снимку'] = (
+                    summary.groupby('Дата')[metric].diff().fillna(0)
+                )
+
+        # Контроль полноты: должны накопить 14 разных номеров снимка на каждую дату.
+        control = combined.groupby('Дата').agg(
+            **{
+                'Снимков накоплено': ('Снимок №', 'nunique'),
+                'Первый снимок': ('Снимок №', 'min'),
+                'Последний снимок': ('Снимок №', 'max'),
+                'Последняя дата снимка': ('Дата снимка', 'max'),
+            }
+        ).reset_index()
+        control['Статус 14 снимков'] = control['Снимков накоплено'].apply(
+            lambda n: 'ГОТОВО 14/14' if int(n) >= 14 else f'{int(n)}/14'
+        )
+        control = control.sort_values('Дата', ascending=False).reset_index(drop=True)
+
+        sheets = {
+            'История': combined,
+            'Сводка_лага': summary,
+            'Контроль_14_снимков': control,
+        }
+        self.s3.write_excel_multi(history_key, sheets)
+
+        # Лог по target_date: сколько снимков уже накоплено для самой свежей даты.
+        target_str = self.target_date.strftime('%Y-%m-%d')
+        target_control = control[control['Дата'] == target_str]
+        if not target_control.empty:
+            count = int(target_control.iloc[0]['Снимков накоплено'])
+            status = target_control.iloc[0]['Статус 14 снимков']
+            self.log(
+                f"📚 История рекламы: дата {target_str} получила снимок №1; "
+                f"сейчас накоплено {count}/14 ({status})"
+            )
+
+        self.log(
+            f"📊 История_рекламы_14дней.xlsx обновлена: {len(combined)} строк снимков; "
+            f"дат статистики в 90-дневном окне: {control['Дата'].nunique() if not control.empty else 0}"
+        )
 
     # ---------- Остатки из 1С (отключено, метод оставлен для возможности возврата) ----------
     def update_1c_stocks(self, store_name: str = '1С') -> bool:
@@ -2541,10 +2754,693 @@ class WildberriesDailyUpdater:
                 os.remove(tmp_path)
                 self.log("🧹 Временный файл удалён")
 
+
+    # ====================== FBS: ЗАКАЗЫ / ОСТАТКИ / ПОСТАВКИ ======================
+
+    def _fbs_headers(self, store_name: str) -> dict:
+        token = (self.api_keys[store_name].get('marketplace') or '').strip()
+        return {"Authorization": token, "Content-Type": "application/json"}
+
+    def _fbs_request_json(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        *,
+        params: Optional[dict] = None,
+        payload: Optional[dict] = None,
+        timeout: int = 120,
+        max_attempts: int = 5,
+        context: str = "FBS",
+    ) -> Tuple[Optional[Any], Optional[int]]:
+        """Унифицированный запрос к Marketplace API с retry на 429/5xx.
+
+        Возвращает (json, status_code). При 204 возвращает ({}, 204).
+        При 401/403 не ретраим: чаще всего у токена нет категории Marketplace.
+        """
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if method.upper() == 'GET':
+                    resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+                else:
+                    resp = requests.post(url, headers=headers, params=params, json=payload, timeout=timeout)
+
+                if resp.status_code == 200:
+                    try:
+                        return resp.json(), 200
+                    except Exception:
+                        self.log(f"❌ {context}: ответ 200, но JSON не разобран: {resp.text[:1000]}")
+                        return None, 200
+                if resp.status_code == 204:
+                    return {}, 204
+                if resp.status_code in (401, 403):
+                    self.log(
+                        f"⏭️ {context}: API недоступен для текущего токена ({resp.status_code}). "
+                        f"Проверь категорию/права токена. Ответ: {resp.text[:700]}"
+                    )
+                    return None, resp.status_code
+                if resp.status_code == 429:
+                    wait = self._rate_limit_wait_seconds(resp, default_seconds=max(5, 5 * attempt), max_seconds=120)
+                    self.log(f"⚠️ {context}: 429, попытка {attempt}/{max_attempts}, ждём {wait} сек")
+                    time.sleep(wait)
+                    continue
+                if resp.status_code in (500, 502, 503, 504):
+                    wait = 10 * attempt
+                    self.log(f"⚠️ {context}: HTTP {resp.status_code}, попытка {attempt}/{max_attempts}, ждём {wait} сек")
+                    time.sleep(wait)
+                    continue
+
+                self.log(f"❌ {context}: HTTP {resp.status_code}: {resp.text[:1000]}")
+                return None, resp.status_code
+            except Exception as e:
+                if attempt >= max_attempts:
+                    self.log(f"❌ {context}: исключение после {attempt} попыток: {e}")
+                    return None, None
+                wait = 5 * attempt
+                self.log(f"⚠️ {context}: исключение {e}; повтор через {wait} сек")
+                time.sleep(wait)
+        return None, None
+
+    def _fbs_completed_7_weeks_range(self) -> Tuple[datetime.date, datetime.date]:
+        """7 полностью завершённых недель, не считая текущую неделю по МСК."""
+        today_msk = self.start_time.date()
+        current_monday = today_msk - timedelta(days=today_msk.weekday())
+        end_date = current_monday - timedelta(days=1)
+        start_date = current_monday - timedelta(weeks=7)
+        return start_date, end_date
+
+    def _fbs_orders_weekly_key(self, store_name: str, week_date: datetime.date) -> str:
+        year, week, _ = week_date.isocalendar()
+        return f"Отчёты/Заказы/{store_name}/Недельные/Заказы_FBS_{year}-W{week:02d}.xlsx"
+
+    def _fbs_stocks_weekly_key(self, store_name: str, week_date: datetime.date) -> str:
+        year, week, _ = week_date.isocalendar()
+        return f"Отчёты/Остатки/{store_name}/Недельные/Остатки_FBS_{year}-W{week:02d}.xlsx"
+
+    def _fbs_registry_key(self, store_name: str) -> str:
+        return f"Отчёты/FBS/{store_name}/Реестр_FBS.xlsx"
+
+    def _fbs_supplies_key(self, store_name: str) -> str:
+        return f"Отчёты/FBS/{store_name}/Поставки_FBS.xlsx"
+
+    def _fbs_to_msk_str(self, value: Any) -> str:
+        if value is None or value == "":
+            return ""
+        try:
+            ts = pd.to_datetime(value, utc=True, errors='coerce')
+            if pd.isna(ts):
+                return ""
+            return ts.tz_convert('Europe/Moscow').strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            return ""
+
+    def _fetch_fbs_orders_range(
+        self,
+        store_name: str,
+        start_date: datetime.date,
+        end_date: datetime.date,
+    ) -> Tuple[Optional[List[dict]], Optional[int]]:
+        """Получить FBS-заказы. WB разрешает максимум 30 календарных дней за запрос."""
+        headers = self._fbs_headers(store_name)
+        url = "https://marketplace-api.wildberries.ru/api/v3/orders"
+        tz_msk = pytz.timezone('Europe/Moscow')
+        all_orders: List[dict] = []
+        chunk_start = start_date
+
+        while chunk_start <= end_date:
+            chunk_end = min(chunk_start + timedelta(days=29), end_date)
+            from_dt = tz_msk.localize(datetime.combine(chunk_start, datetime.min.time())).astimezone(pytz.UTC)
+            to_dt = tz_msk.localize(datetime.combine(chunk_end, datetime.max.time().replace(microsecond=0))).astimezone(pytz.UTC)
+            next_value = 0
+            seen_next = set()
+            self.log(f"📦 FBS заказы: запрос периода {chunk_start:%Y-%m-%d} — {chunk_end:%Y-%m-%d}")
+
+            while True:
+                params = {
+                    'limit': 1000,
+                    'next': next_value,
+                    'dateFrom': int(from_dt.timestamp()),
+                    'dateTo': int(to_dt.timestamp()),
+                }
+                data, status = self._fbs_request_json(
+                    'GET', url, headers, params=params, timeout=120,
+                    context=f"FBS orders {chunk_start:%Y-%m-%d}..{chunk_end:%Y-%m-%d}"
+                )
+                if data is None:
+                    return None, status
+                batch = data.get('orders') or []
+                if batch:
+                    all_orders.extend(batch)
+                new_next = int(data.get('next') or 0)
+                if not batch or new_next == 0 or new_next == next_value or new_next in seen_next:
+                    break
+                seen_next.add(new_next)
+                next_value = new_next
+                time.sleep(0.25)
+
+            chunk_start = chunk_end + timedelta(days=1)
+            if chunk_start <= end_date:
+                time.sleep(0.5)
+
+        # На практике API иногда может повторить граничную строку при пагинации.
+        dedup = {}
+        for order in all_orders:
+            oid = order.get('id')
+            if oid is not None:
+                dedup[int(oid)] = order
+        return list(dedup.values()), 200
+
+    def _fetch_fbs_statuses(self, store_name: str, order_ids: List[int]) -> Tuple[Optional[Dict[int, dict]], Optional[int]]:
+        if not order_ids:
+            return {}, 200
+        headers = self._fbs_headers(store_name)
+        url = "https://marketplace-api.wildberries.ru/api/v3/orders/status"
+        result: Dict[int, dict] = {}
+        unique_ids = sorted(set(int(x) for x in order_ids if x))
+        for i in range(0, len(unique_ids), 1000):
+            batch = unique_ids[i:i+1000]
+            data, status = self._fbs_request_json(
+                'POST', url, headers, payload={'orders': batch}, timeout=120,
+                context=f"FBS statuses {i+1}-{i+len(batch)}"
+            )
+            if data is None:
+                return None, status
+            for item in data.get('orders') or []:
+                oid = item.get('id')
+                if oid is not None:
+                    result[int(oid)] = item
+            time.sleep(0.25)
+        return result, 200
+
+    def _fetch_fbs_supplies(self, store_name: str) -> Tuple[Optional[List[dict]], Optional[int]]:
+        headers = self._fbs_headers(store_name)
+        url = "https://marketplace-api.wildberries.ru/api/v3/supplies"
+        next_value = 0
+        supplies: List[dict] = []
+        seen_next = set()
+        for _ in range(200):
+            data, status = self._fbs_request_json(
+                'GET', url, headers, params={'limit': 1000, 'next': next_value}, timeout=120,
+                context="FBS supplies"
+            )
+            if data is None:
+                return None, status
+            batch = data.get('supplies') or []
+            supplies.extend(batch)
+            new_next = int(data.get('next') or 0)
+            if not batch or new_next == 0 or new_next == next_value or new_next in seen_next:
+                break
+            seen_next.add(new_next)
+            next_value = new_next
+            time.sleep(0.25)
+        dedup = {}
+        for sp in supplies:
+            sid = str(sp.get('id') or '').strip()
+            if sid:
+                dedup[sid] = sp
+        return list(dedup.values()), 200
+
+    def _save_fbs_supplies(self, store_name: str, supplies: List[dict]) -> Dict[str, dict]:
+        now_str = datetime.now(pytz.timezone('Europe/Moscow')).strftime('%Y-%m-%d %H:%M:%S')
+        rows = []
+        supply_map: Dict[str, dict] = {}
+        for sp in supplies or []:
+            sid = str(sp.get('id') or '').strip()
+            if not sid:
+                continue
+            row = {
+                'ID поставки': sid,
+                'Название': sp.get('name', ''),
+                'Создана': self._fbs_to_msk_str(sp.get('createdAt')),
+                'Закрыта / передана в доставку': self._fbs_to_msk_str(sp.get('closedAt')),
+                'Сканирование WB': self._fbs_to_msk_str(sp.get('scanDt')),
+                'done': bool(sp.get('done', False)),
+                'isB2b': bool(sp.get('isB2b', sp.get('isB2B', False))),
+                'cargoType': sp.get('cargoType', ''),
+                'crossBorderType': sp.get('crossBorderType', ''),
+                'destinationOfficeId': sp.get('destinationOfficeId', ''),
+                'Дата обновления': now_str,
+                'Магазин': store_name,
+            }
+            rows.append(row)
+            supply_map[sid] = row
+
+        if rows:
+            df = pd.DataFrame(rows).drop_duplicates(subset=['ID поставки'], keep='last')
+            df = df.sort_values(['Создана', 'ID поставки'], ascending=[False, True])
+            self.s3.write_excel(self._fbs_supplies_key(store_name), df, sheet_name='Поставки FBS')
+            self.log(f"✅ FBS поставки сохранены: {self._fbs_supplies_key(store_name)}, строк: {len(df)}")
+        else:
+            self.log("ℹ️ FBS поставок пока нет")
+        return supply_map
+
+    def _fbs_result_label(self, wb_status: str) -> str:
+        mapping = {
+            'sold': 'Выкуплен',
+            'canceled_by_client': 'Отказ покупателя при получении',
+            'declined_by_client': 'Отмена покупателем в первый час',
+            'canceled': 'Отменён',
+            'defect': 'Отмена из-за брака',
+            'ready_for_pickup': 'Ожидает покупателя в ПВЗ',
+            'sorted': 'Отсортирован WB',
+            'waiting': 'В работе',
+            'postponed_delivery': 'Доставка перенесена',
+            'accepted_by_carrier': 'Передан перевозчику',
+            'sent_to_carrier': 'Направлен перевозчику',
+        }
+        return mapping.get(str(wb_status or '').strip(), str(wb_status or '').strip() or 'Неизвестно')
+
+    def _build_fbs_orders_df(
+        self,
+        store_name: str,
+        orders: List[dict],
+        statuses: Dict[int, dict],
+        supply_map: Dict[str, dict],
+        existing_registry: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        now_str = datetime.now(pytz.timezone('Europe/Moscow')).strftime('%Y-%m-%d %H:%M:%S')
+        old_sold_seen: Dict[int, str] = {}
+        old_cancel_seen: Dict[int, str] = {}
+        if existing_registry is not None and not existing_registry.empty and 'ID заказа FBS' in existing_registry.columns:
+            for _, r in existing_registry.iterrows():
+                try:
+                    oid = int(r.get('ID заказа FBS'))
+                except Exception:
+                    continue
+                old_sold_seen[oid] = str(r.get('Первое обнаружение продажи', '') or '')
+                old_cancel_seen[oid] = str(r.get('Первое обнаружение отказа/отмены', '') or '')
+
+        rows = []
+        for order in orders or []:
+            try:
+                oid = int(order.get('id'))
+            except Exception:
+                continue
+            status = statuses.get(oid, {})
+            supplier_status = str(status.get('supplierStatus') or '')
+            wb_status = str(status.get('wbStatus') or '')
+            supply_id = str(order.get('supplyId') or '').strip()
+            sp = supply_map.get(supply_id, {}) if supply_id else {}
+
+            order_dt = self._fbs_to_msk_str(order.get('createdAt'))
+            closed_dt = str(sp.get('Закрыта / передана в доставку', '') or '')
+            scan_dt = str(sp.get('Сканирование WB', '') or '')
+
+            hours_to_ship = None
+            hours_to_scan = None
+            try:
+                if order_dt and closed_dt:
+                    hours_to_ship = round((pd.to_datetime(closed_dt) - pd.to_datetime(order_dt)).total_seconds() / 3600, 2)
+                if order_dt and scan_dt:
+                    hours_to_scan = round((pd.to_datetime(scan_dt) - pd.to_datetime(order_dt)).total_seconds() / 3600, 2)
+            except Exception:
+                pass
+
+            first_sold = old_sold_seen.get(oid, '')
+            if wb_status == 'sold' and not first_sold:
+                first_sold = now_str
+            first_cancel = old_cancel_seen.get(oid, '')
+            if wb_status in {'canceled', 'canceled_by_client', 'declined_by_client', 'defect'} and not first_cancel:
+                first_cancel = now_str
+
+            skus = order.get('skus') or []
+            offices = order.get('offices') or []
+            addr = order.get('address') or {}
+            row = {
+                'ID заказа FBS': oid,
+                'orderUid': order.get('orderUid', ''),
+                'Дата заказа': order_dt[:10] if order_dt else '',
+                'Время заказа': order_dt,
+                'Артикул продавца': order.get('article', ''),
+                'Артикул WB': order.get('nmId', ''),
+                'chrtId': order.get('chrtId', ''),
+                'Баркод': skus[0] if skus else '',
+                'Баркоды': ', '.join(str(x) for x in skus),
+                'ID склада продавца': order.get('warehouseId', ''),
+                'officeId': order.get('officeId', ''),
+                'Офисы': ', '.join(str(x) for x in offices),
+                'deliveryType': order.get('deliveryType', ''),
+                'supplyId': supply_id,
+                'Поставка создана': sp.get('Создана', ''),
+                'Время отгрузки (closedAt)': closed_dt,
+                'Время сканирования WB (scanDt)': scan_dt,
+                'Часов от заказа до отгрузки': hours_to_ship if hours_to_ship is not None else '',
+                'Часов от заказа до сканирования WB': hours_to_scan if hours_to_scan is not None else '',
+                'Отгружен': 'Да' if (closed_dt or supplier_status == 'complete') else 'Нет',
+                'supplierStatus': supplier_status,
+                'wbStatus': wb_status,
+                'Результат': self._fbs_result_label(wb_status),
+                'Продажа FBS': 1 if wb_status == 'sold' else 0,
+                'Отказ/отмена FBS': 1 if wb_status in {'canceled', 'canceled_by_client', 'declined_by_client', 'defect'} else 0,
+                'Первое обнаружение продажи': first_sold,
+                'Первое обнаружение отказа/отмены': first_cancel,
+                'Цена API': order.get('price', ''),
+                'Финальная цена API': order.get('finalPrice', ''),
+                'Конвертированная цена API': order.get('convertedPrice', ''),
+                'Конвертированная финальная цена API': order.get('convertedFinalPrice', ''),
+                'currencyCode': order.get('currencyCode', ''),
+                'convertedCurrencyCode': order.get('convertedCurrencyCode', ''),
+                'scanPrice': order.get('scanPrice', ''),
+                'cargoType': order.get('cargoType', ''),
+                'crossBorderType': order.get('crossBorderType', ''),
+                'isZeroOrder': order.get('isZeroOrder', False),
+                'isB2B': (order.get('options') or {}).get('isB2B', (order.get('options') or {}).get('isB2b', False)),
+                'Комментарий': order.get('comment', ''),
+                'Адрес': addr.get('fullAddress', '') if isinstance(addr, dict) else '',
+                'Дата обновления статуса': now_str,
+                'Магазин': store_name,
+            }
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    def _upsert_fbs_registry(self, store_name: str, new_df: pd.DataFrame) -> pd.DataFrame:
+        key = self._fbs_registry_key(store_name)
+        old_df = self.s3.read_excel(key, sheet_name=0) if self.s3.file_exists(key) else pd.DataFrame()
+        if new_df.empty:
+            return old_df
+        if old_df.empty:
+            combined = new_df.copy()
+        else:
+            # Не теряем исторические строки вне текущего окна обновления.
+            new_ids = set(pd.to_numeric(new_df['ID заказа FBS'], errors='coerce').dropna().astype('int64').tolist())
+            old_ids = pd.to_numeric(old_df.get('ID заказа FBS'), errors='coerce') if 'ID заказа FBS' in old_df.columns else pd.Series(dtype='float64')
+            keep_mask = ~old_ids.fillna(-1).astype('int64').isin(new_ids) if len(old_ids) else pd.Series([True] * len(old_df), index=old_df.index)
+            combined = pd.concat([old_df.loc[keep_mask].copy(), new_df], ignore_index=True, sort=False)
+        combined = combined.drop_duplicates(subset=['ID заказа FBS'], keep='last')
+        if 'Время заказа' in combined.columns:
+            combined['_sort_dt'] = pd.to_datetime(combined['Время заказа'], errors='coerce')
+            combined = combined.sort_values('_sort_dt', ascending=False).drop(columns=['_sort_dt'])
+        self.s3.write_excel(key, combined, sheet_name='Реестр FBS')
+        self.log(f"✅ FBS реестр сохранён: {key}, заказов: {len(combined)}")
+        return combined
+
+    def _save_fbs_orders_weekly(self, store_name: str, refreshed_df: pd.DataFrame) -> None:
+        if refreshed_df.empty or 'Дата заказа' not in refreshed_df.columns:
+            return
+        tmp = refreshed_df.copy()
+        tmp['_date'] = pd.to_datetime(tmp['Дата заказа'], errors='coerce').dt.date
+        tmp = tmp[tmp['_date'].notna()].copy()
+        tmp['_week'] = tmp['_date'].apply(lambda d: d - timedelta(days=d.weekday()))
+
+        for week_start, week_df in tmp.groupby('_week'):
+            key = self._fbs_orders_weekly_key(store_name, week_start)
+            existing = self.s3.read_excel(key, sheet_name=0) if self.s3.file_exists(key) else pd.DataFrame()
+            week_df = week_df.drop(columns=['_date', '_week'])
+            if existing.empty:
+                combined = week_df.copy()
+            else:
+                new_ids = set(pd.to_numeric(week_df['ID заказа FBS'], errors='coerce').dropna().astype('int64').tolist())
+                old_ids = pd.to_numeric(existing.get('ID заказа FBS'), errors='coerce') if 'ID заказа FBS' in existing.columns else pd.Series(dtype='float64')
+                keep_mask = ~old_ids.fillna(-1).astype('int64').isin(new_ids) if len(old_ids) else pd.Series([True] * len(existing), index=existing.index)
+                combined = pd.concat([existing.loc[keep_mask].copy(), week_df], ignore_index=True, sort=False)
+            combined = combined.drop_duplicates(subset=['ID заказа FBS'], keep='last')
+            if 'Время заказа' in combined.columns:
+                combined['_sort_dt'] = pd.to_datetime(combined['Время заказа'], errors='coerce')
+                combined = combined.sort_values('_sort_dt').drop(columns=['_sort_dt'])
+            self.s3.write_excel(key, combined, sheet_name='Заказы FBS')
+            self.log(f"✅ FBS заказы сохранены: {key}, строк: {len(combined)}")
+
+    def update_fbs_orders(self, store_name: str) -> bool:
+        """FBS-заказы + статусы + поставки + единый накопительный реестр.
+
+        Первый запуск: 7 полностью завершённых недель + целевая дата/текущая неделя.
+        Последующие: обновляем последние 30 дней, чтобы статусы sold/отказов успевали измениться.
+        """
+        self.log("")
+        self.log(f"📌 ОБНОВЛЕНИЕ: Заказы FBS / поставки / реестр для магазина {store_name}")
+        registry_key = self._fbs_registry_key(store_name)
+        existing_registry = self.s3.read_excel(registry_key, sheet_name=0) if self.s3.file_exists(registry_key) else pd.DataFrame()
+
+        if existing_registry.empty:
+            hist_start, hist_end = self._fbs_completed_7_weeks_range()
+            start_date = hist_start
+            end_date = max(hist_end, self.target_date)
+            self.log(
+                f"📚 Первый FBS запуск: собираем 7 завершённых недель {hist_start:%Y-%m-%d} — {hist_end:%Y-%m-%d} "
+                f"и данные до target_date={self.target_date:%Y-%m-%d}"
+            )
+        else:
+            end_date = self.target_date
+            start_date = end_date - timedelta(days=29)
+            self.log(f"🔄 FBS статусы: обновляем скользящее окно 30 дней {start_date:%Y-%m-%d} — {end_date:%Y-%m-%d}")
+
+        orders, status_code = self._fetch_fbs_orders_range(store_name, start_date, end_date)
+        if orders is None:
+            if status_code in (401, 403):
+                self.log(f"⏭️ FBS заказы {store_name} пропущены: текущий токен не имеет категории Marketplace")
+                return True
+            return False
+
+        self.log(f"✅ FBS заказов получено: {len(orders)}")
+        order_ids = [int(o['id']) for o in orders if o.get('id') is not None]
+        statuses, status_code = self._fetch_fbs_statuses(store_name, order_ids)
+        if statuses is None:
+            if status_code in (401, 403):
+                self.log(f"⏭️ FBS статусы {store_name} пропущены: нет Marketplace-доступа")
+                return True
+            return False
+        self.log(f"✅ FBS статусов получено: {len(statuses)}")
+
+        supplies, status_code = self._fetch_fbs_supplies(store_name)
+        if supplies is None:
+            if status_code in (401, 403):
+                self.log(f"⏭️ FBS поставки {store_name} пропущены: нет Marketplace-доступа")
+                return True
+            return False
+        supply_map = self._save_fbs_supplies(store_name, supplies)
+
+        refreshed_df = self._build_fbs_orders_df(store_name, orders, statuses, supply_map, existing_registry)
+        self._save_fbs_orders_weekly(store_name, refreshed_df)
+        registry_df = self._upsert_fbs_registry(store_name, refreshed_df)
+
+        sold = int(pd.to_numeric(registry_df.get('Продажа FBS', pd.Series(dtype='float64')), errors='coerce').fillna(0).sum()) if not registry_df.empty else 0
+        canceled = int(pd.to_numeric(registry_df.get('Отказ/отмена FBS', pd.Series(dtype='float64')), errors='coerce').fillna(0).sum()) if not registry_df.empty else 0
+        shipped = int((registry_df.get('Отгружен', pd.Series(dtype='object')).astype(str) == 'Да').sum()) if not registry_df.empty else 0
+        self.log(f"📊 FBS реестр: всего {len(registry_df)}, отгружено {shipped}, выкуплено {sold}, отказ/отмена {canceled}")
+        return True
+
+    def _fetch_all_product_cards_for_fbs(self, store_name: str) -> Tuple[List[dict], bool]:
+        """Получить chrtId всех карточек для запроса FBS-остатков.
+
+        cards/list доступен по Content или Promotion токену. Возвращает (rows, full_access).
+        """
+        token = (self.api_keys[store_name].get('promo') or '').strip()
+        headers = {"Authorization": token, "Content-Type": "application/json"}
+        url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
+        cursor = {'limit': 100}
+        all_rows: List[dict] = []
+        last_cursor = None
+
+        for page in range(1, 1000):
+            payload = {
+                'settings': {
+                    'sort': {'ascending': True},
+                    'filter': {'withPhoto': -1},
+                    'cursor': cursor,
+                }
+            }
+            data, status = self._fbs_request_json(
+                'POST', url, headers, payload=payload, timeout=120,
+                context=f"FBS cards chrtId page {page}"
+            )
+            if data is None:
+                return all_rows, False
+            cards = data.get('cards') or []
+            for card in cards:
+                nm_id = card.get('nmID', card.get('nmId', ''))
+                vendor = card.get('vendorCode', '')
+                title = card.get('title', '')
+                brand = card.get('brand', '')
+                subject = card.get('subjectName', '')
+                for size in card.get('sizes') or []:
+                    chrt_id = size.get('chrtID', size.get('chrtId'))
+                    if chrt_id is None:
+                        continue
+                    skus = size.get('skus') or []
+                    all_rows.append({
+                        'chrtId': int(chrt_id),
+                        'Артикул WB': nm_id,
+                        'Артикул продавца': vendor,
+                        'Название': title,
+                        'Бренд': brand,
+                        'Предмет': subject,
+                        'Размер': size.get('techSize', size.get('wbSize', '')),
+                        'Баркод': skus[0] if skus else '',
+                        'Баркоды': ', '.join(str(x) for x in skus),
+                    })
+
+            cur = data.get('cursor') or {}
+            if not cards or len(cards) < 100:
+                break
+            next_cursor = (cur.get('updatedAt'), cur.get('nmID', cur.get('nmId')))
+            if not next_cursor[0] or not next_cursor[1] or next_cursor == last_cursor:
+                break
+            last_cursor = next_cursor
+            cursor = {'limit': 100, 'updatedAt': next_cursor[0], 'nmID': next_cursor[1]}
+            time.sleep(0.25)
+
+        dedup = {int(r['chrtId']): r for r in all_rows if r.get('chrtId') is not None}
+        return list(dedup.values()), True
+
+    def _known_fbs_products_from_registry(self, store_name: str) -> List[dict]:
+        key = self._fbs_registry_key(store_name)
+        if not self.s3.file_exists(key):
+            return []
+        df = self.s3.read_excel(key, sheet_name=0)
+        if df.empty or 'chrtId' not in df.columns:
+            return []
+        rows = []
+        for _, r in df.iterrows():
+            try:
+                chrt_id = int(r.get('chrtId'))
+            except Exception:
+                continue
+            rows.append({
+                'chrtId': chrt_id,
+                'Артикул WB': r.get('Артикул WB', ''),
+                'Артикул продавца': r.get('Артикул продавца', ''),
+                'Название': '',
+                'Бренд': '',
+                'Предмет': '',
+                'Размер': '',
+                'Баркод': r.get('Баркод', ''),
+                'Баркоды': r.get('Баркоды', ''),
+            })
+        dedup = {int(r['chrtId']): r for r in rows}
+        return list(dedup.values())
+
+    def _fetch_fbs_warehouses(self, store_name: str) -> Tuple[Optional[List[dict]], Optional[int]]:
+        data, status = self._fbs_request_json(
+            'GET', 'https://marketplace-api.wildberries.ru/api/v3/warehouses',
+            self._fbs_headers(store_name), timeout=120, context='FBS warehouses'
+        )
+        if data is None:
+            return None, status
+        if not isinstance(data, list):
+            self.log(f"❌ FBS warehouses: ожидался список, получено {type(data).__name__}")
+            return None, status
+        # deliveryType=1 — склады FBS; deliveryType=3 — DBW.
+        warehouses = [w for w in data if int(w.get('deliveryType') or 0) == 1 and not bool(w.get('isDeleting', False))]
+        return warehouses, 200
+
+    def update_fbs_stocks(self, store_name: str) -> bool:
+        """Текущий snapshot остатков на складах продавца FBS.
+
+        Важно: API /api/v3/stocks/{warehouseId} возвращает текущий остаток, а не остаток задним числом.
+        Поэтому `Дата запроса` — фактическая дата сбора по МСК, а target_date сохраняем отдельно.
+        """
+        self.log("")
+        self.log(f"📌 ОБНОВЛЕНИЕ: Остатки FBS для магазина {store_name}")
+        warehouses, status_code = self._fetch_fbs_warehouses(store_name)
+        if warehouses is None:
+            if status_code in (401, 403):
+                self.log(f"⏭️ Остатки FBS {store_name} пропущены: текущий токен не имеет категории Marketplace")
+                return True
+            return False
+        if not warehouses:
+            self.log(f"ℹ️ У {store_name} не найдено активных складов FBS (deliveryType=1)")
+            return True
+        self.log(f"✅ Найдено FBS-складов продавца: {len(warehouses)}")
+
+        product_rows, full_cards = self._fetch_all_product_cards_for_fbs(store_name)
+        if not product_rows:
+            product_rows = self._known_fbs_products_from_registry(store_name)
+            full_cards = False
+        if not product_rows:
+            self.log("❌ Не удалось получить chrtId товаров ни из cards/list, ни из FBS-реестра")
+            return False
+        if full_cards:
+            self.log(f"✅ Для FBS-остатков получено chrtId всех карточек: {len(product_rows)}")
+        else:
+            self.log(
+                f"⚠️ cards/list недоступен: остатки будут собраны только по {len(product_rows)} chrtId, "
+                f"которые уже встречались в FBS-заказах"
+            )
+
+        product_map = {int(r['chrtId']): r for r in product_rows}
+        chrt_ids = sorted(product_map.keys())
+        now_msk = datetime.now(pytz.timezone('Europe/Moscow'))
+        request_date = now_msk.date()
+        request_ts = now_msk.strftime('%Y-%m-%d %H:%M:%S')
+        rows = []
+        headers = self._fbs_headers(store_name)
+
+        for wh_idx, wh in enumerate(warehouses, start=1):
+            warehouse_id = int(wh.get('id'))
+            wh_name = str(wh.get('name') or '')
+            self.log(f"🏬 FBS склад {wh_idx}/{len(warehouses)}: {wh_name} (id={warehouse_id}), chrtId={len(chrt_ids)}")
+            amounts: Dict[int, int] = {}
+            for i in range(0, len(chrt_ids), 1000):
+                batch = chrt_ids[i:i+1000]
+                data, status = self._fbs_request_json(
+                    'POST', f'https://marketplace-api.wildberries.ru/api/v3/stocks/{warehouse_id}',
+                    headers, payload={'chrtIds': batch}, timeout=120,
+                    context=f"FBS stocks warehouse={warehouse_id} batch={i//1000+1}"
+                )
+                if data is None:
+                    if status in (401, 403):
+                        self.log(f"⏭️ Остатки FBS {store_name}: нет Marketplace-доступа")
+                        return True
+                    return False
+                for item in data.get('stocks') or []:
+                    try:
+                        amounts[int(item.get('chrtId'))] = int(item.get('amount') or 0)
+                    except Exception:
+                        continue
+                time.sleep(0.25)
+
+            # Пишем и нулевые остатки, чтобы snapshot был полным.
+            for chrt_id in chrt_ids:
+                prod = product_map[chrt_id]
+                rows.append({
+                    'Дата запроса': request_date.strftime('%Y-%m-%d'),
+                    'Дата/время сбора': request_ts,
+                    'Целевая дата запуска': self.target_date.strftime('%Y-%m-%d'),
+                    'Магазин': store_name,
+                    'Тип': 'FBS',
+                    'ID склада продавца': warehouse_id,
+                    'Склад продавца': wh_name,
+                    'officeId': wh.get('officeId', ''),
+                    'deliveryType': wh.get('deliveryType', ''),
+                    'cargoType склада': wh.get('cargoType', ''),
+                    'isProcessing': wh.get('isProcessing', ''),
+                    'Артикул WB': prod.get('Артикул WB', ''),
+                    'Артикул продавца': prod.get('Артикул продавца', ''),
+                    'Название': prod.get('Название', ''),
+                    'Бренд': prod.get('Бренд', ''),
+                    'Предмет': prod.get('Предмет', ''),
+                    'chrtId': chrt_id,
+                    'Размер': prod.get('Размер', ''),
+                    'Баркод': prod.get('Баркод', ''),
+                    'Баркоды': prod.get('Баркоды', ''),
+                    'Остаток FBS': int(amounts.get(chrt_id, 0)),
+                    'Полнота справочника': 'полный cards/list' if full_cards else 'только товары из FBS-заказов',
+                })
+
+        df_day = pd.DataFrame(rows)
+        if df_day.empty:
+            self.log("ℹ️ FBS остатки: данных нет")
+            return True
+
+        key = self._fbs_stocks_weekly_key(store_name, request_date)
+        existing = self.s3.read_excel(key, sheet_name=0) if self.s3.file_exists(key) else pd.DataFrame()
+        if existing.empty:
+            combined = df_day
+        else:
+            dedup_cols = ['Дата запроса', 'ID склада продавца', 'chrtId']
+            combined = pd.concat([existing, df_day], ignore_index=True, sort=False)
+            combined = combined.drop_duplicates(subset=dedup_cols, keep='last')
+        combined = combined.sort_values(['Дата запроса', 'Склад продавца', 'Артикул продавца', 'chrtId'])
+        self.s3.write_excel(key, combined, sheet_name='Остатки FBS')
+        total_qty = int(pd.to_numeric(df_day['Остаток FBS'], errors='coerce').fillna(0).sum())
+        self.log(f"✅ FBS остатки сохранены: {key}, строк snapshot: {len(df_day)}, всего единиц: {total_qty}")
+        return True
+
+
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
         # Исключаем 1c_stocks из списка по умолчанию.
-        all_reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords']
+        all_reports = ['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords']
         disabled_for_finick = {'finance', 'keywords'}
 
         if reports is None:
@@ -2604,6 +3500,14 @@ class WildberriesDailyUpdater:
 STORE_SECRET_ENV = {
     'TOPFACE': 'WB_PROMO_KEY_TOPFACE',
     'MISSTAIS': 'WB_KEY_MISSTAIS',
+    'FINICK': 'FINICK_API_WB',
+}
+
+# Для FBS нужен токен категории Marketplace. Если отдельный токен не задан,
+# пробуем основной токен магазина, чтобы не ломать текущую конфигурацию.
+STORE_MARKETPLACE_SECRET_ENV = {
+    'TOPFACE': 'WB_MARKETPLACE_KEY_TOPFACE',
+    'MISSTAIS': 'WB_MARKETPLACE_KEY_MISSTAIS',
     'FINICK': 'FINICK_API_WB',
 }
 
@@ -2674,10 +3578,22 @@ def build_api_keys_for_stores(stores: List[str]) -> Dict[str, Dict[str, str]]:
             print(f"⚠️ Для {store} отдельный finance-token не задан, используем основной токен {secret_env}. "
                   f"Если новый финансовый метод вернёт 401/403, нужен токен категории Finance.")
 
+        marketplace_secret_env = STORE_MARKETPLACE_SECRET_ENV.get(store)
+        marketplace_key_value = os.environ.get(marketplace_secret_env or '', '').strip() if marketplace_secret_env else ''
+        if marketplace_key_value:
+            if marketplace_secret_env == secret_env:
+                print(f"✅ Для {store} основной токен {secret_env} используется для Marketplace/FBS")
+            else:
+                print(f"✅ Для {store} используется отдельный Marketplace/FBS token: {marketplace_secret_env}")
+        else:
+            marketplace_key_value = key_value
+            print(f"ℹ️ Для {store} отдельный Marketplace/FBS token не задан, пробуем основной токен {secret_env}")
+
         api_keys[store] = {
             'promo': key_value,
             'stats': key_value,
             'finance': finance_key_value,
+            'marketplace': marketplace_key_value,
         }
     return api_keys
 
@@ -2707,7 +3623,7 @@ def show_menu() -> int:
 
 def run_specific_report(updater: WildberriesDailyUpdater, store: str):
     """Подменю для выбора конкретного отчёта."""
-    reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords']
+    reports = ['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords']
     print("\n" + "="*60)
     print("ДОСТУПНЫЕ ОТЧЁТЫ:")
     for i, report in enumerate(reports, 1):
@@ -2743,7 +3659,7 @@ def main():
     """Основная функция запуска с поддержкой меню и магазинов TOPFACE/MISSTAIS/FINICK/ALL."""
     parser = argparse.ArgumentParser(description='Wildberries Daily Updater')
     parser.add_argument('--full', action='store_true', help='Полное ежедневное обновление (все отчёты)')
-    parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords'],
+    parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords'],
                         help='Обновить конкретный отчёт')
     parser.add_argument('--store', type=str, default='TOPFACE', help='Магазин: TOPFACE, MISSTAIS, FINICK или ALL')
 
