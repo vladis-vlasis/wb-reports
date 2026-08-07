@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v18
+Ozon FBO Daily Data Collector v19
 
 Назначение:
 - поддержка магазинов TOPFACE и FINICK;
@@ -59,7 +59,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_FAST_HISTORY_V18_20260806"
+SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_FINANCE_BY_SKU_V19_20260807"
 
 ALLOWED_STORES = {"TOPFACE", "FINICK"}
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -83,6 +83,8 @@ REPORT_SCHEMA_VERSIONS: Dict[str, int] = {
     "returns": 3,             # замена дневного среза целиком
     "funnel": 4,              # пакетные запросы метрик без ложного присвоения
     "finance_accruals": 1,
+    "finance_by_sku": 1,     # управленческий финансовый отчёт по SKU/артикулу
+    "realization_report": 1, # официальный отчёт реализации за последний закрытый месяц
     "ad_statistics": 4,       # замена дневного среза и campaign_id
     "ad_product_statistics": 2,
     "ad_orders": 2,
@@ -113,6 +115,7 @@ REPORT_DATE_CANDIDATES: Dict[str, List[str]] = {
     "returns": ["Дата", "logistic.return_date", "return_date", "logistic.final_moment"],
     "funnel": ["Дата", "day"],
     "finance_accruals": ["Дата", "date", "operation_date", "accrual_date"],
+    "finance_by_sku": ["Дата"],
     "ad_statistics": ["Дата", "date", "day", "statDate"],
     "ad_product_statistics": ["Дата", "date", "day", "statDate"],
     "ad_orders": ["Дата", "date", "day", "statDate"],
@@ -244,6 +247,60 @@ def to_number(value: Any) -> Optional[float]:
         return float(cleaned)
     except (TypeError, ValueError):
         return None
+
+
+
+def parse_json_value(value: Any) -> Any:
+    """Возвращает dict/list из JSON-строки, не меняя уже разобранные значения."""
+    if isinstance(value, (dict, list, tuple)):
+        return value
+    if value in (None, "", "null"):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text[:1] in {"{", "["}:
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+    return None
+
+
+def money_amount(value: Any) -> Optional[float]:
+    """Извлекает рублёвую сумму из числа или объекта Ozon {'amount': ...}."""
+    if isinstance(value, Mapping):
+        for key in ("amount", "value", "units"):
+            if key in value:
+                num = to_number(value.get(key))
+                if num is not None:
+                    return num
+        return None
+    return to_number(value)
+
+
+def infer_finance_quantity(seller_price: Any, sale_amount: Any) -> float:
+    """Пытается восстановить количество единиц в финансовой операции."""
+    price = money_amount(seller_price)
+    amount = money_amount(sale_amount)
+    if price not in (None, 0) and amount is not None:
+        ratio = abs(amount / price)
+        nearest = round(ratio)
+        if nearest >= 1 and abs(ratio - nearest) <= 0.02:
+            return float(nearest)
+    return 1.0
+
+
+def round_money(value: Any) -> int:
+    """Управленческие суммы показываем в целых рублях."""
+    number = to_number(value) or 0.0
+    return int(round(number))
+
+
+def round_percent(value: Any, digits: int = 1) -> Optional[float]:
+    number = to_number(value)
+    return None if number is None else round(number, digits)
 
 
 def safe_ratio(numerator: Any, denominator: Any, multiplier: float = 100.0) -> Optional[float]:
@@ -939,6 +996,9 @@ class OzonFboCollector:
         self.sku_ids: List[int] = []
         self.campaign_ids_override: List[str] = []
         self.active_campaign_ids_override: List[str] = []
+        # Справочник для понятных пользовательских отчётов: SKU -> артикул/название.
+        self.reference_sku_to_offer: Dict[str, str] = {}
+        self.reference_sku_to_name: Dict[str, str] = {}
         self.request_phase = resolve_request_phase()
         self.request_started_at = datetime.now(MOSCOW_TZ)
 
@@ -1088,11 +1148,18 @@ class OzonFboCollector:
             batch_items = extract_items(data, [("items",), ("result", "items")])
             rows.extend(batch_items)
             for item in batch_items:
+                offer = str(item.get("offer_id") or item.get("offerId") or "").strip()
+                name = str(item.get("name") or item.get("product_name") or "").strip()
                 for candidate in ("sku", "fbo_sku", "fbs_sku"):
                     try:
                         value = item.get(candidate)
                         if value not in (None, "", 0):
-                            self.sku_ids.append(int(value))
+                            sku_text = normalize_identifier(value)
+                            self.sku_ids.append(int(float(value)))
+                            if offer:
+                                self.reference_sku_to_offer[sku_text] = offer
+                            if name:
+                                self.reference_sku_to_name[sku_text] = name
                     except Exception:
                         pass
             time.sleep(0.12)
@@ -2185,7 +2252,7 @@ class OzonFboCollector:
     # ------------------------- finance/actions/reviews -------------------------
     def _product_article_map(self) -> Tuple[Dict[str, str], Dict[str, str]]:
         """Возвращает отображения SKU/product_id -> offer_id."""
-        sku_to_offer: Dict[str, str] = {}
+        sku_to_offer: Dict[str, str] = dict(self.reference_sku_to_offer)
         product_to_offer: Dict[str, str] = {}
         for result in self.results:
             if result.code not in {"products", "product_info"} or result.df.empty:
@@ -2265,6 +2332,264 @@ class OzonFboCollector:
         if last_exc:
             raise last_exc
         return pd.DataFrame(), raw, [endpoint]
+
+    def build_finance_by_sku(self, accrual_df: pd.DataFrame) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Строит понятный управленческий финансовый отчёт по SKU.
+
+        Источник — уже полученный /v1/finance/accrual/by-day, поэтому второй API-запрос
+        не выполняется. Все расходы отображаются положительными числами; возврат/сторно
+        расхода уменьшает итог. Поддержка Ozon (аналог СПП) контролируется двумя способами:
+        разницей seller_price - sale_price и суммой bonus + coinvestment.
+        """
+        if accrual_df is None or accrual_df.empty:
+            return pd.DataFrame(), {"source": "finance_accruals", "rows": 0}, ["/v1/finance/accrual/by-day"]
+
+        aggregates: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        def get_bucket(day: str, sku: str) -> Dict[str, Any]:
+            key = (day, sku)
+            if key not in aggregates:
+                offer = self.reference_sku_to_offer.get(sku, "") if sku else ""
+                name = self.reference_sku_to_name.get(sku, "") if sku else ""
+                aggregates[key] = {
+                    "Дата": day,
+                    "Артикул продавца": offer or ("Нераспределённые расходы магазина" if not sku else ""),
+                    "SKU Ozon": sku,
+                    "Название товара": name,
+                    "Реализовано по финансовым данным, шт.": 0.0,
+                    "Сумма по цене продавца, ₽": 0.0,
+                    "Сумма реализации после поддержки Ozon, ₽": 0.0,
+                    "Бонус Ozon, ₽": 0.0,
+                    "Доплата Ozon по программам лояльности, ₽": 0.0,
+                    "Поддержка Ozon по разнице цен, ₽": 0.0,
+                    "Комиссия Ozon, ₽": 0.0,
+                    "Логистика Ozon, ₽": 0.0,
+                    "Другие расходы Ozon по товару, ₽": 0.0,
+                    "Нераспределённые расходы Ozon, ₽": 0.0,
+                    "Финансовых операций, шт.": 0,
+                }
+            return aggregates[key]
+
+        def add_signed_expense(bucket: Dict[str, Any], column: str, signed_amount: Any) -> None:
+            amount = money_amount(signed_amount)
+            if amount is not None:
+                # В API удержания обычно отрицательные. В управленческом отчёте расходы
+                # показываем положительными, а возвраты/сторно — отрицательными.
+                bucket[column] += -amount
+
+        def parse_posting_product(product: Mapping[str, Any], bucket: Dict[str, Any]) -> None:
+            delivery = product.get("delivery") if isinstance(product.get("delivery"), Mapping) else {}
+            if delivery:
+                total_delivery = money_amount(delivery.get("total_accrued"))
+                if total_delivery is None:
+                    total_delivery = 0.0
+                    services = delivery.get("services") if isinstance(delivery.get("services"), list) else []
+                    for service in services:
+                        if isinstance(service, Mapping):
+                            total_delivery += money_amount(service.get("accrued")) or 0.0
+                add_signed_expense(bucket, "Логистика Ozon, ₽", total_delivery)
+
+            commission = product.get("commission") if isinstance(product.get("commission"), Mapping) else {}
+            if commission:
+                seller_price = money_amount(commission.get("seller_price"))
+                sale_price = money_amount(commission.get("sale_price"))
+                sale_amount = money_amount(commission.get("sale_amount"))
+                bonus = money_amount(commission.get("bonus")) or 0.0
+                coinvestment = money_amount(commission.get("coinvestment")) or 0.0
+                quantity = infer_finance_quantity(commission.get("seller_price"), commission.get("sale_amount"))
+
+                if seller_price is not None:
+                    bucket["Реализовано по финансовым данным, шт."] += quantity
+                    bucket["Сумма по цене продавца, ₽"] += seller_price * quantity
+                elif sale_amount is not None:
+                    bucket["Реализовано по финансовым данным, шт."] += quantity
+                    bucket["Сумма по цене продавца, ₽"] += sale_amount
+
+                if sale_price is not None:
+                    bucket["Сумма реализации после поддержки Ozon, ₽"] += sale_price * quantity
+                bucket["Бонус Ozon, ₽"] += bonus * quantity
+                bucket["Доплата Ozon по программам лояльности, ₽"] += coinvestment * quantity
+                if seller_price is not None and sale_price is not None:
+                    bucket["Поддержка Ozon по разнице цен, ₽"] += (seller_price - sale_price) * quantity
+
+                commission_value = commission.get("commission")
+                if commission_value is None:
+                    commission_value = commission.get("sale_commission")
+                add_signed_expense(bucket, "Комиссия Ozon, ₽", commission_value)
+
+        for _, row in accrual_df.iterrows():
+            day = str(row.get("Дата") or row.get("date") or self.target_date.isoformat())[:10]
+            attributed = False
+
+            posting = parse_json_value(row.get("posting"))
+            if isinstance(posting, Mapping):
+                products = posting.get("products") if isinstance(posting.get("products"), list) else []
+                for product in products:
+                    if not isinstance(product, Mapping):
+                        continue
+                    sku = normalize_identifier(product.get("sku"))
+                    if not sku:
+                        continue
+                    bucket = get_bucket(day, sku)
+                    bucket["Финансовых операций, шт."] += 1
+                    parse_posting_product(product, bucket)
+                    attributed = True
+
+            item_fees = parse_json_value(row.get("item_fees"))
+            if isinstance(item_fees, Mapping):
+                fee_groups = item_fees.get("fees") if isinstance(item_fees.get("fees"), list) else []
+                for group in fee_groups:
+                    if not isinstance(group, Mapping):
+                        continue
+                    sku = normalize_identifier(group.get("sku"))
+                    if not sku:
+                        continue
+                    bucket = get_bucket(day, sku)
+                    bucket["Финансовых операций, шт."] += 1
+                    fees = group.get("fees") if isinstance(group.get("fees"), list) else []
+                    for fee in fees:
+                        if isinstance(fee, Mapping):
+                            add_signed_expense(bucket, "Другие расходы Ozon по товару, ₽", fee.get("accrued"))
+                    attributed = True
+
+            # Некоторые версии ответа раскрывают item_fees.fees отдельной колонкой.
+            if not attributed:
+                fees_flat = parse_json_value(row.get("item_fees.fees"))
+                if isinstance(fees_flat, list):
+                    for group in fees_flat:
+                        if not isinstance(group, Mapping):
+                            continue
+                        sku = normalize_identifier(group.get("sku"))
+                        if not sku:
+                            continue
+                        bucket = get_bucket(day, sku)
+                        bucket["Финансовых операций, шт."] += 1
+                        for fee in group.get("fees", []) if isinstance(group.get("fees"), list) else []:
+                            if isinstance(fee, Mapping):
+                                add_signed_expense(bucket, "Другие расходы Ozon по товару, ₽", fee.get("accrued"))
+                        attributed = True
+
+            # Нераспределённые начисления обязательно сохраняем отдельно, а не размазываем по SKU.
+            non_item = parse_json_value(row.get("non_item_fee"))
+            if isinstance(non_item, Mapping):
+                bucket = get_bucket(day, "")
+                bucket["Финансовых операций, шт."] += 1
+                add_signed_expense(bucket, "Нераспределённые расходы Ozon, ₽", non_item.get("accrued"))
+                attributed = True
+            elif row.get("non_item_fee.accrued") not in (None, ""):
+                bucket = get_bucket(day, "")
+                bucket["Финансовых операций, шт."] += 1
+                add_signed_expense(bucket, "Нераспределённые расходы Ozon, ₽", row.get("non_item_fee.accrued"))
+                attributed = True
+
+            if not attributed:
+                total_amount = money_amount(row.get("total_amount"))
+                if total_amount is None:
+                    total_amount = money_amount(row.get("total_amount.amount"))
+                if total_amount not in (None, 0):
+                    bucket = get_bucket(day, "")
+                    bucket["Финансовых операций, шт."] += 1
+                    add_signed_expense(bucket, "Нераспределённые расходы Ozon, ₽", total_amount)
+
+        output: List[Dict[str, Any]] = []
+        for (_, _), row in sorted(aggregates.items(), key=lambda x: (x[0][0], x[0][1])):
+            qty = float(row["Реализовано по финансовым данным, шт."] or 0.0)
+            seller_sum = float(row["Сумма по цене продавца, ₽"] or 0.0)
+            sale_sum = float(row["Сумма реализации после поддержки Ozon, ₽"] or 0.0)
+            bonus = float(row["Бонус Ozon, ₽"] or 0.0)
+            coinvestment = float(row["Доплата Ozon по программам лояльности, ₽"] or 0.0)
+            support_by_diff = float(row["Поддержка Ozon по разнице цен, ₽"] or 0.0)
+            support_components = bonus + coinvestment
+            commission_cost = float(row["Комиссия Ozon, ₽"] or 0.0)
+            logistics_cost = float(row["Логистика Ozon, ₽"] or 0.0)
+            other_cost = float(row["Другие расходы Ozon по товару, ₽"] or 0.0)
+            unallocated_cost = float(row["Нераспределённые расходы Ozon, ₽"] or 0.0)
+            total_cost = commission_cost + logistics_cost + other_cost + unallocated_cost
+            support_check = support_by_diff - support_components
+
+            result_row = {
+                "Дата": row["Дата"],
+                "Артикул продавца": row["Артикул продавца"],
+                "SKU Ozon": row["SKU Ozon"],
+                "Название товара": row["Название товара"],
+                "Реализовано по финансовым данным, шт.": int(round(qty)),
+                "Средняя цена продавца до поддержки Ozon, ₽": round_money(seller_sum / qty) if qty else 0,
+                "Средняя цена реализации после поддержки Ozon, ₽": round_money(sale_sum / qty) if qty else 0,
+                "Сумма по цене продавца, ₽": round_money(seller_sum),
+                "Сумма реализации после поддержки Ozon, ₽": round_money(sale_sum),
+                "Поддержка Ozon (аналог СПП), ₽": round_money(support_by_diff),
+                "Поддержка Ozon (аналог СПП), %": round_percent(safe_ratio(support_by_diff, seller_sum)),
+                "Бонус Ozon, ₽": round_money(bonus),
+                "Доплата Ozon по программам лояльности, ₽": round_money(coinvestment),
+                "Проверка СПП: расхождение, ₽": round_money(support_check),
+                "СПП сверено": "Да" if seller_sum > 0 and abs(support_check) <= max(1.0, seller_sum * 0.001) else ("Нет данных" if seller_sum <= 0 else "Нет"),
+                "Комиссия Ozon, ₽": round_money(commission_cost),
+                "Комиссия Ozon, % от цены продавца": round_percent(safe_ratio(commission_cost, seller_sum)),
+                "Логистика Ozon, ₽": round_money(logistics_cost),
+                "Другие расходы Ozon по товару, ₽": round_money(other_cost),
+                "Нераспределённые расходы Ozon, ₽": round_money(unallocated_cost),
+                "Всего расходов Ozon, ₽": round_money(total_cost),
+                "Расходы Ozon, % от цены продавца": round_percent(safe_ratio(total_cost, seller_sum)),
+                "Остаток после расходов Ozon, ₽": round_money(seller_sum - total_cost),
+                "Финансовых операций, шт.": int(row["Финансовых операций, шт."] or 0),
+            }
+            output.append(result_row)
+
+        df = pd.DataFrame(output)
+        return df, {
+            "source": "finance_accruals",
+            "source_rows": int(len(accrual_df)),
+            "result_rows": int(len(df)),
+            "note": "Управленческий отчёт построен без дополнительного запроса API",
+        }, ["/v1/finance/accrual/by-day"]
+
+    def fetch_realization_report(self) -> Tuple[pd.DataFrame, Any, List[str]]:
+        """Официальный отчёт реализации за последний полностью закрытый месяц."""
+        endpoint = "/v2/finance/realization"
+        first_day = self.target_date.replace(day=1)
+        month_day = first_day - timedelta(days=1)
+        payload = {"month": month_day.month, "year": month_day.year}
+        data = self.client.post(endpoint, payload)
+        rows = extract_items(data, [("result", "rows"), ("rows",)])
+        out: List[Dict[str, Any]] = []
+        month_label = f"{month_day.year:04d}-{month_day.month:02d}"
+        for source in rows:
+            if not isinstance(source, Mapping):
+                continue
+            item = source.get("item") if isinstance(source.get("item"), Mapping) else {}
+            delivery = source.get("delivery_commission") if isinstance(source.get("delivery_commission"), Mapping) else {}
+            returned = source.get("return_commission") if isinstance(source.get("return_commission"), Mapping) else {}
+            seller_price = to_number(source.get("seller_price_per_instance"))
+            sale_price = to_number(delivery.get("price_per_instance"))
+            support = None
+            if seller_price is not None and sale_price is not None:
+                support = seller_price - sale_price
+            out.append({
+                "Месяц отчёта": month_label,
+                "Артикул продавца": item.get("offer_id") or "",
+                "SKU Ozon": normalize_identifier(item.get("sku")),
+                "Название товара": item.get("name") or "",
+                "Штрихкод": item.get("barcode") or "",
+                "Цена продавца, ₽": seller_price,
+                "Цена реализации, ₽": sale_price,
+                "Поддержка Ozon (аналог СПП), ₽ за шт.": support,
+                "Поддержка Ozon (аналог СПП), %": safe_ratio(support, seller_price),
+                "Реализовано, шт.": to_number(delivery.get("quantity")) or 0,
+                "Сумма реализации, ₽": to_number(delivery.get("amount")) or 0,
+                "Бонус Ozon по продажам, ₽": to_number(delivery.get("bonus")) or 0,
+                "Доплата Ozon по лояльности, ₽": to_number(delivery.get("bank_coinvestment")) or 0,
+                "Компенсация Ozon по продажам, ₽": to_number(delivery.get("compensation")) or 0,
+                "Стандартная комиссия по продажам, ₽": to_number(delivery.get("standard_fee")) or 0,
+                "Итого по продажам, ₽": to_number(delivery.get("total")) or 0,
+                "Возвращено, шт.": to_number(returned.get("quantity")) or 0,
+                "Сумма возвратов, ₽": to_number(returned.get("amount")) or 0,
+                "Бонус Ozon по возвратам, ₽": to_number(returned.get("bonus")) or 0,
+                "Доплата Ozon по лояльности при возврате, ₽": to_number(returned.get("bank_coinvestment")) or 0,
+                "Компенсация Ozon по возвратам, ₽": to_number(returned.get("compensation")) or 0,
+                "Итого по возвратам, ₽": to_number(returned.get("total")) or 0,
+                "Комиссия, %": round_percent((to_number(source.get("commission_ratio")) or 0) * 100 if (to_number(source.get("commission_ratio")) or 0) <= 1.5 else to_number(source.get("commission_ratio"))),
+            })
+        return pd.DataFrame(out), {"request": payload, "response": data}, [endpoint]
 
     def fetch_promotions(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         """Доступные акции и товары в них — снимок на дату запуска."""
@@ -3324,6 +3649,13 @@ class OzonFboCollector:
             ["Дата снимка", "warehouse_id", "name"],
             optional=True,
         )
+        self._run(
+            "realization_report", "Отчёт реализации Ozon — последний закрытый месяц",
+            "Отчёт реализации", "Отчёт_реализации_последний_закрытый_месяц",
+            self.fetch_realization_report, "Месяц отчёта",
+            ["Месяц отчёта", "SKU Ozon"],
+            snapshot=True, optional=True,
+        )
 
     def collect_optional_event_reports(self) -> None:
         """Дорогие/экспериментальные методы. В history выполняются один раз, не 60 раз."""
@@ -3379,13 +3711,21 @@ class OzonFboCollector:
             self.fetch_funnel, "Дата",
             ["Дата", "sku"],
         )
-        self._run(
-            "finance_accruals", "Финансовые начисления",
+        finance_result = self._run(
+            "finance_accruals", "Финансовые начисления — технический источник",
             "Финансовые начисления", "Финансовые_начисления",
             self.fetch_finance_accruals, "Дата",
             ["Дата", "accrual_id", "posting.posting_number", "posting.products.sku", "sku"],
             optional=True,
         )
+        if finance_result.status in {"OK", "EMPTY"}:
+            self._run(
+                "finance_by_sku", "Финансы по артикулам — управленческий отчёт",
+                "Финансы по артикулам", "Финансы_по_артикулам",
+                lambda: self.build_finance_by_sku(finance_result.df), "Дата",
+                ["Дата", "SKU Ozon"],
+                optional=True,
+            )
 
         if self.performance_client is not None:
             self._run(
@@ -3467,7 +3807,28 @@ class OzonFboCollector:
                 cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             for col_idx, col in enumerate(df.columns, start=1):
                 sample = [len(str(col))] + [len(str(x)) for x in df[col].dropna().astype(str).head(150)]
-                ws.column_dimensions[get_column_letter(col_idx)].width = min(60, max(10, max(sample, default=10) + 2))
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(42, max(10, max(sample, default=10) + 2))
+                header = str(col)
+                # Понятное отображение чисел: штуки/показы/клики — целые;
+                # управленческие рубли — целые; точные бухгалтерские суммы — с копейками.
+                if header == "SKU Ozon":
+                    number_format = "0"
+                elif "шт." in header or header in {"Показы", "Клики", "Финансовых операций"}:
+                    number_format = "#,##0"
+                elif "%" in header:
+                    number_format = "0.0"
+                elif "₽" in header:
+                    if sheet_name.startswith("Отчёт реализации"):
+                        number_format = "#,##0.00"
+                    elif any(token in header for token in ("CPC", "CPO")):
+                        number_format = "#,##0.00"
+                    else:
+                        number_format = "#,##0"
+                else:
+                    number_format = None
+                if number_format:
+                    for cell in ws[get_column_letter(col_idx)][1:]:
+                        cell.number_format = number_format
         return buffer.getvalue()
 
 
@@ -3754,6 +4115,7 @@ EVENT_REPORT_CODES = [
     "returns",
     "funnel",
     "finance_accruals",
+    "finance_by_sku",
     "ad_statistics",
     "ad_product_statistics",
     "ad_orders",
@@ -3766,6 +4128,7 @@ EVENT_REPORT_LOCATIONS: Dict[str, Tuple[str, str]] = {
     "returns": ("Возвраты", "Возвраты"),
     "funnel": ("Воронка продаж", "Воронка_продаж"),
     "finance_accruals": ("Финансовые начисления", "Финансовые_начисления"),
+    "finance_by_sku": ("Финансы по артикулам", "Финансы_по_артикулам"),
     "ad_statistics": ("Реклама/Статистика", "Реклама_статистика"),
     "ad_product_statistics": ("Реклама/По товарам", "Реклама_по_товарам"),
     "ad_orders": ("Реклама/Заказы", "Рекламные_заказы"),
@@ -3955,6 +4318,104 @@ def copy_reference_context(
     target.sku_ids = list(source.sku_ids)
     target.campaign_ids_override = campaign_ids_from_collector(source)
     target.active_campaign_ids_override = source._active_campaign_ids_from_results()
+    target.reference_sku_to_offer = dict(source.reference_sku_to_offer)
+    target.reference_sku_to_name = dict(source.reference_sku_to_name)
+
+
+def rebuild_finance_by_sku_from_storage(
+    client: OzonSellerClient,
+    storage: S3Storage,
+    store: str,
+    target_date: date,
+    workdir: Path,
+) -> Dict[str, Any]:
+    """Быстро пересобирает 60 дней «Финансов по артикулам» без повторных запросов истории.
+
+    Берёт уже сохранённые недельные «Финансовые начисления», агрегирует их по
+    дата × SKU и перезаписывает понятные управленческие недельные файлы.
+    Из API запрашивается только актуальный справочник товаров для связи SKU -> артикул.
+    """
+    collector = OzonFboCollector(
+        client, storage, store, target_date, "test", workdir / "finance_rebuild",
+        performance_client=None, fast_history=True,
+    )
+    mapping_errors: List[str] = []
+    try:
+        collector.fetch_product_catalog()
+        collector.fetch_product_info()
+    except Exception as exc:
+        mapping_errors.append(str(exc))
+        logging.warning("Не удалось обновить справочник SKU -> артикул: %s", exc)
+
+    start = history_start(target_date)
+    weeks = sorted({iso_week(day) for day in iter_days(start, target_date)})
+    files_done: List[Dict[str, Any]] = []
+    missing_sources: List[str] = []
+    total_source_rows = 0
+    total_result_rows = 0
+
+    for year, week in weeks:
+        week_day = date.fromisocalendar(year, week, 1)
+        source_key = (
+            f"Отчёты/Финансовые начисления/{store}/Недельные/"
+            f"Финансовые_начисления_{year}-W{week:02d}.xlsx"
+        )
+        source = storage.read_excel(source_key)
+        if source is None or source.empty:
+            missing_sources.append(source_key)
+            continue
+
+        # Ограничиваем первый/последний неполный недельный файл нашим 60-дневным окном.
+        date_col = collector._detect_row_date_column(source, "Дата", "finance_accruals")
+        if date_col:
+            parsed = pd.to_datetime(source[date_col], errors="coerce", utc=True).dt.date
+            source = source[(parsed >= start) & (parsed <= target_date)].copy()
+        if source.empty:
+            continue
+
+        result_df, meta, _ = collector.build_finance_by_sku(source)
+        result_df = collector._postprocess_report_df("finance_by_sku", result_df)
+        target_key = (
+            f"Отчёты/Финансы по артикулам/{store}/Недельные/"
+            f"Финансы_по_артикулам_{year}-W{week:02d}.xlsx"
+        )
+        storage.upload_bytes(
+            target_key,
+            collector._excel_bytes(result_df, "Финансы по артикулам"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        files_done.append({
+            "неделя": f"{year}-W{week:02d}",
+            "источник": source_key,
+            "файл": target_key,
+            "строк_источника": int(len(source)),
+            "строк_результата": int(len(result_df)),
+        })
+        total_source_rows += int(len(source))
+        total_result_rows += int(len(result_df))
+        logging.info(
+            "Финансы по артикулам %s-W%02d: %s -> %s строк",
+            year, week, len(source), len(result_df),
+        )
+
+    info = {
+        "status": "OK",
+        "store": store,
+        "period_from": start.isoformat(),
+        "period_to": target_date.isoformat(),
+        "weeks_processed": len(files_done),
+        "source_rows": total_source_rows,
+        "result_rows": total_result_rows,
+        "files": files_done,
+        "missing_sources": missing_sources,
+        "mapping_errors": mapping_errors,
+        "created_at": datetime.now(MOSCOW_TZ).isoformat(),
+    }
+    storage.upload_json(
+        f"Отчёты/Служебные/{store}/Финансы по артикулам/Последняя_пересборка.json",
+        info,
+    )
+    return info
 
 
 def create_archive_all(
@@ -3975,7 +4436,7 @@ def create_archive_all(
     period_start = history_start(target_date)
 
     event_prefixes = {
-        "Возвраты", "Воронка продаж", "Заказы", "Финансовые начисления",
+        "Возвраты", "Воронка продаж", "Заказы", "Финансовые начисления", "Финансы по артикулам",
         "Реклама/Статистика", "Реклама/По товарам", "Реклама/Заказы",
         "Поисковые запросы", "Поисковые запросы по товарам",
     }
@@ -4003,7 +4464,11 @@ def create_archive_all(
         relative = key[len("Отчёты/"):] if key.startswith("Отчёты/") else key
         is_service = relative.startswith("Служебные/")
         is_weekly = "/Недельные/" in key
-        if not is_service and not is_weekly:
+        is_current_realization = (
+            relative.startswith("Отчёт реализации/")
+            and key.endswith("/Отчёт_реализации_последний_закрытый_месяц.xlsx")
+        )
+        if not is_service and not is_weekly and not is_current_realization:
             return False, "legacy_non_weekly"
 
         if is_weekly:
@@ -4101,13 +4566,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Ozon FBO: ежедневный сбор продаж, аналитики и рекламы")
     p.add_argument(
         "--mode",
-        choices=["test", "daily", "history", "archive", "archive_all"],
+        choices=["test", "daily", "history", "finance_rebuild", "archive", "archive_all"],
         default=env_first("OZON_MODE", default="test"),
     )
     p.add_argument("--target-date", default=env_first("OZON_TARGET_DATE"))
     p.add_argument("--store", default=env_first("OZON_STORE", "STORE", default=DEFAULT_STORE))
     p.add_argument("--bucket", default=env_first("OZON_YC_BUCKET", "YC_BUCKET_NAME", default=DEFAULT_BUCKET))
-    p.add_argument("--workdir", default="output_ozon_v18")
+    p.add_argument("--workdir", default="output_ozon_v19")
     p.add_argument(
         "--repair-days-per-run",
         type=int,
@@ -4170,6 +4635,13 @@ def main() -> int:
     if not client_id or not api_key:
         raise RuntimeError(f"Не заданы OZON_CLIENT_ID_{store} и/или OZON_API_KEY_{store}")
     seller_client = OzonSellerClient(client_id, api_key)
+
+    if args.mode == "finance_rebuild":
+        info = rebuild_finance_by_sku_from_storage(
+            seller_client, storage, store, target, workdir
+        )
+        print(json.dumps(info, ensure_ascii=False, indent=2, default=str))
+        return 0
 
     performance_client: Optional[OzonPerformanceClient] = None
     if performance_client_id and performance_client_secret:
