@@ -53,10 +53,10 @@ import boto3
 import numpy as np
 import pandas as pd
 
-VERSION = "assistant-wb-finick-ads-analytics-v2-github-2026-08-07"
+VERSION = "assistant-wb-finick-ads-analytics-v3-bid-history-s3fix-2026-08-07"
 STORE = "FINICK"
 MOSCOW = ZoneInfo("Europe/Moscow")
-S3_ENDPOINT = os.getenv("YC_S3_ENDPOINT", "https://storage.yandexcloud.net")
+S3_ENDPOINT_DEFAULT = "https://storage.yandexcloud.net"
 
 ORDERS_PREFIX = "Отчёты/Заказы/FINICK/Недельные/"
 ADS_PREFIX = "Отчёты/Реклама/FINICK/Недельные/"
@@ -72,6 +72,7 @@ OUTPUT_HISTORY_PREFIX = OUTPUT_PREFIX + "history/"
 OUTPUT_XLSX_KEY = OUTPUT_CURRENT_PREFIX + "Техническая_аналитика.xlsx"
 OUTPUT_JSON_KEY = OUTPUT_CURRENT_PREFIX + "ui_payload.json"
 OUTPUT_META_KEY = OUTPUT_CURRENT_PREFIX + "meta.json"
+BID_STATE_KEY = OUTPUT_CURRENT_PREFIX + "bid_state.json"
 
 # Динамика: менее 0.5% считаем практически без изменения.
 TREND_FLAT_EPS_PCT = 0.5
@@ -129,9 +130,15 @@ def env_required(name: str) -> str:
 
 
 def make_s3():
+    # GitHub Actions подставляет пустую строку, если secret не создан.
+    # Поэтому endpoint разрешаем в момент вызова и подставляем Yandex S3 по умолчанию.
+    endpoint = (os.getenv("YC_S3_ENDPOINT") or "").strip() or S3_ENDPOINT_DEFAULT
+    if not endpoint.startswith(("http://", "https://")):
+        raise RuntimeError(f"Некорректный YC_S3_ENDPOINT: {endpoint!r}")
+    print(f"S3 endpoint: {endpoint}", flush=True)
     return boto3.client(
         "s3",
-        endpoint_url=S3_ENDPOINT,
+        endpoint_url=endpoint,
         aws_access_key_id=env_required("YC_ACCESS_KEY_ID"),
         aws_secret_access_key=env_required("YC_SECRET_ACCESS_KEY"),
         region_name="ru-central1",
@@ -423,6 +430,179 @@ def normalize_manager_queries(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     out["campaign_id"] = out["campaign_id"].astype(int)
     out["nm_id"] = out["nm_id"].astype("Int64")
     return out.drop_duplicates(["campaign_id", "nm_id", "query"], keep="last")
+
+
+
+def load_bid_state(s3, bucket: str) -> Dict[str, Any]:
+    try:
+        if not key_exists(s3, bucket, BID_STATE_KEY):
+            return {"version": 1, "campaigns": {}, "queries": {}}
+        raw = download_bytes(s3, bucket, BID_STATE_KEY)
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("bid_state.json is not an object")
+        data.setdefault("version", 1)
+        data.setdefault("campaigns", {})
+        data.setdefault("queries", {})
+        return data
+    except Exception as exc:
+        print(f"WARN bid state: {exc}", flush=True)
+        return {"version": 1, "campaigns": {}, "queries": {}}
+
+
+def _valid_bid(v: Any) -> Optional[float]:
+    try:
+        x = float(v)
+    except Exception:
+        return None
+    if not math.isfinite(x) or x <= 0:
+        return None
+    return round(x, 4)
+
+
+def _bid_entry(old: Optional[Dict[str, Any]], current: float, observed_on: date) -> Dict[str, Any]:
+    if not old or _valid_bid(old.get("current")) is None:
+        return {
+            "previous": None,
+            "current": current,
+            "direction": "→",
+            "changed_date": None,
+            "changed_date_iso": None,
+        }
+
+    old_current = float(old["current"])
+    if abs(current - old_current) >= 1e-9:
+        return {
+            "previous": old_current,
+            "current": current,
+            "direction": "↑" if current > old_current else "↓",
+            "changed_date": observed_on.strftime("%d.%m.%Y"),
+            "changed_date_iso": observed_on.isoformat(),
+        }
+
+    return {
+        "previous": old.get("previous"),
+        "current": current,
+        "direction": old.get("direction") or "→",
+        "changed_date": old.get("changed_date"),
+        "changed_date_iso": old.get("changed_date_iso"),
+    }
+
+
+def _campaign_primary_bid(row: pd.Series) -> Optional[float]:
+    search_bid = _valid_bid(row.get("search_bid"))
+    reco_bid = _valid_bid(row.get("reco_bid"))
+    if search_bid is not None:
+        return search_bid
+    return reco_bid
+
+
+def update_bid_state(
+    old_state: Dict[str, Any],
+    campaign_meta: pd.DataFrame,
+    manager_queries: pd.DataFrame,
+    as_of: date,
+) -> Dict[str, Any]:
+    state = {
+        "version": 1,
+        "updated_at_msk": datetime.now(MOSCOW).isoformat(),
+        "campaigns": dict((old_state or {}).get("campaigns") or {}),
+        "queries": dict((old_state or {}).get("queries") or {}),
+    }
+
+    if campaign_meta is not None and not campaign_meta.empty:
+        for _, row in campaign_meta.iterrows():
+            current = _campaign_primary_bid(row)
+            if current is None:
+                continue
+            cid = int(row["campaign_id"])
+            nm = "" if pd.isna(row.get("nm_id")) else str(int(row.get("nm_id")))
+            key = f"{cid}|{nm}"
+            entry = _bid_entry(state["campaigns"].get(key), current, as_of)
+            entry.update({"campaign_id": cid, "nm_id": int(nm) if nm else None})
+            state["campaigns"][key] = entry
+
+    if manager_queries is not None and not manager_queries.empty:
+        for _, row in manager_queries.iterrows():
+            current = _valid_bid(row.get("query_bid"))
+            if current is None:
+                continue
+            cid = int(row["campaign_id"])
+            nm = "" if pd.isna(row.get("nm_id")) else str(int(row.get("nm_id")))
+            query = norm_text(row.get("query"))
+            if not query:
+                continue
+            key = f"{cid}|{nm}|{query}"
+            entry = _bid_entry(state["queries"].get(key), current, as_of)
+            entry.update({
+                "campaign_id": cid,
+                "nm_id": int(nm) if nm else None,
+                "query": query,
+            })
+            state["queries"][key] = entry
+    return state
+
+
+def attach_campaign_bid_state(df: pd.DataFrame, state: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    camp_state = (state or {}).get("campaigns") or {}
+    prev, cur, direction, changed, changed_iso = [], [], [], [], []
+
+    for _, row in out.iterrows():
+        cid = int(row["campaign_id"])
+        nm = "" if pd.isna(row.get("nm_id")) else str(int(row.get("nm_id")))
+        e = camp_state.get(f"{cid}|{nm}") or {}
+        prev.append(e.get("previous"))
+        cur.append(e.get("current") if e.get("current") is not None else _campaign_primary_bid(row))
+        direction.append(e.get("direction") or "→")
+        changed.append(e.get("changed_date"))
+        changed_iso.append(e.get("changed_date_iso"))
+
+    out["bid_previous"] = prev
+    out["bid_current"] = cur
+    out["bid_direction"] = direction
+    out["bid_changed_date"] = changed
+    out["bid_changed_date_iso"] = changed_iso
+    out["bid_display"] = [
+        (f"{float(p):g} → {float(c):g} {d}" if p is not None and c is not None
+         else f"{float(c):g}" if c is not None else "")
+        for p, c, d in zip(prev, cur, direction)
+    ]
+    return out
+
+
+def attach_query_bid_state(df: pd.DataFrame, state: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    query_state = (state or {}).get("queries") or {}
+    prev, cur, direction, changed, changed_iso = [], [], [], [], []
+
+    for _, row in out.iterrows():
+        cid = int(row["campaign_id"])
+        nm = "" if pd.isna(row.get("nm_id")) else str(int(row.get("nm_id")))
+        query = norm_text(row.get("query"))
+        e = query_state.get(f"{cid}|{nm}|{query}") or {}
+        current_fallback = _valid_bid(row.get("query_bid"))
+        prev.append(e.get("previous"))
+        cur.append(e.get("current") if e.get("current") is not None else current_fallback)
+        direction.append(e.get("direction") or "→")
+        changed.append(e.get("changed_date"))
+        changed_iso.append(e.get("changed_date_iso"))
+
+    out["bid_previous"] = prev
+    out["bid_current"] = cur
+    out["bid_direction"] = direction
+    out["bid_changed_date"] = changed
+    out["bid_changed_date_iso"] = changed_iso
+    out["bid_display"] = [
+        (f"{float(p):g} → {float(c):g} {d}" if p is not None and c is not None
+         else f"{float(c):g}" if c is not None else "")
+        for p, c, d in zip(prev, cur, direction)
+    ]
+    return out
 
 
 def build_windows(as_of: date) -> Dict[str, PeriodWindow]:
@@ -1013,13 +1193,18 @@ def run(as_of: date, out_dir: Path, upload: bool = True) -> Tuple[Path, Path]:
         ads = ads.drop(columns=[c for c in ["campaign_name", "subject", "supplier_article"] if c in ads.columns]).merge(cmap, on=["campaign_id", "nm_id"], how="left")
         ads = add_product_fields(ads, pmap)
 
+    old_bid_state = load_bid_state(s3, bucket)
+    bid_state = update_bid_state(old_bid_state, manager_campaigns, manager_queries, as_of)
+
     windows = build_windows(as_of)
     tables: Dict[str, Dict[str, pd.DataFrame]] = {}
     for code, w in windows.items():
         articles = build_article_table(orders, ads, w, as_of)
         campaigns = build_campaign_table(ads, manager_campaigns, w)
+        campaigns = attach_campaign_bid_state(campaigns, bid_state)
         subjects = build_subject_table(orders, ads, w)
         queries = build_query_table(manager_queries, keywords, articles, campaigns, w)
+        queries = attach_query_bid_state(queries, bid_state)
         tables[code] = {"subjects": subjects, "articles": articles, "campaigns": campaigns, "queries": queries}
 
     quality = data_quality_table(source_keys, orders, ads, stocks, keywords, manager_queries)
@@ -1035,6 +1220,12 @@ def run(as_of: date, out_dir: Path, upload: bool = True) -> Tuple[Path, Path]:
         # current/ всегда содержит последнюю актуальную версию для веб-приложения.
         upload_file(s3, bucket, xlsx_path, OUTPUT_XLSX_KEY, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         upload_file(s3, bucket, json_path, OUTPUT_JSON_KEY, "application/json; charset=utf-8")
+        s3.put_object(
+            Bucket=bucket,
+            Key=BID_STATE_KEY,
+            Body=json.dumps(bid_state, ensure_ascii=False, indent=2).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
 
         # history/YYYY-MM-DD/ в течение одного дня перезаписывается в 09/12/16 МСК.
         # На следующий день создаётся новый дневной срез.
@@ -1063,6 +1254,7 @@ def run(as_of: date, out_dir: Path, upload: bool = True) -> Tuple[Path, Path]:
             "outputs": {
                 "current_xlsx": OUTPUT_XLSX_KEY,
                 "current_json": OUTPUT_JSON_KEY,
+                "bid_state": BID_STATE_KEY,
                 "history_xlsx": hist_xlsx_key,
                 "history_json": hist_json_key,
             },
