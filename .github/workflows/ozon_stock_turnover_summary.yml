@@ -3,66 +3,153 @@ name: Ozon — Остатки и оборачиваемость
 on:
   workflow_dispatch:
     inputs:
-      store:
-        description: "Магазин"
-        required: true
-        default: "FINICK"
-        type: choice
-        options:
-          - FINICK
-          - TOPFACE
       target_date:
-        description: "Дата отчёта YYYY-MM-DD; пусто = вчера по Москве"
+        description: "Дата отчёта YYYY-MM-DD. Пусто = вчера по Москве"
         required: false
         default: ""
         type: string
+
   schedule:
-    - cron: "15 7 * * *"
+    # 09:15 МСК ежедневно = 06:15 UTC
+    - cron: "15 6 * * *"
+
+concurrency:
+  group: ozon-stock-turnover-summary-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  stock-turnover:
+  run:
+    name: Остатки и оборачиваемость FINICK
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    permissions:
-      contents: read
+    timeout-minutes: 60
+
+    env:
+      TZ: Europe/Moscow
+      OZON_STORE: FINICK
+      OZON_TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
+
+      # Ключи лежат так же, как в действующих workflow проекта:
+      # часть может быть отдельными GitHub Secrets, часть — внутри REPORT_ENV.
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+
+      OZON_CLIENT_ID_FINICK: ${{ secrets.OZON_CLIENT_ID_FINICK }}
+      OZON_API_KEY_FINICK: ${{ secrets.OZON_API_KEY_FINICK }}
+
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Получить код
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Установить зависимости
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests boto3 pandas openpyxl lxml html5lib beautifulsoup4
-
-      - name: Проверить наличие скрипта
+      - name: Workflow diagnostics
         shell: bash
         run: |
-          echo "Корень репозитория: $GITHUB_WORKSPACE"
-          echo "Найденные Python-файлы:"
-          find . -maxdepth 4 -type f -name "*.py" -print
+          set -euo pipefail
+          echo "WORKFLOW_VERSION=stock_summary_v1_3_report_env_fix"
+          echo "OZON_STORE=${OZON_STORE}"
+          echo "OZON_TARGET_DATE=${OZON_TARGET_DATE:-}"
           if [ ! -f "ozon_stock_turnover_summary.py" ]; then
-            echo "ОШИБКА: в корне репозитория нет файла ozon_stock_turnover_summary.py"
-            exit 1
+            echo "ERROR: ozon_stock_turnover_summary.py not found in repo root"
+            ls -la
+            exit 2
           fi
 
-      - name: Сформировать сводный отчёт
-        env:
-          REPORT_ENV: ${{ secrets.REPORT_ENV }}
-          OZON_CLIENT_ID_FINICK: ${{ secrets.OZON_CLIENT_ID_FINICK }}
-          OZON_API_KEY_FINICK: ${{ secrets.OZON_API_KEY_FINICK }}
-          OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
-          OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
-          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
-          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-          YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
-          OZON_CROSSDOCK_SLA_JSON: ${{ secrets.OZON_CROSSDOCK_SLA_JSON }}
-          OZON_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.store || 'FINICK' }}
-          OZON_TARGET_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.target_date || '' }}
-        run: python ozon_stock_turnover_summary.py
+      - name: Load secrets from REPORT_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "YC_ENDPOINT_URL",
+              "OZON_CLIENT_ID_FINICK",
+              "OZON_API_KEY_FINICK",
+          ]
+
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+
+          for raw_line in report_env.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('"').strip("'")
+              if key in allowed and value:
+                  parsed[key] = value
+
+          loaded = []
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              for key in allowed:
+                  value = (os.getenv(key) or parsed.get(key) or "").strip()
+                  if value:
+                      f.write(f"{key}={value}\n")
+                      loaded.append(key)
+
+          print("Loaded env names: " + (", ".join(loaded) if loaded else "none"))
+          PY
+
+      - name: Verify required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          required = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "OZON_CLIENT_ID_FINICK",
+              "OZON_API_KEY_FINICK",
+          ]
+
+          missing = [name for name in required if not (os.getenv(name) or "").strip()]
+          if missing:
+              raise SystemExit("Missing env/secrets after REPORT_ENV load: " + ", ".join(missing))
+
+          print("All required secrets are present after REPORT_ENV load.")
+          print("YC_BUCKET_NAME length:", len(os.getenv("YC_BUCKET_NAME", "")))
+          print("OZON_CLIENT_ID_FINICK length:", len(os.getenv("OZON_CLIENT_ID_FINICK", "")))
+          PY
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile ozon_stock_turnover_summary.py
+
+      - name: Run stock turnover summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(--store FINICK)
+          if [[ -n "${OZON_TARGET_DATE:-}" ]]; then
+            ARGS+=(--target-date "$OZON_TARGET_DATE")
+          fi
+          python ozon_stock_turnover_summary.py "${ARGS[@]}"
