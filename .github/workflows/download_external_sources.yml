@@ -1,5 +1,5 @@
 name: Загрузка Внешних источников
-# Назначение: Торгстат АБС-анализ и Точки входа ВБ.
+# Назначение: Торгстат АБС-анализ, Точки входа ВБ и Поисковые запросы WB FINICK.
 # Python в репозитории: download_external_sources.py
 # Workflow в репозитории: .github/workflows/download_external_sources.yml
 
@@ -12,11 +12,12 @@ on:
     # - ежедневно выгружает Торгстат АБС за вчера;
     # - по понедельникам дополнительно выгружает закрытую неделю Торгстат АБС
     #   и отчёт WB «Портрет покупателя → Точки входа» за прошлый Mon-Sun.
+    # - ежедневно выгружает «Поисковые запросы на WB» FINICK за вчера.
     - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
       source:
-        description: "Источник: Торгстат АБС-анализ и/или Точки входа ВБ"
+        description: "Источник: Торгстат / Точки входа / Поисковые запросы WB FINICK"
         required: true
         default: "all"
         type: choice
@@ -24,6 +25,7 @@ on:
           - all
           - torgstat_abc
           - wb_entry_points
+          - wb_search_queries_finick
       mode:
         description: "Период выгрузки"
         required: true
@@ -50,13 +52,14 @@ on:
 
 jobs:
   download-external-sources:
-    name: Торгстат АБС-анализ и Точки входа ВБ
+    name: Торгстат АБС, Точки входа ВБ, Поисковые запросы WB FINICK
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
       TORGSTAT_ABC_CURL: ${{ secrets.TORGSTAT_ABC_CURL }}
       WB_ENTRY_POINTS_CURLS: ${{ secrets.WB_ENTRY_POINTS_CURLS }}
+      WB_SEARCH_QUERIES_FINICK_CURLS: ${{ secrets.WB_SEARCH_QUERIES_FINICK_CURLS }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
@@ -87,9 +90,9 @@ jobs:
           echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S')"
           echo "MSK now: $(TZ=Europe/Moscow date '+%Y-%m-%d %H:%M:%S')"
           echo "Workflow: Загрузка Внешних источников"
-          echo "Sources: Торгстат АБС-анализ и Точки входа ВБ"
+          echo "Sources: Торгстат АБС, Точки входа ВБ, Поисковые запросы WB FINICK"
 
-      - name: Verify Python v10
+      - name: Verify Python v11
         shell: bash
         run: |
           set -euo pipefail
@@ -108,8 +111,8 @@ jobs:
           echo "Selected script: $SCRIPT_PATH"
           echo "Detected: $ACTUAL_VERSION"
 
-          if ! grep -q 'EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V10_20260730' "$SCRIPT_PATH"; then
-            echo "::error::В download_external_sources.py лежит не версия V10. Замените содержимое файла на актуальную версию."
+          if ! grep -q 'EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_SEARCH_V11_20260807' "$SCRIPT_PATH"; then
+            echo "::error::В download_external_sources.py лежит не версия V11. Замените содержимое файла на актуальную версию."
             exit 1
           fi
 
@@ -133,6 +136,9 @@ jobs:
             --reports-root "Отчёты"
             --abc-folder "ABC"
             --wb-entry-folder "Точки входа"
+            --wb-search-store "FINICK"
+            --wb-search-folder "Поисковые запросы"
+            --wb-search-subfolder "Запросы с WB"
             --wb-max-wait-minutes 20
           )
 
