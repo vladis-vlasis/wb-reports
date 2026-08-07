@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-08-07_v37_FINICK_FREE_HISTORY"
+SCRIPT_VERSION = "2026-08-07_v38_FINICK_RESUME_FUNNEL"
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -1549,14 +1549,14 @@ class WildberriesDailyUpdater:
     def _update_funnel_finick_free(self, store_name: str) -> bool:
         """FINICK: бесплатная воронка через /api/analytics/v3/sales-funnel/products.
 
-        Почему не /products/history:
-        - /products/history даёт максимум последнюю неделю;
-        - /products позволяет запросить период до 365 дней.
-        Чтобы сохранить дневную структуру старого файла, исторические дни запрашиваем
-        по одному дню. При первом запуске догружаем 7 полностью завершённых недель,
-        текущую неделю в исторический backfill не включаем; отдельно добавляем target_date.
+        v38:
+        - при первом запуске догружаем 7 полностью завершённых недель + target_date;
+        - сохраняем прогресс ПОСЛЕ КАЖДОГО успешно загруженного дня;
+        - 502/503/504 считаем временными ошибками и повторяем запрос;
+        - если отдельная дата после повторов не загрузилась, продолжаем остальные даты;
+        - следующий запуск увидит сохранённые даты и повторит только пропущенные.
         """
-        self.log(f"\n📌 ОБНОВЛЕНИЕ: Воронка продаж для магазина {store_name} (FREE v3, без Jam)")
+        self.log(f"\n📌 ОБНОВЛЕНИЕ: Воронка продаж для магазина {store_name} (FREE v3, resume-safe)")
         config = self.reports_config['funnel']
         key = f"Отчёты/{config['folder']}/{store_name}/{config['filename']}"
 
@@ -1612,14 +1612,16 @@ class WildberriesDailyUpdater:
         }
         url = "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products"
 
-        new_rows: List[dict] = []
+        total_added_rows = 0
+        failed_dates: List[str] = []
 
         for date_idx, target_date in enumerate(sorted(dates_to_load), start=1):
             date_str = target_date.strftime("%Y-%m-%d")
             self.log(f"📅 Funnel FREE {date_idx}/{len(dates_to_load)}: {date_str}")
             offset = 0
             page_size = 1000
-            day_rows = 0
+            day_data_rows: List[dict] = []
+            day_failed = False
 
             while True:
                 payload = {
@@ -1635,15 +1637,30 @@ class WildberriesDailyUpdater:
                 }
 
                 response_data = None
-                for attempt in range(1, 5):
+                max_attempts = 5
+                for attempt in range(1, max_attempts + 1):
                     try:
-                        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+                        resp = requests.post(url, headers=headers, json=payload, timeout=150)
                         if resp.status_code == 200:
                             response_data = resp.json()
                             break
+
                         if resp.status_code == 429:
-                            wait = 20 * attempt
-                            self.log(f"    ⚠️ Funnel FREE 429, попытка {attempt}/4, ждём {wait} сек")
+                            wait = min(20 * attempt, 120)
+                            self.log(
+                                f"    ⚠️ Funnel FREE 429 за {date_str}, "
+                                f"попытка {attempt}/{max_attempts}, ждём {wait} сек"
+                            )
+                            time.sleep(wait)
+                            continue
+
+                        if resp.status_code in (502, 503, 504):
+                            wait = min(30 * attempt, 150)
+                            self.log(
+                                f"    ⚠️ Funnel FREE HTTP {resp.status_code} за {date_str}, "
+                                f"попытка {attempt}/{max_attempts}, ждём {wait} сек. "
+                                f"Ответ: {resp.text[:500]}"
+                            )
                             time.sleep(wait)
                             continue
 
@@ -1651,15 +1668,29 @@ class WildberriesDailyUpdater:
                             f"    ❌ Funnel FREE HTTP {resp.status_code} за {date_str}: "
                             f"{resp.text[:1500]}"
                         )
-                        return False
-                    except Exception as e:
-                        if attempt == 4:
-                            self.log(f"    ❌ Funnel FREE: ошибка запроса за {date_str}: {e}")
-                            return False
-                        time.sleep(10 * attempt)
+                        day_failed = True
+                        break
 
+                    except Exception as e:
+                        if attempt == max_attempts:
+                            self.log(
+                                f"    ❌ Funnel FREE: ошибка запроса за {date_str} "
+                                f"после {max_attempts} попыток: {e}"
+                            )
+                            day_failed = True
+                            break
+                        wait = min(15 * attempt, 90)
+                        self.log(
+                            f"    ⚠️ Funnel FREE: исключение за {date_str}, "
+                            f"попытка {attempt}/{max_attempts}: {e}; ждём {wait} сек"
+                        )
+                        time.sleep(wait)
+
+                if day_failed:
+                    break
                 if response_data is None:
-                    return False
+                    day_failed = True
+                    break
 
                 data_obj = response_data.get("data", response_data) if isinstance(response_data, dict) else {}
                 products = data_obj.get("products", []) if isinstance(data_obj, dict) else []
@@ -1674,7 +1705,7 @@ class WildberriesDailyUpdater:
                     selected = statistic.get("selected") or {}
                     conversions = selected.get("conversions") or {}
 
-                    row = {
+                    day_data_rows.append({
                         "nmID": product.get("nmId", ""),
                         "dt": date_str,
                         "openCardCount": selected.get("openCount", 0),
@@ -1710,45 +1741,67 @@ class WildberriesDailyUpdater:
                         "productRating": product.get("productRating", 0),
                         "feedbackRating": product.get("feedbackRating", 0),
                         "store": store_name,
-                    }
-                    new_rows.append(row)
-                    day_rows += 1
+                    })
 
                 if len(products) < page_size:
                     break
                 offset += page_size
-                # Лимит метода — 3 запроса/мин; между страницами выдерживаем интервал.
                 time.sleep(20)
 
-            self.log(f"    ✅ Funnel FREE за {date_str}: {day_rows} товарных строк")
-            if date_idx < len(dates_to_load):
-                # Официальный лимит — 3 запроса в минуту.
-                time.sleep(20)
+            if day_failed:
+                failed_dates.append(date_str)
+                self.log(
+                    f"    ❌ Funnel FREE за {date_str} не загружен. "
+                    f"Переходим к следующей дате; следующий запуск повторит этот день."
+                )
+                if date_idx < len(dates_to_load):
+                    time.sleep(30)
+                continue
 
-        if new_rows:
-            new_df = pd.DataFrame(new_rows)
-            if df_existing.empty:
-                combined = new_df
+            # Критично для resume: сохраняем каждый успешно завершённый день сразу.
+            day_rows_count = len(day_data_rows)
+            if day_data_rows:
+                day_df = pd.DataFrame(day_data_rows)
+                if df_existing.empty:
+                    combined = day_df
+                else:
+                    combined = pd.concat([df_existing, day_df], ignore_index=True)
+
+                if 'dt' in combined.columns:
+                    combined['dt'] = pd.to_datetime(combined['dt'], errors='coerce').dt.strftime('%Y-%m-%d')
+                dedup_cols = [c for c in ['dt', 'nmID'] if c in combined.columns]
+                if dedup_cols:
+                    combined = combined.drop_duplicates(subset=dedup_cols, keep='last')
+                if 'dt' in combined.columns:
+                    combined = combined.sort_values(['dt', 'nmID'] if 'nmID' in combined.columns else ['dt'])
+
+                self.s3.write_excel(key, combined, sheet_name=config['name'])
+                df_existing = combined
+                existing_dates.add(target_date)
+                total_added_rows += day_rows_count
+                self.log(
+                    f"    ✅ Funnel FREE за {date_str}: {day_rows_count} товарных строк; "
+                    f"день сразу сохранён в {key}"
+                )
             else:
-                combined = pd.concat([df_existing, new_df], ignore_index=True)
+                self.log(f"    ℹ️ Funnel FREE за {date_str}: API вернул 0 товарных строк")
 
-            if 'dt' in combined.columns:
-                combined['dt'] = pd.to_datetime(combined['dt'], errors='coerce').dt.strftime('%Y-%m-%d')
-            dedup_cols = [c for c in ['dt', 'nmID'] if c in combined.columns]
-            if dedup_cols:
-                combined = combined.drop_duplicates(subset=dedup_cols, keep='last')
+            if date_idx < len(dates_to_load):
+                time.sleep(20)
 
-            if 'dt' in combined.columns:
-                combined = combined.sort_values(['dt', 'nmID'] if 'nmID' in combined.columns else ['dt'])
+        self.log(
+            f"📊 Funnel FINICK: за запуск добавлено {total_added_rows} строк; "
+            f"успешно сохранённых дат в файле: {len(existing_dates)}"
+        )
 
-            self.s3.write_excel(key, combined, sheet_name=config['name'])
+        if failed_dates:
             self.log(
-                f"✅ Воронка FINICK сохранена: {key}. "
-                f"Добавлено строк: {len(new_df)}, всего строк: {len(combined)}"
+                f"❌ Funnel FINICK завершён с пропусками. Не загружены даты: "
+                f"{', '.join(failed_dates)}. Следующий запуск повторит только их."
             )
-        else:
-            self.log("ℹ️ Funnel FREE не вернул новых строк")
+            return False
 
+        self.log("✅ Funnel FINICK: все требуемые даты загружены")
         return True
 
     # ---------- Воронка продаж ----------
