@@ -54,7 +54,7 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_3_20260807"
+SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_4_20260807"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -619,52 +619,68 @@ class ReportBuilder:
 
     def fetch_clusters(self) -> None:
         logging.info("2/8 Кластеры FBO")
-        # v2 нужен для актуальных макролокальных кластеров, а v1 остаётся полезным
-        # для точной связки FBO-склад -> кластер. Берём оба ответа и объединяем.
-        responses: List[Tuple[str, Any]] = []
-        for endpoint in ("/v2/cluster/list", "/v1/cluster/list"):
-            try:
-                responses.append((endpoint, self.client.post(endpoint, {})))
-            except OzonApiError as exc:
-                if exc.status not in {400, 404, 405, 422}:
-                    raise
-                logging.warning("%s недоступен: %s", endpoint, exc)
-        if not responses:
-            logging.warning("Список кластеров недоступен — часть складов останется без кластера")
+        # v1.4: используем актуальный /v2/cluster/list. Его структура:
+        # clusters[] -> logistic_clusters[] -> warehouses[].
+        # В v1.3 этот ответ парсился как старая v1-структура, поэтому при успешном
+        # ответе v2 мы всё равно получали «Кластеров: 0».
+        try:
+            response = self.client.post("/v2/cluster/list", {})
+        except OzonApiError as exc:
+            logging.warning("/v2/cluster/list недоступен: %s", exc)
             return
+
+        clusters = extract_items(response, [("clusters",), ("result", "clusters"), ("result", "items"), ("items",)])
+        # На случай изменения обёртки ищем словари, похожие именно на кластер v2.
+        if not clusters:
+            clusters = [dict(x) for x in walk_dicts(response)
+                        if isinstance(x, Mapping) and x.get("name") and isinstance(x.get("logistic_clusters"), list)]
 
         names: List[str] = []
         wh_id: Dict[str, str] = {}
         wh_name: Dict[str, str] = {}
         macro: Dict[str, str] = {}
-        for endpoint, response in responses:
-            for c in walk_dicts(response):
-                cname = str(c.get("name") or c.get("cluster_name") or c.get("macrolocal_cluster_name") or "").strip()
-                warehouses = c.get("warehouses")
-                # Не каждый словарь с name является кластером. Считаем его кластером,
-                # если есть warehouses либо явный cluster/macrolocal id.
-                has_cluster_id = any(c.get(k) not in (None, "") for k in ("cluster_id", "macrolocal_cluster_id", "macro_cluster_id"))
-                if not cname or (not isinstance(warehouses, list) and not has_cluster_id):
+
+        for c in clusters:
+            cname = str(c.get("name") or c.get("cluster_name") or c.get("macrolocal_cluster_name") or "").strip()
+            if not cname:
+                continue
+            if cname not in names:
+                names.append(cname)
+            cid = norm_id(c.get("id") or c.get("cluster_id") or c.get("macrolocal_cluster_id") or c.get("macro_cluster_id"))
+            if cid:
+                macro[cid] = cname
+
+            logistic_clusters = c.get("logistic_clusters")
+            if not isinstance(logistic_clusters, list):
+                logistic_clusters = []
+            # Совместимость, если Ozon когда-нибудь снова вернёт warehouses прямо в кластере.
+            direct_warehouses = c.get("warehouses")
+            if isinstance(direct_warehouses, list):
+                logistic_clusters = list(logistic_clusters) + [{"warehouses": direct_warehouses}]
+
+            for lc in logistic_clusters:
+                if not isinstance(lc, Mapping):
                     continue
-                if cname not in names:
-                    names.append(cname)
-                for mk in ("macrolocal_cluster_id", "macro_cluster_id", "cluster_id", "id"):
-                    mid = norm_id(c.get(mk))
-                    if mid:
-                        macro.setdefault(mid, cname)
-                if isinstance(warehouses, list):
-                    for w in warehouses:
-                        if not isinstance(w, Mapping):
-                            continue
-                        wid = norm_id(w.get("warehouse_id") or w.get("id"))
-                        wname = str(w.get("name") or w.get("warehouse_name") or "").strip()
-                        if wid:
-                            wh_id[wid] = cname
-                        if wname:
-                            wh_name[norm_name(wname)] = cname
-        used = ", ".join(x[0] for x in responses)
-        self.cluster_maps = ClusterMaps(names, wh_id, wh_name, macro, used)
+                if bool(lc.get("is_archived")):
+                    continue
+                warehouses = lc.get("warehouses")
+                if not isinstance(warehouses, list):
+                    continue
+                for w in warehouses:
+                    if not isinstance(w, Mapping):
+                        continue
+                    wid = norm_id(w.get("warehouse_id") or w.get("id"))
+                    wname = str(w.get("name") or w.get("warehouse_name") or "").strip()
+                    if wid:
+                        wh_id[wid] = cname
+                    if wname:
+                        wh_name[norm_name(wname)] = cname
+
+        self.cluster_maps = ClusterMaps(names, wh_id, wh_name, macro, "/v2/cluster/list")
         logging.info("Кластеров: %s, складов с привязкой: %s", len(names), len(wh_id) + len(wh_name))
+        if not names:
+            top_keys = list(response.keys()) if isinstance(response, Mapping) else []
+            logging.warning("/v2/cluster/list ответил, но кластеры не распознаны. Верхние поля ответа: %s", top_keys)
 
     # ---------- остатки ----------
     def fetch_stock_warehouses(self) -> pd.DataFrame:
@@ -745,12 +761,12 @@ class ReportBuilder:
         variants = [
             {
                 "dir": "ASC", "filter": {"since": to_ozon_datetime(start), "to": to_ozon_datetime(end, True), "status": ""},
-                "limit": 1000, "offset": 0,
+                "limit": 100, "offset": 0,
                 "with": {"analytics_data": True, "financial_data": True, "translit": True},
             },
             {
                 "dir": "ASC", "filter": {"since": to_ozon_datetime(start), "to": to_ozon_datetime(end, True), "status": ""},
-                "limit": 1000, "offset": 0,
+                "limit": 100, "offset": 0,
             },
         ]
         last: Optional[Exception] = None
@@ -758,7 +774,7 @@ class ReportBuilder:
             try:
                 return self.client.offset_pages(
                     "/v3/posting/fbo/list", payload,
-                    [("result", "postings"), ("postings",), ("result",)], limit=1000, max_pages=100)
+                    [("result", "postings"), ("postings",), ("result",)], limit=100, max_pages=1000)
             except OzonApiError as exc:
                 last = exc
                 if exc.status not in {400, 404, 405, 422}:
