@@ -1,10 +1,10 @@
-name: WB Ads V90
+name: WB Ads Manager V90 TOPFACE + FINICK
 
 on:
   workflow_dispatch:
     inputs:
       store:
-        description: "Какой магазин запускать"
+        description: "Какой магазин запускать в V90"
         required: true
         default: "ALL"
         type: choice
@@ -13,36 +13,50 @@ on:
           - TOPFACE
           - FINICK
       live:
-        description: "Реально менять ставки и минус-фразы"
+        description: "Реально менять CPM-ставки и минус-фразы"
         required: true
         default: false
         type: boolean
       run_legacy:
-        description: "Запускать прежний контур CPC и полок"
+        description: "Запустить также старый контур CPC/полок TOPFACE"
         required: true
         default: true
         type: boolean
+
   schedule:
-    # Каждые 2 часа в 00:05, 02:05, 04:05 ... по Москве.
-    # GitHub cron работает по UTC; Москва = UTC+3.
+    # Старый основной контур TOPFACE: каждые 10 минут с 18:00 до 23:50 МСК.
+    # GitHub cron работает в UTC, Москва = UTC+3.
+    - cron: "*/10 15-20 * * *"
+
+    # V90 CPM: каждые 2 часа примерно в 00:05, 02:05, 04:05 ... 22:05 МСК.
     - cron: "5 1-23/2 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: wb-ads-v90
+  group: wb-ads-v90-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
   cancel-in-progress: false
 
+env:
+  WORKFLOW_VERSION: "v90_github_report_env_fix_2026-08-07"
+  WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
+  PYTHON_VERSION: "3.11"
+  PYTHONUNBUFFERED: "1"
+  TZ: "Europe/Moscow"
+  WB_ADS_V90_CONFIG: "wb_ads_v90_config.json"
+  DAILY_LOCK_PREFIX: "Служебные файлы/Ассистент WB/TOPFACE/locks"
+
 jobs:
-  manage-ads:
+  wb_ads_manager:
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     env:
-      PYTHONUNBUFFERED: "1"
-      TZ: Europe/Moscow
-      WB_ADS_V90_CONFIG: wb_ads_v90_config.json
+      # ВАЖНО: сохраняем старую рабочую схему.
+      # Часть секретов может быть отдельными Repository secrets,
+      # а YC-доступы могут лежать одной пачкой в REPORT_ENV.
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
 
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
@@ -58,53 +72,186 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Resolve run mode
-        id: mode
         shell: bash
         run: |
-          STORE="ALL"
-          LIVE="${{ vars.WB_ADS_V90_LIVE }}"
-          RUN_LEGACY="${{ vars.WB_ADS_RUN_LEGACY }}"
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz reportlab
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            STORE="${{ inputs.store }}"
-            LIVE="${{ inputs.live }}"
-            RUN_LEGACY="${{ inputs.run_legacy }}"
-          fi
+      - name: Load secrets from REPORT_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
 
-          if [[ -z "$LIVE" ]]; then LIVE="false"; fi
-          if [[ -z "$RUN_LEGACY" ]]; then RUN_LEGACY="true"; fi
+          # Список разрешённых переменных, которые можно добрать из старого REPORT_ENV.
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+              "FINICK_API_WB",
+              "TELEGRAM_BOT_TOKEN",
+              "TELEGRAM_CHAT_ID",
+          ]
 
-          echo "store=$STORE" >> "$GITHUB_OUTPUT"
-          echo "live=$LIVE" >> "$GITHUB_OUTPUT"
-          echo "run_legacy=$RUN_LEGACY" >> "$GITHUB_OUTPUT"
+          report_env = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
 
-          echo "Store: $STORE"
-          echo "Live changes: $LIVE"
-          echo "Legacy CPC/shelves: $RUN_LEGACY"
+          for raw_line in report_env.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[len("export "):].strip()
+              if "=" not in line:
+                  continue
+
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('"').strip("'")
+
+              if key in allowed and value:
+                  parsed[key] = value
+
+          github_env = os.environ.get("GITHUB_ENV")
+          if not github_env:
+              raise SystemExit("GITHUB_ENV is not available")
+
+          loaded = []
+          sources = []
+
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in allowed:
+                  direct = os.getenv(key, "") or ""
+                  fallback = parsed.get(key, "")
+                  value = direct or fallback
+
+                  if value:
+                      f.write(f"{key}={value}\n")
+                      loaded.append(key)
+                      sources.append(f"{key}={'direct_secret' if direct else 'REPORT_ENV'}")
+
+          # Значения секретов НЕ печатаем.
+          print("Loaded secret names: " + (", ".join(loaded) if loaded else "none"))
+          print("Secret sources: " + (", ".join(sources) if sources else "none"))
+          PY
+
+      - name: Verify required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          required_common = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "WB_PROMO_KEY_TOPFACE",
+          ]
+
+          missing = [name for name in required_common if not os.getenv(name)]
+          if missing:
+              raise SystemExit(
+                  "Missing secrets after REPORT_ENV load: " + ", ".join(missing)
+              )
+
+          # FINICK обязателен для schedule V90 (там запускаем ALL),
+          # а в manual — только если выбран FINICK/ALL.
+          event_name = "${{ github.event_name }}"
+          manual_store = "${{ inputs.store }}" if event_name == "workflow_dispatch" else "ALL"
+          need_finick = event_name == "schedule" or manual_store.upper() in {"ALL", "FINICK"}
+
+          if need_finick and not os.getenv("FINICK_API_WB"):
+              raise SystemExit("Missing secret FINICK_API_WB")
+
+          print("All required secrets are present.")
+          PY
+
+      - name: Resolve run slot
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          event_name = "${{ github.event_name }}"
+          schedule = "${{ github.event.schedule }}"
+          now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+
+          if event_name == "workflow_dispatch":
+              run_slot = "manual"
+              store = "${{ inputs.store }}" or "ALL"
+              live = str("${{ inputs.live }}").lower() == "true"
+              run_legacy = str("${{ inputs.run_legacy }}").lower() == "true"
+
+          elif schedule == "5 1-23/2 * * *":
+              run_slot = "v90_cpm_2h"
+              store = "ALL"
+              live = str(os.getenv("WB_ADS_V90_LIVE", "false")).lower() == "true"
+              run_legacy = False
+
+          else:
+              run_slot = "legacy_main"
+              store = "TOPFACE"
+              live = True
+              run_legacy = True
+
+          print(f"MSK now={now_msk:%Y-%m-%d %H:%M:%S}")
+          print(f"run_slot={run_slot}")
+          print(f"store={store}")
+          print(f"live={live}")
+          print(f"run_legacy={run_legacy}")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"RUN_SLOT={run_slot}\n")
+              f.write(f"RUN_STORE={store}\n")
+              f.write(f"RUN_LIVE={'true' if live else 'false'}\n")
+              f.write(f"RUN_LEGACY={'true' if run_legacy else 'false'}\n")
+          PY
+
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile upravlenie_reklamoy.py
+
+      - name: Check V90 config
+        if: env.RUN_SLOT == 'manual' || env.RUN_SLOT == 'v90_cpm_2h'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f wb_ads_v90_config.json || {
+            echo "ERROR: wb_ads_v90_config.json отсутствует в корне репозитория"
+            exit 1
+          }
+          python -m json.tool wb_ads_v90_config.json >/dev/null
+          echo "V90 config OK"
 
       - name: Run V90 adaptive CPM manager
+        if: env.RUN_SLOT == 'manual' || env.RUN_SLOT == 'v90_cpm_2h'
         shell: bash
         run: |
+          set -euo pipefail
+
           ARGS=(
             cpm-manager
-            --store "${{ steps.mode.outputs.store }}"
+            --store "${RUN_STORE}"
             --config wb_ads_v90_config.json
             --stats-days 7
           )
 
-          if [[ "${{ steps.mode.outputs.live }}" == "true" ]]; then
+          if [[ "${RUN_LIVE}" == "true" ]]; then
             ARGS+=(
               --apply-query-bids
               --apply-campaign-bids
@@ -112,26 +259,51 @@ jobs:
             )
           fi
 
+          echo "=== V90 CPM ==="
+          echo "store=${RUN_STORE}"
+          echo "live=${RUN_LIVE}"
+          printf 'Command: python upravlenie_reklamoy.py'
+          printf ' %q' "${ARGS[@]}"
+          printf '\n'
+
           python upravlenie_reklamoy.py "${ARGS[@]}"
 
-      - name: Run legacy CPC and shelves contour
-        if: steps.mode.outputs.run_legacy == 'true'
+      - name: Run legacy CPC and shelves TOPFACE
+        if: env.RUN_LEGACY == 'true'
         shell: bash
         run: |
-          if [[ "${{ steps.mode.outputs.live }}" == "true" ]]; then
-            python upravlenie_reklamoy.py run --apply-pause --apply-start
+          set -euo pipefail
+
+          echo "=== Legacy CPC / shelves TOPFACE ==="
+
+          if [[ "${RUN_SLOT}" == "legacy_main" ]]; then
+            # Полностью сохраняем старое боевое поведение.
+            python upravlenie_reklamoy.py run --skip-price
           else
-            python upravlenie_reklamoy.py preview --dry-run
+            # При ручном запуске live=false старый контур тоже только preview.
+            if [[ "${RUN_LIVE}" == "true" ]]; then
+              python upravlenie_reklamoy.py run --skip-price --apply-pause --apply-start
+            else
+              python upravlenie_reklamoy.py preview --dry-run
+            fi
           fi
 
-      - name: Upload run reports
+      - name: Upload GitHub artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wb-ads-v90-${{ github.run_number }}
+          name: wb-ads-v90-${{ env.RUN_SLOT }}-${{ github.run_number }}
           if-no-files-found: ignore
           retention-days: 14
           path: |
-            *.xlsx
-            *.json
+            Предпросмотр_последнего_запуска.xlsx
+            Итог_последнего_запуска.xlsx
+            Сводка_последнего_запуска.json
+            Лог_API.xlsx
+            История_ставок.xlsx
+            История_пауз.xlsx
+            CPM_чистка_запросов.xlsx
+            CPM_управление_запросами.xlsx
+            V90_*.xlsx
+            V90_*.json
             *.log
