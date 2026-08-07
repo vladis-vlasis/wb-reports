@@ -1,24 +1,25 @@
-# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V10_20260730
+# VERSION: EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_SEARCH_V11_20260807
 """Загрузка внешних источников в Yandex Object Storage.
 
 Источники:
 1. Торгстат — АБС-анализ.
 2. Wildberries — «Портрет покупателя → Точки входа».
+3. Wildberries FINICK — «Аналитика поиска → Поисковые запросы на WB».
 
 Имя файла в репозитории: download_external_sources.py
 
 GitHub Secrets:
 - TORGSTAT_ABC_CURL: один актуальный Copy as cURL запроса выгрузки Торгстат.
-- WB_ENTRY_POINTS_CURLS: несколько Copy as cURL подряд из кабинета WB. Код сам
-  распознаёт запросы по URL. Достаточно запросов /file-manager/download и
-  /tokensjrpc; список отчётов и конечный URL файла код умеет построить сам.
+- WB_ENTRY_POINTS_CURLS: cURL-запросы отчёта «Точки входа».
+- WB_SEARCH_QUERIES_FINICK_CURLS: cURL-запросы FINICK отчёта
+  SEARCH_ANALYSIS_PREMIUM_REPORT.
 - REPORT_ENV или отдельные YC_ACCESS_KEY_ID, YC_SECRET_ACCESS_KEY,
   YC_BUCKET_NAME, YC_ENDPOINT_URL.
 
 Режим auto:
-- ежедневно: Торгстат АБС за вчера;
-- по понедельникам: Торгстат АБС за закрытую неделю и Точки входа ВБ за
-  закрытую неделю понедельник–воскресенье.
+- ежедневно: Торгстат АБС за вчера и Поисковые запросы WB FINICK за вчера;
+- по понедельникам: дополнительно Торгстат АБС и Точки входа ВБ за закрытую
+  неделю понедельник–воскресенье.
 """
 from __future__ import annotations
 
@@ -44,13 +45,17 @@ import boto3
 import requests
 from openpyxl import load_workbook
 
-VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_POINTS_V10_20260730"
+VERSION = "EXTERNAL_SOURCES_TORGSTAT_ABC_WB_ENTRY_SEARCH_V11_20260807"
 DEFAULT_REPORTS_ROOT = "Отчёты"
 DEFAULT_ABC_FOLDER = "ABC"
 DEFAULT_WB_ENTRY_FOLDER = "Точки входа"
 DEFAULT_STORE = "TOPFACE"
 DEFAULT_TZ_OFFSET_HOURS = 3
 WB_REPORT_TYPE = "CUSTOMER_PROFILE_ENTRY_POINTS_REPORT_V2"
+WB_SEARCH_REPORT_TYPE = "SEARCH_ANALYSIS_PREMIUM_REPORT"
+DEFAULT_WB_SEARCH_STORE = "FINICK"
+DEFAULT_WB_SEARCH_FOLDER = "Поисковые запросы"
+DEFAULT_WB_SEARCH_SUBFOLDER = "Запросы с WB"
 WB_MANAGER_BASE = "https://seller-content.wildberries.ru/ns/analytics-api/content-analytics/api/v1/file-manager"
 WB_TOKEN_URL = "https://seller-content.wildberries.ru/ns/suppliers-auth-tokens/suppliers-portal-core/api/v1/tokensjrpc"
 WB_FILE_BASE = "https://downloads-content-analytics.wildberries.ru/api/v1/file-manager/download"
@@ -128,7 +133,7 @@ def load_report_env() -> None:
 
     interesting = [
         "YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY", "YC_BUCKET_NAME", "YC_ENDPOINT_URL",
-        "TORGSTAT_ABC_CURL", "WB_ENTRY_POINTS_CURLS",
+        "TORGSTAT_ABC_CURL", "WB_ENTRY_POINTS_CURLS", "WB_SEARCH_QUERIES_FINICK_CURLS",
     ]
     state = ", ".join(f"{key}={'set' if (os.environ.get(key) or '').strip() else 'empty'}" for key in interesting)
     log(f"report_env: loaded_keys={loaded}, skipped_existing={skipped}, bad_lines={bad_lines}")
@@ -566,6 +571,45 @@ def validate_wb_entry_xlsx(content: bytes) -> Tuple[str, int, int]:
         safe_remove(path)
 
 
+def validate_wb_search_xlsx(content: bytes) -> Tuple[str, int, int]:
+    if not is_real_xlsx(content):
+        fail("WB SEARCH вернул ZIP, который не является корректным XLSX")
+
+    path = write_temp_xlsx(content)
+    try:
+        wb = load_workbook(path, read_only=False, data_only=True)
+        for ws in wb.worksheets:
+            max_scan = min(ws.max_row or 1, 40)
+            for row_index, row in enumerate(
+                ws.iter_rows(min_row=1, max_row=max_scan, values_only=True),
+                1,
+            ):
+                headers = {normalize_header(value) for value in row if value is not None}
+                if "поисковый запрос" in headers and any(
+                    token in headers
+                    for token in ("количество запросов", "частота", "частотность")
+                ):
+                    return ws.title, row_index, ws.max_row
+
+        # Формат WB иногда меняет подписи, поэтому второй контур проверки:
+        # файл должен быть валидным XLSX и содержать хотя бы непустые строки.
+        for ws in wb.worksheets:
+            nonempty = 0
+            for row in ws.iter_rows(
+                min_row=1,
+                max_row=min(ws.max_row or 1, 100),
+                values_only=True,
+            ):
+                if any(value not in (None, "") for value in row):
+                    nonempty += 1
+            if nonempty >= 2:
+                return ws.title, 1, ws.max_row
+
+        fail("XLSX WB SEARCH пустой или не похож на отчёт поисковых запросов")
+    finally:
+        safe_remove(path)
+
+
 def write_temp_xlsx(content: bytes) -> str:
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as handle:
         handle.write(content)
@@ -626,6 +670,31 @@ def wb_entry_key(store: str, start: dt.date, end: dt.date, reports_root: str, fo
         f"{reports_root.rstrip('/')}/"
         f"{folder.strip('/') or DEFAULT_WB_ENTRY_FOLDER}/"
         f"{store.strip('/')}/"
+        f"{filename}"
+    )
+
+
+def wb_search_key(
+    store: str,
+    report_date: dt.date,
+    reports_root: str,
+    folder: str,
+    subfolder: str,
+) -> str:
+    # Сохраняем ровно в существующем формате:
+    # 7-8-2026 Поисковые запросы на WB. Джем с 06-08-2026 по 06-08-2026.xlsx
+    generated_at = today_local()
+    generated_date = f"{generated_at.day}-{generated_at.month}-{generated_at.year}"
+    period = report_date.strftime("%d-%m-%Y")
+    filename = (
+        f"{generated_date} Поисковые запросы на WB. "
+        f"Джем с {period} по {period}.xlsx"
+    )
+    return (
+        f"{reports_root.rstrip('/')}/"
+        f"{folder.strip('/') or DEFAULT_WB_SEARCH_FOLDER}/"
+        f"{store.strip('/')}/"
+        f"{subfolder.strip('/') or DEFAULT_WB_SEARCH_SUBFOLDER}/"
         f"{filename}"
     )
 
@@ -773,10 +842,14 @@ def find_first_base64_xlsx(obj: Any) -> Optional[bytes]:
     return None
 
 
-def classify_wb_requests(raw: str) -> Tuple[CurlRequest, CurlRequest, CurlRequest, Optional[CurlRequest], Dict[str, str]]:
+def classify_wb_requests(
+    raw: str,
+    report_type: str = WB_REPORT_TYPE,
+    secret_name: str = "WB_ENTRY_POINTS_CURLS",
+) -> Tuple[CurlRequest, CurlRequest, CurlRequest, Optional[CurlRequest], Dict[str, str]]:
     commands = split_curl_commands(raw)
     if not commands:
-        fail("WB_ENTRY_POINTS_CURLS пустой")
+        fail(f"{secret_name} пустой")
     requests_ = [parse_curl(command) for command in commands]
     create_req: Optional[CurlRequest] = None
     list_req: Optional[CurlRequest] = None
@@ -797,9 +870,9 @@ def classify_wb_requests(raw: str) -> Tuple[CurlRequest, CurlRequest, CurlReques
             token_req = req
 
     if not create_req:
-        fail("WB_ENTRY_POINTS_CURLS: не найден cURL /file-manager/download")
+        fail(f"{secret_name}: не найден cURL /file-manager/download")
     if not token_req:
-        fail("WB_ENTRY_POINTS_CURLS: не найден cURL /tokensjrpc")
+        fail(f"{secret_name}: не найден cURL /tokensjrpc")
 
     auth = best_wb_auth_headers(requests_)
     create_req = apply_wb_auth(create_req, auth)
@@ -807,7 +880,7 @@ def classify_wb_requests(raw: str) -> Tuple[CurlRequest, CurlRequest, CurlReques
 
     if not list_req:
         list_req = CurlRequest(
-            url=f"{WB_MANAGER_BASE}/downloads?report_types={WB_REPORT_TYPE}",
+            url=f"{WB_MANAGER_BASE}/downloads?report_types={report_type}",
             method="GET",
             headers=dict(create_req.headers or {}),
             body=None,
@@ -838,6 +911,38 @@ def prepare_wb_create_request(template: CurlRequest, start: dt.date, end: dt.dat
     headers = dict(template.headers or {})
     header_set(headers, "content-type", "application/json")
     return CurlRequest(template.url, "POST", headers, json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def prepare_wb_search_create_request(template: CurlRequest, report_id: str) -> CurlRequest:
+    """Подготовить ежедневный отчёт FINICK «Поисковые запросы на WB»."""
+    try:
+        payload = json.loads((template.body or b"{}").decode("utf-8"))
+    except Exception as exc:
+        fail(f"Не удалось прочитать JSON SEARCH_ANALYSIS_PREMIUM_REPORT: {exc}")
+
+    payload["id"] = report_id
+    payload["reportType"] = WB_SEARCH_REPORT_TYPE
+    params = payload.setdefault("params", {})
+
+    # Сохраняем фактический фильтр из кабинета (items=[1126]) и остальные поля,
+    # но принудительно задаём ежедневный завершённый период.
+    params["interval"] = "yesterday"
+    params.setdefault("items", [1126])
+    params.setdefault("subjectIDs", [])
+    params.setdefault("searchText", "")
+    params.setdefault("cartToOrder", [])
+    params.setdefault("openToCart", [])
+    params.setdefault("orderBy", {"field": "frequency", "mode": "desc"})
+    params.setdefault("limit", 300000)
+
+    headers = dict(template.headers or {})
+    header_set(headers, "content-type", "application/json")
+    return CurlRequest(
+        template.url,
+        "POST",
+        headers,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+    )
 
 
 def prepare_token_request(template: CurlRequest) -> CurlRequest:
@@ -1018,6 +1123,107 @@ def download_wb_entry_period(
     fail(f"WB отчёт не был скачан за {max_wait_seconds // 60} мин. Последний state={last_state}; {last_error}")
 
 
+def download_wb_search_daily(
+    raw_curls: str,
+    store: str,
+    reports_root: str,
+    folder: str,
+    subfolder: str,
+    dry_run: bool,
+    max_wait_seconds: int,
+) -> str:
+    create_template, list_template, token_template, file_template, auth = classify_wb_requests(
+        raw_curls,
+        report_type=WB_SEARCH_REPORT_TYPE,
+        secret_name="WB_SEARCH_QUERIES_FINICK_CURLS",
+    )
+
+    report_date = today_local() - dt.timedelta(days=1)
+    report_id = str(uuid.uuid4())
+    key = wb_search_key(store, report_date, reports_root, folder, subfolder)
+
+    log(f"WB search FINICK report_id={report_id}")
+    log(f"WB search FINICK report_date={fmt_iso(report_date)}")
+    log(f"WB search FINICK target_key: {key}")
+
+    if dry_run:
+        prepared = prepare_wb_search_create_request(create_template, report_id)
+        log(
+            "WB search dry_run: "
+            f"create_url={prepared.url}, list_url={list_template.url}, token_url={token_template.url}"
+        )
+        return key
+
+    session = requests.Session()
+    create_data = request_json(
+        session,
+        prepare_wb_search_create_request(create_template, report_id),
+    )
+    log(f"WB search create response: {str(create_data)[:500]}")
+
+    deadline = time.monotonic() + max_wait_seconds
+    attempt = 0
+    last_state = "unknown"
+    last_error = ""
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            list_data = request_json(session, list_template)
+            entry = find_dict_by_id(list_data, report_id)
+            last_state = report_state(entry)
+            log(f"WB search poll #{attempt}: state={last_state}")
+            if any(token in last_state for token in ("fail", "error", "cancel", "reject")):
+                fail(
+                    f"WB SEARCH не сформировал отчёт {report_id}: "
+                    f"state={last_state}, entry={entry}"
+                )
+        except SystemExit:
+            raise
+        except Exception as exc:
+            last_error = str(exc)
+            log(f"WB search list warning: {last_error}")
+
+        if attempt >= 2 or last_state in {
+            "ready", "done", "success", "completed", "created", "finished"
+        }:
+            try:
+                content, status, preview = try_download_wb_file(
+                    session,
+                    report_id,
+                    token_template,
+                    file_template,
+                    auth,
+                )
+                if content:
+                    sheet, header_row, rows = validate_wb_search_xlsx(content)
+                    log(
+                        "WB SEARCH XLSX OK: "
+                        f"sheet={sheet}, header_row={header_row}, rows={rows}"
+                    )
+                    upload_to_s3(content, key)
+                    return key
+
+                if status in {401, 403}:
+                    fail(
+                        "WB SEARCH download: сервер отклонил x-download-token "
+                        f"или сессию (HTTP {status}). Ответ: {preview}"
+                    )
+                last_error = f"download status={status}, response={preview}"
+            except SystemExit:
+                raise
+            except Exception as exc:
+                last_error = str(exc)
+                log(f"WB search download waiting: {last_error}")
+
+        time.sleep(10)
+
+    fail(
+        f"WB SEARCH отчёт не был скачан за {max_wait_seconds // 60} мин. "
+        f"Последний state={last_state}; {last_error}"
+    )
+
+
 def self_test() -> None:
     commands = split_curl_commands("curl 'https://a.test/x' \\\n -H 'accept: */*'\n\ncurl 'https://b.test/y' -d '{\"x\":1}'")
     assert len(commands) == 2
@@ -1065,12 +1271,30 @@ def self_test() -> None:
     assert decoded_torgstat == fake_xlsx
     assert is_real_xlsx(decoded_torgstat)
 
+    original_today_local = globals()["today_local"]
+    try:
+        globals()["today_local"] = lambda: dt.date(2026, 8, 7)
+        search_key = wb_search_key(
+            "FINICK",
+            dt.date(2026, 8, 6),
+            "Отчёты",
+            "Поисковые запросы",
+            "Запросы с WB",
+        )
+        assert search_key == (
+            "Отчёты/Поисковые запросы/FINICK/Запросы с WB/"
+            "7-8-2026 Поисковые запросы на WB. Джем "
+            "с 06-08-2026 по 06-08-2026.xlsx"
+        )
+    finally:
+        globals()["today_local"] = original_today_local
+
     log("self-test: OK")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Загрузка внешних источников: Торгстат АБС-анализ и Точки входа ВБ")
-    parser.add_argument("--source", default="all", choices=["all", "torgstat_abc", "wb_entry_points"])
+    parser = argparse.ArgumentParser(description="Загрузка внешних источников: Торгстат АБС, Точки входа ВБ и Поисковые запросы WB FINICK")
+    parser.add_argument("--source", default="all", choices=["all", "torgstat_abc", "wb_entry_points", "wb_search_queries_finick"])
     parser.add_argument("--mode", default="auto", choices=["auto", "daily", "weekly", "custom"])
     parser.add_argument("--store", default=DEFAULT_STORE)
     parser.add_argument("--date-from", default="")
@@ -1078,6 +1302,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--reports-root", default=os.environ.get("REPORTS_ROOT", DEFAULT_REPORTS_ROOT))
     parser.add_argument("--abc-folder", default=os.environ.get("ABC_FOLDER", DEFAULT_ABC_FOLDER))
     parser.add_argument("--wb-entry-folder", default=os.environ.get("WB_ENTRY_POINTS_FOLDER", DEFAULT_WB_ENTRY_FOLDER))
+    parser.add_argument("--wb-search-store", default=os.environ.get("WB_SEARCH_STORE", DEFAULT_WB_SEARCH_STORE))
+    parser.add_argument("--wb-search-folder", default=os.environ.get("WB_SEARCH_FOLDER", DEFAULT_WB_SEARCH_FOLDER))
+    parser.add_argument("--wb-search-subfolder", default=os.environ.get("WB_SEARCH_SUBFOLDER", DEFAULT_WB_SEARCH_SUBFOLDER))
     parser.add_argument("--wb-max-wait-minutes", type=int, default=20)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -1125,6 +1352,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     args.dry_run,
                     max(1, args.wb_max_wait_minutes) * 60,
                 ))
+
+    if args.source in {"all", "wb_search_queries_finick"}:
+        # Этот внутренний WB-отчёт работает с interval="yesterday".
+        # В auto и daily запускаем его ежедневно. Для weekly/custom специально
+        # не подменяем смысл периода, чтобы не подписать вчерашний файл неверной датой.
+        if args.mode in {"auto", "daily"}:
+            raw_search = os.environ.get("WB_SEARCH_QUERIES_FINICK_CURLS", "")
+            if not raw_search.strip():
+                fail("Не задан secret WB_SEARCH_QUERIES_FINICK_CURLS")
+
+            log("--- WB search FINICK daily: yesterday ---")
+            results.append(
+                download_wb_search_daily(
+                    raw_search,
+                    args.wb_search_store,
+                    args.reports_root,
+                    args.wb_search_folder,
+                    args.wb_search_subfolder,
+                    args.dry_run,
+                    max(1, args.wb_max_wait_minutes) * 60,
+                )
+            )
+        elif args.source == "wb_search_queries_finick":
+            fail(
+                "Для wb_search_queries_finick используй mode=auto или mode=daily: "
+                "запрос WB формирует только interval=yesterday."
+            )
 
     log("DONE")
     for key in results:
