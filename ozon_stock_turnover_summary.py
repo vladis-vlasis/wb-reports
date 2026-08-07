@@ -54,7 +54,7 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_20260807"
+SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_3_20260807"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -1389,12 +1389,20 @@ class ReportBuilder:
         return buf.getvalue()
 
 
+def env_first(*names: str, default: str = "") -> str:
+    """Возвращает первое непустое значение переменной окружения из списка."""
+    for name in names:
+        value = (os.getenv(name, "") or "").strip()
+        if value:
+            return value
+    return default
+
+
 def required_env(store: str, suffix: str) -> str:
     options = [f"OZON_{suffix}_{store}", f"OZON_{store}_{suffix}"]
-    for key in options:
-        val = os.getenv(key, "").strip()
-        if val:
-            return val
+    value = env_first(*options)
+    if value:
+        return value
     raise RuntimeError(f"Не найден секрет: {' / '.join(options)}")
 
 
@@ -1412,12 +1420,22 @@ def main() -> int:
 
     client_id = required_env(store, "CLIENT_ID")
     api_key = required_env(store, "API_KEY")
-    access = os.getenv("YC_ACCESS_KEY_ID", "").strip()
-    secret = os.getenv("YC_SECRET_ACCESS_KEY", "").strip()
+    # Поддерживаем все варианты имён, которые использовались в предыдущих
+    # Ozon-сборщиках и в GitHub Secrets. Это позволяет запускать отдельный
+    # отчёт без создания новых секретов.
+    access = env_first("OZON_YC_ACCESS_KEY_ID", "YC_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID")
+    secret = env_first("OZON_YC_SECRET_ACCESS_KEY", "YC_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY")
     if not access or not secret:
-        raise RuntimeError("Не заданы YC_ACCESS_KEY_ID / YC_SECRET_ACCESS_KEY")
-    bucket = os.getenv("YC_BUCKET_NAME", DEFAULT_BUCKET).strip() or DEFAULT_BUCKET
-    endpoint = os.getenv("YC_ENDPOINT_URL", "https://storage.yandexcloud.net").strip()
+        raise RuntimeError(
+            "Не найдены ключи Object Storage. Поддерживаются: "
+            "OZON_YC_ACCESS_KEY_ID/SECRET_ACCESS_KEY, "
+            "YC_ACCESS_KEY_ID/YC_SECRET_ACCESS_KEY или AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
+        )
+    bucket = env_first("OZON_YC_BUCKET", "YC_BUCKET_NAME", default=DEFAULT_BUCKET) or DEFAULT_BUCKET
+    endpoint = env_first(
+        "OZON_YC_ENDPOINT_URL", "YC_ENDPOINT_URL",
+        default="https://storage.yandexcloud.net"
+    )
 
     storage = Storage(access, secret, bucket, endpoint)
     client = OzonClient(client_id, api_key)
