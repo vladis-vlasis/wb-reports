@@ -1,4 +1,4 @@
-# version: v1.6
+# version: v1.8
 # В GitHub этот файл должен называться:
 # .github/workflows/ozon_stock_turnover_summary.yml
 
@@ -56,9 +56,6 @@ jobs:
       OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
       OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
 
-      # Если позже вручную зададим нормативы кросс-дока, скрипт их тоже подхватит.
-      OZON_CROSSDOCK_SLA_JSON: ${{ secrets.OZON_CROSSDOCK_SLA_JSON }}
-
       PYTHONUNBUFFERED: "1"
 
     steps:
@@ -69,7 +66,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "WORKFLOW_VERSION=stock_summary_v1_6_quantity_cluster_supply_crossdock_sla"
+          echo "WORKFLOW_VERSION=stock_summary_v1_8_supply_order_ids_crossdock_latest50_buyout"
           echo "STORE_INPUT=${STORE_INPUT}"
           echo "OZON_TARGET_DATE=${OZON_TARGET_DATE:-}"
           if [ ! -f "ozon_stock_turnover_summary.py" ]; then
@@ -92,7 +89,6 @@ jobs:
               "OZON_API_KEY_FINICK",
               "OZON_CLIENT_ID_TOPFACE",
               "OZON_API_KEY_TOPFACE",
-              "OZON_CROSSDOCK_SLA_JSON",
           ]
 
           report_env = os.getenv("REPORT_ENV", "") or ""
