@@ -11,7 +11,7 @@
 Поисковые запросы: загружается целевая дата по правилу времени запуска.
 Реклама: в ежедневном режиме получает статистику только за целевую дату и объединяет её с существующей историей.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
-Для TOPFACE/MISSTAIS используются основные WB-токены, для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB.
+Для TOPFACE/MISSTAIS используются основные WB-токены, для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB; finance и keywords для FINICK отключены. FINICK при первом запуске догружает 7 полностью завершённых недель истории (без текущей недели) для доступных исторических отчётов.
 """
 
 import os
@@ -39,7 +39,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-08-06_v36_FINICK"
+SCRIPT_VERSION = "2026-08-07_v37_FINICK_FREE_HISTORY"
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -334,6 +334,32 @@ class WildberriesDailyUpdater:
         if start_date > end_date:
             start_date = end_date
         return start_date, end_date
+
+    def _get_last_completed_weeks_range(self, weeks: int = 7) -> Tuple[datetime.date, datetime.date]:
+        """Диапазон последних полностью завершённых недель, не включая текущую неделю.
+
+        Для запуска в пятницу 2026-08-07:
+        - текущая неделя начинается 2026-08-03 и НЕ входит в историю;
+        - 7 завершённых недель = 2026-06-15 .. 2026-08-02.
+        """
+        current_date = self.start_time.date()
+        current_week_start = current_date - timedelta(days=current_date.weekday())
+        end_date = current_week_start - timedelta(days=1)
+        start_date = end_date - timedelta(days=weeks * 7 - 1)
+        return start_date, end_date
+
+    @staticmethod
+    def _split_date_range(start_date: datetime.date, end_date: datetime.date, max_days: int) -> List[Tuple[datetime.date, datetime.date]]:
+        """Разбить диапазон на куски не длиннее max_days включительно."""
+        if start_date > end_date:
+            return []
+        result = []
+        cur = start_date
+        while cur <= end_date:
+            chunk_end = min(end_date, cur + timedelta(days=max_days - 1))
+            result.append((cur, chunk_end))
+            cur = chunk_end + timedelta(days=1)
+        return result
 
     def _get_date_range_last_n_days(self, n: int) -> Tuple[datetime.date, datetime.date]:
         today = datetime.now(pytz.timezone('Europe/Moscow')).date()
@@ -705,52 +731,80 @@ class WildberriesDailyUpdater:
     # ---------- Заказы ----------
     def update_orders(self, store_name: str) -> bool:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Заказы для магазина {store_name}")
-        config = self.reports_config['orders']
-        start_date, end_date = self._get_daily_or_backfill_range("WB_ORDERS_BACKFILL_FROM")
-        self.log(f"📅 Диапазон заказов: {start_date:%Y-%m-%d} — {end_date:%Y-%m-%d}")
-        all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
+
+        explicit_backfill = _parse_optional_date_env("WB_ORDERS_BACKFILL_FROM")
+        if store_name == "FINICK" and explicit_backfill is None:
+            history_start, history_end = self._get_last_completed_weeks_range(7)
+            history_dates = [
+                history_start + timedelta(days=i)
+                for i in range((history_end - history_start).days + 1)
+            ]
+            # Текущую неделю не догружаем как историю. Добавляем только целевую дату ежедневного запуска.
+            all_dates = history_dates + ([self.target_date] if self.target_date not in history_dates else [])
+            self.log(
+                f"📚 FINICK: проверяем/догружаем 7 завершённых недель истории заказов "
+                f"{history_start:%Y-%m-%d} — {history_end:%Y-%m-%d}; "
+                f"текущая неделя исключена. Отдельно целевая дата: {self.target_date:%Y-%m-%d}"
+            )
+        else:
+            start_date, end_date = self._get_daily_or_backfill_range("WB_ORDERS_BACKFILL_FROM")
+            self.log(f"📅 Диапазон заказов: {start_date:%Y-%m-%d} — {end_date:%Y-%m-%d}")
+            all_dates = [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]
 
         weeks = defaultdict(list)
         for d in all_dates:
             week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
             weeks[week_start].append(d)
 
+        config = self.reports_config['orders']
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": api_key.strip()}
 
-        for week_start, dates in weeks.items():
+        total_loaded = 0
+        for week_start, dates in sorted(weeks.items()):
             self.log(f"📅 Обработка недели, начинающейся {week_start.strftime('%Y-%m-%d')}")
             weekly_df = self._load_weekly_data(store_name, 'orders', week_start)
             if not weekly_df.empty:
-                existing_dates = set(pd.to_datetime(weekly_df['date']).dt.date.unique()) if 'date' in weekly_df.columns else set()
+                existing_dates = set(
+                    pd.to_datetime(weekly_df['date'], errors='coerce').dt.date.dropna().unique()
+                ) if 'date' in weekly_df.columns else set()
             else:
                 existing_dates = set()
 
-            dates_to_load = [d for d in dates if d not in existing_dates]
+            dates_to_load = [d for d in sorted(set(dates)) if d not in existing_dates]
             if not dates_to_load:
-                self.log(f"✅ Все дни недели уже загружены")
+                self.log("✅ Все нужные дни недели уже загружены")
                 continue
 
             self.log(f"📅 Недостающие дни: {[d.strftime('%Y-%m-%d') for d in dates_to_load]}")
             new_data = []
-            for date in dates_to_load:
+
+            for idx, date in enumerate(dates_to_load):
                 date_str = date.strftime('%Y-%m-%d')
                 self.log(f"📅 Загрузка дня: {date_str}")
                 data = self._make_request(config, headers, date_str)
                 if data and isinstance(data, list):
                     day_df = pd.DataFrame(data)
                     if not day_df.empty:
-                        day_df['store'] = store_name
+                        # supplier/orders с flag=1 обычно возвращает день dateFrom, но дополнительно
+                        # страхуемся и оставляем только строки нужной даты заказа.
                         if 'date' in day_df.columns:
-                            day_df['date'] = pd.to_datetime(day_df['date']).dt.strftime('%Y-%m-%d')
+                            parsed_date = pd.to_datetime(day_df['date'], errors='coerce').dt.date
+                            exact_df = day_df.loc[parsed_date == date].copy()
+                            if not exact_df.empty:
+                                day_df = exact_df
+                            day_df['date'] = pd.to_datetime(day_df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+
+                        day_df['store'] = store_name
                         new_data.append(day_df)
+                        total_loaded += len(day_df)
                         self.log(f"✅ Получено {len(day_df)} записей")
                     else:
                         self.log(f"ℹ️ Нет данных за {date_str}")
                 else:
                     self.log(f"⚠️ Не удалось получить данные за {date_str}")
 
-                if date != dates_to_load[-1]:
+                if idx < len(dates_to_load) - 1:
                     time.sleep(self.delays['orders'])
 
             if new_data:
@@ -761,7 +815,9 @@ class WildberriesDailyUpdater:
                     weekly_df = pd.concat([weekly_df, new_df], ignore_index=True)
                 self._save_weekly_data(weekly_df, store_name, 'orders', week_start)
             else:
-                self.log(f"ℹ️ Нет новых данных за неделю")
+                self.log("ℹ️ Нет новых данных за неделю")
+
+        self.log(f"✅ Заказы обновлены. Новых строк в этом запуске: {total_loaded}")
         return True
 
     # ---------- Остатки ----------
@@ -1485,6 +1541,218 @@ class WildberriesDailyUpdater:
 
     # ---------- Воронка продаж ----------
     def update_funnel(self, store_name: str) -> bool:
+        """Воронка: для FINICK — бесплатный v3 API; для остальных магазинов сохраняем прежний CSV/Jam-метод."""
+        if store_name == "FINICK":
+            return self._update_funnel_finick_free(store_name)
+        return self._update_funnel_jam(store_name)
+
+    def _update_funnel_finick_free(self, store_name: str) -> bool:
+        """FINICK: бесплатная воронка через /api/analytics/v3/sales-funnel/products.
+
+        Почему не /products/history:
+        - /products/history даёт максимум последнюю неделю;
+        - /products позволяет запросить период до 365 дней.
+        Чтобы сохранить дневную структуру старого файла, исторические дни запрашиваем
+        по одному дню. При первом запуске догружаем 7 полностью завершённых недель,
+        текущую неделю в исторический backfill не включаем; отдельно добавляем target_date.
+        """
+        self.log(f"\n📌 ОБНОВЛЕНИЕ: Воронка продаж для магазина {store_name} (FREE v3, без Jam)")
+        config = self.reports_config['funnel']
+        key = f"Отчёты/{config['folder']}/{store_name}/{config['filename']}"
+
+        if self.s3.file_exists(key):
+            df_existing = self.s3.read_excel(key, sheet_name=0)
+        else:
+            df_existing = pd.DataFrame()
+            self.log("⚠️ Файл воронки FINICK не найден, будет создан")
+
+        existing_dates: Set[datetime.date] = set()
+        if not df_existing.empty and 'dt' in df_existing.columns:
+            existing_dates = set(
+                pd.to_datetime(df_existing['dt'], errors='coerce').dt.date.dropna().unique()
+            )
+
+        explicit_backfill = _parse_optional_date_env("WB_FUNNEL_BACKFILL_FROM")
+        if explicit_backfill:
+            requested_dates = [
+                explicit_backfill + timedelta(days=i)
+                for i in range((self.target_date - explicit_backfill).days + 1)
+            ] if explicit_backfill <= self.target_date else [self.target_date]
+            self.log(
+                f"📚 FINICK funnel: ручная догрузка {requested_dates[0]:%Y-%m-%d} — "
+                f"{requested_dates[-1]:%Y-%m-%d}"
+            )
+        else:
+            history_start, history_end = self._get_last_completed_weeks_range(7)
+            history_dates = [
+                history_start + timedelta(days=i)
+                for i in range((history_end - history_start).days + 1)
+            ]
+            requested_dates = history_dates + ([self.target_date] if self.target_date not in history_dates else [])
+            self.log(
+                f"📚 FINICK funnel: 7 завершённых недель {history_start:%Y-%m-%d} — "
+                f"{history_end:%Y-%m-%d}; текущая неделя исключена. "
+                f"Отдельно target_date={self.target_date:%Y-%m-%d}"
+            )
+
+        dates_to_load = [d for d in requested_dates if d not in existing_dates]
+        if not dates_to_load:
+            self.log("✅ Воронка FINICK уже содержит все требуемые исторические дни и целевую дату")
+            return True
+
+        self.log(
+            f"📅 Воронка FINICK: отсутствует {len(dates_to_load)} дней. "
+            f"Будут загружены только недостающие даты."
+        )
+
+        api_key = self.api_keys[store_name][config['key_type']]
+        headers = {
+            "Authorization": f"Bearer {api_key.strip()}",
+            "Content-Type": "application/json",
+        }
+        url = "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products"
+
+        new_rows: List[dict] = []
+
+        for date_idx, target_date in enumerate(sorted(dates_to_load), start=1):
+            date_str = target_date.strftime("%Y-%m-%d")
+            self.log(f"📅 Funnel FREE {date_idx}/{len(dates_to_load)}: {date_str}")
+            offset = 0
+            page_size = 1000
+            day_rows = 0
+
+            while True:
+                payload = {
+                    "selectedPeriod": {"start": date_str, "end": date_str},
+                    "nmIds": [],
+                    "brandNames": [],
+                    "subjectIds": [],
+                    "tagIds": [],
+                    "skipDeletedNm": False,
+                    "orderBy": {"field": "openCard", "mode": "desc"},
+                    "limit": page_size,
+                    "offset": offset,
+                }
+
+                response_data = None
+                for attempt in range(1, 5):
+                    try:
+                        resp = requests.post(url, headers=headers, json=payload, timeout=120)
+                        if resp.status_code == 200:
+                            response_data = resp.json()
+                            break
+                        if resp.status_code == 429:
+                            wait = 20 * attempt
+                            self.log(f"    ⚠️ Funnel FREE 429, попытка {attempt}/4, ждём {wait} сек")
+                            time.sleep(wait)
+                            continue
+
+                        self.log(
+                            f"    ❌ Funnel FREE HTTP {resp.status_code} за {date_str}: "
+                            f"{resp.text[:1500]}"
+                        )
+                        return False
+                    except Exception as e:
+                        if attempt == 4:
+                            self.log(f"    ❌ Funnel FREE: ошибка запроса за {date_str}: {e}")
+                            return False
+                        time.sleep(10 * attempt)
+
+                if response_data is None:
+                    return False
+
+                data_obj = response_data.get("data", response_data) if isinstance(response_data, dict) else {}
+                products = data_obj.get("products", []) if isinstance(data_obj, dict) else []
+                currency = data_obj.get("currency", "RUB") if isinstance(data_obj, dict) else "RUB"
+
+                if not products:
+                    break
+
+                for item in products:
+                    product = item.get("product") or {}
+                    statistic = item.get("statistic") or {}
+                    selected = statistic.get("selected") or {}
+                    conversions = selected.get("conversions") or {}
+
+                    row = {
+                        "nmID": product.get("nmId", ""),
+                        "dt": date_str,
+                        "openCardCount": selected.get("openCount", 0),
+                        "addToCartCount": selected.get("cartCount", 0),
+                        "ordersCount": selected.get("orderCount", 0),
+                        "ordersSumRub": selected.get("orderSum", 0),
+                        "buyoutsCount": selected.get("buyoutCount", 0),
+                        "buyoutsSumRub": selected.get("buyoutSum", 0),
+                        "cancelCount": selected.get("cancelCount", 0),
+                        "cancelSumRub": selected.get("cancelSum", 0),
+                        "addToCartConversion": selected.get(
+                            "addToCartConversion",
+                            selected.get("openToCartPercent", 0),
+                        ),
+                        "cartToOrderConversion": selected.get(
+                            "cartToOrderConversion",
+                            conversions.get("cartToOrderPercent", 0),
+                        ),
+                        "buyoutPercent": selected.get(
+                            "buyoutPercent",
+                            conversions.get("buyoutPercent", 0),
+                        ),
+                        "addToWishlist": selected.get(
+                            "addToWishlist",
+                            selected.get("addToWishlistCount", 0),
+                        ),
+                        "currency": currency,
+                        "title": product.get("title", ""),
+                        "vendorCode": product.get("vendorCode", ""),
+                        "brandName": product.get("brandName", ""),
+                        "subjectId": product.get("subjectId", ""),
+                        "subjectName": product.get("subjectName", ""),
+                        "productRating": product.get("productRating", 0),
+                        "feedbackRating": product.get("feedbackRating", 0),
+                        "store": store_name,
+                    }
+                    new_rows.append(row)
+                    day_rows += 1
+
+                if len(products) < page_size:
+                    break
+                offset += page_size
+                # Лимит метода — 3 запроса/мин; между страницами выдерживаем интервал.
+                time.sleep(20)
+
+            self.log(f"    ✅ Funnel FREE за {date_str}: {day_rows} товарных строк")
+            if date_idx < len(dates_to_load):
+                # Официальный лимит — 3 запроса в минуту.
+                time.sleep(20)
+
+        if new_rows:
+            new_df = pd.DataFrame(new_rows)
+            if df_existing.empty:
+                combined = new_df
+            else:
+                combined = pd.concat([df_existing, new_df], ignore_index=True)
+
+            if 'dt' in combined.columns:
+                combined['dt'] = pd.to_datetime(combined['dt'], errors='coerce').dt.strftime('%Y-%m-%d')
+            dedup_cols = [c for c in ['dt', 'nmID'] if c in combined.columns]
+            if dedup_cols:
+                combined = combined.drop_duplicates(subset=dedup_cols, keep='last')
+
+            if 'dt' in combined.columns:
+                combined = combined.sort_values(['dt', 'nmID'] if 'nmID' in combined.columns else ['dt'])
+
+            self.s3.write_excel(key, combined, sheet_name=config['name'])
+            self.log(
+                f"✅ Воронка FINICK сохранена: {key}. "
+                f"Добавлено строк: {len(new_df)}, всего строк: {len(combined)}"
+            )
+        else:
+            self.log("ℹ️ Funnel FREE не вернул новых строк")
+
+        return True
+
+    # ---------- Воронка продаж ----------
+    def _update_funnel_jam(self, store_name: str) -> bool:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Воронка продаж для магазина {store_name}")
         config = self.reports_config['funnel']
         key = f"Отчёты/{config['folder']}/{store_name}/{config['filename']}"
@@ -1539,7 +1807,7 @@ class WildberriesDailyUpdater:
         try:
             resp = requests.post(config['api_url'], headers=headers, json=create_payload, timeout=60)
             if resp.status_code != 200:
-                self.log(f"❌ Ошибка создания отчёта: {resp.status_code}")
+                self.log(f"❌ Ошибка создания отчёта: HTTP {resp.status_code}: {resp.text[:1500]}")
                 return False
         except Exception as e:
             self.log(f"❌ Ошибка соединения: {e}")
@@ -1607,6 +1875,31 @@ class WildberriesDailyUpdater:
         self.log(f"\n📌 ОБНОВЛЕНИЕ: Реклама для магазина {store_name}")
         config = self.reports_config['adverts']
 
+        # Для FINICK при первом запуске догружаем 7 полностью завершённых недель,
+        # не включая текущую. Отмечаем недели, для которых недельного файла ещё нет.
+        finick_missing_week_ranges: List[Tuple[datetime.date, datetime.date]] = []
+        if store_name == "FINICK" and not _parse_optional_date_env("WB_ADVERTS_BACKFILL_FROM"):
+            history_start, history_end = self._get_last_completed_weeks_range(7)
+            for week_idx in range(7):
+                ws = history_start + timedelta(days=week_idx * 7)
+                we = ws + timedelta(days=6)
+                week_key = self._get_weekly_key(
+                    store_name,
+                    'adverts',
+                    datetime.combine(ws, datetime.min.time()),
+                )
+                if not self.s3.file_exists(week_key):
+                    finick_missing_week_ranges.append((ws, we))
+
+            if finick_missing_week_ranges:
+                self.log(
+                    f"📚 FINICK: требуется догрузить рекламную историю за "
+                    f"{len(finick_missing_week_ranges)} из 7 завершённых недель "
+                    f"({history_start:%Y-%m-%d} — {history_end:%Y-%m-%d})."
+                )
+            else:
+                self.log("✅ FINICK: недельные файлы рекламы за 7 завершённых недель уже есть")
+
         # Проверяем актуальность и полноту аналитического файла
         analytics_key = f"Отчёты/{config['folder']}/{store_name}/Анализ рекламы.xlsx"
         required_sheets = ['Статистика_Ежедневно', 'Статистика_Итого', 'Список_кампаний', 'Отчет_по_Категории', 'Отчет_по_Категории_Итог']
@@ -1636,8 +1929,11 @@ class WildberriesDailyUpdater:
                             self.log(f"⚠️ Данные в аналитическом файле устарели: последняя дата {max_date}, требуется обновление до {target_date}")
 
                 if sheets_present and all_sheets_non_empty and latest_date_ok:
-                    self.log("✅ Данные рекламы актуальны и полны. Пропускаем обновление.")
-                    return True
+                    if store_name == "FINICK" and finick_missing_week_ranges:
+                        self.log("📚 Текущая реклама FINICK актуальна, но не хватает исторических недель — продолжаем backfill")
+                    else:
+                        self.log("✅ Данные рекламы актуальны и полны. Пропускаем обновление.")
+                        return True
             except Exception as e:
                 self.log(f"⚠️ Ошибка при проверке аналитического файла: {e}, продолжаем обновление")
         else:
@@ -1646,11 +1942,13 @@ class WildberriesDailyUpdater:
         api_key = self.api_keys[store_name][config['key_type']]
         headers = {"Authorization": f"Bearer {api_key.strip()}"}
 
-        # 1. Получаем список всех кампаний (статусы 9 - активные, 11 - на паузе)
+        # 1. Получаем список кампаний.
+        # Для FINICK добавляем статус 7 (завершённые), иначе историческая реклама будет неполной.
         self.log("📋 Запрос списка рекламных кампаний...")
         all_adverts = []
+        statuses = "7,9,11" if store_name == "FINICK" else "9,11"
         for payment_type in ['cpm', 'cpc']:
-            url = f"{config['api_url']}?statuses=9,11&payment_type={payment_type}"
+            url = f"{config['api_url']}?statuses={statuses}&payment_type={payment_type}"
             try:
                 resp = requests.get(url, headers=headers, timeout=30)
                 if resp.status_code == 200:
@@ -1730,57 +2028,105 @@ class WildberriesDailyUpdater:
 
         self.log(f"📊 Получено {len(campaign_ids)} кампаний с информацией")
 
-        # 3. Определяем диапазон дат для статистики.
-        # v28: в ежедневном режиме только целевую дату. Историческая догрузка только явно через WB_ADVERTS_BACKFILL_FROM.
-        start_date, end_date = self._get_daily_or_backfill_range("WB_ADVERTS_BACKFILL_FROM")
-        start_str = start_date.strftime('%Y-%m-%d')
-        end_str = end_date.strftime('%Y-%m-%d')
-        self.log(f"📅 Запрашиваем статистику за период: {start_str} - {end_str}")
+        # 3. Определяем периоды статистики.
+        explicit_adverts_backfill = _parse_optional_date_env("WB_ADVERTS_BACKFILL_FROM")
+        if store_name == "FINICK" and explicit_adverts_backfill is None:
+            requested_periods: List[Tuple[datetime.date, datetime.date]] = list(finick_missing_week_ranges)
+            # Текущую неделю не добавляем в исторический backfill. Берём только target_date.
+            requested_periods.append((self.target_date, self.target_date))
+        else:
+            start_date, end_date = self._get_daily_or_backfill_range("WB_ADVERTS_BACKFILL_FROM")
+            requested_periods = self._split_date_range(start_date, end_date, 31)
 
-        # 4. Загружаем статистику для всех кампаний
-        all_stats = []  # список ответов от API (каждый ответ содержит данные по группе кампаний)
+        # adv/v3/fullstats принимает максимум 31 день за запрос.
+        safe_periods: List[Tuple[datetime.date, datetime.date]] = []
+        for p_start, p_end in requested_periods:
+            safe_periods.extend(self._split_date_range(p_start, p_end, 31))
+
+        # Убираем дубли периодов, сохраняя порядок.
+        dedup_periods = []
+        seen_periods = set()
+        for p_start, p_end in safe_periods:
+            key_period = (p_start, p_end)
+            if key_period not in seen_periods:
+                seen_periods.add(key_period)
+                dedup_periods.append(key_period)
+        requested_periods = dedup_periods
+
+        self.log(
+            "📅 Периоды рекламы: " +
+            ", ".join(f"{a:%Y-%m-%d}..{b:%Y-%m-%d}" for a, b in requested_periods)
+        )
+
+        # Набор разрешённых дат нужен ниже, чтобы не захватывать текущую неделю между
+        # последней завершённой неделей и target_date.
+        requested_dates: Set[str] = set()
+        for p_start, p_end in requested_periods:
+            for i in range((p_end - p_start).days + 1):
+                requested_dates.add((p_start + timedelta(days=i)).strftime('%Y-%m-%d'))
+
+        # 4. Загружаем статистику для всех кампаний по каждому периоду.
+        all_stats = []
         stats_url = "https://advert-api.wildberries.ru/adv/v3/fullstats"
-        # Разбиваем ID на группы по 30
-        for i in range(0, len(campaign_ids), 30):
-            chunk = campaign_ids[i:i+30]
-            ids_param = ','.join(map(str, chunk))
-            params = {
-                'ids': ids_param,
-                'beginDate': start_str,
-                'endDate': end_str
-            }
-            retries = 0
-            success = False
-            while retries < 3 and not success:
-                try:
-                    self.log(f"⏳ Запрос статистики для кампаний {i+1}-{min(i+30, len(campaign_ids))}...")
-                    resp = requests.get(stats_url, headers=headers, params=params, timeout=60)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data:
-                            all_stats.extend(data)
-                            self.log(f"✅ Получены данные для {len(data)} кампаний")
+
+        for period_idx, (p_start, p_end) in enumerate(requested_periods, start=1):
+            start_str = p_start.strftime('%Y-%m-%d')
+            end_str = p_end.strftime('%Y-%m-%d')
+            self.log(
+                f"📅 Реклама период {period_idx}/{len(requested_periods)}: "
+                f"{start_str} — {end_str}"
+            )
+
+            # API допускает до 50 ID, оставляем консервативные чанки по 30.
+            for i in range(0, len(campaign_ids), 30):
+                chunk = campaign_ids[i:i+30]
+                ids_param = ','.join(map(str, chunk))
+                params = {
+                    'ids': ids_param,
+                    'beginDate': start_str,
+                    'endDate': end_str,
+                }
+
+                retries = 0
+                success = False
+                while retries < 3 and not success:
+                    try:
+                        self.log(
+                            f"⏳ Запрос статистики кампаний "
+                            f"{i+1}-{min(i+30, len(campaign_ids))}..."
+                        )
+                        resp = requests.get(stats_url, headers=headers, params=params, timeout=60)
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            if data:
+                                all_stats.extend(data)
+                                self.log(f"✅ Получены данные для {len(data)} кампаний")
+                            else:
+                                self.log("ℹ️ Нет данных для этой группы")
+                            success = True
+                        elif resp.status_code == 429:
+                            retries += 1
+                            wait = 60 * retries
+                            self.log(f"    ⚠️ Лимит, ждём {wait} сек...")
+                            time.sleep(wait)
                         else:
-                            self.log(f"ℹ️ Нет данных для этой группы")
-                        success = True
-                    elif resp.status_code == 429:
-                        retries += 1
-                        wait = 60 * retries
-                        self.log(f"    ⚠️ Лимит, ждём {wait} сек...")
-                        time.sleep(wait)
-                    else:
-                        self.log(f"❌ Ошибка {resp.status_code}: {resp.text[:200]}")
+                            self.log(
+                                f"❌ Ошибка рекламы HTTP {resp.status_code} "
+                                f"за {start_str}..{end_str}: {resp.text[:1000]}"
+                            )
+                            break
+                    except Exception as e:
+                        self.log(f"❌ Исключение: {e}")
                         break
-                except Exception as e:
-                    self.log(f"❌ Исключение: {e}")
-                    break
-            time.sleep(30)  # пауза между группами
+
+                # Лимит fullstats — 3 запроса в минуту.
+                time.sleep(20)
 
         if not all_stats:
             self.log("⚠️ Не получено статистических данных.")
             return False
 
-        self.log(f"📊 Получена статистика для {len(all_stats)} записей кампаний")
+        self.log(f"📊 Получена статистика для {len(all_stats)} записей кампаний/периодов")
 
         # 5. Преобразуем полученную статистику в DataFrame (ежедневная) и итоговую
         daily_rows = []
@@ -1815,7 +2161,7 @@ class WildberriesDailyUpdater:
             }
             for day in days:
                 day_date = day.get('date', '').split('T')[0]
-                if not day_date or day_date < start_str or day_date > end_str:
+                if not day_date or day_date not in requested_dates:
                     continue
                 row = {
                     'ID кампании': camp_id,
@@ -1870,9 +2216,10 @@ class WildberriesDailyUpdater:
 
         self.log(f"📊 Сформировано {len(daily_df)} ежедневных записей, {len(summary_df)} итоговых записей по кампаниям")
 
-        # 6. Группируем по неделям и сохраняем недельные файлы с несколькими листами
+        # 6. Группируем только реально запрошенные даты по неделям.
         weeks = defaultdict(list)
-        for d in [start_date + timedelta(days=i) for i in range((end_date - start_date).days + 1)]:
+        for date_str in sorted(requested_dates):
+            d = datetime.strptime(date_str, '%Y-%m-%d').date()
             week_start = self._get_week_start(datetime.combine(d, datetime.min.time()))
             weeks[week_start].append(d)
 
@@ -1967,7 +2314,11 @@ class WildberriesDailyUpdater:
                         analytics_daily = pd.concat([old_daily, analytics_daily], ignore_index=True)
                         if 'Дата' in analytics_daily.columns:
                             analytics_daily['Дата'] = pd.to_datetime(analytics_daily['Дата'], errors='coerce').dt.strftime('%Y-%m-%d')
-                            cutoff = (datetime.now(pytz.timezone('Europe/Moscow')).date() - timedelta(days=30)).strftime('%Y-%m-%d')
+                            retention_days = 56 if store_name == "FINICK" else 30
+                            cutoff = (
+                                datetime.now(pytz.timezone('Europe/Moscow')).date()
+                                - timedelta(days=retention_days)
+                            ).strftime('%Y-%m-%d')
                             analytics_daily = analytics_daily[analytics_daily['Дата'] >= cutoff]
                         analytics_daily = analytics_daily.drop_duplicates(subset=['ID кампании', 'Дата'], keep='last')
                 except Exception as e:
@@ -2139,12 +2490,26 @@ class WildberriesDailyUpdater:
 
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
-        # Исключаем 1c_stocks из списка по умолчанию (можно вернуть позже, добавив в список)
+        # Исключаем 1c_stocks из списка по умолчанию.
         all_reports = ['orders', 'stocks', 'finance', 'funnel', 'adverts', 'keywords']
+        disabled_for_finick = {'finance', 'keywords'}
+
         if reports is None:
-            reports = all_reports
+            reports = list(all_reports)
+
+        if store_name == "FINICK":
+            before = list(reports)
+            reports = [r for r in reports if r not in disabled_for_finick]
+            skipped = [r for r in before if r in disabled_for_finick]
+            if skipped:
+                self.log(
+                    "⏭️ FINICK: временно отключены недоступные методы: "
+                    + ", ".join(skipped)
+                    + ". Остальные магазины работают без изменений."
+                )
 
         self.log(f"🚀 Начало обновления для магазина {store_name}. Запрошенные отчёты: {reports}")
+        overall_success = True
         for report in reports:
             self.log(f"➡️ Переход к отчёту: {report}")
             method_name = f"update_{report}"
@@ -2152,18 +2517,26 @@ class WildberriesDailyUpdater:
                 method = getattr(self, method_name)
                 try:
                     success = method(store_name)
+                    if not success:
+                        overall_success = False
                     self.log(f"📊 Отчёт {report}: {'✅' if success else '❌'}")
                 except Exception as e:
+                    overall_success = False
                     self.log(f"❌ Критическая ошибка в {report}: {e}")
                     traceback.print_exc()
                     self.log(f"📊 Отчёт {report}: ❌ (исключение)")
             else:
+                overall_success = False
                 self.log(f"⚠️ Неизвестный тип отчёта: {report}")
             if report != reports[-1]:
                 self.log(f"⏳ Пауза 30 секунд перед следующим отчётом...")
                 time.sleep(30)
 
-        self.log("✅ Обновление завершено")
+        if overall_success:
+            self.log("✅ Обновление завершено успешно")
+        else:
+            self.log("❌ Обновление завершено с ошибками в доступных отчётах")
+        return overall_success
 
     def log_section(self, title: str):
         self.log("")
@@ -2295,6 +2668,12 @@ def run_specific_report(updater: WildberriesDailyUpdater, store: str):
                 return
             if 1 <= choice <= len(reports):
                 selected = reports[choice-1]
+                if store == "FINICK" and selected in {'finance', 'keywords'}:
+                    updater.log(
+                        f"⏭️ Отчёт {selected} для FINICK временно отключён: "
+                        f"нет необходимого доступа/подписки."
+                    )
+                    return
                 updater.log(f"➡️ Запуск обновления отчёта: {selected}")
                 method = getattr(updater, f"update_{selected}")
                 success = method(store)
@@ -2342,16 +2721,21 @@ def main():
     api_keys = build_api_keys_for_stores(stores)
     updater = WildberriesDailyUpdater(api_keys, s3)
 
-    def run_for_store(store: str) -> None:
+    def run_for_store(store: str) -> bool:
         if args.full:
-            updater.run_daily_update(store)
-            return
+            return updater.run_daily_update(store)
         if args.report:
+            if store == "FINICK" and args.report in {'finance', 'keywords'}:
+                updater.log(
+                    f"⏭️ Отчёт {args.report} для FINICK временно отключён: "
+                    f"нет необходимого доступа/подписки. Другие магазины не затронуты."
+                )
+                return True
             updater.log(f"➡️ Запуск обновления отчёта: {args.report} | магазин {store}")
             method = getattr(updater, f"update_{args.report}")
             success = method(store)
             updater.log(f"📊 Отчёт {args.report} | {store}: {'✅' if success else '❌'}")
-            return
+            return success
 
         if sys.stdin.isatty() and len(stores) == 1:
             while True:
@@ -2367,12 +2751,20 @@ def main():
                 input("Нажмите Enter, чтобы вернуться в меню...")
         else:
             updater.log("🚀 Запуск в неинтерактивном режиме: выполняем полное ежедневное обновление")
-            updater.run_daily_update(store)
+            return updater.run_daily_update(store)
 
+        return True
+
+    overall_run_success = True
     for idx, store in enumerate(stores, start=1):
         if len(stores) > 1:
             updater.log(f"===== Магазин {idx}/{len(stores)}: {store} =====")
-        run_for_store(store)
+        store_success = run_for_store(store)
+        if store_success is False:
+            overall_run_success = False
+
+    if not overall_run_success:
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
