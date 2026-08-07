@@ -51,7 +51,6 @@ jobs:
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_S3_ENDPOINT: ${{ secrets.YC_S3_ENDPOINT }}
       FINICK_API_WB: ${{ secrets.FINICK_API_WB }}
 
     steps:
