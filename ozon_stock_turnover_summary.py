@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Отдельный сводный отчёт Ozon FBO: остатки, оборачиваемость, кластеры и прогноз OOS.
+Отдельный сводный отчёт Ozon FBO: остатки, оборачиваемость, активные поставки и прогноз OOS.
 
 Это САМОСТОЯТЕЛЬНЫЙ скрипт. Он не запускает рекламу, финансы, отзывы и прочие
 модули большого сборщика.
@@ -14,19 +14,17 @@
 - среднесуточные продажи за 7 дней по артикулу и по кластеру;
 - доступный остаток FBO сейчас;
 - товары в пути внутри Ozon и возвраты покупателей на склад;
-- все активные FBO-заявки продавца (и уже переданные Ozon, и ещё ожидающие отгрузки);
+- активные FBO-заявки продавца через рабочую связку /v3/supply-order/list -> /v3/supply-order/get;
+- состав активных поставок через /v1/supply-order/bundle;
+- дату отгрузки из timeslot поставки;
+- плановую дату прибытия: сначала из API, если она есть, иначе дата отгрузки + норматив кросс-дока;
+- самый свежий процент выкупа по артикулу: последние 50 завершённых единиц (delivered/cancelled), ClientReturn учитывается как невыкуп;
 - запас в днях сейчас и с учётом пути/активных заявок;
-- процент выкупа за 30 дней без ранних отмен и без обычных ClientReturn;
-- прогноз дефицита по кластерам;
-- норматив кросс-дока из «Москва — Кавказский» из Базы знаний Ozon + 4 дня на сборку;
-- консервативный срок до доступности товара: после прибытия добавляем до 5 рабочих дней на приёмку/размещение Ozon.
+- прогноз дефицита по кластерам.
 
-Важно по кросс-доку:
-с 16.02.2026 Ozon для кросс-докинговых поставок не возвращает
-storage_warehouse.arrival_date. Поэтому прогноз строится по сроку маршрута из
-официальной Базы знаний Ozon и фактическому статусу/слоту существующей заявки.
-Если срок маршрута не удалось прочитать ни из БЗ, ни из кэша/override, скрипт
-НЕ выдумывает срок и помечает прогноз как «Нет срока маршрута».
+Для FINICK расчёт кросс-дока использует точку «Москва — Кавказский» и верхнюю
+границу сроков из переданного тарифного файла Ozon от 03.08.2026. Нормативы
+встроены в код, поэтому внешний сайт/Яндекс Диск для расчёта не требуются.
 """
 from __future__ import annotations
 
@@ -42,9 +40,7 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
-from html import unescape
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -55,22 +51,113 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_6_20260807"
+SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_8_20260807"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
 SELLER_MIN_INTERVAL_SECONDS = 0.55
+
+# FINICK отгружается из Москвы. Для текущего рабочего контура используем
+# точку Москва — Кавказский, как и в предыдущем расчёте.
 CROSSDOCK_ORIGIN = "Москва — Кавказский"
-CROSSDOCK_KB_URL = "https://seller-edu.ozon.ru/fbo/crossdoking/delivery-time"
-# Публичная копия XLSX из статьи MPSTATS, где источником указан Ozon Knowledge Base.
-# Через публичный API Яндекс Диска GitHub Runner может получить бинарный XLSX без браузера.
-CROSSDOCK_XLSX_PUBLIC_KEY = "https://disk.yandex.lt/i/Az_zYiNu-3KHBg"
-YANDEX_PUBLIC_DOWNLOAD_API = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+CROSSDOCK_TARIFF_AS_OF = "2026-08-03"
+CROSSDOCK_TARIFF_SOURCE = "Тарифы Ozon cross-dock, файл от 03.08.2026, Москва — Кавказский"
 PREPARATION_DAYS = 4
-# Ozon/профильные источники указывают 2–5 рабочих дней на приёмку и размещение
-# после прибытия на конечный склад. Для OOS-прогноза используем консервативно 5.
-FINAL_ACCEPTANCE_WORKDAYS = 5
-CROSSDOCK_CACHE_DAYS = 30
+
+# Выкуп: считаем по самым свежим завершённым единицам товара.
+# Берём до 50 последних delivered/cancelled. Если за окно истории набралось меньше,
+# считаем по фактически доступной базе и явно показываем её размер в отчёте.
+BUYOUT_TARGET_UNITS = 50
+BUYOUT_LOOKBACK_DAYS = 60
+
+# Верхняя граница планового срока доставки из переданного тарифного XLSX.
+# Сначала пытаемся сопоставить конкретный конечный склад, а если API отдаёт
+# только макролокальный кластер — используем консервативный максимум по кластеру.
+CROSSDOCK_WAREHOUSE_DAYS: Dict[str, int] = {
+    "Адыгейск РФЦ": 6,
+    "Алматы 2 РФЦ": 19,
+    "Астана РФЦ": 17,
+    "Волгоград МРФЦ": 6,
+    "Воронеж МРФЦ": 6,
+    "Воронеж Негабарит РФЦ": 5,
+    "Воронеж-2 РФЦ": 5,
+    "Гривно РФЦ": 3,
+    "Гривно РФЦ Негабарит": 3,
+    "Давыдовское РФЦ Негабарит": 3,
+    "Домодедово РФЦ": 5,
+    "Екатеринбург РФЦ": 8,
+    "Екатеринбург РФЦ Негабарит": 8,
+    "Жуковский РФЦ": 3,
+    "Казань РФЦ": 6,
+    "Казань Столбище РФЦ Негабарит": 6,
+    "Калининград МРФЦ": 32,
+    "Красноярск МРФЦ": 24,
+    "Махачкала РФЦ": 14,
+    "Минск МПСЦ": 11,
+    "Минск МРФЦ Негабарит": 11,
+    "Невинномысск РФЦ": 14,
+    "Нижний Новгород РФЦ": 5,
+    "Нижний Новгород-2 РФЦ": 5,
+    "Новороссийск МРФЦ": 6,
+    "Новосибирск РФЦ": 24,
+    "Ногинск РФЦ": 5,
+    "Ногинск РФЦ Негабарит": 5,
+    "Омск РФЦ": 24,
+    "Оренбург РФЦ": 6,
+    "Павловская Слобода РФЦ Негабарит": 3,
+    "Пермь РФЦ": 8,
+    "Петровское РФЦ": 3,
+    "Пушкино-1 РФЦ": 3,
+    "Пушкино-2 РФЦ": 3,
+    "Радумля РФЦ Негабарит": 3,
+    "Ростов-На-Дону РФЦ": 6,
+    "СПБ Бугры РФЦ": 5,
+    "СПБ Волхонка РФЦ Негабарит": 5,
+    "СПБ Колпино РФЦ": 5,
+    "СПБ Шушары РФЦ": 5,
+    "СПБ Шушары РФЦ Негабарит": 5,
+    "Самара РФЦ": 6,
+    "Самара РФЦ Негабарит": 6,
+    "Санкт-Петербург РФЦ": 5,
+    "Саратов РФЦ": 6,
+    "Софьино РФЦ": 3,
+    "Тверь РФЦ": 5,
+    "Тюмень РФЦ": 8,
+    "Уфа РФЦ": 6,
+    "Хабаровск-2 РФЦ": 44,
+    "Хоругвино РФЦ": 3,
+    "Хоругвино РФЦ Негабарит": 5,
+    "Южный Обход РФЦ Негабарит": 13,
+    "Ярославль РФЦ": 5,
+}
+
+CROSSDOCK_CLUSTER_DAYS: Dict[str, int] = {
+    "Алматы": 19,
+    "Астана": 17,
+    "Беларусь": 11,
+    "Воронеж": 6,
+    "Дальний Восток": 44,
+    "Екатеринбург": 8,
+    "Казань": 6,
+    "Калининград": 32,
+    "Краснодар": 13,
+    "Красноярск": 24,
+    "Махачкала": 14,
+    "Москва, МО и Дальние регионы": 5,
+    "Невинномысск": 14,
+    "Новосибирск": 24,
+    "Омск": 24,
+    "Оренбург": 6,
+    "Пермь": 8,
+    "Ростов": 6,
+    "Самара": 6,
+    "Санкт-Петербург и СЗО": 5,
+    "Саратов": 6,
+    "Тверь": 5,
+    "Тюмень": 8,
+    "Уфа": 6,
+    "Ярославль": 5,
+}
 
 TERMINAL_SUPPLY_STATES = {
     "COMPLETED", "CANCELLED", "CANCELED", "OVERDUE", "REJECTED", "ARCHIVED",
@@ -116,8 +203,6 @@ ACTIVE_STATES = {
     "ACCEPTED_AT_SUPPLY_WAREHOUSE",
     "IN_TRANSIT",
     "ACCEPTANCE_AT_STORAGE_WAREHOUSE",
-    "REPORTS_CONFIRMATION_AWAITING",
-    "REPORT_REJECTED",
 }
 PHYSICAL_STATES = {
     "ACCEPTED_AT_SUPPLY_WAREHOUSE",
@@ -137,13 +222,6 @@ STATUS_RU = {
     "CANCELLED": "Отменена",
     "OVERDUE": "Просрочена",
 }
-REFUSAL_MARKERS = (
-    "отказался при вручении", "отказалась при вручении", "отказ при вручении",
-    "не забрал", "не забрала", "не забрали", "истек срок хранения",
-    "истёк срок хранения", "срок хранения", "отказ от получения",
-    "отказался от получения", "отказалась от получения", "не пришел",
-    "не пришёл", "не пришла", "не востребован", "невыкуп",
-)
 
 
 def load_report_env() -> None:
@@ -493,269 +571,66 @@ class ClusterMaps:
         return best_name if best_score >= 0.62 else text
 
 
-class CrossdockSLAProvider:
-    """Сроки кросс-дока из Москва — Кавказский.
+class CrossdockTariffProvider:
+    """Встроенные сроки кросс-дока для FINICK из тарифного XLSX от 03.08.2026."""
 
-    Приоритет источников:
-    1) явный OZON_CROSSDOCK_SLA_JSON;
-    2) свежий кэш в Object Storage (30 дней);
-    3) XLSX, ссылка на который опубликована MPSTATS со ссылкой на БЗ Ozon;
-    4) прямое чтение страницы БЗ Ozon;
-    5) старый кэш.
-
-    В расчёте используем верхнюю границу диапазона, то есть консервативный срок.
-    """
-    def __init__(self, storage: Storage, store: str):
-        self.storage = storage
-        self.store = store
-        self.cache_key = f"Сводные отчёты/{store}/Справочники/Сроки_кроссдока_Кавказский.json"
-        self.rows: Dict[str, int] = {}
-        self.source = ""
-        self.updated_at = ""
-        self.raw_rows: Dict[str, int] = {}
-
-    def _set(self, mapping: Mapping[str, Any], source: str, updated_at: Optional[str] = None) -> Dict[str, int]:
-        rows: Dict[str, int] = {}
-        for k, v in mapping.items():
-            d = conservative_days(v)
-            if str(k).strip() and d is not None:
-                rows[str(k).strip()] = d
-        # Добавляем агрегаты по кластерам из названий конечных складов.
-        cluster_max: Dict[str, int] = {}
-        for key, days in rows.items():
-            cluster = static_cluster_from_warehouse(key)
-            if cluster:
-                cluster_max[cluster] = max(cluster_max.get(cluster, 0), days)
-        for cluster, days in cluster_max.items():
-            rows.setdefault(cluster, days)
-        self.raw_rows = dict(rows)
-        self.rows = rows
-        self.source = source
-        self.updated_at = updated_at or datetime.now(MOSCOW_TZ).isoformat()
-        return self.rows
+    def __init__(self, store: str):
+        self.store = store.upper()
+        self.source = CROSSDOCK_TARIFF_SOURCE
+        self.updated_at = CROSSDOCK_TARIFF_AS_OF
+        self.rows: Dict[str, int] = dict(CROSSDOCK_CLUSTER_DAYS)
 
     @staticmethod
-    def _cache_is_fresh(cached: Mapping[str, Any]) -> bool:
-        stamp = str(cached.get("updated_at") or "")
-        try:
-            dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=MOSCOW_TZ)
-            return datetime.now(MOSCOW_TZ) - dt.astimezone(MOSCOW_TZ) <= timedelta(days=CROSSDOCK_CACHE_DAYS)
-        except Exception:
-            return False
-
-    def _save_cache(self) -> None:
-        if not self.rows:
-            return
-        self.storage.upload_json(self.cache_key, {
-            "source": self.source,
-            "url": CROSSDOCK_KB_URL,
-            "xlsx_public_key": CROSSDOCK_XLSX_PUBLIC_KEY,
-            "updated_at": self.updated_at,
-            "origin": CROSSDOCK_ORIGIN,
-            "sla_days": self.rows,
-            "note": "В расчёте используется верхняя граница диапазона срока кросс-дока.",
-        })
-
-    def load(self) -> Dict[str, int]:
-        # Явный override всегда имеет наивысший приоритет.
-        raw = os.getenv("OZON_CROSSDOCK_SLA_JSON", "").strip()
-        if raw:
-            try:
-                obj = json.loads(raw)
-                if isinstance(obj, Mapping) and obj:
-                    result = self._set(obj, "Ручной норматив OZON_CROSSDOCK_SLA_JSON")
-                    self._save_cache()
-                    logging.info("Сроки кросс-дока: используется ручной норматив (%s маршрутов)", len(result))
-                    return result
-            except Exception as exc:
-                logging.warning("Некорректный OZON_CROSSDOCK_SLA_JSON: %s", exc)
-
-        cached = self.storage.read_json(self.cache_key)
-        cached_map = cached.get("sla_days") if isinstance(cached, Mapping) else None
-        if isinstance(cached_map, Mapping) and cached_map and self._cache_is_fresh(cached):
-            result = self._set(cached_map, str(cached.get("source") or "Кэш сроков кросс-дока"), str(cached.get("updated_at") or ""))
-            logging.info("Сроки кросс-дока: свежий кэш (%s маршрутов)", len(result))
-            return result
-
-        # Основной автоматический источник — XLSX из материала, где источником указана БЗ Ozon.
-        try:
-            mapping = self._load_from_yandex_public_xlsx()
-            if mapping:
-                result = self._set(mapping, "XLSX сроков кросс-дока из БЗ Ozon (публичная копия MPSTATS/Yandex Disk)")
-                self._save_cache()
-                logging.info("Сроки кросс-дока: XLSX успешно прочитан (%s маршрутов)", len(result))
-                return result
-        except Exception as exc:
-            logging.warning("Не удалось загрузить XLSX сроков кросс-дока: %s", exc)
-
-        # Прямой сайт часто отвечает 403 GitHub Runner'у, поэтому это только резерв.
-        try:
-            mapping = self._load_from_ozon_kb()
-            if mapping:
-                result = self._set(mapping, "База знаний Ozon — Москва — Кавказский")
-                self._save_cache()
-                return result
-        except Exception as exc:
-            logging.warning("Прямая БЗ Ozon недоступна: %s", exc)
-
-        if isinstance(cached_map, Mapping) and cached_map:
-            result = self._set(cached_map, str(cached.get("source") or "Старый кэш сроков кросс-дока"), str(cached.get("updated_at") or ""))
-            logging.warning("Сроки кросс-дока: используется старый кэш (%s маршрутов)", len(result))
-            return result
-
-        logging.warning("Сроки кросс-дока не получены. Прогноз OOS будет рассчитан только там, где есть фактическая дата/слот поставки.")
-        return {}
-
-    def lookup(self, cluster: str) -> Tuple[Optional[int], str]:
-        if not cluster or not self.rows:
-            return None, self.source or "Срок не найден"
-        # Сначала точное/нормализованное совпадение.
-        target = norm_name(cluster)
-        for key, days in self.rows.items():
+    def _best_match(value: str, mapping: Mapping[str, int], threshold: float) -> Tuple[Optional[int], str]:
+        value = str(value or "").strip()
+        if not value:
+            return None, ""
+        target = norm_name(value)
+        for key, days in mapping.items():
             if norm_name(key) == target:
-                return int(days), self.source
+                return int(days), key
         best_key, best_score = "", 0.0
-        for key in self.rows:
-            score = similarity(cluster, key)
+        for key in mapping:
+            score = similarity(value, key)
             if score > best_score:
                 best_key, best_score = key, score
-        if best_key and best_score >= 0.60:
-            return int(self.rows[best_key]), self.source
-        return None, self.source or "Срок не найден"
+        if best_key and best_score >= threshold:
+            return int(mapping[best_key]), best_key
+        return None, ""
+
+    def lookup(self, cluster: str, warehouse: str = "") -> Tuple[Optional[int], str]:
+        if self.store != "FINICK":
+            return None, f"Тарифный маршрут пока настроен только для FINICK ({CROSSDOCK_ORIGIN})"
+        # Точный конечный склад сильнее агрегата по кластеру.
+        days, matched = self._best_match(warehouse, CROSSDOCK_WAREHOUSE_DAYS, 0.72)
+        if days is not None:
+            return days, f"{self.source}; склад={matched}"
+        days, matched = self._best_match(cluster, CROSSDOCK_CLUSTER_DAYS, 0.60)
+        if days is not None:
+            return days, f"{self.source}; кластер={matched}, верхняя граница"
+        return None, self.source
 
     def as_dataframe(self) -> pd.DataFrame:
-        rows = [{
-            "Точка отправления": CROSSDOCK_ORIGIN,
-            "Кластер / конечный склад": key,
-            "Срок кросс-дока, дней (верхняя граница)": days,
-            "Источник": self.source,
-            "Обновлено": self.updated_at,
-        } for key, days in sorted(self.rows.items())]
+        rows: List[Dict[str, Any]] = []
+        for warehouse, days in sorted(CROSSDOCK_WAREHOUSE_DAYS.items()):
+            rows.append({
+                "Точка отправления": CROSSDOCK_ORIGIN,
+                "Уровень норматива": "Конечный склад",
+                "Кластер / конечный склад": warehouse,
+                "Плановый срок доставки, дней (верхняя граница)": days,
+                "Источник": self.source,
+                "Актуально на": self.updated_at,
+            })
+        for cluster, days in sorted(CROSSDOCK_CLUSTER_DAYS.items()):
+            rows.append({
+                "Точка отправления": CROSSDOCK_ORIGIN,
+                "Уровень норматива": "Кластер — резерв",
+                "Кластер / конечный склад": cluster,
+                "Плановый срок доставки, дней (верхняя граница)": days,
+                "Источник": self.source,
+                "Актуально на": self.updated_at,
+            })
         return pd.DataFrame(rows)
-
-    def _load_from_yandex_public_xlsx(self) -> Dict[str, int]:
-        api = requests.get(
-            YANDEX_PUBLIC_DOWNLOAD_API,
-            params={"public_key": CROSSDOCK_XLSX_PUBLIC_KEY},
-            headers={"User-Agent": "Mozilla/5.0 (OzonAssist)"},
-            timeout=45,
-        )
-        api.raise_for_status()
-        href = str((api.json() if api.content else {}).get("href") or "").strip()
-        if not href:
-            raise RuntimeError("Яндекс Диск не вернул ссылку download.href")
-        fr = requests.get(href, headers={"User-Agent": "Mozilla/5.0 (OzonAssist)"}, timeout=90)
-        fr.raise_for_status()
-        if len(fr.content) < 1000:
-            raise RuntimeError("Слишком маленький ответ вместо XLSX")
-        book = pd.ExcelFile(io.BytesIO(fr.content))
-        mapping: Dict[str, int] = {}
-        for sheet in book.sheet_names:
-            table = pd.read_excel(book, sheet_name=sheet, header=None)
-            mapping.update(self._extract_from_table(table))
-        return mapping
-
-    def _load_from_ozon_kb(self) -> Dict[str, int]:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; OzonAssist/1.0)"}
-        r = requests.get(CROSSDOCK_KB_URL, headers=headers, timeout=45, allow_redirects=True)
-        r.raise_for_status()
-        html = r.text
-        tables: List[pd.DataFrame] = []
-        try:
-            tables.extend(pd.read_html(io.StringIO(html)))
-        except Exception:
-            pass
-        links = set(re.findall(r"""(?:href|src)=["']([^"']+\.(?:xlsx?|csv)(?:\?[^"']*)?)["']""", html, flags=re.I))
-        for href in links:
-            try:
-                url = urljoin(r.url, unescape(href))
-                fr = requests.get(url, headers=headers, timeout=45)
-                fr.raise_for_status()
-                if re.search(r"\.csv(?:\?|$)", url, re.I):
-                    tables.append(pd.read_csv(io.BytesIO(fr.content)))
-                else:
-                    book = pd.ExcelFile(io.BytesIO(fr.content))
-                    for sheet in book.sheet_names:
-                        tables.append(pd.read_excel(book, sheet_name=sheet, header=None))
-            except Exception:
-                continue
-        mapping: Dict[str, int] = {}
-        for table in tables:
-            mapping.update(self._extract_from_table(table))
-        return mapping
-
-    def _extract_from_table(self, table: pd.DataFrame) -> Dict[str, int]:
-        if table is None or table.empty:
-            return {}
-        df = table.copy().fillna("")
-        result: Dict[str, int] = {}
-
-        # 1) Ищем строку/маршрут с Кавказским и пару «назначение — дни» в той же строке.
-        # 2) Ищем матричную форму: строка = Кавказский, заголовки столбцов = назначения.
-        for idx in range(len(df)):
-            vals = [str(x).strip() for x in df.iloc[idx].tolist()]
-            origin_cols = [j for j, x in enumerate(vals) if "кавказ" in norm_name(x) and ("моск" in norm_name(x) or "мск" in norm_name(x))]
-            if not origin_cols:
-                continue
-            # Заголовки пробуем взять из нескольких строк выше.
-            candidates: List[List[str]] = []
-            for h in range(max(0, idx - 5), idx):
-                candidates.append([str(x).strip() for x in df.iloc[h].tolist()])
-            if not candidates:
-                candidates.append([str(x) for x in df.columns])
-            headers = max(candidates, key=lambda hs: sum(bool(norm_name(x)) for x in hs))
-            for j, value in enumerate(vals):
-                if j in origin_cols:
-                    continue
-                days = conservative_days(value)
-                dest = headers[j].strip() if j < len(headers) else ""
-                if days is not None and dest and not dest.isdigit() and "unnamed" not in dest.lower():
-                    result[dest] = days
-
-        # 3) Обратная ориентация матрицы: Кавказский может быть заголовком СТОЛБЦА,
-        # а конечные склады — строками. Это важно, потому что формат XLSX Ozon менялся.
-        for origin_row in range(min(len(df), 12)):
-            for origin_col in range(df.shape[1]):
-                cell = str(df.iat[origin_row, origin_col]).strip()
-                ncell = norm_name(cell)
-                if "кавказ" not in ncell or not ("моск" in ncell or "мск" in ncell):
-                    continue
-                for r in range(origin_row + 1, len(df)):
-                    days = conservative_days(df.iat[r, origin_col])
-                    if days is None:
-                        continue
-                    # Название назначения ищем слева в той же строке — обычно это
-                    # один из первых текстовых столбцов матрицы.
-                    dest = ""
-                    for c in range(0, origin_col):
-                        candidate = str(df.iat[r, c]).strip()
-                        if not candidate or conservative_days(candidate) is not None:
-                            continue
-                        nc = norm_name(candidate)
-                        if len(nc) >= 3 and "кавказ" not in nc:
-                            dest = candidate
-                            break
-                    if dest:
-                        result[dest] = days
-
-        # Строчная форма: в окрестности Кавказского ищем отдельные поля назначения и срока.
-        for idx in range(len(df)):
-            vals = [str(x).strip() for x in df.iloc[idx].tolist()]
-            if not any("кавказ" in norm_name(x) for x in vals):
-                continue
-            textual = [x for x in vals if x and conservative_days(x) is None]
-            numeric = [(x, conservative_days(x)) for x in vals if conservative_days(x) is not None]
-            for dest in textual:
-                nd = norm_name(dest)
-                if "кавказ" in nd or len(nd) < 3:
-                    continue
-                # Последнее числовое значение в строке обычно срок; берём консервативно максимум.
-                if numeric:
-                    result.setdefault(dest, max(d for _, d in numeric if d is not None))
-
-        return result
 
 
 class ReportBuilder:
@@ -768,10 +643,13 @@ class ReportBuilder:
         self.name_by_sku: Dict[str, str] = {}
         self.sku_ids: List[int] = []
         self.cluster_maps = ClusterMaps([], {}, {}, {}, "")
-        self.sla = CrossdockSLAProvider(storage, self.store)
-        # FBO-отправления за 30 дней загружаем один раз и переиспользуем
-        # для продаж за 7 дней и расчёта выкупа.
-        self._postings_30d_cache: Optional[List[Dict[str, Any]]] = None
+        self.sla = CrossdockTariffProvider(self.store)
+        # FBO-отправления за 7 дней загружаем один раз для расчёта продаж.
+        self._postings_7d_cache: Optional[List[Dict[str, Any]]] = None
+        # Для свежего выкупа используем историю до BUYOUT_LOOKBACK_DAYS,
+        # при этом последние 7 дней повторно не скачиваем.
+        self._postings_buyout_cache: Optional[List[Dict[str, Any]]] = None
+        self._buyout_diagnostics: Dict[str, Any] = {}
         self._posting_qty_scale: int = 1
         self._posting_qty_detection: Dict[str, Any] = {}
         self._unknown_warehouses: set[str] = set()
@@ -1114,14 +992,14 @@ class ReportBuilder:
         q = int(round(raw))
         return max(1, q)
 
-    def postings_30d(self) -> List[Dict[str, Any]]:
-        if self._postings_30d_cache is None:
-            start = self.target_date - timedelta(days=29)
-            logging.info("Загрузка FBO-отправлений за 30 дней — один раз для продаж и выкупа")
-            self._postings_30d_cache = self.fetch_postings(start, self.target_date)
-            self._detect_posting_quantity_scale(self._postings_30d_cache)
-            logging.info("FBO-отправлений за 30 дней получено: %s", len(self._postings_30d_cache))
-        return self._postings_30d_cache
+    def postings_7d(self) -> List[Dict[str, Any]]:
+        if self._postings_7d_cache is None:
+            start = self.target_date - timedelta(days=6)
+            logging.info("Загрузка FBO-отправлений только за последние 7 дней")
+            self._postings_7d_cache = self.fetch_postings(start, self.target_date)
+            self._detect_posting_quantity_scale(self._postings_7d_cache)
+            logging.info("FBO-отправлений за 7 дней получено: %s", len(self._postings_7d_cache))
+        return self._postings_7d_cache
 
     @staticmethod
     def _posting_date(posting: Mapping[str, Any]) -> Optional[date]:
@@ -1134,12 +1012,12 @@ class ReportBuilder:
     def sales_7d_by_cluster(self) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
         logging.info("5/8 Продажи за 7 дней по кластерам")
         start = self.target_date - timedelta(days=6)
-        all_postings = self.postings_30d()
+        all_postings = self.postings_7d()
         postings = [
             p for p in all_postings
             if (self._posting_date(p) is not None and start <= self._posting_date(p) <= self.target_date)
         ]
-        logging.info("Из них попало в окно последних 7 дней: %s", len(postings))
+        logging.info("FBO-отправлений в окне последних 7 дней: %s", len(postings))
 
         rows: List[Dict[str, Any]] = []
         for p in postings:
@@ -1172,89 +1050,238 @@ class ReportBuilder:
         agg["Среднесуточные продажи за 7 дней, шт."] = (agg["Заказано за 7 дней, шт."] / 7).round(1)
         return agg, postings
 
-    # ---------- выкуп ----------
+    # ---------- выкуп: самые свежие завершённые единицы ----------
     def fetch_returns(self, start: date, end: date) -> List[Dict[str, Any]]:
+        """Возвраты Ozon за период. Для выкупа используем только type=ClientReturn.
+
+        Cancellation из returns/list НЕ считаем отдельно: отменённая единица уже
+        учитывается по status=cancelled у FBO posting, иначе получится двойной невыкуп.
+        """
         rows: List[Dict[str, Any]] = []
         last_id: Any = 0
         seen_last_ids: set[str] = set()
         for page in range(1, 101):
             payload = {
-                "filter": {"logistic_return_date": {"time_from": to_ozon_datetime(start), "time_to": to_ozon_datetime(end, True)}},
-                "limit": 500, "last_id": last_id,
+                "filter": {
+                    "logistic_return_date": {
+                        "time_from": to_ozon_datetime(start),
+                        "time_to": to_ozon_datetime(end, True),
+                    }
+                },
+                "limit": 500,
+                "last_id": last_id,
             }
             data = self.client.post("/v1/returns/list", payload)
             got = extract_items(data, [("returns",), ("result", "returns"), ("result", "items"), ("items",)])
-            rows.extend(got)
+
+            # Дополнительный локальный контроль диапазона: API иногда содержит несколько
+            # дат возврата, поэтому не даём событию позже даты отчёта попасть в расчёт.
+            accepted: List[Dict[str, Any]] = []
+            for item in got:
+                rdate = parse_any_date(deep_first(item, ["logistic_return_date", "return_date", "final_moment", "created_at"]))
+                if rdate is not None and not (start <= rdate <= end):
+                    continue
+                accepted.append(item)
+            rows.extend(accepted)
+
             nxt = deep_first(data, ["last_id"])
-            logging.info("Возвраты: страница %s, получено %s, итого %s", page, len(got), len(rows))
+            logging.info("Возвраты для выкупа: страница %s, получено %s, в диапазоне %s, итого %s", page, len(got), len(accepted), len(rows))
             if not got or nxt in (None, "", 0, last_id):
                 break
             nxt_s = str(nxt)
             if nxt_s in seen_last_ids:
-                logging.warning("Возвраты: повторился last_id, пагинация остановлена")
+                logging.warning("Возвраты для выкупа: повторился last_id, пагинация остановлена")
                 break
             seen_last_ids.add(nxt_s)
             last_id = nxt
         else:
-            logging.warning("Возвраты: достигнут защитный лимит 100 страниц")
+            logging.warning("Возвраты для выкупа: достигнут защитный лимит 100 страниц")
         return rows
 
-    def buyout_30d(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        logging.info("6/8 Процент выкупа за 30 дней")
-        start = self.target_date - timedelta(days=29)
-        postings = self.postings_30d()
-        logging.info("FBO-отправления повторно не скачиваем: используем кэш из шага 5 (%s шт.)", len(postings))
-        returns = self.fetch_returns(start, self.target_date)
-        logging.info("Возвратов за 30 дней получено: %s", len(returns))
-        bought: Dict[str, int] = {}
-        refused: Dict[str, int] = {}
-        audit_rows: List[Dict[str, Any]] = []
-        for p in postings:
-            if str(p.get("status") or "").lower() != "delivered":
+    @staticmethod
+    def _return_posting_number(item: Mapping[str, Any]) -> str:
+        return str(deep_first(item, ["posting_number", "postingNumber"]) or "").strip()
+
+    def postings_for_buyout(self) -> List[Dict[str, Any]]:
+        """История FBO для последних 50 завершённых единиц без повторной загрузки 7 дней."""
+        if self._postings_buyout_cache is not None:
+            return self._postings_buyout_cache
+
+        recent = list(self.postings_7d())
+        start = self.target_date - timedelta(days=BUYOUT_LOOKBACK_DAYS - 1)
+        older_end = self.target_date - timedelta(days=7)
+        older: List[Dict[str, Any]] = []
+        if start <= older_end:
+            logging.info(
+                "7/8 Выкуп: загружаем FBO-историю %s дней; последние 7 дней уже в кэше",
+                BUYOUT_LOOKBACK_DAYS,
+            )
+            # FINICK имеет большой поток заказов. Один длинный диапазон может упереться
+            # в защитный лимит страниц FBO list, поэтому читаем историю кусками по 14 дней.
+            chunk_start = start
+            while chunk_start <= older_end:
+                chunk_end = min(older_end, chunk_start + timedelta(days=13))
+                logging.info("Выкуп: FBO-история %s..%s", chunk_start, chunk_end)
+                older.extend(self.fetch_postings(chunk_start, chunk_end))
+                chunk_start = chunk_end + timedelta(days=1)
+
+        merged: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for p in older + recent:
+            key = str(p.get("posting_number") or p.get("order_id") or p.get("order_number") or "").strip()
+            if not key:
+                key = json.dumps(p, ensure_ascii=False, sort_keys=True, default=str)[:500]
+            if key in seen:
                 continue
-            for product in p.get("products") or []:
+            seen.add(key)
+            pdate = self._posting_date(p)
+            if pdate is not None and start <= pdate <= self.target_date:
+                merged.append(p)
+
+        self._postings_buyout_cache = merged
+        logging.info("FBO-отправлений в истории выкупа: %s", len(merged))
+        return merged
+
+    def buyout_latest_by_article(self) -> pd.DataFrame:
+        """Самый свежий выкуп по артикулу: до 50 последних завершённых единиц.
+
+        completed = delivered + cancelled. Незавершённые статусы не участвуют.
+        delivered + ClientReturn по ключу posting_number + SKU считается возвратом.
+        Cancellation из returns/list повторно не вычитается.
+        """
+        postings = self.postings_for_buyout()
+        start = self.target_date - timedelta(days=BUYOUT_LOOKBACK_DAYS - 1)
+        returns = self.fetch_returns(start, self.target_date)
+
+        # Сколько ClientReturn приходится на конкретный posting + SKU.
+        client_returns: Dict[Tuple[str, str], int] = {}
+        client_return_rows = 0
+        for r in returns:
+            rtype = str(r.get("type") or r.get("return_type") or "").strip().lower().replace("_", "")
+            if rtype != "clientreturn":
+                continue
+            product = r.get("product") if isinstance(r.get("product"), Mapping) else {}
+            sku = norm_id(product.get("sku") or r.get("sku") or deep_first(r, ["sku"]))
+            posting_number = self._return_posting_number(r)
+            if not sku or not posting_number:
+                continue
+            qty = max(1, int_qty(product.get("quantity") or r.get("quantity") or 1))
+            key = (posting_number, sku)
+            client_returns[key] = client_returns.get(key, 0) + qty
+            client_return_rows += 1
+
+        # На один артикул храним события завершённых единиц. Сортировка по дате
+        # идёт от свежих к старым; затем отрезаем первые BUYOUT_TARGET_UNITS.
+        # tuple: (date, posting_number, bought_qty, cancelled_qty, returned_qty)
+        events: Dict[str, List[Tuple[date, str, int, int, int]]] = {}
+        for p in postings:
+            status = str(p.get("status") or "").strip().lower()
+            if status not in {"delivered", "cancelled"}:
+                continue
+            pdate = self._posting_date(p)
+            if pdate is None:
+                continue
+            posting_number = str(p.get("posting_number") or p.get("order_number") or p.get("order_id") or "").strip()
+            products = p.get("products") if isinstance(p.get("products"), list) else []
+            for product in products:
                 if not isinstance(product, Mapping):
                     continue
                 sku = norm_id(product.get("sku") or product.get("product_id"))
                 if not sku:
                     continue
                 offer = str(product.get("offer_id") or self.offer_by_sku.get(sku, f"SKU {sku}")).strip()
+                if not offer:
+                    continue
                 qty = self._posting_product_qty(product)
-                bought[offer] = bought.get(offer, 0) + qty
-        for r in returns:
-            rtype = str(r.get("type") or r.get("return_type") or "").lower()
-            reason = str(r.get("return_reason_name") or r.get("reason_name") or r.get("reason") or "").lower()
-            include = rtype == "cancellation" and any(m in reason for m in REFUSAL_MARKERS)
-            product = r.get("product") if isinstance(r.get("product"), Mapping) else {}
-            sku = norm_id(product.get("sku") or r.get("sku"))
-            offer = str(product.get("offer_id") or self.offer_by_sku.get(sku, f"SKU {sku}" if sku else "")).strip()
-            qty = max(1, int_qty(product.get("quantity") or r.get("quantity") or 1))
-            audit_rows.append({
-                "Дата возврата": str(deep_first(r, ["return_date", "logistic_return_date", "final_moment"]) or "")[:10],
-                "Артикул": offer,
-                "SKU Ozon": sku,
-                "Тип возврата": r.get("type") or r.get("return_type"),
-                "Причина": r.get("return_reason_name") or r.get("reason_name") or r.get("reason"),
-                "Количество, шт.": qty,
-                "Считаем невыкупом": "Да" if include else "Нет",
-            })
-            if include and offer:
-                refused[offer] = refused.get(offer, 0) + qty
+                if status == "cancelled":
+                    bought_qty, cancelled_qty, returned_qty = 0, qty, 0
+                else:
+                    returned_qty = min(qty, client_returns.get((posting_number, sku), 0))
+                    bought_qty = max(0, qty - returned_qty)
+                    cancelled_qty = 0
+                events.setdefault(offer, []).append((pdate, posting_number, bought_qty, cancelled_qty, returned_qty))
+
         result: List[Dict[str, Any]] = []
-        for offer in sorted(set(bought) | set(refused)):
-            b, f = bought.get(offer, 0), refused.get(offer, 0)
-            denom = b + f
+        bases: List[int] = []
+        full50 = 0
+        for offer, article_events in events.items():
+            article_events.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            remaining = BUYOUT_TARGET_UNITS
+            bought = cancelled = returned = 0
+            latest_date: Optional[date] = article_events[0][0] if article_events else None
+            oldest_used: Optional[date] = None
+
+            for event_date, _posting, b, c, r in article_events:
+                if remaining <= 0:
+                    break
+                total = b + c + r
+                if total <= 0:
+                    continue
+                take = min(remaining, total)
+
+                # Обычно quantity=1. Если граница 50 попала внутрь многоколичественного
+                # posting, сначала берём возвраты/отмены, затем выкуп — консервативно.
+                take_r = min(r, take)
+                left = take - take_r
+                take_c = min(c, left)
+                left -= take_c
+                take_b = min(b, left)
+
+                returned += take_r
+                cancelled += take_c
+                bought += take_b
+                remaining -= take_r + take_c + take_b
+                oldest_used = event_date
+
+            base = bought + cancelled + returned
+            if base <= 0:
+                continue
+            pct = round(bought / base * 100, 1)
+            bases.append(base)
+            if base >= BUYOUT_TARGET_UNITS:
+                full50 += 1
             result.append({
                 "Артикул": offer,
-                "Выкуплено за 30 дней, шт.": b,
-                "Невыкуплено после доставки покупателю, шт.": f,
-                "Процент выкупа за 30 дней, %": round(b / denom * 100, 1) if denom else None,
+                "Выкуп, % (последние завершённые)": pct,
+                "База выкупа, шт.": base,
+                "Выкуплено в базе, шт.": bought,
+                "Отменено в базе, шт.": cancelled,
+                "ClientReturn в базе, шт.": returned,
+                "Дата самого свежего завершённого заказа": latest_date,
+                "Дата самого старого заказа в базе": oldest_used,
+                "Целевая база, шт.": BUYOUT_TARGET_UNITS,
             })
-        return pd.DataFrame(result), pd.DataFrame(audit_rows)
+
+        self._buyout_diagnostics = {
+            "lookback_days": BUYOUT_LOOKBACK_DAYS,
+            "target_units": BUYOUT_TARGET_UNITS,
+            "postings_history": len(postings),
+            "returns_rows": len(returns),
+            "client_return_rows_with_key": client_return_rows,
+            "articles_with_buyout": len(result),
+            "articles_with_full_50": full50,
+            "min_base": min(bases) if bases else 0,
+            "max_base": max(bases) if bases else 0,
+        }
+        logging.info(
+            "Выкуп рассчитан: артикулов=%s, полная база 50=%s, ClientReturn с posting+SKU=%s",
+            len(result), full50, client_return_rows,
+        )
+        return pd.DataFrame(result)
 
     # ---------- поставки ----------
     @staticmethod
     def _extract_timeslot(obj: Any) -> Tuple[Optional[date], Optional[date]]:
+        if not isinstance(obj, Mapping):
+            return None, None
+        timeslot = obj.get("timeslot") if isinstance(obj.get("timeslot"), Mapping) else {}
+        nested = timeslot.get("timeslot") if isinstance(timeslot.get("timeslot"), Mapping) else {}
+        start = parse_any_date(nested.get("from") or timeslot.get("from"))
+        end = parse_any_date(nested.get("to") or timeslot.get("to"))
+        if start or end:
+            return start or end, end or start
+
+        # Резерв на старую схему ответа, где from/to могли лежать глубже.
         pairs: List[Tuple[date, date]] = []
         for d in walk_dicts(obj):
             if d.get("from") and d.get("to"):
@@ -1300,79 +1327,53 @@ class ReportBuilder:
         return rows
 
     def _supply_list_v3(self) -> List[Dict[str, Any]]:
-        variants = [
-            {"filter": {}, "limit": 100, "last_id": "", "sort_by": 1, "sort_direction": 2},
-            {"filter": {"states": []}, "limit": 100, "last_id": "", "sort_by": 1, "sort_direction": 2},
-            {"filter": {}, "limit": 100, "last_id": ""},
-            {"limit": 100, "last_id": ""},
-            {"filter": {"created_date_from": (self.target_date - timedelta(days=180)).isoformat(),
-                        "created_date_to": (self.target_date + timedelta(days=60)).isoformat()},
-             "limit": 100, "last_id": "", "sort_by": 1, "sort_direction": 2},
-        ]
-        errors: List[str] = []
-        for base in variants:
-            try:
-                rows: List[Dict[str, Any]] = []
-                last_id = str(base.get("last_id") or "")
-                seen_ids: set[str] = set()
-                for page in range(1, 101):
-                    payload = dict(base)
-                    payload["last_id"] = last_id
-                    data = self.client.post("/v3/supply-order/list", payload)
-                    got = extract_items(data, [("result", "items"), ("items",), ("result", "orders"), ("orders",)])
-                    if isinstance(data, Mapping) and isinstance(data.get("result"), list):
-                        got = [dict(x) for x in data["result"] if isinstance(x, Mapping)]
-                    added = 0
-                    for item in got:
-                        oid = norm_id(item.get("supply_order_id") or item.get("order_id") or item.get("id"))
-                        key = oid or json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)[:500]
-                        if key in seen_ids:
-                            continue
-                        seen_ids.add(key)
-                        rows.append(item)
-                        added += 1
-                    nxt = str(deep_first(data, ["last_id", "cursor", "next_cursor"]) or "").strip()
-                    has_next = bool(deep_first(data, ["has_next"]))
-                    logging.info("Supply list v3: страница %s, получено %s, новых %s, итого %s", page, len(got), added, len(rows))
-                    if not got or added == 0:
-                        break
-                    if not has_next and (len(got) < 100 or not nxt):
-                        break
-                    if not nxt or nxt == last_id:
-                        break
-                    last_id = nxt
-                return rows
-            except OzonApiError as exc:
-                errors.append(str(exc))
-                if exc.status not in {400, 404, 405, 422}:
-                    raise
-        logging.warning("/v3/supply-order/list не принял варианты запроса: %s", " | ".join(errors[-3:]))
-        return []
+        """Получаем order_id по каждому активному статусу.
 
-    def _supply_list_legacy(self) -> List[Dict[str, Any]]:
-        """Резерв для кабинетов, где v3/list не возвращает ранее созданные заявки.
-        Старый метод давно помечен устаревшим, поэтому используется только после пустого v3."""
-        for states in ([], sorted(ACTIVE_STATES)):
-            try:
-                rows: List[Dict[str, Any]] = []
-                page = 1
-                for _ in range(100):
-                    payload = {"page": page, "page_size": 100, "states": states}
-                    data = self.client.post("/v1/supply-order/list", payload)
-                    got = extract_items(data, [("supply_orders",), ("result", "supply_orders"), ("items",)])
-                    rows.extend(got)
-                    has_next = bool(data.get("has_next")) if isinstance(data, Mapping) else False
-                    if not got or not has_next:
-                        break
-                    page += 1
-                if rows:
-                    logging.warning("Поставки получены через legacy /v1/supply-order/list: %s", len(rows))
-                    self._supply_diagnostics["list_source"] = "/v1/supply-order/list fallback"
-                    return rows
-            except OzonApiError as exc:
-                if exc.status not in {400, 403, 404, 405, 422}:
-                    logging.warning("Legacy supply list: %s", exc)
-        return []
+        Это та же схема, которая уже работает в пользовательском контуре поставок:
+        /v3/supply-order/list -> order_ids -> /v3/supply-order/get.
+        """
+        result: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        per_state: Dict[str, int] = {}
+
+        for state in sorted(ACTIVE_STATES):
+            last_id = ""
+            state_ids: List[str] = []
+            for page in range(1, 101):
+                payload: Dict[str, Any] = {
+                    "filter": {"states": [state]},
+                    "limit": 100,
+                    "sort_by": "ORDER_CREATION",
+                    "sort_dir": "DESC",
+                }
+                if last_id:
+                    payload["last_id"] = last_id
+                data = self.client.post("/v3/supply-order/list", payload)
+                raw_ids: Any = data.get("order_ids") if isinstance(data, Mapping) else []
+                if not isinstance(raw_ids, list) and isinstance(data, Mapping) and isinstance(data.get("result"), Mapping):
+                    raw_ids = data["result"].get("order_ids")
+                ids = [norm_id(x) for x in (raw_ids or []) if norm_id(x)]
+                logging.info("Supply list v3: статус=%s, страница=%s, order_ids=%s", state, page, len(ids))
+                state_ids.extend(ids)
+
+                nxt = str((data.get("last_id") if isinstance(data, Mapping) else "") or "").strip()
+                if not nxt and isinstance(data, Mapping) and isinstance(data.get("result"), Mapping):
+                    nxt = str(data["result"].get("last_id") or "").strip()
+                if not nxt or len(ids) < 100 or nxt == last_id:
+                    break
+                last_id = nxt
+
+            unique_state_ids = list(dict.fromkeys(state_ids))
+            per_state[state] = len(unique_state_ids)
+            for oid in unique_state_ids:
+                if oid in seen:
+                    continue
+                seen.add(oid)
+                result.append({"order_id": oid, "state": state})
+
+        self._supply_diagnostics["order_ids_by_state"] = per_state
+        self._supply_diagnostics["list_source"] = "/v3/supply-order/list -> order_ids"
+        return result
 
     def _legacy_supply_items(self, oid: str) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -1405,132 +1406,132 @@ class ReportBuilder:
         return not any(token in state for token in TERMINAL_SUPPLY_STATES)
 
     def _supply_detail(self, oid: str) -> Mapping[str, Any]:
-        errors: List[Exception] = []
-        for payload in ({"order_id": oid}, {"supply_order_id": oid}):
-            try:
-                return self.client.post("/v3/supply-order/get", payload)
-            except OzonApiError as exc:
-                errors.append(exc)
-                if exc.status not in {400, 404, 422}:
-                    raise
-        # Последний резерв — legacy get, если кабинет его ещё поддерживает.
-        try:
-            return self.client.post("/v1/supply-order/get", {
-                "supply_order_id": int(oid) if str(oid).isdigit() else oid
-            })
-        except Exception:
-            raise errors[-1] if errors else RuntimeError("Нет ответа supply-order/get")
+        payload_id: Any = int(oid) if str(oid).isdigit() else oid
+        data = self.client.post("/v3/supply-order/get", {"order_ids": [payload_id]})
+        orders = data.get("orders") if isinstance(data, Mapping) else None
+        if not isinstance(orders, list) and isinstance(data, Mapping) and isinstance(data.get("result"), Mapping):
+            orders = data["result"].get("orders")
+        if not isinstance(orders, list) or not orders:
+            raise RuntimeError(f"/v3/supply-order/get не вернул orders для order_id={oid}")
+        for order in orders:
+            if isinstance(order, Mapping) and norm_id(order.get("order_id")) == norm_id(oid):
+                return order
+        first = orders[0]
+        return first if isinstance(first, Mapping) else {}
 
     def supply_orders(self) -> pd.DataFrame:
-        logging.info("7/8 Активные FBO-заявки и поставки")
-        # Счётчик нужен только как диагностика и не влияет на расчёт.
-        try:
-            counters = self.client.post("/v1/supply-order/status/counter", {})
-            self._supply_diagnostics["status_counter_available"] = True
-            logging.info("Supply status counter: ответ получен")
-        except Exception as exc:
-            self._supply_diagnostics["status_counter_available"] = False
-            logging.warning("Supply status counter недоступен: %s", exc)
-
+        logging.info("6/8 Активные FBO-заявки и поставки")
         list_items = self._supply_list_v3()
-        if list_items:
-            self._supply_diagnostics["list_source"] = "/v3/supply-order/list"
-        else:
-            list_items = self._supply_list_legacy()
         self._supply_diagnostics["list_total"] = len(list_items)
-        logging.info("Заявок supply-order/list получено без раннего фильтра по статусу: %s", len(list_items))
+        logging.info("Уникальных активных заявок supply-order/list: %s", len(list_items))
         if not list_items:
-            logging.warning("Поставки не найдены ни v3, ни legacy API. Отчёт продолжит работу без seller supply-order.")
+            logging.info("Активных заявок нет")
             return pd.DataFrame()
 
         status_counts: Dict[str, int] = {}
-        active_short: List[Dict[str, Any]] = []
         for item in list_items:
             state = self._supply_state(item) or "НЕИЗВЕСТНО"
             status_counts[state] = status_counts.get(state, 0) + 1
-            if self._is_active_supply_state(state):
-                active_short.append(item)
         self._supply_diagnostics["status_counts"] = status_counts
-        self._supply_diagnostics["active_short"] = len(active_short)
-        logging.info("Статусы заявок: %s", ", ".join(f"{k}={v}" for k,v in sorted(status_counts.items())))
-        logging.info("Активных/нефинальных заявок после локального фильтра: %s", len(active_short))
 
         seen: set[str] = set()
         rows: List[Dict[str, Any]] = []
-        for idx, short in enumerate(active_short, 1):
-            oid = norm_id(short.get("supply_order_id") or short.get("order_id") or short.get("id"))
+        detail_errors = 0
+
+        for idx, short in enumerate(list_items, 1):
+            oid = norm_id(short.get("order_id") or short.get("supply_order_id") or short.get("id"))
             if not oid or oid in seen:
                 continue
             seen.add(oid)
             try:
-                detail = self._supply_detail(oid)
+                order_root = self._supply_detail(oid)
             except Exception as exc:
+                detail_errors += 1
                 logging.warning("Заявка %s: детали недоступны: %s", oid, exc)
-                detail = short
+                continue
 
-            root = detail.get("result", detail) if isinstance(detail, Mapping) else detail
-            order_root = root if isinstance(root, Mapping) else short
             order_state = self._supply_state(order_root) or self._supply_state(short)
             if not self._is_active_supply_state(order_state):
                 continue
-            order_slot_from, _ = self._extract_timeslot(order_root)
 
-            # Ищем все реальные supply-узлы по bundle_id; если структура изменилась,
-            # не теряем root/short, где bundle_id может лежать напрямую.
-            supply_nodes: List[Mapping[str, Any]] = []
-            for node in walk_dicts(order_root):
-                if node.get("bundle_id") not in (None, ""):
-                    supply_nodes.append(node)
-            if not supply_nodes and isinstance(short, Mapping) and short.get("bundle_id") not in (None, ""):
-                supply_nodes = [short]
-            # В некоторых ответах supplies есть, но bundle_id может быть выше/ниже.
+            order_slot_from, _ = self._extract_timeslot(order_root)
+            order_dropoff = order_root.get("drop_off_warehouse") if isinstance(order_root.get("drop_off_warehouse"), Mapping) else {}
+            order_dropoff_id = norm_id(order_dropoff.get("warehouse_id") or order_dropoff.get("id"))
+            order_dropoff_name = str(order_dropoff.get("name") or "").strip()
+
+            supplied = order_root.get("supplies") if isinstance(order_root, Mapping) else None
+            supply_nodes = [x for x in (supplied or []) if isinstance(x, Mapping)] if isinstance(supplied, list) else []
             if not supply_nodes:
-                supplied = order_root.get("supplies") if isinstance(order_root, Mapping) else None
-                if isinstance(supplied, list):
-                    supply_nodes = [x for x in supplied if isinstance(x, Mapping)]
+                # Резерв на случай очередной смены вложенности ответа Ozon.
+                for node in walk_dicts(order_root):
+                    if node.get("bundle_id") not in (None, ""):
+                        supply_nodes.append(node)
             if not supply_nodes:
-                logging.warning("Заявка %s: не найден supply/bundle в деталях", oid)
+                logging.warning("Заявка %s: в /v3/supply-order/get не найдено supplies/bundle_id", oid)
                 continue
 
             unique_nodes: List[Mapping[str, Any]] = []
-            seen_bundle_nodes: set[str] = set()
+            seen_nodes: set[str] = set()
             for node in supply_nodes:
-                k = norm_id(node.get("bundle_id")) or norm_id(node.get("supply_id") or node.get("id")) or str(id(node))
-                if k in seen_bundle_nodes:
+                key = norm_id(node.get("supply_id") or node.get("id")) or norm_id(node.get("bundle_id")) or str(id(node))
+                if key in seen_nodes:
                     continue
-                seen_bundle_nodes.add(k)
+                seen_nodes.add(key)
                 unique_nodes.append(node)
 
             for supply in unique_nodes:
                 state = self._supply_state(supply) or order_state
                 if not self._is_active_supply_state(state):
                     continue
+
                 supply_slot_from, _ = self._extract_timeslot(supply)
-                slot_from = order_slot_from or supply_slot_from
+                shipment_date = supply_slot_from or order_slot_from
                 bundle_id = norm_id(supply.get("bundle_id"))
+
                 storage_wh = supply.get("storage_warehouse") if isinstance(supply.get("storage_warehouse"), Mapping) else {}
-                dropoff_wh = supply.get("drop_off_warehouse") if isinstance(supply.get("drop_off_warehouse"), Mapping) else {}
+                supply_dropoff = supply.get("drop_off_warehouse") if isinstance(supply.get("drop_off_warehouse"), Mapping) else {}
                 storage_id = norm_id(supply.get("storage_warehouse_id") or storage_wh.get("warehouse_id") or storage_wh.get("id"))
-                dropoff_id = norm_id(supply.get("dropoff_warehouse_id") or supply.get("drop_off_warehouse_id") or dropoff_wh.get("warehouse_id") or dropoff_wh.get("id") or deep_first(order_root,["dropoff_warehouse_id"]))
-                storage_name = str(storage_wh.get("name") or supply.get("storage_warehouse_name") or deep_first(supply,["storage_warehouse_name"]) or "").strip()
-                dropoff_name = str(dropoff_wh.get("name") or deep_first(order_root,["dropoff_warehouse_name"]) or "").strip()
-                macro_id = norm_id(supply.get("macrolocal_cluster_id") or deep_first(supply,["macrolocal_cluster_id","cluster_id"]) or deep_first(order_root,["macrolocal_cluster_id","cluster_id"]))
+                storage_name = str(storage_wh.get("name") or supply.get("storage_warehouse_name") or deep_first(supply, ["storage_warehouse_name"]) or "").strip()
+                dropoff_id = norm_id(
+                    supply.get("dropoff_warehouse_id") or supply.get("drop_off_warehouse_id") or
+                    supply_dropoff.get("warehouse_id") or supply_dropoff.get("id") or order_dropoff_id
+                )
+                dropoff_name = str(supply_dropoff.get("name") or order_dropoff_name or "").strip()
+
+                macro_id = norm_id(
+                    supply.get("macrolocal_cluster_id") or
+                    deep_first(supply, ["macrolocal_cluster_id", "cluster_id"]) or
+                    deep_first(order_root, ["macrolocal_cluster_id", "cluster_id"])
+                )
                 cluster = self.cluster_maps.macro_to_cluster.get(macro_id, "")
                 if not cluster and storage_id:
                     cluster = self.cluster_maps.warehouse_to_cluster.get(storage_id, "")
                 if not cluster and storage_name:
                     cluster = self.cluster_maps.warehouse_name_to_cluster.get(norm_name(storage_name), "") or static_cluster_from_warehouse(storage_name)
-                # Новая модель кросс-дока может отдавать название целевого кластера без конечного склада.
                 if not cluster:
-                    cluster = str(deep_first(supply,["macrolocal_cluster_name","cluster_name"]) or deep_first(order_root,["macrolocal_cluster_name","cluster_name"]) or "").strip()
+                    cluster = str(
+                        deep_first(supply, ["macrolocal_cluster_name", "cluster_name"]) or
+                        deep_first(order_root, ["macrolocal_cluster_name", "cluster_name"]) or ""
+                    ).strip()
                 cluster = self.cluster_maps.canonical(cluster) if cluster else "Кластер не определён"
 
+                # FINICK всегда сдаёт поставки в Москве. Тарифный норматив текущей версии
+                # привязан к Москва — Кавказский. Фактическое имя из API показываем отдельно.
                 route = "Кросс-док"
-                if dropoff_id and storage_id and dropoff_id == storage_id:
-                    route = "Прямая"
-                elif storage_name and dropoff_name and similarity(storage_name, dropoff_name) >= 0.9:
-                    route = "Прямая"
-                arrival_api = parse_any_date(storage_wh.get("arrival_date") or supply.get("arrival_date"))
+                tariff_origin = CROSSDOCK_ORIGIN
+                if self.store == "FINICK" and dropoff_name and "моск" not in norm_name(dropoff_name):
+                    logging.warning("FINICK: API вернул немосковскую точку отгрузки '%s'; тариф всё равно считается от %s", dropoff_name, tariff_origin)
+
+                arrival_api = parse_any_date(
+                    storage_wh.get("arrival_date") or supply.get("arrival_date") or
+                    deep_first(supply, ["planned_arrival_date", "estimated_arrival_date", "arrival_date"])
+                )
+                planned_arrival, eta_basis, sla_days = self._estimate_supply_arrival(
+                    cluster=cluster,
+                    storage_warehouse=storage_name,
+                    shipment_date=shipment_date,
+                    arrival_api=arrival_api,
+                )
 
                 products: List[Dict[str, Any]] = []
                 if bundle_id:
@@ -1555,11 +1556,11 @@ class ReportBuilder:
                     sku = norm_id(product.get("sku") or product.get("product_id"))
                     if not sku:
                         continue
-                    offer = str(product.get("contractor_item_code") or product.get("offer_id") or self.offer_by_sku.get(sku, f"SKU {sku}")).strip()
+                    offer = str(
+                        product.get("contractor_item_code") or product.get("offer_id") or
+                        self.offer_by_sku.get(sku, f"SKU {sku}")
+                    ).strip()
                     qty = int_qty(product.get("quantity"))
-                    availability, eta_basis, sla_days = self._estimate_supply_eta(
-                        state=state, route=route, cluster=cluster, slot_from=slot_from,
-                        arrival_api=arrival_api, detail=order_root, supply=supply)
                     rows.append({
                         "Артикул": offer,
                         "SKU Ozon": sku,
@@ -1570,82 +1571,58 @@ class ReportBuilder:
                         "Статус API": state,
                         "Уже передано Ozon": "Да" if state in PHYSICAL_STATES else "Нет",
                         "Тип поставки": route,
-                        "Точка отгрузки": dropoff_name or (CROSSDOCK_ORIGIN if route == "Кросс-док" else ""),
+                        "Точка отгрузки из API": dropoff_name,
+                        "Точка для тарифа": tariff_origin,
                         "Склад назначения": storage_name,
-                        "Слот отгрузки / приёмки": slot_from,
-                        "Дата прибытия от API": arrival_api,
-                        "Прогноз доступности к продаже": availability,
-                        "Основание прогноза": eta_basis,
-                        "Срок кросс-дока из Кавказского, дней": sla_days,
-                        "Приёмка Ozon после прибытия, рабочих дней": FINAL_ACCEPTANCE_WORKDAYS,
+                        "Дата отгрузки": shipment_date,
+                        "Плановая дата прибытия от API": arrival_api,
+                        "Плановая дата прибытия": planned_arrival,
+                        "Источник плановой даты прибытия": eta_basis,
+                        "Срок кросс-дока, дней": sla_days,
                         "ID заявки": oid,
                         "ID поставки": norm_id(supply.get("supply_id") or supply.get("id")),
+                        "Bundle ID": bundle_id,
+                        "ID точки отгрузки": dropoff_id,
                     })
-            if idx % 20 == 0:
-                logging.info("Обработано активных заявок: %s/%s", idx, len(active_short))
 
+            if idx % 20 == 0:
+                logging.info("Обработано активных заявок: %s/%s", idx, len(list_items))
+
+        self._supply_diagnostics["detail_errors"] = detail_errors
         self._supply_diagnostics["product_rows"] = len(rows)
         logging.info("Строк товаров в активных поставках: %s", len(rows))
         return pd.DataFrame(rows)
 
-    def _estimate_supply_eta(self, state: str, route: str, cluster: str, slot_from: Optional[date],
-                             arrival_api: Optional[date], detail: Mapping[str, Any], supply: Mapping[str, Any]) -> Tuple[Optional[date], str, Optional[int]]:
-        # Возвращаем не просто прибытие машины, а дату, когда товар консервативно
-        # должен стать доступен к продаже после приёмки Ozon.
-        if state == "ACCEPTANCE_AT_STORAGE_WAREHOUSE":
-            avail = add_workdays(self.target_date, FINAL_ACCEPTANCE_WORKDAYS)
-            return avail, f"Уже на приёмке конечного склада + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней на размещение", 0
+    def _estimate_supply_arrival(self, cluster: str, storage_warehouse: str,
+                                 shipment_date: Optional[date], arrival_api: Optional[date]) -> Tuple[Optional[date], str, Optional[int]]:
+        # 1. Если Ozon сам дал плановую дату прибытия — не пересчитываем её.
         if arrival_api:
-            avail = add_workdays(max(self.target_date, arrival_api), FINAL_ACCEPTANCE_WORKDAYS)
-            return avail, f"Дата прибытия API + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней на приёмку", None
-        if route == "Прямая":
-            if slot_from:
-                avail = add_workdays(max(self.target_date, slot_from), FINAL_ACCEPTANCE_WORKDAYS)
-                return avail, f"Слот прямой поставки + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней на приёмку", 0
-            return None, "Нет даты прямой поставки в API", None
+            return arrival_api, "Плановая дата прибытия получена из API Ozon", None
 
-        sla_days, source = self.sla.lookup(cluster)
+        # 2. Иначе нужен реальный/плановый слот отгрузки и срок маршрута.
+        if not shipment_date:
+            return None, "API не вернул дату отгрузки; рассчитать прибытие нельзя", None
+
+        sla_days, source = self.sla.lookup(cluster, storage_warehouse)
         if sla_days is None:
-            return None, "Нет подтверждённого срока маршрута Москва — Кавказский → кластер", None
+            return None, f"Нет тарифа кросс-дока для склада/кластера ({source})", None
 
-        if state in PHYSICAL_STATES:
-            # 4 дня на сборку уже НЕ добавляем. Если известен слот фактической/плановой
-            # передачи Ozon, учитываем уже прошедшие дни маршрута. Если нормативный
-            # срок уже истёк, консервативно считаем, что прибытие не раньше даты отчёта.
-            if slot_from:
-                arrival = max(self.target_date, slot_from + timedelta(days=sla_days))
-                basis = f"Слот передачи Ozon + до {sla_days} дн. кросс-дока + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней приёмки ({source})"
-            else:
-                arrival = self.target_date + timedelta(days=sla_days)
-                basis = f"Поставка уже передана Ozon; без даты передачи закладываем до {sla_days} дн. кросс-дока + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней приёмки ({source})"
-            avail = add_workdays(arrival, FINAL_ACCEPTANCE_WORKDAYS)
-            return avail, basis, sla_days
-
-        # Заявка создана, но товар ещё у продавца. Реальный будущий слот сильнее
-        # стандартных +4 дней; если слота нет — добавляем 4 дня на сборку.
-        handoff = max(self.target_date, slot_from) if slot_from else self.target_date + timedelta(days=PREPARATION_DAYS)
-        arrival = handoff + timedelta(days=sla_days)
-        avail = add_workdays(arrival, FINAL_ACCEPTANCE_WORKDAYS)
-        if slot_from:
-            basis = f"Существующий слот + до {sla_days} дн. кросс-дока + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней приёмки ({source})"
-        else:
-            basis = f"{PREPARATION_DAYS} дн. на сборку + до {sla_days} дн. кросс-дока + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней приёмки ({source})"
-        return avail, basis, sla_days
+        arrival = shipment_date + timedelta(days=sla_days)
+        return arrival, f"Дата отгрузки + {sla_days} дн. кросс-дока ({source})", sla_days
 
     # ---------- сборка ----------
     def build(self) -> Dict[str, pd.DataFrame]:
         self.fetch_products()
         self.fetch_clusters()
-        sla_map = self.sla.load()
-        logging.info("Сроков кросс-дока из Кавказского загружено: %s", len(sla_map))
+        logging.info("Встроенных нормативов кросс-дока: складов=%s, кластеров=%s", len(CROSSDOCK_WAREHOUSE_DAYS), len(CROSSDOCK_CLUSTER_DAYS))
         stocks = self.fetch_stock_warehouses()
         transit = self.fetch_transit_stocks()
         sales_cluster, _ = self.sales_7d_by_cluster()
-        buyout, buyout_audit = self.buyout_30d()
         supplies = self.supply_orders()
+        buyout = self.buyout_latest_by_article()
         logging.info("8/8 Формирование сводки")
 
-        by_article = self._build_by_article(stocks, transit, sales_cluster, buyout, supplies)
+        by_article = self._build_by_article(stocks, transit, sales_cluster, supplies, buyout)
         by_cluster = self._build_by_cluster(stocks, transit, sales_cluster, supplies)
         method = self._methodology()
         cluster_ref = self._cluster_reference()
@@ -1654,7 +1631,7 @@ class ReportBuilder:
             "По артикулам": by_article,
             "По кластерам": by_cluster,
             "Поставки и прогноз": supplies,
-            "Расчёт выкупа": buyout_audit,
+            "Выкуп - последние 50": buyout,
             "Нормативы кросс-дока": self.sla.as_dataframe(),
             "Диагностика": diag,
             "Справочник кластеров": cluster_ref,
@@ -1670,17 +1647,20 @@ class ReportBuilder:
             {"Проверка": "Складов без определённого кластера", "Значение": len(self._unknown_warehouses)},
             {"Проверка": "Строк товаров в активных поставках", "Значение": 0 if supplies is None else len(supplies)},
             {"Проверка": "Диагностика поставок", "Значение": json.dumps(self._supply_diagnostics, ensure_ascii=False, default=str)},
-            {"Проверка": "Источник сроков кросс-дока", "Значение": self.sla.source or "Не получен"},
-            {"Проверка": "Количество нормативов кросс-дока", "Значение": len(self.sla.rows)},
+            {"Проверка": "Диагностика выкупа", "Значение": json.dumps(self._buyout_diagnostics, ensure_ascii=False, default=str)},
+            {"Проверка": "Источник сроков кросс-дока", "Значение": self.sla.source},
+            {"Проверка": "Тариф актуален на", "Значение": self.sla.updated_at},
+            {"Проверка": "Нормативов по конечным складам", "Значение": len(CROSSDOCK_WAREHOUSE_DAYS)},
+            {"Проверка": "Нормативов по кластерам", "Значение": len(CROSSDOCK_CLUSTER_DAYS)},
         ]
         for wh in sorted(self._unknown_warehouses):
             rows.append({"Проверка": "Склад без кластера", "Значение": wh})
         return pd.DataFrame(rows)
 
     def _build_by_article(self, stocks: pd.DataFrame, transit: pd.DataFrame, sales_cluster: pd.DataFrame,
-                          buyout: pd.DataFrame, supplies: pd.DataFrame) -> pd.DataFrame:
+                          supplies: pd.DataFrame, buyout: pd.DataFrame) -> pd.DataFrame:
         articles = set()
-        for df in (stocks, transit, sales_cluster, buyout, supplies):
+        for df in (stocks, transit, sales_cluster, supplies):
             if df is not None and not df.empty and "Артикул" in df.columns:
                 articles |= set(str(x) for x in df["Артикул"].dropna() if str(x).strip())
         rows: List[Dict[str, Any]] = []
@@ -1689,7 +1669,9 @@ class ReportBuilder:
             t = transit[transit["Артикул"] == article] if not transit.empty else pd.DataFrame()
             sc = sales_cluster[sales_cluster["Артикул"] == article] if not sales_cluster.empty else pd.DataFrame()
             sp = supplies[supplies["Артикул"] == article] if not supplies.empty else pd.DataFrame()
-            b = buyout[buyout["Артикул"] == article] if not buyout.empty else pd.DataFrame()
+            bo = buyout[buyout["Артикул"] == article] if buyout is not None and not buyout.empty else pd.DataFrame()
+            buyout_pct = float(bo.iloc[0]["Выкуп, % (последние завершённые)"]) if not bo.empty else None
+            buyout_base = int(bo.iloc[0]["База выкупа, шт."]) if not bo.empty else 0
             current = int(s["Доступно сейчас, шт."].sum()) if not s.empty else 0
             ret = int(t["Возврат покупателя в пути, шт."].sum()) if not t.empty else 0
             internal = int(t["Перемещение внутри Ozon, шт."].sum()) if not t.empty else 0
@@ -1714,18 +1696,13 @@ class ReportBuilder:
                     if self.name_by_sku.get(sku):
                         name = self.name_by_sku[sku]
                         break
-            pct = None
-            bought = refused = 0
-            if not b.empty:
-                bought = int(b["Выкуплено за 30 дней, шт."].sum())
-                refused = int(b["Невыкуплено после доставки покупателю, шт."].sum())
-                pct = round(bought / (bought + refused) * 100, 1) if bought + refused else None
             rows.append({
                 "Артикул": article,
+                "Выкуп, % (последние завершённые)": buyout_pct,
+                "База выкупа, шт.": buyout_base,
                 "Среднесуточные продажи за 7 дней, шт.": avg,
                 "Запас, дней: сейчас (с учётом пути и заявок)": f"{days_now if days_now is not None else '—'} ({days_future if days_future is not None else '—'})",
                 "Остаток, шт.: сейчас (с учётом пути и заявок)": f"{current} ({future})",
-                "Процент выкупа за 30 дней, %": pct,
                 "Название товара": name,
                 "Заказано за 7 дней, шт.": sold7,
                 "Доступно к продаже сейчас, шт.": current,
@@ -1737,8 +1714,6 @@ class ReportBuilder:
                 "Итого с учётом пути и заявок, шт.": future,
                 "Запас сейчас, дней": days_now,
                 "Запас с учётом пути и заявок, дней": days_future,
-                "Выкуплено за 30 дней, шт.": bought,
-                "Невыкуплено после доставки покупателю, шт.": refused,
                 "Дата отчёта": self.target_date,
             })
         df = pd.DataFrame(rows)
@@ -1780,7 +1755,7 @@ class ReportBuilder:
             events: List[Tuple[date, int, str]] = []
             if not sp.empty:
                 for _, r in sp.iterrows():
-                    eta = r.get("Прогноз доступности к продаже")
+                    eta = r.get("Плановая дата прибытия")
                     if isinstance(eta, pd.Timestamp):
                         eta = eta.date()
                     elif not isinstance(eta, date):
@@ -1789,16 +1764,13 @@ class ReportBuilder:
                         events.append((eta, int_qty(r.get("Количество, шт.")), str(r.get("Статус") or "")))
             events.sort(key=lambda x: x[0])
 
-            sla_days, sla_source = self.sla.lookup(cluster)
+            sla_days, sla_source = self.sla.lookup(cluster, "")
             normal_lead = PREPARATION_DAYS + sla_days if sla_days is not None else None
-            hypothetical_eta = None
-            if normal_lead is not None:
-                arrival = self.target_date + timedelta(days=normal_lead)
-                hypothetical_eta = add_workdays(arrival, FINAL_ACCEPTANCE_WORKDAYS)
+            hypothetical_eta = self.target_date + timedelta(days=normal_lead) if normal_lead is not None else None
 
             # Если supply-order не раскрыл всю поставку, но stock API показывает promised_amount,
             # не теряем этот товар. Для неизвестного статуса используем консервативный ETA
-            # новой поставки: +4 дня на сборку + кросс-док + приёмка Ozon.
+            # новой поставки: +4 дня на сборку + срок кросс-дока.
             if promised_fallback > 0 and hypothetical_eta is not None:
                 events.append((hypothetical_eta, promised_fallback, "Подтверждено Ozon, детали заявки не получены"))
                 events.sort(key=lambda x: x[0])
@@ -1818,7 +1790,7 @@ class ReportBuilder:
                     oos_days = max(0, int(math.ceil((hypothetical_eta - depletion).total_seconds() / 86400)))
                 else:
                     oos_days = None
-                forecast_basis = f"Если начать сборку сегодня: {PREPARATION_DAYS} дн. сборка + кросс-док + до {FINAL_ACCEPTANCE_WORKDAYS} раб. дней приёмки" if hypothetical_eta else "Нет срока маршрута"
+                forecast_basis = f"Если начать сборку сегодня: {PREPARATION_DAYS} дн. сборка + кросс-док" if hypothetical_eta else "Нет срока маршрута"
 
             if avg <= 0:
                 will_make = "Продаж за 7 дней нет"
@@ -1845,10 +1817,9 @@ class ReportBuilder:
                 "Дата ожидаемого окончания остатка": depletion if depletion else None,
                 "Ближайшее пополнение, шт.": forecast_qty,
                 "Статус ближайшего пополнения": forecast_status,
-                "Прогноз доступности пополнения к продаже": forecast_eta,
+                "Плановая дата прибытия ближайшего пополнения": forecast_eta,
                 "Срок кросс-дока из Москвы — Кавказский, дней": sla_days,
                 "Срок до прибытия новой поставки: 4 дня сборки + кросс-док, дней": normal_lead,
-                "Дополнительно на приёмку Ozon, рабочих дней": FINAL_ACCEPTANCE_WORKDAYS,
                 "Источник срока кросс-дока": sla_source,
                 "Успеет пополнение до дефицита": will_make,
                 "Прогноз дней без остатка": oos_days,
@@ -1901,13 +1872,15 @@ class ReportBuilder:
             {"Показатель": "Среднесуточные продажи за 7 дней", "Как считаем": "Заказанные FBO-штуки за последние 7 календарных дней / 7. quantity FBO автоматически проверяется на масштаб ×1000 и нормализуется только если структура данных это подтверждает."},
             {"Показатель": "Остаток сейчас", "Как считаем": "free_to_sell_amount — реально доступно к продаже на FBO-складах Ozon."},
             {"Показатель": "Остаток в скобках по артикулу", "Как считаем": "Остаток сейчас + возвраты покупателей в пути + внутренние перемещения Ozon + все активные заявки продавца, включая ещё не переданные Ozon."},
-            {"Показатель": "Кластер", "Как считаем": "Сначала кластер из API, затем справочник склад→кластер, затем резерв по географическому названию склада. Физическое имя РФЦ никогда не используется как отдельный кластер."},
-            {"Показатель": "promised_amount", "Как считаем": "Используем как резерв: прибавляем только ту часть promised_amount, которая не покрыта найденными supply-order. Так поставка не теряется при неполном API и не считается дважды."},
-            {"Показатель": "Процент выкупа", "Как считаем": "Delivered / (Delivered + явный отказ/неполучение после прибытия покупателю). Ранние отмены и ClientReturn после покупки исключены."},
-            {"Показатель": "Срок кросс-дока", "Как считаем": f"Верхняя граница маршрута от точки «{CROSSDOCK_ORIGIN}» до конечного склада/кластера. Источник — таблица сроков из БЗ Ozon (публичная копия XLSX), кэш обновляется не чаще чем раз в {CROSSDOCK_CACHE_DAYS} дней."},
-            {"Показатель": "Новая поставка без заявки", "Как считаем": f"{PREPARATION_DAYS} календарных дня на сборку + срок кросс-дока + до {FINAL_ACCEPTANCE_WORKDAYS} рабочих дней на приёмку/размещение Ozon."},
-            {"Показатель": "Существующая заявка", "Как считаем": f"Если товар уже передан Ozon, {PREPARATION_DAYS} дня на сборку повторно не добавляем. Если есть слот — считаем от слота. После прибытия консервативно добавляем до {FINAL_ACCEPTANCE_WORKDAYS} рабочих дней на приёмку."},
-            {"Показатель": "Прогноз дней без остатка", "Как считаем": "Сравниваем текущий запас в днях с датой доступности ближайшего известного пополнения; если заявки нет — с нормативным сроком новой поставки."},
+            {"Показатель": "Кластер", "Как считаем": "Сначала кластер из API, затем справочник склад→кластер, затем резерв по географическому названию склада. Физическое имя РФЦ не становится отдельным кластером."},
+            {"Показатель": "Выкуп, % (последние завершённые)", "Как считаем": f"Для каждого артикула берём до {BUYOUT_TARGET_UNITS} самых свежих завершённых единиц за доступное окно {BUYOUT_LOOKBACK_DAYS} дней. status=cancelled — невыкуп; status=delivered — выкуп, кроме количества, сопоставленного с type=ClientReturn по posting_number + SKU. Cancellation из returns/list повторно не вычитаем. Незавершённые отправления не участвуют. Если завершённых единиц меньше {BUYOUT_TARGET_UNITS}, процент считается по фактической базе, её размер показан рядом."},
+            {"Показатель": "Активные поставки", "Как считаем": "Список заявок: /v3/supply-order/list с фильтром по активным статусам; метод возвращает order_ids. Детали: /v3/supply-order/get по order_ids. Состав: /v1/supply-order/bundle."},
+            {"Показатель": "promised_amount", "Как считаем": "Используем только как резерв: прибавляем часть promised_amount, которая не покрыта найденными supply-order, чтобы не считать поставку дважды."},
+            {"Показатель": "Дата отгрузки", "Как считаем": "Берём начало timeslot поставки из /v3/supply-order/get. Если timeslot отсутствует, дату не выдумываем."},
+            {"Показатель": "Плановая дата прибытия", "Как считаем": "Если API Ozon вернул arrival_date/плановую дату — используем её. Иначе: дата отгрузки + верхняя граница срока кросс-дока из переданного тарифа Ozon от 03.08.2026."},
+            {"Показатель": "Срок кросс-дока", "Как считаем": f"Для FINICK источник — {CROSSDOCK_ORIGIN}. Сначала берём норматив конкретного конечного склада, если он известен; иначе консервативный максимум по кластеру."},
+            {"Показатель": "Новая поставка без заявки", "Как считаем": f"Для оценки, успеет ли новая поставка: {PREPARATION_DAYS} календарных дня на сборку + срок кросс-дока. Дополнительные 5 дней приёмки больше не добавляются."},
+            {"Показатель": "Прогноз дней без остатка", "Как считаем": "Сравниваем текущий запас в днях с плановой датой прибытия ближайшего известного пополнения; если заявки нет — с расчётным прибытием новой поставки."},
         ])
 
     # ---------- Excel / S3 ----------
@@ -1930,8 +1903,8 @@ class ReportBuilder:
             "rows_articles": len(sheets.get("По артикулам", [])),
             "rows_clusters": len(sheets.get("По кластерам", [])),
             "rows_supplies": len(sheets.get("Поставки и прогноз", [])),
-            "crossdock_sla_source": self.sla.source,
-            "crossdock_sla_updated_at": self.sla.updated_at,
+            "crossdock_tariff_source": self.sla.source,
+            "crossdock_tariff_as_of": self.sla.updated_at,
             "posting_quantity_scale": self._posting_qty_scale,
             "unknown_warehouses": sorted(self._unknown_warehouses),
             "supply_diagnostics": self._supply_diagnostics,
