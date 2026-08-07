@@ -1,337 +1,137 @@
-name: WB Ads Manager TOPFACE
+name: WB Ads V90
 
 on:
   workflow_dispatch:
+    inputs:
+      store:
+        description: "Какой магазин запускать"
+        required: true
+        default: "ALL"
+        type: choice
+        options:
+          - ALL
+          - TOPFACE
+          - FINICK
+      live:
+        description: "Реально менять ставки и минус-фразы"
+        required: true
+        default: false
+        type: boolean
+      run_legacy:
+        description: "Запускать прежний контур CPC и полок"
+        required: true
+        default: true
+        type: boolean
   schedule:
-    # GitHub cron работает в UTC. Москва = UTC+3.
-    # Основной контур schedule: каждые 10 минут с 18:00 до 23:50 МСК; manual запускается сразу.
-    # Если GitHub задержит job после 00:00 МСК, MSK time guard заблокирует запуск до Python/API.
-    - cron: "*/10 15-20 * * *"
-    # CPM-чистка и управление ставками поисковых кластеров: каждые 2 часа, без ограничения 18:00-23:59.
-    # v88: fix import shutil для cpm-manager; CPM stats-days=1; основной run управляет только активными кистями; paused РК не запускаем, остальные РК логируются.
-    - cron: "0 */2 * * *"
+    # Каждые 2 часа в 00:05, 02:05, 04:05 ... по Москве.
+    # GitHub cron работает по UTC; Москва = UTC+3.
+    - cron: "5 1-23/2 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  # Разделяем очереди по cron/manual, чтобы повторные schedule не отменяли друг друга.
-  group: wb-ads-manager-topface-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
+  group: wb-ads-v90
   cancel-in-progress: false
 
-env:
-  WORKFLOW_VERSION: "v89_cpm_profiles_effective_bid_fix_2026-08-01"
-  WORKFLOW_FILE: ".github/workflows/04_upravlenie_reklamoy.yml"
-  PYTHON_VERSION: "3.11"
-  STORE_NAME: "TOPFACE"
-  DAILY_LOCK_PREFIX: "Служебные файлы/Ассистент WB/TOPFACE/locks"
-
 jobs:
-  wb_ads_manager:
+  manage-ads:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     env:
-      # Старый рабочий формат: часть ключей может лежать отдельными secrets, часть — внутри REPORT_ENV.
-      # Сначала передаём прямые secrets, затем шаг Load secrets from REPORT_ENV добирает недостающее из REPORT_ENV.
-      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+      PYTHONUNBUFFERED: "1"
+      TZ: Europe/Moscow
+      WB_ADS_V90_CONFIG: wb_ads_v90_config.json
+
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
       YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
+      FINICK_API_WB: ${{ secrets.FINICK_API_WB }}
+
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      PYTHONUNBUFFERED: "1"
-      TZ: "Europe/Moscow"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Workflow identity diagnostics
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "=== Workflow identity diagnostics ==="
-          echo "WORKFLOW_VERSION=${WORKFLOW_VERSION}"
-          echo "WORKFLOW_FILE=${WORKFLOW_FILE}"
-          echo "GITHUB_WORKFLOW=${GITHUB_WORKFLOW}"
-          echo "github.workflow_ref=${{ github.workflow_ref }}"
-          echo "github.workflow_sha=${{ github.workflow_sha }}"
-          echo "github.ref=${{ github.ref }}"
-          echo "github.sha=${{ github.sha }}"
-          echo "github.event_name=${{ github.event_name }}"
-          echo "github.event.schedule=${{ github.event.schedule }}"
-          echo "UTC now=$(date -u '+%Y-%m-%d %H:%M:%S')"
-          TZ=Europe/Moscow date '+MSK now=%Y-%m-%d %H:%M:%S'
-          echo "=== Workflow file hash and markers ==="
-          if [[ -f "${WORKFLOW_FILE}" ]]; then
-            sha256sum "${WORKFLOW_FILE}"
-            grep -nE "WORKFLOW_VERSION|cron:|18:|МСК|RUN_SLOT|REPORT_ENV|CORE" "${WORKFLOW_FILE}" || true
-          else
-            echo "WARNING: ${WORKFLOW_FILE} not found after checkout"
-            find .github/workflows -maxdepth 1 -type f -print || true
-          fi
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
-        shell: bash
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+          pip install -r requirements.txt
 
-      - name: Load secrets from REPORT_ENV
+      - name: Resolve run mode
+        id: mode
         shell: bash
         run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
+          STORE="ALL"
+          LIVE="${{ vars.WB_ADS_V90_LIVE }}"
+          RUN_LEGACY="${{ vars.WB_ADS_RUN_LEGACY }}"
 
-          allowed = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "YC_BUCKET_NAME",
-              "WB_PROMO_KEY_TOPFACE",
-              "TELEGRAM_BOT_TOKEN",
-              "TELEGRAM_CHAT_ID",
-          ]
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            STORE="${{ inputs.store }}"
+            LIVE="${{ inputs.live }}"
+            RUN_LEGACY="${{ inputs.run_legacy }}"
+          fi
 
-          report_env = os.getenv("REPORT_ENV", "") or ""
-          parsed = {}
-          for raw_line in report_env.splitlines():
-              line = raw_line.strip()
-              if not line or line.startswith("#"):
-                  continue
-              if line.startswith("export "):
-                  line = line[len("export "):].strip()
-              if "=" not in line:
-                  continue
-              key, value = line.split("=", 1)
-              key = key.strip()
-              value = value.strip().strip('"').strip("'")
-              if key in allowed and value:
-                  parsed[key] = value
+          if [[ -z "$LIVE" ]]; then LIVE="false"; fi
+          if [[ -z "$RUN_LEGACY" ]]; then RUN_LEGACY="true"; fi
 
-          github_env = os.environ.get("GITHUB_ENV")
-          if not github_env:
-              raise SystemExit("GITHUB_ENV is not available")
+          echo "store=$STORE" >> "$GITHUB_OUTPUT"
+          echo "live=$LIVE" >> "$GITHUB_OUTPUT"
+          echo "run_legacy=$RUN_LEGACY" >> "$GITHUB_OUTPUT"
 
-          loaded = []
-          with open(github_env, "a", encoding="utf-8") as f:
-              for key in allowed:
-                  value = os.getenv(key) or parsed.get(key)
-                  if value:
-                      f.write(f"{key}={value}\n")
-                      loaded.append(key)
+          echo "Store: $STORE"
+          echo "Live changes: $LIVE"
+          echo "Legacy CPC/shelves: $RUN_LEGACY"
 
-          print("Loaded secret names: " + (", ".join(loaded) if loaded else "none"))
-          PY
-
-      - name: Verify required secrets
+      - name: Run V90 adaptive CPM manager
         shell: bash
         run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          required = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "YC_BUCKET_NAME",
-              "WB_PROMO_KEY_TOPFACE",
-          ]
-          missing = [name for name in required if not os.getenv(name)]
-          if missing:
-              raise SystemExit("Missing secrets after REPORT_ENV load: " + ", ".join(missing))
-          print("All required secrets are present after REPORT_ENV load.")
-          PY
-
-      - name: Resolve slot and guard time
-        id: guard
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          from datetime import datetime
-          from zoneinfo import ZoneInfo
-
-          event_name = "${{ github.event_name }}"
-          schedule = "${{ github.event.schedule }}"
-          now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
-          minutes = now_msk.hour * 60 + now_msk.minute
-          weekday = now_msk.weekday()  # Monday=0
-
-          run_slot = "manual_main"
-          allowed = True
-          reason = "manual_dispatch_single_mode"
-          lock_name = f"manual_main_{now_msk:%Y-%m-%d_%H%M%S}"
-          if event_name == "schedule":
-              if schedule == "0 */2 * * *":
-                  run_slot = "cpm_query_cleaner"
-                  allowed = True
-                  reason = "cpm_query_cleaner_every_2_hours"
-                  lock_name = f"cpm_query_cleaner_{now_msk:%Y-%m-%d_%H}"
-              else:
-                  run_slot = "main_run"
-                  allowed = 18 <= now_msk.hour <= 23
-                  reason = "main_18_00_23_59_msk_window" if allowed else "BLOCKED_MAIN_TIME_GUARD"
-                  lock_name = f"main_run_{now_msk:%Y-%m-%d}"
-
-          print("=== Slot resolution ===")
-          print(f"event_name={event_name}")
-          print(f"schedule={schedule}")
-          print(f"MSK now={now_msk:%Y-%m-%d %H:%M:%S}")
-          print(f"resolved_run_slot={run_slot}")
-          print(f"run_allowed={allowed}")
-          print(f"guard_reason={reason}")
-          print(f"lock_name={lock_name}")
-
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              f.write(f"RUN_SLOT={run_slot}\n")
-              f.write(f"RUN_ALLOWED={'true' if allowed else 'false'}\n")
-              f.write(f"GUARD_REASON={reason}\n")
-              f.write(f"MSK_RUN_DATE={now_msk:%Y-%m-%d}\n")
-              f.write(f"LOCK_NAME={lock_name}\n")
-          PY
-
-      - name: Stop if blocked by time guard
-        if: env.RUN_ALLOWED != 'true'
-        shell: bash
-        run: |
-          echo "${GUARD_REASON}: запуск заблокирован до старта Python. WB API не трогаем."
-          exit 0
-
-      - name: Check schedule marker
-        if: github.event_name == 'schedule' && env.RUN_ALLOWED == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          import boto3
-          from botocore.exceptions import ClientError
-
-          bucket = os.environ["YC_BUCKET_NAME"]
-          lock_key = f"{os.environ['DAILY_LOCK_PREFIX']}/{os.environ['LOCK_NAME']}.json"
-          s3 = boto3.client(
-              "s3",
-              endpoint_url="https://storage.yandexcloud.net",
-              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
-              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
+          ARGS=(
+            cpm-manager
+            --store "${{ steps.mode.outputs.store }}"
+            --config wb_ads_v90_config.json
+            --stats-days 7
           )
-          already_done = False
-          try:
-              s3.head_object(Bucket=bucket, Key=lock_key)
-              already_done = True
-          except ClientError as exc:
-              code = str(exc.response.get("Error", {}).get("Code", ""))
-              if code not in {"404", "NoSuchKey", "NotFound"}:
-                  raise
-          print("=== Marker check ===")
-          print(f"lock_key={lock_key}")
-          print(f"already_done={already_done}")
-          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              f.write(f"SCHEDULE_ALREADY_DONE={'true' if already_done else 'false'}\n")
-              f.write(f"SCHEDULE_LOCK_KEY={lock_key}\n")
-          PY
 
-      - name: Stop if schedule already completed
-        if: github.event_name == 'schedule' && env.SCHEDULE_ALREADY_DONE == 'true'
+          if [[ "${{ steps.mode.outputs.live }}" == "true" ]]; then
+            ARGS+=(
+              --apply-query-bids
+              --apply-campaign-bids
+              --apply-minus
+            )
+          fi
+
+          python upravlenie_reklamoy.py "${ARGS[@]}"
+
+      - name: Run legacy CPC and shelves contour
+        if: steps.mode.outputs.run_legacy == 'true'
         shell: bash
         run: |
-          echo "Schedule already completed: ${SCHEDULE_LOCK_KEY}"
-          exit 0
+          if [[ "${{ steps.mode.outputs.live }}" == "true" ]]; then
+            python upravlenie_reklamoy.py run --apply-pause --apply-start
+          else
+            python upravlenie_reklamoy.py preview --dry-run
+          fi
 
-      - name: Validate Python syntax
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m py_compile upravlenie_reklamoy.py
-
-      - name: Run WB Ads Manager
-        if: env.RUN_ALLOWED == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "=== Run command resolution ==="
-          echo "WORKFLOW_VERSION=${WORKFLOW_VERSION}"
-          echo "RUN_SLOT=${RUN_SLOT}"
-          echo "GUARD_REASON=${GUARD_REASON}"
-          TZ=Europe/Moscow date '+MSK before run=%Y-%m-%d %H:%M:%S'
-
-          case "${RUN_SLOT}" in
-            manual_main)
-              CMD="python upravlenie_reklamoy.py run --skip-price"
-              ;;
-            main_run)
-              CMD="python upravlenie_reklamoy.py run --skip-price"
-              ;;
-            cpm_query_cleaner)
-              CMD="python upravlenie_reklamoy.py cpm-manager --campaigns 38914318,38914345 --apply-cpm-minus --apply-cpm-bids --min-bid 340 --bid-step 40 --max-cpo 160 --stats-days 1"
-              ;;
-            *)
-              echo "Unknown RUN_SLOT=${RUN_SLOT}"
-              exit 2
-              ;;
-          esac
-          echo "Running: ${CMD}"
-          eval "${CMD}"
-          TZ=Europe/Moscow date '+MSK after run=%Y-%m-%d %H:%M:%S'
-
-      - name: Write schedule marker after success
-        if: success() && github.event_name == 'schedule' && env.RUN_ALLOWED == 'true' && env.SCHEDULE_ALREADY_DONE != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import os
-          import json
-          from datetime import datetime, timezone
-          from zoneinfo import ZoneInfo
-          import boto3
-
-          bucket = os.environ["YC_BUCKET_NAME"]
-          lock_key = os.environ["SCHEDULE_LOCK_KEY"]
-          payload = {
-              "workflow_version": os.environ.get("WORKFLOW_VERSION"),
-              "workflow_file": os.environ.get("WORKFLOW_FILE"),
-              "run_slot": os.environ.get("RUN_SLOT"),
-              "guard_reason": os.environ.get("GUARD_REASON"),
-              "github_workflow": os.environ.get("GITHUB_WORKFLOW"),
-              "github_sha": "${{ github.sha }}",
-              "github_ref": "${{ github.ref }}",
-              "github_workflow_ref": "${{ github.workflow_ref }}",
-              "github_workflow_sha": "${{ github.workflow_sha }}",
-              "utc_completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-              "msk_completed_at": datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S"),
-          }
-          s3 = boto3.client(
-              "s3",
-              endpoint_url="https://storage.yandexcloud.net",
-              aws_access_key_id=os.environ["YC_ACCESS_KEY_ID"],
-              aws_secret_access_key=os.environ["YC_SECRET_ACCESS_KEY"],
-          )
-          s3.put_object(Bucket=bucket, Key=lock_key, Body=json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), ContentType="application/json")
-          print(f"Marker written: {lock_key}")
-          PY
-
-      - name: Upload GitHub artifacts
+      - name: Upload run reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wb-ads-manager-${{ env.RUN_SLOT }}-${{ github.run_number }}
+          name: wb-ads-v90-${{ github.run_number }}
           if-no-files-found: ignore
+          retention-days: 14
           path: |
-            Предпросмотр_последнего_запуска.xlsx
-            Итог_последнего_запуска.xlsx
-            Сводка_последнего_запуска.json
-            Лог_API.xlsx
-            История_ставок.xlsx
-            История_пауз.xlsx
-            CPM_чистка_запросов.xlsx
-            CPM_управление_запросами.xlsx
+            *.xlsx
+            *.json
+            *.log
