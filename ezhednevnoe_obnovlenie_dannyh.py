@@ -9,9 +9,9 @@
 Финансовые показатели: новый метод POST /api/finance/v1/sales-reports/detailed, в ежедневном режиме только целевая дата.
 Всегда читается первый лист в файле.
 Поисковые запросы: загружается целевая дата по правилу времени запуска.
-Реклама: в ежедневном режиме получает статистику только за целевую дату и объединяет её с существующей историей.
+Реклама: каждый день заново получает последние 14 дат статистики и хранит ежедневные снимки для анализа лага.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
-Для TOPFACE/MISSTAIS используются основные WB-токены, для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB; finance и keywords для FINICK отключены. FINICK при первом запуске догружает 7 полностью завершённых недель истории (без текущей недели) для доступных исторических отчётов.
+Для TOPFACE/MISSTAIS используются основные WB-токены; FBS по этим магазинам собирается только по подтверждённым складам в Липецке (ID 1728667/1935990). Для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB; finance и keywords для FINICK отключены. FINICK при первом запуске догружает 7 полностью завершённых недель истории (без текущей недели) для доступных исторических отчётов.
 """
 
 import os
@@ -39,7 +39,14 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-08-07_v40_FBS_ADVERTS_LAG14"
+SCRIPT_VERSION = "2026-08-07_v41_FBS_LIPETSK_ONLY"
+
+# Для TOPFACE и MISSTAIS FBS собираем только с двух подтверждённых липецких
+# складов продавца. Набор общий намеренно: токен каждого магазина видит только
+# свои склады, поэтому это не требует жёстко привязывать скрин к конкретному магазину.
+# Все остальные FBS-склады этих магазинов игнорируются. FINICK не ограничиваем.
+FBS_LIPETSK_WAREHOUSE_IDS = {1728667, 1935990}
+FBS_LIPETSK_ONLY_STORES = {'TOPFACE', 'MISSTAIS'}
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -2854,6 +2861,86 @@ class WildberriesDailyUpdater:
         except Exception:
             return ""
 
+    def _fbs_allowed_warehouse_ids(self, store_name: str) -> Optional[Set[int]]:
+        """Разрешённые FBS-склады для магазина.
+
+        TOPFACE и MISSTAIS: только подтверждённые липецкие склады со скриншотов
+        (1728667 и 1935990). У каждого токена WB видны только собственные склады.
+        Для остальных магазинов фильтр не применяется.
+        """
+        if str(store_name or '').upper() in FBS_LIPETSK_ONLY_STORES:
+            return set(FBS_LIPETSK_WAREHOUSE_IDS)
+        return None
+
+    def _filter_fbs_orders_by_warehouse(self, store_name: str, orders: List[dict]) -> List[dict]:
+        allowed = self._fbs_allowed_warehouse_ids(store_name)
+        if not allowed:
+            return list(orders or [])
+        before = len(orders or [])
+        filtered = []
+        skipped_ids = set()
+        for order in orders or []:
+            try:
+                wid = int(order.get('warehouseId') or 0)
+            except Exception:
+                wid = 0
+            if wid in allowed:
+                filtered.append(order)
+            else:
+                skipped_ids.add(wid)
+        self.log(
+            f"🏬 FBS {store_name}: фильтр Липецк — оставлено заказов {len(filtered)} из {before}; "
+            f"прочие склады игнорируются"
+        )
+        if skipped_ids:
+            self.log(f"⏭️ Игнорируем ID FBS-складов: {sorted(x for x in skipped_ids if x)}")
+        return filtered
+
+    def _filter_fbs_df_by_warehouse(self, store_name: str, df: pd.DataFrame) -> pd.DataFrame:
+        allowed = self._fbs_allowed_warehouse_ids(store_name)
+        if not allowed or df is None or df.empty or 'ID склада продавца' not in df.columns:
+            return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        ids = pd.to_numeric(df['ID склада продавца'], errors='coerce')
+        return df[ids.isin(sorted(allowed))].copy()
+
+    def _prune_fbs_saved_files_to_allowed_warehouses(self, store_name: str) -> None:
+        """Удалить из уже накопленных FBS-файлов TOPFACE/MISSTAIS строки других складов.
+
+        Это нужно один раз после перехода на правило «только Липецк», но безопасно
+        выполнять и далее: файлы переписываются только если реально найдены лишние строки.
+        """
+        allowed = self._fbs_allowed_warehouse_ids(store_name)
+        if not allowed:
+            return
+
+        candidates = [self._fbs_registry_key(store_name)]
+        candidates += [
+            k for k in self.s3.list_files(f"Отчёты/Заказы/{store_name}/Недельные/")
+            if '/Заказы_FBS_' in k or k.split('/')[-1].startswith('Заказы_FBS_')
+        ]
+        candidates += [
+            k for k in self.s3.list_files(f"Отчёты/Остатки/{store_name}/Недельные/")
+            if '/Остатки_FBS_' in k or k.split('/')[-1].startswith('Остатки_FBS_')
+        ]
+
+        seen = set()
+        for key in candidates:
+            if key in seen or not self.s3.file_exists(key):
+                continue
+            seen.add(key)
+            df = self.s3.read_excel(key, sheet_name=0)
+            if df.empty or 'ID склада продавца' not in df.columns:
+                continue
+            filtered = self._filter_fbs_df_by_warehouse(store_name, df)
+            if len(filtered) == len(df):
+                continue
+            sheet = 'Реестр FBS' if key.endswith('/Реестр_FBS.xlsx') else ('Остатки FBS' if 'Остатки_FBS_' in key else 'Заказы FBS')
+            self.s3.write_excel(key, filtered, sheet_name=sheet)
+            self.log(
+                f"🧹 {store_name}: удалены строки других FBS-складов из {key}: "
+                f"{len(df)} → {len(filtered)}"
+            )
+
     def _fetch_fbs_orders_range(
         self,
         store_name: str,
@@ -3145,6 +3232,7 @@ class WildberriesDailyUpdater:
         for week_start, week_df in tmp.groupby('_week'):
             key = self._fbs_orders_weekly_key(store_name, week_start)
             existing = self.s3.read_excel(key, sheet_name=0) if self.s3.file_exists(key) else pd.DataFrame()
+            existing = self._filter_fbs_df_by_warehouse(store_name, existing)
             week_df = week_df.drop(columns=['_date', '_week'])
             if existing.empty:
                 combined = week_df.copy()
@@ -3168,8 +3256,10 @@ class WildberriesDailyUpdater:
         """
         self.log("")
         self.log(f"📌 ОБНОВЛЕНИЕ: Заказы FBS / поставки / реестр для магазина {store_name}")
+        self._prune_fbs_saved_files_to_allowed_warehouses(store_name)
         registry_key = self._fbs_registry_key(store_name)
         existing_registry = self.s3.read_excel(registry_key, sheet_name=0) if self.s3.file_exists(registry_key) else pd.DataFrame()
+        existing_registry = self._filter_fbs_df_by_warehouse(store_name, existing_registry)
 
         if existing_registry.empty:
             hist_start, hist_end = self._fbs_completed_7_weeks_range()
@@ -3191,7 +3281,8 @@ class WildberriesDailyUpdater:
                 return True
             return False
 
-        self.log(f"✅ FBS заказов получено: {len(orders)}")
+        orders = self._filter_fbs_orders_by_warehouse(store_name, orders)
+        self.log(f"✅ FBS заказов после фильтра склада: {len(orders)}")
         order_ids = [int(o['id']) for o in orders if o.get('id') is not None]
         statuses, status_code = self._fetch_fbs_statuses(store_name, order_ids)
         if statuses is None:
@@ -3207,6 +3298,10 @@ class WildberriesDailyUpdater:
                 self.log(f"⏭️ FBS поставки {store_name} пропущены: нет Marketplace-доступа")
                 return True
             return False
+        allowed_supply_ids = {str(o.get('supplyId') or '').strip() for o in orders if str(o.get('supplyId') or '').strip()}
+        if self._fbs_allowed_warehouse_ids(store_name):
+            supplies = [sp for sp in supplies if str(sp.get('id') or '').strip() in allowed_supply_ids]
+            self.log(f"🏬 FBS {store_name}: в файл поставок попадут только поставки липецкого склада: {len(supplies)}")
         supply_map = self._save_fbs_supplies(store_name, supplies)
 
         refreshed_df = self._build_fbs_orders_df(store_name, orders, statuses, supply_map, existing_registry)
@@ -3321,6 +3416,16 @@ class WildberriesDailyUpdater:
             return None, status
         # deliveryType=1 — склады FBS; deliveryType=3 — DBW.
         warehouses = [w for w in data if int(w.get('deliveryType') or 0) == 1 and not bool(w.get('isDeleting', False))]
+
+        allowed = self._fbs_allowed_warehouse_ids(store_name)
+        if allowed:
+            before = len(warehouses)
+            warehouses = [w for w in warehouses if int(w.get('id') or 0) in allowed]
+            matched = [int(w.get('id') or 0) for w in warehouses]
+            self.log(
+                f"🏬 FBS {store_name}: используем только липецкий склад. "
+                f"Найдено разрешённых складов: {len(warehouses)} из {before}; ID={matched}"
+            )
         return warehouses, 200
 
     def update_fbs_stocks(self, store_name: str) -> bool:
@@ -3424,6 +3529,7 @@ class WildberriesDailyUpdater:
 
         key = self._fbs_stocks_weekly_key(store_name, request_date)
         existing = self.s3.read_excel(key, sheet_name=0) if self.s3.file_exists(key) else pd.DataFrame()
+        existing = self._filter_fbs_df_by_warehouse(store_name, existing)
         if existing.empty:
             combined = df_day
         else:
