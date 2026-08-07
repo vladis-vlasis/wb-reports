@@ -7718,5 +7718,1529 @@ def make_summary_json(mode: str, decisions: pd.DataFrame, successful: pd.DataFra
             summary["Автопауз активных флагманов заблокировано v89"] = int(rc.eq("ACTIVE_FLAGSHIP_NO_AUTO_PAUSE").sum())
     return summary
 
+
+# =========================
+# V90 OVERRIDES: adaptive 2-hour CPM management, budgets, multi-store
+# =========================
+# This block intentionally comes after all legacy overrides. It keeps the old
+# report/pause machinery, but replaces the CPM query manager with a safer,
+# stateful, two-hour control loop.
+
+import sqlite3
+from copy import deepcopy
+
+SCRIPT_VERSION = "v90-adaptive-cpm-multistore-2026-08-06"
+VERSION = "WB_ADS_V90_ADAPTIVE_CPM_MULTISTORE"
+
+V90_CONFIG_FILENAME = "wb_ads_v90_config.json"
+V90_FULLSTATS_ENDPOINT = "/adv/v3/fullstats"
+V90_QUERY_STEP_RUB = 20
+V90_CAMPAIGN_STEP_RUB = 20
+V90_CRITICAL_STEP_RUB = 40
+V90_POSTCHECK_HOURS = 2.0
+V90_ROLLBACK_HOURS = 4.0
+V90_TARGET_DRR_PCT = 15.0
+V90_HARD_DRR_PCT = 20.0
+V90_WEEKLY_BUDGET_SHARE = 0.10
+V90_PAUSE_WEEKLY_SPEND_RUB = 3000.0
+V90_PAUSE_DRR_PCT = 15.0
+V90_AUTO_PAUSE_REASON = "AUTO_PAUSE_MIN_BID_DRR15_SPEND3000_V90"
+V90_AUTO_START_REASON = "AUTO_START_AFTER_MATURED_ORDERS_DRR15_V90"
+V90_BLOCKED_ARTICLES = {"901/11"}
+# V90 re-enables the narrow auto-pause guard for managed brush CPC/shelves only.
+PAUSE_ALLOWED_SUBJECTS_CANON = {"Кисти косметические"}
+V90_TOPFACE_CPM_ARTICLES = {"901/2", "901/14", "255/101", "261/2", "263/2", "265/6", "269/1"}
+
+V90_DEFAULT_CONFIG: Dict[str, Any] = {
+    "version": SCRIPT_VERSION,
+    "budget": {
+        "advertising_share_of_sales": 0.10,
+        "weekly_sales_weeks": 4,
+        "pacing_points": [[0, 0.0], [8, 0.05], [12, 0.15], [14, 0.33], [17, 0.55], [21, 0.85], [24, 1.0]],
+        "underpace_ratio": 0.75,
+        "normal_max_ratio": 1.10,
+        "overpace_ratio": 1.25,
+    },
+    "bids": {
+        "query_step_rub": 20,
+        "campaign_step_rub": 20,
+        "critical_step_rub": 40,
+        "max_query_bid_rub": 1500,
+        "max_campaign_bid_rub": 1500,
+        "postcheck_hours": 2,
+        "rollback_hours": 4,
+        "target_position_max": 8,
+        "target_visibility_pct": 95,
+        "target_drr_pct": 15,
+        "hard_drr_pct": 20,
+    },
+    "pause_policy": {
+        "enabled_for": ["cpc", "shelves"],
+        "min_weekly_spend_rub": 3000,
+        "pause_drr_pct": 15,
+        "maturity_days": 7,
+        "lag_days": 3,
+        "blocked_articles": ["901/11"],
+        "new_cpm_search_auto_pause": False,
+    },
+    "stores": {
+        "TOPFACE": {
+            "secret_env": "WB_PROMO_KEY_TOPFACE",
+            "manage_all_products": False,
+            "blocked_articles": ["901/11"],
+            "not_flagships": ["901/5", "901/11"],
+            "profiles": {},
+        },
+        "FINICK": {
+            "secret_env": "FINICK_API_WB",
+            "manage_all_products": True,
+            "baseline_runs_before_actions": 2,
+            "unknown_query_policy": "keep",
+            "profiles": {},
+        },
+    },
+}
+
+
+def _v90_deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _v90_deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _v90_config_candidates(explicit_path: Optional[str] = None) -> List[Path]:
+    candidates: List[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    env_path = os.getenv("WB_ADS_V90_CONFIG", "").strip()
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates += [
+        Path.cwd() / V90_CONFIG_FILENAME,
+        Path(__file__).resolve().parent / V90_CONFIG_FILENAME,
+        Path("/opt/wb-ads-manager") / V90_CONFIG_FILENAME,
+    ]
+    seen: set[str] = set()
+    return [p for p in candidates if not (str(p) in seen or seen.add(str(p)))]
+
+
+def load_v90_config(explicit_path: Optional[str] = None) -> Dict[str, Any]:
+    cfg = deepcopy(V90_DEFAULT_CONFIG)
+    for path in _v90_config_candidates(explicit_path):
+        if not path.exists():
+            continue
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            cfg = _v90_deep_merge(cfg, loaded)
+            cfg["_loaded_from"] = str(path)
+            return cfg
+        except Exception as exc:
+            print(f"Не удалось прочитать V90 config {path}: {exc!r}", flush=True)
+    cfg["_loaded_from"] = "built-in defaults"
+    return cfg
+
+
+def _v90_store_cfg(cfg: Dict[str, Any], store: str) -> Dict[str, Any]:
+    store_u = str(store or "").strip().upper()
+    stores = cfg.get("stores", {})
+    if store_u not in stores:
+        raise RuntimeError(f"Магазин {store_u!r} отсутствует в config stores")
+    out = deepcopy(stores[store_u])
+    out["name"] = store_u
+    out.setdefault("secret_env", "WB_PROMO_KEY_TOPFACE" if store_u == "TOPFACE" else f"{store_u}_API_WB")
+    out.setdefault("service_prefix", f"Служебные файлы/Ассистент WB/{store_u}/")
+    out.setdefault("ads_main_key", f"Отчёты/Реклама/{store_u}/Анализ рекламы.xlsx")
+    out.setdefault("ads_weekly_prefix", f"Отчёты/Реклама/{store_u}/Недельные/")
+    out.setdefault("orders_weekly_prefix", f"Отчёты/Заказы/{store_u}/Недельные/")
+    out.setdefault("run_output_key", out["service_prefix"] + "Итог_последнего_запуска.xlsx")
+    out.setdefault("manager_output_key", out["service_prefix"] + "CPM_адаптивное_управление.xlsx")
+    out.setdefault("state_db_key", out["service_prefix"] + "adaptive/state_v90.sqlite3")
+    out.setdefault("api_log_key", out["service_prefix"] + "Лог_API.xlsx")
+    return out
+
+
+def load_store_runner_config_v90(store_cfg: Dict[str, Any]) -> RunnerConfig:
+    secret_env = str(store_cfg.get("secret_env") or "").strip()
+    if not secret_env:
+        raise RuntimeError("Для магазина не указан secret_env")
+    return RunnerConfig(
+        yc_access_key_id=_env_required("YC_ACCESS_KEY_ID"),
+        yc_secret_access_key=_env_required("YC_SECRET_ACCESS_KEY"),
+        yc_bucket_name=_env_required("YC_BUCKET_NAME"),
+        wb_promo_key=_env_required(secret_env),
+    )
+
+
+def _v90_norm_query(value: Any) -> str:
+    text = normalize_cpm_query_text(value)
+    text = text.replace("ё", "е")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _v90_article(value: Any) -> str:
+    return _normalize_article_for_experiment(value)
+
+
+def _v90_tokenize(text: Any) -> set[str]:
+    return set(re.findall(r"[a-zа-я0-9]+", _v90_norm_query(text)))
+
+
+def _v90_query_baseline(profile: Dict[str, Any], query: str) -> Dict[str, Any]:
+    baseline = profile.get("annual_baseline", {}) or {}
+    qn = _v90_norm_query(query)
+    for key, value in baseline.items():
+        if _v90_norm_query(key) == qn:
+            return value if isinstance(value, dict) else {}
+    return {}
+
+
+def classify_query_v90(store_cfg: Dict[str, Any], article: str, query: str) -> Dict[str, Any]:
+    """Strict TOPFACE semantics; FINICK unknown products are kept, not minus-listed."""
+    q = _v90_norm_query(query)
+    profiles = store_cfg.get("profiles", {}) or {}
+    profile = profiles.get(article, {}) or {}
+    if not profile:
+        if bool(store_cfg.get("manage_all_products")):
+            return {
+                "keep": True,
+                "is_core": True,
+                "profile": "generic_all_products",
+                "group": "generic",
+                "reason": "FINICK: товар без отдельного профиля, запрос сохраняем; автоматическая минусация запрещена",
+                "historical": {},
+            }
+        return {
+            "keep": False,
+            "is_core": False,
+            "profile": "unknown",
+            "group": "no_profile",
+            "reason": "Для товара нет утверждённого CORE-профиля",
+            "historical": {},
+        }
+
+    allow_exact = {_v90_norm_query(x) for x in profile.get("allow_exact", []) if str(x).strip()}
+    required = [_v90_norm_query(x) for x in profile.get("required", []) if str(x).strip()]
+    intent = [_v90_norm_query(x) for x in profile.get("intent", []) if str(x).strip()]
+    forbidden = [_v90_norm_query(x) for x in profile.get("forbidden", []) if str(x).strip()]
+
+    if any(token and token in q for token in forbidden):
+        return {
+            "keep": False,
+            "is_core": False,
+            "profile": profile.get("profile", article),
+            "group": "forbidden_semantics",
+            "reason": "Запрос содержит семантику другого товара/назначения",
+            "historical": {},
+        }
+    if q in allow_exact:
+        return {
+            "keep": True,
+            "is_core": True,
+            "profile": profile.get("profile", article),
+            "group": "exact_core",
+            "reason": "Точный утверждённый CORE-запрос",
+            "historical": _v90_query_baseline(profile, q),
+        }
+
+    required_ok = not required or any(token and token in q for token in required)
+    intent_ok = not intent or any(token and token in q for token in intent)
+    if required_ok and intent_ok:
+        q_tokens = _v90_tokenize(q)
+        best_similarity = 0.0
+        for allowed in allow_exact:
+            a_tokens = _v90_tokenize(allowed)
+            if not a_tokens or not q_tokens:
+                continue
+            sim = len(q_tokens & a_tokens) / max(1, len(q_tokens | a_tokens))
+            best_similarity = max(best_similarity, sim)
+        if best_similarity >= 0.42 or (required and intent):
+            return {
+                "keep": True,
+                "is_core": True,
+                "profile": profile.get("profile", article),
+                "group": "semantic_core",
+                "reason": f"Похожий по смыслу CORE-запрос, similarity={best_similarity:.2f}",
+                "historical": {},
+            }
+
+    return {
+        "keep": False,
+        "is_core": False,
+        "profile": profile.get("profile", article),
+        "group": "non_core",
+        "reason": "Запрос не соответствует утверждённому назначению товара",
+        "historical": {},
+    }
+
+
+class V90StateDB:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(path))
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self.conn.executescript(
+            """
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE IF NOT EXISTS campaign_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                local_date TEXT NOT NULL,
+                campaign_id INTEGER NOT NULL,
+                nm_id INTEGER,
+                article TEXT,
+                campaign_bid REAL,
+                impressions REAL DEFAULT 0,
+                clicks REAL DEFAULT 0,
+                spend REAL DEFAULT 0,
+                orders REAL DEFAULT 0,
+                order_sum REAL DEFAULT 0,
+                ctr REAL,
+                drr REAL,
+                daily_budget REAL,
+                planned_spend_now REAL,
+                pacing_ratio REAL,
+                query_count INTEGER DEFAULT 0,
+                delta_impressions REAL DEFAULT 0,
+                delta_clicks REAL DEFAULT 0,
+                delta_spend REAL DEFAULT 0,
+                delta_orders REAL DEFAULT 0,
+                delta_order_sum REAL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS ix_campaign_snapshots_key
+                ON campaign_snapshots(store, campaign_id, nm_id, captured_at);
+
+            CREATE TABLE IF NOT EXISTS query_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store TEXT NOT NULL,
+                captured_at TEXT NOT NULL,
+                local_date TEXT NOT NULL,
+                campaign_id INTEGER NOT NULL,
+                nm_id INTEGER,
+                article TEXT,
+                norm_query TEXT NOT NULL,
+                query_bid REAL,
+                impressions REAL DEFAULT 0,
+                clicks REAL DEFAULT 0,
+                spend REAL DEFAULT 0,
+                orders REAL DEFAULT 0,
+                cpo REAL,
+                estimated_drr REAL,
+                position REAL,
+                visibility REAL,
+                delta_impressions REAL DEFAULT 0,
+                delta_clicks REAL DEFAULT 0,
+                delta_spend REAL DEFAULT 0,
+                delta_orders REAL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS ix_query_snapshots_key
+                ON query_snapshots(store, campaign_id, nm_id, norm_query, captured_at);
+
+            CREATE TABLE IF NOT EXISTS bid_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store TEXT NOT NULL,
+                changed_at TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                campaign_id INTEGER NOT NULL,
+                nm_id INTEGER,
+                article TEXT,
+                norm_query TEXT,
+                old_bid REAL,
+                new_bid REAL,
+                action TEXT,
+                reason_code TEXT,
+                reason_text TEXT,
+                api_status TEXT,
+                baseline_impressions REAL DEFAULT 0,
+                baseline_clicks REAL DEFAULT 0,
+                baseline_spend REAL DEFAULT 0,
+                baseline_position REAL,
+                baseline_visibility REAL,
+                postcheck_status TEXT DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS ix_bid_changes_key
+                ON bid_changes(store, scope, campaign_id, nm_id, norm_query, changed_at);
+
+            CREATE TABLE IF NOT EXISTS run_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                store TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                mode TEXT,
+                campaigns INTEGER DEFAULT 0,
+                queries INTEGER DEFAULT 0,
+                changes INTEGER DEFAULT 0,
+                status TEXT,
+                message TEXT
+            );
+            """
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _row_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        return dict(row) if row is not None else None
+
+    def count_runs(self, store: str) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM run_log WHERE store=? AND status='ok'", (store,)).fetchone()
+        return int(row["n"] if row else 0)
+
+    def last_campaign(self, store: str, campaign_id: int, nm_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """SELECT * FROM campaign_snapshots
+               WHERE store=? AND campaign_id=? AND COALESCE(nm_id,0)=COALESCE(?,0)
+               ORDER BY id DESC LIMIT 1""",
+            (store, int(campaign_id), nm_id),
+        ).fetchone()
+        return self._row_dict(row)
+
+    def last_query(self, store: str, campaign_id: int, nm_id: Optional[int], norm_query: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """SELECT * FROM query_snapshots
+               WHERE store=? AND campaign_id=? AND COALESCE(nm_id,0)=COALESCE(?,0) AND norm_query=?
+               ORDER BY id DESC LIMIT 1""",
+            (store, int(campaign_id), nm_id, _v90_norm_query(norm_query)),
+        ).fetchone()
+        return self._row_dict(row)
+
+    def last_change(self, store: str, scope: str, campaign_id: int, nm_id: Optional[int], norm_query: str = "") -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """SELECT * FROM bid_changes
+               WHERE store=? AND scope=? AND campaign_id=? AND COALESCE(nm_id,0)=COALESCE(?,0)
+                 AND COALESCE(norm_query,'')=?
+               ORDER BY id DESC LIMIT 1""",
+            (store, scope, int(campaign_id), nm_id, _v90_norm_query(norm_query)),
+        ).fetchone()
+        return self._row_dict(row)
+
+    def insert_campaign(self, row: Dict[str, Any]) -> None:
+        cols = [
+            "store", "captured_at", "local_date", "campaign_id", "nm_id", "article", "campaign_bid",
+            "impressions", "clicks", "spend", "orders", "order_sum", "ctr", "drr", "daily_budget",
+            "planned_spend_now", "pacing_ratio", "query_count", "delta_impressions", "delta_clicks",
+            "delta_spend", "delta_orders", "delta_order_sum",
+        ]
+        self.conn.execute(
+            f"INSERT INTO campaign_snapshots ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+            [row.get(c) for c in cols],
+        )
+        self.conn.commit()
+
+    def insert_query(self, row: Dict[str, Any]) -> None:
+        cols = [
+            "store", "captured_at", "local_date", "campaign_id", "nm_id", "article", "norm_query", "query_bid",
+            "impressions", "clicks", "spend", "orders", "cpo", "estimated_drr", "position", "visibility",
+            "delta_impressions", "delta_clicks", "delta_spend", "delta_orders",
+        ]
+        self.conn.execute(
+            f"INSERT INTO query_snapshots ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+            [row.get(c) for c in cols],
+        )
+        self.conn.commit()
+
+    def insert_change(self, row: Dict[str, Any]) -> None:
+        cols = [
+            "store", "changed_at", "scope", "campaign_id", "nm_id", "article", "norm_query", "old_bid", "new_bid",
+            "action", "reason_code", "reason_text", "api_status", "baseline_impressions", "baseline_clicks",
+            "baseline_spend", "baseline_position", "baseline_visibility", "postcheck_status",
+        ]
+        self.conn.execute(
+            f"INSERT INTO bid_changes ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+            [row.get(c) for c in cols],
+        )
+        self.conn.commit()
+
+    def table_df(self, table: str, store: str, limit: int = 5000) -> pd.DataFrame:
+        return pd.read_sql_query(f"SELECT * FROM {table} WHERE store=? ORDER BY id DESC LIMIT ?", self.conn, params=(store, int(limit)))
+
+    def start_run(self, store: str, mode: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO run_log(store, started_at, mode, status) VALUES(?,?,?,'running')",
+            (store, _now_msk().isoformat(), mode),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def finish_run(self, run_id: int, campaigns: int, queries: int, changes: int, status: str, message: str = "") -> None:
+        self.conn.execute(
+            "UPDATE run_log SET finished_at=?, campaigns=?, queries=?, changes=?, status=?, message=? WHERE id=?",
+            (_now_msk().isoformat(), int(campaigns), int(queries), int(changes), status, str(message)[:2000], int(run_id)),
+        )
+        self.conn.commit()
+
+    def close(self) -> None:
+        self.conn.commit()
+        self.conn.close()
+
+
+def _v90_pacing_fraction(now_msk: datetime, points: Sequence[Sequence[float]]) -> float:
+    hour = now_msk.hour + now_msk.minute / 60.0 + now_msk.second / 3600.0
+    pts = sorted([(float(x), float(y)) for x, y in points], key=lambda t: t[0])
+    if not pts:
+        return min(1.0, max(0.0, hour / 24.0))
+    if hour <= pts[0][0]:
+        return pts[0][1]
+    for (h1, p1), (h2, p2) in zip(pts, pts[1:]):
+        if h1 <= hour <= h2:
+            if h2 == h1:
+                return p2
+            return p1 + (p2 - p1) * (hour - h1) / (h2 - h1)
+    return pts[-1][1]
+
+
+def _v90_hours_since(value: Any) -> float:
+    dt = _v85_parse_dt(value)
+    if dt is None:
+        return 99999.0
+    now_naive = _now_msk().replace(tzinfo=None)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+    return max(0.0, (now_naive - dt).total_seconds() / 3600.0)
+
+
+def _v90_delta(current: float, previous: Optional[Dict[str, Any]], field: str, local_date: str) -> float:
+    if not previous or str(previous.get("local_date")) != str(local_date):
+        return max(0.0, float(current or 0.0))
+    prev = _v85_as_float(previous.get(field), 0.0)
+    return max(0.0, float(current or 0.0) - prev)
+
+
+def _v90_s3_download_state(s3, bucket: str, key: str, local_path: Path) -> None:
+    if local_path.exists():
+        return
+    try:
+        if s3_key_exists(s3, bucket, key):
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(read_s3_bytes(s3, bucket, key))
+    except Exception as exc:
+        print(f"State DB не загружена из S3: {exc!r}", flush=True)
+
+
+def _v90_s3_upload_state(s3, bucket: str, key: str, local_path: Path) -> None:
+    if not local_path.exists():
+        return
+    upload_s3_bytes(s3, bucket, key, local_path.read_bytes(), "application/vnd.sqlite3")
+
+
+def _v90_read_previous_catalog(path: Optional[str]) -> pd.DataFrame:
+    if not path or not Path(path).exists():
+        return pd.DataFrame()
+    frames: List[pd.DataFrame] = []
+    try:
+        xl = pd.ExcelFile(path)
+        for sh in ["Решения", "Все_РК_лог"]:
+            if sh in xl.sheet_names:
+                d = pd.read_excel(path, sheet_name=sh)
+                if not d.empty:
+                    frames.append(d)
+    except Exception:
+        return pd.DataFrame()
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    if "campaign_id" not in df.columns:
+        return pd.DataFrame()
+    df["campaign_id"] = df["campaign_id"].map(_clean_int)
+    df = df[df["campaign_id"].notna()].copy()
+    df["campaign_id"] = df["campaign_id"].astype(int)
+    if "supplier_article" not in df.columns:
+        df["supplier_article"] = ""
+    df["supplier_article"] = df["supplier_article"].map(_v90_article)
+    if "nm_id" not in df.columns:
+        df["nm_id"] = pd.NA
+    if "campaign_status" not in df.columns:
+        df["campaign_status"] = ""
+    if "placement" not in df.columns:
+        df["placement"] = ""
+    if "payment_type" not in df.columns:
+        df["payment_type"] = ""
+    if "campaign_name" not in df.columns:
+        df["campaign_name"] = ""
+    for col in ["real_bid_rub", "search_bid", "reco_bid", "order_sum_7d", "spend_7d", "orders_7d"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    df = df.sort_values(["campaign_id"]).drop_duplicates("campaign_id", keep="last")
+    return df
+
+
+def _v90_read_campaigns_from_ads(path: Optional[str]) -> pd.DataFrame:
+    if not path or not Path(path).exists():
+        return pd.DataFrame()
+    try:
+        raw = read_sheet(path, ["Список_кампаний", "campaigns", "Кампании"])
+    except Exception:
+        return pd.DataFrame()
+    if raw.empty:
+        return pd.DataFrame()
+    out = normalize_campaigns(raw)
+    supplied = s(raw, "supplier_article", "").map(clean_article)
+    if len(supplied) == len(out):
+        supplied = supplied.reset_index(drop=True)
+        out = out.reset_index(drop=True)
+        fill = supplied.astype(str).str.strip().ne("")
+        out.loc[fill, "supplier_article"] = supplied.loc[fill].map(_v90_article)
+        out["product_root"] = out["supplier_article"].map(product_root)
+    return out
+
+
+def _v90_campaign_map_arg(raw: str) -> Dict[str, List[int]]:
+    value = str(raw or "").strip()
+    if not value:
+        return {}
+    try:
+        obj = json.loads(value)
+        out: Dict[str, List[int]] = {}
+        if isinstance(obj, dict):
+            for article, ids in obj.items():
+                vals = ids if isinstance(ids, list) else [ids]
+                out[_v90_article(article)] = [int(x) for x in vals if _clean_int(x)]
+        return out
+    except Exception:
+        out: Dict[str, List[int]] = {}
+        for part in re.split(r"[;]", value):
+            if ":" not in part:
+                continue
+            article, ids = part.split(":", 1)
+            vals = [int(x) for x in re.split(r"[,\s]+", ids) if _clean_int(x)]
+            if vals:
+                out[_v90_article(article)] = vals
+        return out
+
+
+def _v90_is_active(value: Any) -> bool:
+    return _v87_is_active_status(value)
+
+
+def _v90_is_cpm_campaign(row: pd.Series) -> bool:
+    text = " ".join(str(row.get(c, "") or "") for c in ["payment_type", "bid_type", "placement", "campaign_name"]).lower()
+    return any(x in text for x in ["cpm", "единая", "combined", "полк"])
+
+
+def _v90_resolve_campaigns(store_cfg: Dict[str, Any], catalog: pd.DataFrame, explicit_map: Dict[str, List[int]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    profiles = store_cfg.get("profiles", {}) or {}
+    manage_all = bool(store_cfg.get("manage_all_products"))
+    blocked = {_v90_article(x) for x in store_cfg.get("blocked_articles", [])}
+    rows: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
+
+    if manage_all:
+        if catalog.empty:
+            return pd.DataFrame(), pd.DataFrame({"reason": ["Каталог кампаний пуст"]})
+        for _, r in catalog.iterrows():
+            article = _v90_article(r.get("supplier_article", ""))
+            if article in blocked or not _v90_is_active(r.get("campaign_status", "")) or not _v90_is_cpm_campaign(r):
+                continue
+            item = r.to_dict()
+            item["supplier_article"] = article
+            rows.append(item)
+    else:
+        for article, profile in profiles.items():
+            article_n = _v90_article(article)
+            if article_n in blocked:
+                continue
+            candidates = catalog[catalog.get("supplier_article", pd.Series(dtype=str)).map(_v90_article).eq(article_n)].copy() if not catalog.empty else pd.DataFrame()
+            ids = explicit_map.get(article_n, [])
+            if ids and not catalog.empty:
+                candidates = pd.concat([candidates, catalog[catalog["campaign_id"].isin(ids)]], ignore_index=True).drop_duplicates("campaign_id")
+            elif ids and catalog.empty:
+                candidates = pd.DataFrame([{"campaign_id": cid, "supplier_article": article_n, "nm_id": profile.get("nm_id"), "campaign_status": "active", "placement": "combined", "payment_type": "CPM"} for cid in ids])
+            if not candidates.empty:
+                active = candidates[candidates["campaign_status"].map(_v90_is_active)].copy()
+                cpm = active[active.apply(_v90_is_cpm_campaign, axis=1)].copy() if not active.empty else pd.DataFrame()
+                pick = cpm if not cpm.empty else active
+                if not pick.empty:
+                    pick = pick.sort_values(["campaign_id"], ascending=False).head(1)
+                    item = pick.iloc[0].to_dict()
+                    item["supplier_article"] = article_n
+                    item["nm_id"] = _clean_int(item.get("nm_id")) or _clean_int(profile.get("nm_id"))
+                    rows.append(item)
+                    continue
+            missing.append({
+                "supplier_article": article_n,
+                "nm_id": profile.get("nm_id"),
+                "profile": profile.get("profile"),
+                "reason": "Не найдена активная CPM-кампания. Создайте CPM только поиск или передайте --campaign-map",
+            })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["campaign_id"] = df["campaign_id"].map(_clean_int)
+        df["nm_id"] = df.get("nm_id", pd.Series([None] * len(df))).map(_clean_int)
+        df = df[df["campaign_id"].notna()].copy()
+        df["campaign_id"] = df["campaign_id"].astype(int)
+        df = df.drop_duplicates(["campaign_id", "nm_id"], keep="last")
+    return df, pd.DataFrame(missing)
+
+
+def _v90_metrics_direct(node: Dict[str, Any]) -> Tuple[Dict[str, float], bool]:
+    aliases = {
+        "impressions": ["views", "impressions", "shows"],
+        "clicks": ["clicks"],
+        "spend": ["sum", "spend", "expense", "cost"],
+        "orders": ["orders", "shks", "orderCount"],
+        "order_sum": ["sum_price", "sumPrice", "revenue", "order_sum", "orderSum"],
+    }
+    low = {str(k).lower(): k for k in node.keys()}
+    out: Dict[str, float] = {}
+    found = False
+    for field, names in aliases.items():
+        value = None
+        for name in names:
+            if name.lower() in low:
+                value = node.get(low[name.lower()])
+                found = True
+                break
+        out[field] = _v85_as_float(value, 0.0)
+    return out, found
+
+
+def _v90_sum_leaf_metrics(node: Any) -> Dict[str, float]:
+    totals = {"impressions": 0.0, "clicks": 0.0, "spend": 0.0, "orders": 0.0, "order_sum": 0.0}
+    if isinstance(node, list):
+        for item in node:
+            part = _v90_sum_leaf_metrics(item)
+            for key in totals:
+                totals[key] += part[key]
+        return totals
+    if not isinstance(node, dict):
+        return totals
+    direct, found = _v90_metrics_direct(node)
+    children = [v for v in node.values() if isinstance(v, (list, dict))]
+    if found and not children:
+        return direct
+    if found and any(str(k).lower() in {"date", "day", "dt"} for k in node):
+        return direct
+    for child in children:
+        part = _v90_sum_leaf_metrics(child)
+        for key in totals:
+            totals[key] += part[key]
+    if not children and found:
+        return direct
+    return totals
+
+
+def _v90_fetch_campaign_stats(config: RunnerConfig, campaign_ids: Sequence[int], day: date) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    logs: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+    date_s = day.strftime("%Y-%m-%d")
+    for i in range(0, len(campaign_ids), 50):
+        ids = [int(x) for x in campaign_ids[i:i + 50]]
+        params = {"ids": ",".join(map(str, ids)), "beginDate": date_s, "endDate": date_s}
+        try:
+            resp = requests.get(config.wb_base_url.rstrip("/") + V90_FULLSTATS_ENDPOINT, headers=wb_headers(config), params=params, timeout=90)
+            logs.append(_api_log_row("GET", V90_FULLSTATS_ENDPOINT, params, str(resp.status_code), resp.text, "", "", "campaign_fullstats_v90"))
+            if not (200 <= resp.status_code < 300):
+                continue
+            data = resp.json()
+        except Exception as exc:
+            logs.append(_api_log_row("GET", V90_FULLSTATS_ENDPOINT, params, "exception", repr(exc), "", "", "campaign_fullstats_v90"))
+            continue
+        items = data if isinstance(data, list) else _v85_extract_items_any(data)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cid = _clean_int(item.get("advertId") or item.get("advert_id") or item.get("id"))
+            if cid is None:
+                continue
+            metrics: Optional[Dict[str, float]] = None
+            days = item.get("days") or item.get("stats") or item.get("dates")
+            if isinstance(days, list):
+                for dnode in days:
+                    if not isinstance(dnode, dict):
+                        continue
+                    dval = str(dnode.get("date") or dnode.get("day") or dnode.get("dt") or "")[:10]
+                    if dval and dval != date_s:
+                        continue
+                    direct, found = _v90_metrics_direct(dnode)
+                    metrics = direct if found else _v90_sum_leaf_metrics(dnode)
+                    break
+            if metrics is None:
+                direct, found = _v90_metrics_direct(item)
+                metrics = direct if found else _v90_sum_leaf_metrics(item)
+            rows.append({"campaign_id": int(cid), **metrics})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["campaign_id", "impressions", "clicks", "spend", "orders", "order_sum"]), logs
+    return df.groupby("campaign_id", as_index=False)[["impressions", "clicks", "spend", "orders", "order_sum"]].sum(), logs
+
+
+def _v90_aggregate_query_stats(stats: pd.DataFrame, today: date) -> pd.DataFrame:
+    if stats is None or stats.empty:
+        return pd.DataFrame(columns=["campaign_id", "nm_id", "norm_query", "norm_query_clean"])
+    df = stats.copy()
+    df["_date"] = pd.to_datetime(df.get("date", pd.Series([pd.NaT] * len(df))), errors="coerce").dt.date
+    numeric = ["impressions", "clicks", "orders", "spend", "position", "visibility"]
+    for col in numeric:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    keys = ["campaign_id", "nm_id", "norm_query", "norm_query_clean"]
+    today_df = df[df["_date"].eq(today)].copy()
+    if today_df.empty:
+        # Some WB responses omit dates for current cumulative stats.
+        today_df = df.copy()
+    cur = today_df.groupby(keys, dropna=False, as_index=False).agg(
+        impressions=("impressions", "sum"), clicks=("clicks", "sum"), orders=("orders", "sum"), spend=("spend", "sum"),
+        position=("position", "median"), visibility=("visibility", "mean"),
+    )
+    total = df.groupby(keys, dropna=False, as_index=False).agg(
+        impressions_7d=("impressions", "sum"), clicks_7d=("clicks", "sum"), orders_7d=("orders", "sum"), spend_7d=("spend", "sum"),
+    )
+    out = cur.merge(total, on=keys, how="outer")
+    out["cpo_7d"] = np.where(out["orders_7d"].fillna(0) > 0, out["spend_7d"] / out["orders_7d"], np.nan)
+    return out
+
+
+def _v90_load_orders_for_budget(s3, bucket: str, store_cfg: Dict[str, Any], workdir: Path, weeks_limit: int = 8) -> pd.DataFrame:
+    paths: List[str] = []
+    for key in latest_excel_keys(s3, bucket, store_cfg["orders_weekly_prefix"], limit=max(weeks_limit, 4)):
+        try:
+            paths.append(download_key_to_dir(s3, bucket, key, workdir))
+        except Exception:
+            continue
+    return load_orders(";".join(paths)) if paths else pd.DataFrame()
+
+
+def _v90_sales_budget_table(orders: pd.DataFrame, store_cfg: Dict[str, Any], cfg: Dict[str, Any]) -> pd.DataFrame:
+    if orders is None or orders.empty:
+        return pd.DataFrame(columns=["budget_group", "avg_weekly_sales", "weekly_budget", "daily_budget", "avg_price"])
+    df = orders.copy()
+    df["day"] = pd.to_datetime(df["day"], errors="coerce")
+    df = df[df["day"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame()
+    df["supplier_article"] = df["supplier_article"].map(_v90_article)
+    df["finished_price"] = pd.to_numeric(df["finished_price"], errors="coerce").fillna(0.0)
+    iso = df["day"].dt.isocalendar()
+    df["week_label"] = iso.year.astype(str) + "-W" + iso.week.astype(str).str.zfill(2)
+    profiles = store_cfg.get("profiles", {}) or {}
+    article_to_group = { _v90_article(article): str(meta.get("budget_group") or article) for article, meta in profiles.items() }
+    if bool(store_cfg.get("manage_all_products")):
+        df["budget_group"] = df["supplier_article"]
+    else:
+        df["budget_group"] = df["supplier_article"].map(article_to_group).fillna(df["supplier_article"])
+    by_week = df.groupby(["budget_group", "week_label"], as_index=False).agg(sales=("finished_price", "sum"), orders=("finished_price", "size"))
+    max_weeks = int(cfg.get("budget", {}).get("weekly_sales_weeks", 4) or 4)
+    by_week = by_week.sort_values("week_label").groupby("budget_group", as_index=False).tail(max_weeks)
+    avg = by_week.groupby("budget_group", as_index=False).agg(avg_weekly_sales=("sales", "mean"), avg_weekly_orders=("orders", "mean"))
+    prices = df.groupby("budget_group", as_index=False).agg(avg_price=("finished_price", "mean"))
+    out = avg.merge(prices, on="budget_group", how="left")
+    share = float(cfg.get("budget", {}).get("advertising_share_of_sales", V90_WEEKLY_BUDGET_SHARE) or V90_WEEKLY_BUDGET_SHARE)
+    out["weekly_budget"] = out["avg_weekly_sales"] * share
+    out["daily_budget"] = out["weekly_budget"] / 7.0
+    return out
+
+
+def _v90_budget_for_article(article: str, store_cfg: Dict[str, Any], budget_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    profile = (store_cfg.get("profiles", {}) or {}).get(article, {}) or {}
+    group = str(profile.get("budget_group") or product_root(article) if article else article)
+    if bool(store_cfg.get("manage_all_products")):
+        group = article
+    return budget_map.get(group, {"budget_group": group, "avg_weekly_sales": 0.0, "weekly_budget": 0.0, "daily_budget": 0.0, "avg_price": np.nan})
+
+
+def _v90_current_campaign_bid(row: Dict[str, Any]) -> int:
+    for key in ["real_bid_rub", "search_bid", "reco_bid", "campaign_bid"]:
+        val = _v85_as_int(row.get(key), None)
+        if val and val > 0:
+            return int(val)
+    return 0
+
+
+def _v90_efficiency_drr(query_row: Dict[str, Any], avg_price: float, historical: Dict[str, Any]) -> Tuple[float, str]:
+    cpo = _v85_as_float(query_row.get("cpo_7d"), float("nan"))
+    orders = _v85_as_float(query_row.get("orders_7d"), 0.0)
+    if orders > 0 and pd.notna(cpo) and avg_price and pd.notna(avg_price) and avg_price > 0:
+        return float(cpo) / float(avg_price) * 100.0, "live_7d_cpo/avg_price"
+    hist = _v85_as_float(historical.get("drr_at_cpc6"), float("nan")) if historical else float("nan")
+    if pd.notna(hist):
+        return float(hist), "annual_at_cpc6"
+    return float("nan"), "no_efficiency_data"
+
+
+def _v90_postcheck_growth(current: Dict[str, Any], change: Dict[str, Any]) -> Tuple[bool, str]:
+    imp_growth = _v85_as_float(current.get("impressions"), 0.0) - _v85_as_float(change.get("baseline_impressions"), 0.0)
+    click_growth = _v85_as_float(current.get("clicks"), 0.0) - _v85_as_float(change.get("baseline_clicks"), 0.0)
+    pos_now = _v85_as_float(current.get("position"), 0.0)
+    pos_before = _v85_as_float(change.get("baseline_position"), 0.0)
+    vis_now = _v85_as_float(current.get("visibility"), 0.0)
+    vis_before = _v85_as_float(change.get("baseline_visibility"), 0.0)
+    parts: List[str] = []
+    if imp_growth >= 50:
+        parts.append(f"показы +{imp_growth:.0f}")
+    if click_growth >= 2:
+        parts.append(f"клики +{click_growth:.0f}")
+    if pos_now > 0 and pos_before > 0 and pos_now <= pos_before - 1:
+        parts.append(f"позиция {pos_before:.1f}->{pos_now:.1f}")
+    if vis_now >= vis_before + 3:
+        parts.append(f"видимость +{vis_now-vis_before:.1f} п.п.")
+    return bool(parts), ", ".join(parts) if parts else "рост показов/кликов/позиции/видимости не подтверждён"
+
+
+def _v90_decide_query(
+    row: Dict[str, Any], previous: Optional[Dict[str, Any]], last_change: Optional[Dict[str, Any]],
+    semantic: Dict[str, Any], pacing_ratio: float, avg_price: float, cfg: Dict[str, Any], baseline_ready: bool,
+) -> Dict[str, Any]:
+    bids_cfg = cfg.get("bids", {})
+    step = int(bids_cfg.get("query_step_rub", V90_QUERY_STEP_RUB))
+    critical_step = int(bids_cfg.get("critical_step_rub", V90_CRITICAL_STEP_RUB))
+    max_bid = int(bids_cfg.get("max_query_bid_rub", 1500))
+    postcheck_hours = float(bids_cfg.get("postcheck_hours", V90_POSTCHECK_HOURS))
+    rollback_hours = float(bids_cfg.get("rollback_hours", V90_ROLLBACK_HOURS))
+    target_pos = float(bids_cfg.get("target_position_max", 8))
+    target_vis = float(bids_cfg.get("target_visibility_pct", 95))
+    target_drr = float(bids_cfg.get("target_drr_pct", 15))
+    hard_drr = float(bids_cfg.get("hard_drr_pct", 20))
+    underpace = float(cfg.get("budget", {}).get("underpace_ratio", 0.75))
+    normal_max = float(cfg.get("budget", {}).get("normal_max_ratio", 1.10))
+    overpace = float(cfg.get("budget", {}).get("overpace_ratio", 1.25))
+
+    current_bid = _v85_as_int(row.get("current_bid_rub"), 0) or _v85_as_int(row.get("campaign_bid"), 0) or 0
+    min_bid = _v85_as_int(row.get("min_bid_rub"), CPM_MIN_BID_RUB_DEFAULT) or CPM_MIN_BID_RUB_DEFAULT
+    current_bid = max(current_bid, min_bid)
+    target_bid = current_bid
+    action = "hold"
+    reason_code = "QUERY_HOLD_V90"
+    reason = "Нет достаточного основания менять ставку запроса"
+
+    if not semantic.get("keep"):
+        return {"target_bid_rub": current_bid, "bid_action": "minus_non_core", "reason_code": "QUERY_NON_CORE_MINUS_V90", "bid_reason": semantic.get("reason", "Не CORE"), "estimated_drr_pct": np.nan, "efficiency_source": "not_applicable"}
+
+    historical = semantic.get("historical", {}) or {}
+    estimated_drr, eff_source = _v90_efficiency_drr(row, avg_price, historical)
+    position = _v85_as_float(row.get("position"), 0.0)
+    visibility = _v85_as_float(row.get("visibility"), 0.0)
+    d_imp = _v85_as_float(row.get("delta_impressions"), 0.0)
+    d_click = _v85_as_float(row.get("delta_clicks"), 0.0)
+    d_spend = _v85_as_float(row.get("delta_spend"), 0.0)
+    prev_d_imp = _v85_as_float(previous.get("delta_impressions"), 0.0) if previous else 0.0
+    prev_d_click = _v85_as_float(previous.get("delta_clicks"), 0.0) if previous else 0.0
+    poor_target = (position > target_pos if position > 0 else d_imp < 50) or (visibility > 0 and visibility < target_vis)
+    peak_started = _now_msk().hour >= 12
+    traffic_weak = d_imp < max(30.0, prev_d_imp * 0.70) and d_click <= max(1.0, prev_d_click * 0.70)
+
+    if not baseline_ready:
+        return {"target_bid_rub": current_bid, "bid_action": "collect_baseline", "reason_code": "QUERY_BASELINE_NOT_READY_V90", "bid_reason": "Сначала собираем минимум два двухчасовых снимка; API-изменения запрещены", "estimated_drr_pct": estimated_drr, "efficiency_source": eff_source}
+
+    if last_change:
+        hours = _v90_hours_since(last_change.get("changed_at"))
+        last_action = str(last_change.get("action") or "")
+        if hours < postcheck_hours:
+            return {"target_bid_rub": current_bid, "bid_action": "wait_postcheck", "reason_code": "QUERY_WAIT_2H_POSTCHECK_V90", "bid_reason": f"После изменения прошло {hours:.1f} ч; ждём минимум {postcheck_hours:.0f} ч", "estimated_drr_pct": estimated_drr, "efficiency_source": eff_source}
+        if last_action == "raise":
+            improved, growth_reason = _v90_postcheck_growth(row, last_change)
+            if improved:
+                return {"target_bid_rub": current_bid, "bid_action": "hold_after_effective_raise", "reason_code": "QUERY_RAISE_EFFECTIVE_HOLD_V90", "bid_reason": "Повышение дало CORE-трафик: " + growth_reason, "estimated_drr_pct": estimated_drr, "efficiency_source": eff_source}
+            if hours >= rollback_hours:
+                old_bid = _v85_as_int(last_change.get("old_bid"), current_bid)
+                return {"target_bid_rub": max(min_bid, old_bid), "bid_action": "rollback_raise_no_growth", "reason_code": "QUERY_RAISE_NO_GROWTH_ROLLBACK_V90", "bid_reason": f"За {hours:.1f} ч повышение не дало роста показов, кликов, позиции или видимости; откат", "estimated_drr_pct": estimated_drr, "efficiency_source": eff_source}
+        elif last_action == "lower":
+            improved, growth_reason = _v90_postcheck_growth(row, last_change)
+            # For a lower action, a severe traffic loss means restore old bid.
+            base_imp = _v85_as_float(last_change.get("baseline_impressions"), 0.0)
+            base_clicks = _v85_as_float(last_change.get("baseline_clicks"), 0.0)
+            if _v85_as_float(row.get("impressions"), 0.0) < base_imp and _v85_as_float(row.get("clicks"), 0.0) < base_clicks and hours >= rollback_hours:
+                old_bid = _v85_as_int(last_change.get("old_bid"), current_bid)
+                return {"target_bid_rub": min(max_bid, old_bid), "bid_action": "restore_after_traffic_drop", "reason_code": "QUERY_LOWER_TRAFFIC_DROP_RESTORE_V90", "bid_reason": "После снижения трафик просел; возвращаем предыдущую ставку", "estimated_drr_pct": estimated_drr, "efficiency_source": eff_source}
+
+    if pacing_ratio > overpace:
+        target_bid = max(min_bid, current_bid - critical_step)
+        action = "lower" if target_bid < current_bid else "hold_min"
+        reason_code = "QUERY_CRITICAL_OVERPACE_LOWER_V90"
+        reason = f"Расход РК идёт слишком быстро: {pacing_ratio:.2f} от планового темпа; тормозим запрос на {critical_step} ₽"
+    elif pacing_ratio > normal_max and (pd.notna(estimated_drr) and estimated_drr > target_drr or d_spend > 0 and d_click == 0):
+        target_bid = max(min_bid, current_bid - step)
+        action = "lower" if target_bid < current_bid else "hold_min"
+        reason_code = "QUERY_OVERPACE_OR_EXPENSIVE_LOWER_V90"
+        reason = f"Темп расхода {pacing_ratio:.2f}, оценка ДРР {estimated_drr:.1f}%: снижаем ставку запроса"
+    elif pd.notna(estimated_drr) and estimated_drr > hard_drr and _v85_as_float(row.get("orders_7d"), 0.0) > 0:
+        target_bid = max(min_bid, current_bid - step)
+        action = "lower" if target_bid < current_bid else "hold_min"
+        reason_code = "QUERY_DRR_GT20_LOWER_V90"
+        reason = f"Зрелая оценка ДРР запроса {estimated_drr:.1f}% выше 20%; разгон запрещён"
+    elif peak_started and pacing_ratio < underpace and poor_target and traffic_weak and (pd.isna(estimated_drr) or estimated_drr <= hard_drr):
+        target_bid = min(max_bid, current_bid + step)
+        action = "raise" if target_bid > current_bid else "hold_max"
+        reason_code = "QUERY_UNDERPACE_LOW_TRAFFIC_RAISE_V90"
+        reason = f"После 12:00 расход отстаёт ({pacing_ratio:.2f}), за 2 ч слабый трафик: +{d_imp:.0f} показов, +{d_click:.0f} кликов; позиция/видимость ниже цели"
+    elif peak_started and pacing_ratio < underpace and poor_target and pd.notna(estimated_drr) and target_drr < estimated_drr <= hard_drr:
+        target_bid = min(max_bid, current_bid + step)
+        action = "raise" if target_bid > current_bid else "hold_max"
+        reason_code = "QUERY_DRR15_20_CAUTIOUS_RAISE_V90"
+        reason = f"Запрос в пограничном коридоре ДРР {estimated_drr:.1f}%; разрешён только один осторожный шаг на фоне недобора бюджета"
+    elif position > 0 and position <= 3 and visibility >= target_vis and pacing_ratio >= normal_max:
+        target_bid = max(min_bid, current_bid - step)
+        action = "lower" if target_bid < current_bid else "hold_min"
+        reason_code = "QUERY_TOP_POSITION_OVERPACE_LOWER_V90"
+        reason = "Позиция уже 1-3 и видимость 95%+, а расход выше плана; экономим ставку"
+
+    return {
+        "target_bid_rub": int(target_bid),
+        "bid_action": action,
+        "reason_code": reason_code,
+        "bid_reason": reason,
+        "estimated_drr_pct": estimated_drr,
+        "efficiency_source": eff_source,
+    }
+
+
+def _v90_decide_campaign(
+    row: Dict[str, Any], previous: Optional[Dict[str, Any]], last_change: Optional[Dict[str, Any]],
+    query_changes_planned: int, cfg: Dict[str, Any], baseline_ready: bool,
+) -> Dict[str, Any]:
+    bids_cfg = cfg.get("bids", {})
+    step = int(bids_cfg.get("campaign_step_rub", V90_CAMPAIGN_STEP_RUB))
+    critical_step = int(bids_cfg.get("critical_step_rub", V90_CRITICAL_STEP_RUB))
+    max_bid = int(bids_cfg.get("max_campaign_bid_rub", 1500))
+    postcheck_hours = float(bids_cfg.get("postcheck_hours", V90_POSTCHECK_HOURS))
+    rollback_hours = float(bids_cfg.get("rollback_hours", V90_ROLLBACK_HOURS))
+    underpace = float(cfg.get("budget", {}).get("underpace_ratio", 0.75))
+    normal_max = float(cfg.get("budget", {}).get("normal_max_ratio", 1.10))
+    overpace = float(cfg.get("budget", {}).get("overpace_ratio", 1.25))
+
+    current_bid = _v85_as_int(row.get("campaign_bid"), 0) or 0
+    min_bid = _v85_as_int(row.get("campaign_min_bid"), CPM_MIN_BID_RUB_DEFAULT) or CPM_MIN_BID_RUB_DEFAULT
+    current_bid = max(current_bid, min_bid)
+    pacing = _v85_as_float(row.get("pacing_ratio"), 0.0)
+    d_imp = _v85_as_float(row.get("delta_impressions"), 0.0)
+    d_click = _v85_as_float(row.get("delta_clicks"), 0.0)
+    d_spend = _v85_as_float(row.get("delta_spend"), 0.0)
+    prev_d_imp = _v85_as_float(previous.get("delta_impressions"), 0.0) if previous else 0.0
+    prev_d_click = _v85_as_float(previous.get("delta_clicks"), 0.0) if previous else 0.0
+    new_queries = max(0, int(row.get("query_count", 0) or 0) - int(previous.get("query_count", 0) or 0)) if previous else 0
+    peak_started = _now_msk().hour >= 12
+    low_traffic = d_imp < max(100.0, prev_d_imp * 0.70) and d_click <= max(2.0, prev_d_click * 0.70)
+
+    if not baseline_ready:
+        return {"campaign_target_bid": current_bid, "campaign_action": "collect_baseline", "campaign_reason_code": "CAMPAIGN_BASELINE_NOT_READY_V90", "campaign_reason": "Сначала собираем два снимка РК"}
+
+    if last_change:
+        hours = _v90_hours_since(last_change.get("changed_at"))
+        if hours < postcheck_hours:
+            return {"campaign_target_bid": current_bid, "campaign_action": "wait_postcheck", "campaign_reason_code": "CAMPAIGN_WAIT_2H_POSTCHECK_V90", "campaign_reason": f"После изменения общей ставки прошло {hours:.1f} ч"}
+        if str(last_change.get("action")) == "raise":
+            improved, growth_reason = _v90_postcheck_growth(row, last_change)
+            if improved:
+                return {"campaign_target_bid": current_bid, "campaign_action": "hold_after_effective_raise", "campaign_reason_code": "CAMPAIGN_RAISE_EFFECTIVE_HOLD_V90", "campaign_reason": "Общая ставка дала трафик: " + growth_reason}
+            if hours >= rollback_hours:
+                old_bid = _v85_as_int(last_change.get("old_bid"), current_bid)
+                return {"campaign_target_bid": max(min_bid, old_bid), "campaign_action": "rollback_raise_no_growth", "campaign_reason_code": "CAMPAIGN_RAISE_NO_GROWTH_ROLLBACK_V90", "campaign_reason": "Общая ставка не дала роста всей РК; откат"}
+
+    if pacing > overpace:
+        target = max(min_bid, current_bid - critical_step)
+        return {"campaign_target_bid": target, "campaign_action": "lower" if target < current_bid else "hold_min", "campaign_reason_code": "CAMPAIGN_CRITICAL_OVERPACE_LOWER_V90", "campaign_reason": f"Расход всей РК {pacing:.2f} от плана; аварийное снижение"}
+    if query_changes_planned > 0:
+        return {"campaign_target_bid": current_bid, "campaign_action": "hold_query_changes_first", "campaign_reason_code": "CAMPAIGN_HOLD_WHILE_QUERY_BIDS_CHANGE_V90", "campaign_reason": "В этом цикле меняются ставки отдельных запросов; общую ставку не трогаем, чтобы видеть причинность"}
+    if peak_started and pacing < underpace and low_traffic and new_queries == 0:
+        target = min(max_bid, current_bid + step)
+        return {"campaign_target_bid": target, "campaign_action": "raise" if target > current_bid else "hold_max", "campaign_reason_code": "CAMPAIGN_UNDERPACE_NO_NEW_QUERIES_RAISE_V90", "campaign_reason": f"После 12:00 РК недобирает бюджет ({pacing:.2f}), трафик слабый и новые запросы не появились; повышаем общую ставку"}
+    if pacing > normal_max and d_spend > 0 and d_click == 0:
+        target = max(min_bid, current_bid - step)
+        return {"campaign_target_bid": target, "campaign_action": "lower" if target < current_bid else "hold_min", "campaign_reason_code": "CAMPAIGN_SPEND_WITHOUT_CLICKS_LOWER_V90", "campaign_reason": "Вся РК расходует быстрее плана без роста кликов; снижаем общую ставку"}
+    return {"campaign_target_bid": current_bid, "campaign_action": "hold", "campaign_reason_code": "CAMPAIGN_HOLD_V90", "campaign_reason": "Общий темп расхода и трафика не требуют изменения"}
+
+
+def _v90_apply_campaign_bid(config: RunnerConfig, row: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+    payload = build_wb_bid_payload(pd.Series({
+        "campaign_id": row.get("campaign_id"),
+        "nm_id": row.get("nm_id"),
+        "placement": "search",
+        "new_bid_rub": row.get("campaign_target_bid"),
+    }))
+    if payload is None:
+        return _api_log_row("PATCH", WB_BIDS_ENDPOINT, {}, "payload_error", "Не удалось собрать общую ставку РК", row.get("campaign_id"), row.get("nm_id"), "search")
+    if dry_run:
+        return _api_log_row("PATCH", WB_BIDS_ENDPOINT, payload, "dry_run_no_call", "Общая ставка не отправлена: preview", row.get("campaign_id"), row.get("nm_id"), "search")
+    try:
+        resp = requests.patch(config.wb_base_url.rstrip("/") + WB_BIDS_ENDPOINT, headers=wb_headers(config), json=payload, timeout=60)
+        return _api_log_row("PATCH", WB_BIDS_ENDPOINT, payload, str(resp.status_code), resp.text, row.get("campaign_id"), row.get("nm_id"), "search")
+    except Exception as exc:
+        return _api_log_row("PATCH", WB_BIDS_ENDPOINT, payload, "exception", repr(exc), row.get("campaign_id"), row.get("nm_id"), "search")
+
+
+def _v90_api_success(status: Any) -> bool:
+    try:
+        code = int(str(status))
+        return 200 <= code < 300
+    except Exception:
+        return False
+
+
+def _v90_output_workbook(
+    path: Path, summary: pd.DataFrame, campaigns: pd.DataFrame, queries: pd.DataFrame,
+    minus_candidates: pd.DataFrame, missing: pd.DataFrame, budgets: pd.DataFrame,
+    db: V90StateDB, store: str, api_log: pd.DataFrame, cfg: Dict[str, Any],
+) -> None:
+    with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
+        summary.to_excel(writer, sheet_name="Сводка", index=False)
+        campaigns.to_excel(writer, sheet_name="РК_2ч_управление", index=False)
+        queries.to_excel(writer, sheet_name="Запросы_2ч_управление", index=False)
+        minus_candidates.to_excel(writer, sheet_name="Минус_кандидаты", index=False)
+        missing.to_excel(writer, sheet_name="Не_найдены_РК", index=False)
+        budgets.to_excel(writer, sheet_name="Бюджеты_10проц", index=False)
+        db.table_df("campaign_snapshots", store, 5000).to_excel(writer, sheet_name="История_снимков_РК", index=False)
+        db.table_df("query_snapshots", store, 10000).to_excel(writer, sheet_name="История_снимков_запросов", index=False)
+        db.table_df("bid_changes", store, 5000).to_excel(writer, sheet_name="Журнал_ставок", index=False)
+        api_log.to_excel(writer, sheet_name="Лог_API_текущий", index=False)
+        pd.DataFrame({
+            "parameter": ["version", "store", "config", "query_step", "campaign_step", "budget_share", "logic"],
+            "value": [
+                SCRIPT_VERSION, store, cfg.get("_loaded_from", ""),
+                cfg.get("bids", {}).get("query_step_rub", 20), cfg.get("bids", {}).get("campaign_step_rub", 20),
+                cfg.get("budget", {}).get("advertising_share_of_sales", 0.10),
+                "Каждые 2 часа: накопительный снимок -> дельта -> бюджетный pacing -> запросы -> общая ставка. Общая и запросные ставки одновременно не повышаются.",
+            ],
+        }).to_excel(writer, sheet_name="Параметры", index=False)
+
+
+def run_adaptive_cpm_store_v90(args: argparse.Namespace, store: str) -> int:
+    cfg = load_v90_config(getattr(args, "config", None))
+    store_cfg = _v90_store_cfg(cfg, store)
+    config = load_store_runner_config_v90(store_cfg)
+    s3 = make_s3_client(config)
+    bucket = config.yc_bucket_name
+    mode = "apply" if bool(getattr(args, "apply_query_bids", False) or getattr(args, "apply_campaign_bids", False) or getattr(args, "apply_minus", False)) else "preview"
+
+    state_dir = Path(getattr(args, "state_dir", "") or os.getenv("WB_ADS_STATE_DIR", ".wb_ads_state"))
+    state_path = state_dir / f"{store.lower()}_state_v90.sqlite3"
+    _v90_s3_download_state(s3, bucket, store_cfg["state_db_key"], state_path)
+    db = V90StateDB(state_path)
+    run_id = db.start_run(store, mode)
+
+    all_api_logs: List[Dict[str, Any]] = []
+    try:
+        with tempfile.TemporaryDirectory(prefix=f"wb_ads_v90_{store.lower()}_") as tmp:
+            workdir = Path(tmp)
+            previous_path = maybe_download_key_to_dir(s3, bucket, store_cfg["run_output_key"], workdir)
+            ads_path = maybe_download_key_to_dir(s3, bucket, store_cfg["ads_main_key"], workdir)
+            if not ads_path:
+                keys = latest_excel_keys(s3, bucket, store_cfg["ads_weekly_prefix"], limit=2)
+                ads_path = download_key_to_dir(s3, bucket, keys[0], workdir) if keys else None
+
+            catalog_parts = [_v90_read_previous_catalog(previous_path), _v90_read_campaigns_from_ads(ads_path)]
+            catalog = pd.concat([x for x in catalog_parts if x is not None and not x.empty], ignore_index=True, sort=False) if any(x is not None and not x.empty for x in catalog_parts) else pd.DataFrame()
+            if not catalog.empty and "campaign_id" in catalog.columns:
+                catalog = catalog.drop_duplicates("campaign_id", keep="last")
+
+            explicit_map = _v90_campaign_map_arg(getattr(args, "campaign_map", ""))
+            campaigns, missing = _v90_resolve_campaigns(store_cfg, catalog, explicit_map)
+            orders = _v90_load_orders_for_budget(s3, bucket, store_cfg, workdir, weeks_limit=8)
+            budgets = _v90_sales_budget_table(orders, store_cfg, cfg)
+            budget_map = {str(r["budget_group"]): r.to_dict() for _, r in budgets.iterrows()} if not budgets.empty else {}
+
+            if campaigns.empty:
+                summary = pd.DataFrame({"metric": ["store", "status", "campaigns"], "value": [store, "Нет найденных CPM-кампаний", 0]})
+                local_out = workdir / f"CPM_адаптивное_управление_{store}.xlsx"
+                _v90_output_workbook(local_out, summary, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), missing, budgets, db, store, pd.DataFrame(), cfg)
+                upload_s3_bytes(s3, bucket, store_cfg["manager_output_key"], local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                shutil.copy2(local_out, Path.cwd() / local_out.name)
+                db.finish_run(run_id, 0, 0, 0, "ok", "Нет найденных CPM-кампаний")
+                _v90_s3_upload_state(s3, bucket, store_cfg["state_db_key"], state_path)
+                return 0
+
+            now = _now_msk()
+            today = now.date()
+            local_date = today.isoformat()
+            captured_at = now.isoformat()
+            fullstats, logs = _v90_fetch_campaign_stats(config, campaigns["campaign_id"].astype(int).tolist(), today)
+            all_api_logs.extend(logs)
+            fullstats_map = fullstats.set_index("campaign_id").to_dict("index") if not fullstats.empty else {}
+            run_count_before = db.count_runs(store)
+            baseline_need = int(store_cfg.get("baseline_runs_before_actions", 1 if store == "TOPFACE" else 2) or 1)
+            baseline_ready_store = run_count_before >= baseline_need
+
+            campaign_rows: List[Dict[str, Any]] = []
+            query_rows: List[Dict[str, Any]] = []
+            minus_rows: List[Dict[str, Any]] = []
+            query_apply: List[Dict[str, Any]] = []
+            campaign_apply: List[Dict[str, Any]] = []
+
+            for _, camp in campaigns.iterrows():
+                cid = int(camp["campaign_id"])
+                article = _v90_article(camp.get("supplier_article", ""))
+                if article in {_v90_article(x) for x in store_cfg.get("blocked_articles", [])}:
+                    continue
+                nm = _clean_int(camp.get("nm_id"))
+                if not nm:
+                    profile = (store_cfg.get("profiles", {}) or {}).get(article, {}) or {}
+                    nm = _clean_int(profile.get("nm_id"))
+                if not nm:
+                    ids, logs = _cpm_fetch_advert_nm_ids(config, cid)
+                    all_api_logs.extend(logs)
+                    nm = ids[0] if ids else None
+                if not nm:
+                    missing = pd.concat([missing, pd.DataFrame([{"supplier_article": article, "campaign_id": cid, "reason": "Не удалось определить nm_id"}])], ignore_index=True)
+                    continue
+
+                campaign_bid = _v90_current_campaign_bid(camp.to_dict())
+                if campaign_bid <= 0:
+                    campaign_bid = int(getattr(args, "min_bid", CPM_MIN_BID_RUB_DEFAULT) or CPM_MIN_BID_RUB_DEFAULT)
+                min_bid, min_source, logs = _v85_try_detect_min_bid(config, cid, nm, int(getattr(args, "min_bid", CPM_MIN_BID_RUB_DEFAULT) or CPM_MIN_BID_RUB_DEFAULT))
+                all_api_logs.extend(logs)
+
+                active, excluded, logs = _cpm_fetch_normquery_list(config, cid, nm)
+                all_api_logs.extend(logs)
+                bids_df, logs = _v85_fetch_query_bids(config, cid, nm)
+                all_api_logs.extend(logs)
+                stats_df, logs = _v85_fetch_query_stats(config, cid, nm, days=max(1, int(getattr(args, "stats_days", 7) or 7)))
+                all_api_logs.extend(logs)
+                qstats = _v90_aggregate_query_stats(stats_df, today)
+
+                base = active.copy() if active is not None and not active.empty else pd.DataFrame()
+                if base.empty and not bids_df.empty:
+                    base = bids_df[["campaign_id", "nm_id", "norm_query", "norm_query_clean"]].copy()
+                if base.empty and not qstats.empty:
+                    base = qstats[["campaign_id", "nm_id", "norm_query", "norm_query_clean"]].copy()
+                if base.empty:
+                    base = pd.DataFrame(columns=["campaign_id", "nm_id", "norm_query", "norm_query_clean"])
+                base["campaign_id"] = cid
+                base["nm_id"] = int(nm)
+                if "norm_query" not in base.columns:
+                    base["norm_query"] = ""
+                base["norm_query_clean"] = base["norm_query"].map(_v90_norm_query)
+                merged = base.drop_duplicates(["campaign_id", "nm_id", "norm_query_clean"])
+                if not bids_df.empty:
+                    b = bids_df.copy()
+                    b["norm_query_clean"] = b["norm_query"].map(_v90_norm_query)
+                    merged = merged.merge(b[["campaign_id", "nm_id", "norm_query_clean", "current_bid_rub"]], on=["campaign_id", "nm_id", "norm_query_clean"], how="left")
+                if not qstats.empty:
+                    qstats["norm_query_clean"] = qstats["norm_query"].map(_v90_norm_query)
+                    stat_cols = [c for c in qstats.columns if c not in {"norm_query"}]
+                    merged = merged.merge(qstats[stat_cols], on=["campaign_id", "nm_id", "norm_query_clean"], how="left")
+
+                camp_stats = fullstats_map.get(cid, {})
+                budget = _v90_budget_for_article(article, store_cfg, budget_map)
+                daily_budget = _v85_as_float(budget.get("daily_budget"), 0.0)
+                pace_fraction = _v90_pacing_fraction(now, cfg.get("budget", {}).get("pacing_points", []))
+                planned_spend_now = daily_budget * pace_fraction
+                campaign_spend = _v85_as_float(camp_stats.get("spend"), 0.0)
+                pacing_ratio = campaign_spend / planned_spend_now if planned_spend_now > 1 else 0.0
+                prev_campaign = db.last_campaign(store, cid, nm)
+                camp_snapshot = {
+                    "store": store, "captured_at": captured_at, "local_date": local_date, "campaign_id": cid, "nm_id": nm,
+                    "article": article, "campaign_bid": campaign_bid,
+                    "impressions": _v85_as_float(camp_stats.get("impressions"), 0.0),
+                    "clicks": _v85_as_float(camp_stats.get("clicks"), 0.0),
+                    "spend": campaign_spend,
+                    "orders": _v85_as_float(camp_stats.get("orders"), 0.0),
+                    "order_sum": _v85_as_float(camp_stats.get("order_sum"), 0.0),
+                    "daily_budget": daily_budget, "planned_spend_now": planned_spend_now, "pacing_ratio": pacing_ratio,
+                    "query_count": int(len(merged)),
+                }
+                camp_snapshot["ctr"] = safe_div(camp_snapshot["clicks"] * 100.0, camp_snapshot["impressions"], np.nan)
+                camp_snapshot["drr"] = safe_div(camp_snapshot["spend"] * 100.0, camp_snapshot["order_sum"], np.nan)
+                for field in ["impressions", "clicks", "spend", "orders", "order_sum"]:
+                    camp_snapshot[f"delta_{field}"] = _v90_delta(camp_snapshot[field], prev_campaign, field, local_date)
+
+                avg_price = _v85_as_float(budget.get("avg_price"), float("nan"))
+                baseline_ready_campaign = baseline_ready_store and prev_campaign is not None
+                local_query_rows: List[Dict[str, Any]] = []
+                local_query_change_count = 0
+                query_impressions_sum = query_clicks_sum = query_spend_sum = 0.0
+
+                for _, qr in merged.iterrows():
+                    query = str(qr.get("norm_query") or qr.get("norm_query_clean") or "").strip()
+                    if not query:
+                        continue
+                    qclean = _v90_norm_query(query)
+                    semantic = classify_query_v90(store_cfg, article, query)
+                    current_q_bid = _v85_as_int(qr.get("current_bid_rub"), None)
+                    bid_source = "query_bid"
+                    if not current_q_bid or current_q_bid <= 0:
+                        current_q_bid = campaign_bid
+                        bid_source = "campaign_bid_fallback"
+                    prev_q = db.last_query(store, cid, nm, qclean)
+                    qrow = {
+                        "store": store, "captured_at": captured_at, "local_date": local_date, "campaign_id": cid, "nm_id": nm,
+                        "article": article, "norm_query": qclean, "query_bid": current_q_bid,
+                        "impressions": _v85_as_float(qr.get("impressions"), 0.0),
+                        "clicks": _v85_as_float(qr.get("clicks"), 0.0),
+                        "spend": _v85_as_float(qr.get("spend"), 0.0),
+                        "orders": _v85_as_float(qr.get("orders"), 0.0),
+                        "position": _v85_as_float(qr.get("position"), 0.0),
+                        "visibility": _v85_as_float(qr.get("visibility"), 0.0),
+                    }
+                    qrow["cpo"] = safe_div(qrow["spend"], qrow["orders"], np.nan)
+                    qrow["estimated_drr"] = safe_div(qrow["cpo"] * 100.0, avg_price, np.nan) if pd.notna(avg_price) and avg_price > 0 else np.nan
+                    for field in ["impressions", "clicks", "spend", "orders"]:
+                        qrow[f"delta_{field}"] = _v90_delta(qrow[field], prev_q, field, local_date)
+                    query_impressions_sum += qrow["impressions"]
+                    query_clicks_sum += qrow["clicks"]
+                    query_spend_sum += qrow["spend"]
+
+                    decision_input = {**qr.to_dict(), **qrow, "current_bid_rub": current_q_bid, "campaign_bid": campaign_bid, "min_bid_rub": min_bid}
+                    last_change = db.last_change(store, "query", cid, nm, qclean)
+                    decision = _v90_decide_query(decision_input, prev_q, last_change, semantic, pacing_ratio, avg_price, cfg, baseline_ready_campaign)
+                    out = {
+                        **decision_input, **decision,
+                        "supplier_article": article, "semantic_profile": semantic.get("profile"), "query_group": semantic.get("group"),
+                        "keep_query": semantic.get("keep"), "semantic_reason": semantic.get("reason"), "current_bid_source": bid_source,
+                        "avg_weekly_sales": budget.get("avg_weekly_sales", 0.0), "weekly_budget": budget.get("weekly_budget", 0.0),
+                        "daily_budget": daily_budget, "planned_spend_now": planned_spend_now, "campaign_pacing_ratio": pacing_ratio,
+                        "impressions_7d": _v85_as_float(qr.get("impressions_7d"), 0.0), "clicks_7d": _v85_as_float(qr.get("clicks_7d"), 0.0),
+                        "orders_7d": _v85_as_float(qr.get("orders_7d"), 0.0), "spend_7d": _v85_as_float(qr.get("spend_7d"), 0.0),
+                        "cpo_7d": _v85_as_float(qr.get("cpo_7d"), float("nan")),
+                    }
+                    local_query_rows.append(out)
+                    if not semantic.get("keep"):
+                        minus_rows.append({"store": store, "campaign_id": cid, "nm_id": nm, "supplier_article": article, "norm_query": query, "reason": semantic.get("reason")})
+                    target = _v85_as_int(decision.get("target_bid_rub"), current_q_bid)
+                    if semantic.get("keep") and target != current_q_bid and decision.get("bid_action") in {"raise", "lower", "rollback_raise_no_growth", "restore_after_traffic_drop"}:
+                        local_query_change_count += 1
+                        query_apply.append({**out, "target_bid_rub": target})
+                    db.insert_query(qrow)
+
+                camp_snapshot["unattributed_impressions"] = max(0.0, camp_snapshot["impressions"] - query_impressions_sum)
+                camp_snapshot["unattributed_clicks"] = max(0.0, camp_snapshot["clicks"] - query_clicks_sum)
+                camp_snapshot["unattributed_spend"] = max(0.0, camp_snapshot["spend"] - query_spend_sum)
+                last_campaign_change = db.last_change(store, "campaign", cid, nm, "")
+                camp_decision = _v90_decide_campaign(camp_snapshot, prev_campaign, last_campaign_change, local_query_change_count, cfg, baseline_ready_campaign)
+                camp_out = {**camp.to_dict(), **camp_snapshot, **camp_decision, "supplier_article": article, "campaign_min_bid": min_bid, "min_bid_source": min_source, "avg_weekly_sales": budget.get("avg_weekly_sales", 0.0), "weekly_budget": budget.get("weekly_budget", 0.0), "avg_price": avg_price}
+                campaign_rows.append(camp_out)
+                query_rows.extend(local_query_rows)
+                target_campaign_bid = _v85_as_int(camp_decision.get("campaign_target_bid"), campaign_bid)
+                if target_campaign_bid != campaign_bid and camp_decision.get("campaign_action") in {"raise", "lower", "rollback_raise_no_growth"}:
+                    campaign_apply.append(camp_out)
+                db.insert_campaign(camp_snapshot)
+
+            # Apply in deterministic order: query bids first; campaign bids only if the campaign has no query change.
+            query_logs: List[Dict[str, Any]] = []
+            dry_query = not bool(getattr(args, "apply_query_bids", False))
+            if query_apply:
+                query_logs = _v85_apply_query_bids(config, query_apply, dry_run=dry_query)
+                all_api_logs.extend(query_logs)
+            if bool(getattr(args, "apply_minus", False)) and minus_rows:
+                minus_df_temp = pd.DataFrame(minus_rows)
+                for (cid, nm), part in minus_df_temp.groupby(["campaign_id", "nm_id"]):
+                    all_api_logs.extend(_cpm_apply_set_minus(config, int(cid), int(nm), part["norm_query"].tolist(), dry_run=False))
+
+            campaign_logs: List[Dict[str, Any]] = []
+            for row in campaign_apply:
+                log = _v90_apply_campaign_bid(config, row, dry_run=not bool(getattr(args, "apply_campaign_bids", False)))
+                campaign_logs.append(log)
+                all_api_logs.append(log)
+                time.sleep(0.55)
+
+            # Persist journal with API result matched best-effort by scope.
+            query_statuses = [str(x.get("api_status", "")) for x in query_logs]
+            query_status = next((s for s in query_statuses if _v90_api_success(s)), query_statuses[-1] if query_statuses else "preview")
+            for row in query_apply:
+                db.insert_change({
+                    "store": store, "changed_at": captured_at, "scope": "query", "campaign_id": row.get("campaign_id"), "nm_id": row.get("nm_id"),
+                    "article": row.get("supplier_article"), "norm_query": row.get("norm_query_clean") or row.get("norm_query"),
+                    "old_bid": row.get("current_bid_rub"), "new_bid": row.get("target_bid_rub"),
+                    "action": "raise" if _v85_as_float(row.get("target_bid_rub")) > _v85_as_float(row.get("current_bid_rub")) else "lower",
+                    "reason_code": row.get("reason_code"), "reason_text": row.get("bid_reason"), "api_status": query_status,
+                    "baseline_impressions": row.get("impressions"), "baseline_clicks": row.get("clicks"), "baseline_spend": row.get("spend"),
+                    "baseline_position": row.get("position"), "baseline_visibility": row.get("visibility"), "postcheck_status": "pending",
+                })
+            for row, log in zip(campaign_apply, campaign_logs):
+                db.insert_change({
+                    "store": store, "changed_at": captured_at, "scope": "campaign", "campaign_id": row.get("campaign_id"), "nm_id": row.get("nm_id"),
+                    "article": row.get("supplier_article"), "norm_query": "", "old_bid": row.get("campaign_bid"), "new_bid": row.get("campaign_target_bid"),
+                    "action": "raise" if _v85_as_float(row.get("campaign_target_bid")) > _v85_as_float(row.get("campaign_bid")) else "lower",
+                    "reason_code": row.get("campaign_reason_code"), "reason_text": row.get("campaign_reason"), "api_status": log.get("api_status"),
+                    "baseline_impressions": row.get("impressions"), "baseline_clicks": row.get("clicks"), "baseline_spend": row.get("spend"),
+                    "baseline_position": 0, "baseline_visibility": 0, "postcheck_status": "pending",
+                })
+
+            campaigns_df = pd.DataFrame(campaign_rows)
+            queries_df = pd.DataFrame(query_rows)
+            minus_df = pd.DataFrame(minus_rows)
+            api_log_df = pd.DataFrame(all_api_logs)
+            changes_count = len(query_apply) + len(campaign_apply)
+            summary = pd.DataFrame({
+                "metric": ["version", "store", "mode", "campaigns", "queries", "query_bid_changes", "campaign_bid_changes", "minus_candidates", "baseline_runs_before", "baseline_ready"],
+                "value": [SCRIPT_VERSION, store, mode, len(campaigns_df), len(queries_df), len(query_apply), len(campaign_apply), len(minus_df), run_count_before, baseline_ready_store],
+            })
+            local_out = workdir / f"CPM_адаптивное_управление_{store}.xlsx"
+            _v90_output_workbook(local_out, summary, campaigns_df, queries_df, minus_df, missing, budgets, db, store, api_log_df, cfg)
+            upload_s3_bytes(s3, bucket, store_cfg["manager_output_key"], local_out.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            shutil.copy2(local_out, Path.cwd() / local_out.name)
+            db.finish_run(run_id, len(campaigns_df), len(queries_df), changes_count, "ok", f"mode={mode}")
+            _v90_s3_upload_state(s3, bucket, store_cfg["state_db_key"], state_path)
+            print(f"V90 {store}: campaigns={len(campaigns_df)}, queries={len(queries_df)}, changes={changes_count}, output={local_out.name}")
+            return 0
+    except Exception as exc:
+        db.finish_run(run_id, 0, 0, 0, "error", repr(exc))
+        try:
+            _v90_s3_upload_state(s3, bucket, store_cfg["state_db_key"], state_path)
+        except Exception:
+            pass
+        raise
+    finally:
+        db.close()
+
+
+def run_adaptive_cpm_v90(args: argparse.Namespace) -> int:
+    store_arg = str(getattr(args, "store", "TOPFACE") or "TOPFACE").upper()
+    stores = ["TOPFACE", "FINICK"] if store_arg == "ALL" else [store_arg]
+    result = 0
+    for store in stores:
+        result = max(result, run_adaptive_cpm_store_v90(args, store))
+    return result
+
+
+def build_adaptive_cpm_parser_v90() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="WB Ads V90: двухчасовой CPM manager по РК и отдельным запросам")
+    p.add_argument("--store", choices=["TOPFACE", "FINICK", "ALL", "topface", "finick", "all"], default="TOPFACE")
+    p.add_argument("--config", default=os.getenv("WB_ADS_V90_CONFIG", ""))
+    p.add_argument("--state-dir", default=os.getenv("WB_ADS_STATE_DIR", ".wb_ads_state"))
+    p.add_argument("--campaign-map", default=os.getenv("WB_ADS_CAMPAIGN_MAP", ""), help='JSON {"901/2":123,"901/14":456} или 901/2:123;901/14:456')
+    p.add_argument("--apply-query-bids", "--apply-cpm-bids", dest="apply_query_bids", action="store_true", help="Реально менять ставки отдельных запросов")
+    p.add_argument("--apply-campaign-bids", action="store_true", help="Реально менять общую поисковую ставку РК")
+    p.add_argument("--apply-minus", "--apply-cpm-minus", dest="apply_minus", action="store_true", help="Реально отправлять нерелевантные запросы в минус")
+    p.add_argument("--campaigns", default="", help="Совместимость со старым workflow; V90 предпочитает автообнаружение/--campaign-map")
+    p.add_argument("--nm-map", default="", help="Совместимость со старым workflow")
+    p.add_argument("--allow-sets", action="store_true", help="Совместимость со старым workflow; профили V90 всё равно решают семантику")
+    p.add_argument("--min-bid", type=int, default=int(os.getenv("CPM_MIN_BID_RUB", CPM_MIN_BID_RUB_DEFAULT)))
+    p.add_argument("--bid-step", type=int, default=int(os.getenv("CPM_BID_STEP_RUB", "20")), help="Совместимость; рабочий шаг задаётся config V90")
+    p.add_argument("--max-bid", type=int, default=int(os.getenv("CPM_MAX_BID_RUB", "1500")), help="Совместимость; рабочий максимум задаётся config V90")
+    p.add_argument("--max-cpo", type=float, default=float(os.getenv("CPM_MAX_CPO_RUB", "160")), help="Совместимость; V90 оценивает ДРР через бюджет/среднюю цену")
+    p.add_argument("--stats-days", type=int, default=int(os.getenv("CPM_STATS_DAYS", "7")))
+    return p
+
+
+# ----- V90 pause policy for the legacy CPC / shelves contour -----
+_LOAD_PAUSE_HISTORY_PRE_V90 = load_pause_history
+_APPLY_FLAGSHIP_PRE_V90 = apply_flagship_core_priority_v79
+LAST_PAUSE_HISTORY_V90 = pd.DataFrame()
+
+
+def load_pause_history(path: Optional[str]) -> pd.DataFrame:
+    global LAST_PAUSE_HISTORY_V90
+    LAST_PAUSE_HISTORY_V90 = _LOAD_PAUSE_HISTORY_PRE_V90(path)
+    return LAST_PAUSE_HISTORY_V90
+
+
+def _v90_last_pause_row(campaign_id: int) -> Dict[str, Any]:
+    if LAST_PAUSE_HISTORY_V90 is None or LAST_PAUSE_HISTORY_V90.empty:
+        return {}
+    p = LAST_PAUSE_HISTORY_V90[LAST_PAUSE_HISTORY_V90["campaign_id"].eq(int(campaign_id))].copy()
+    if p.empty:
+        return {}
+    p["_dt"] = pd.to_datetime(p.get("pause_date"), errors="coerce")
+    return p.sort_values("_dt").iloc[-1].to_dict()
+
+
+def _v90_is_cpc_row(row: pd.Series) -> bool:
+    text = " ".join(str(row.get(c, "") or "") for c in ["payment_type", "bid_type", "placement"]).lower()
+    return "cpc" in text or str(row.get("placement", "")).lower() == "search"
+
+
+def _v90_is_shelves_row(row: pd.Series) -> bool:
+    text = " ".join(str(row.get(c, "") or "") for c in ["payment_type", "bid_type", "placement", "campaign_name"]).lower()
+    return any(x in text for x in ["recommend", "рекоменд", "полк", "combined", "единая"])
+
+
+def _v90_bid_at_min(row: pd.Series) -> Tuple[bool, int]:
+    if _v90_is_cpc_row(row) and not _v90_is_shelves_row(row):
+        min_bid = SEARCH_MIN_BID_RUB
+    else:
+        min_bid = COMBINED_MIN_BID_RUB
+    bid = pd.to_numeric(row.get("real_bid_rub", row.get("new_bid_rub", np.nan)), errors="coerce")
+    return bool(pd.notna(bid) and float(bid) <= float(min_bid)), int(min_bid)
+
+
+def apply_flagship_core_priority_v79(decisions: pd.DataFrame, flagship_pairs: pd.DataFrame) -> pd.DataFrame:
+    """V90: no mass closure. Pause only CPC or shelves at minimum bid, DRR>15%, spend>3000/week."""
+    out = _APPLY_FLAGSHIP_PRE_V90(decisions, flagship_pairs)
+    if out is None or out.empty:
+        return out
+    for idx, row in out.iterrows():
+        article = _v90_article(row.get("supplier_article", ""))
+        cid = _clean_int(row.get("campaign_id"))
+        paused = _v86_is_paused_status(row.get("campaign_status", "")) or str(row.get("action", "")).lower() == "hold_paused"
+        bid = pd.to_numeric(row.get("real_bid_rub", row.get("new_bid_rub", np.nan)), errors="coerce")
+
+        # 901/11 was manually closed by the user and must never be restarted.
+        if article in V90_BLOCKED_ARTICLES:
+            out.at[idx, "action"] = "hold_paused" if paused else "hold"
+            out.at[idx, "new_bid_rub"] = bid
+            out.at[idx, "reason_code"] = "ARTICLE_901_11_MANUALLY_CLOSED_V90"
+            out.at[idx, "reason_text"] = "901/11 закрыт пользователем: start/pause/raise/lower запрещены"
+            continue
+
+        # New CPM search flagships are managed by the adaptive manager, not by legacy economic actions.
+        if article in V90_TOPFACE_CPM_ARTICLES and _v90_is_shelves_row(row):
+            if not paused:
+                out.at[idx, "action"] = "hold"
+                out.at[idx, "new_bid_rub"] = bid
+                out.at[idx, "reason_code"] = "MANAGED_BY_ADAPTIVE_CPM_V90"
+                out.at[idx, "reason_text"] = "Ставки CPM-флагмана и его запросов управляются отдельным двухчасовым V90-контуром"
+            continue
+
+        # Remove the obsolete hard floor of 10 rubles for CPC flagships.
+        if str(row.get("reason_code", "")) in {"ACTIVE_FLAGSHIP_SEARCH_MIN10_RAISE", "FLAGSHIP_CORE_MIN10_RAISE"}:
+            out.at[idx, "action"] = "hold"
+            out.at[idx, "new_bid_rub"] = bid
+            out.at[idx, "reason_code"] = "CPC_MIN10_RULE_REMOVED_V90"
+            out.at[idx, "reason_text"] = "Правило обязательной ставки 10 ₽ отменено; минимальная ставка CPC — 4 ₽"
+
+        eligible_type = _v90_is_cpc_row(row) or _v90_is_shelves_row(row)
+        at_min, min_bid = _v90_bid_at_min(row)
+        spend7 = _v85_as_float(row.get("spend_7d"), 0.0)
+        drr7 = _v85_as_float(row.get("drr_pct_7d"), float("nan"))
+        orders14 = _v85_as_float(row.get("orders_14d"), 0.0)
+        drr14 = _v85_as_float(row.get("drr_pct_14d"), float("nan"))
+
+        if paused:
+            last_pause = _v90_last_pause_row(cid) if cid else {}
+            reason = str(last_pause.get("reason_code", ""))
+            pause_date = pd.to_datetime(last_pause.get("pause_date"), errors="coerce")
+            days_paused = (pd.Timestamp(_now_msk().date()) - pause_date.normalize()).days if pd.notna(pause_date) else 0
+            if reason == V90_AUTO_PAUSE_REASON:
+                if days_paused >= 10 and orders14 > 0 and pd.notna(drr14) and drr14 <= V90_PAUSE_DRR_PCT:
+                    out.at[idx, "action"] = "start"
+                    out.at[idx, "new_bid_rub"] = min_bid
+                    out.at[idx, "reason_code"] = V90_AUTO_START_REASON
+                    out.at[idx, "reason_text"] = f"После паузы прошло {days_paused} дней, заказы дозрели и ДРР14={drr14:.1f}% <=15%; запуск на минимальной ставке"
+                else:
+                    out.at[idx, "action"] = "hold_paused"
+                    out.at[idx, "new_bid_rub"] = min_bid
+                    out.at[idx, "reason_code"] = "WAIT_MATURED_ORDERS_AFTER_AUTO_PAUSE_V90"
+                    out.at[idx, "reason_text"] = f"Автопауза: ждём 7+3 и дозревание заказов; days={days_paused}, orders14={orders14:.0f}, drr14={drr14 if pd.notna(drr14) else 'н/д'}"
+            else:
+                out.at[idx, "action"] = "hold_paused"
+                out.at[idx, "new_bid_rub"] = bid
+                out.at[idx, "reason_code"] = "MANUAL_PAUSE_RESPECTED_V90"
+                out.at[idx, "reason_text"] = "Пауза не создана V90-кодом; автоматический start запрещён"
+            continue
+
+        if eligible_type and at_min and spend7 > V90_PAUSE_WEEKLY_SPEND_RUB and pd.notna(drr7) and drr7 > V90_PAUSE_DRR_PCT:
+            out.at[idx, "action"] = "pause"
+            out.at[idx, "new_bid_rub"] = min_bid
+            out.at[idx, "reason_code"] = V90_AUTO_PAUSE_REASON
+            out.at[idx, "reason_text"] = f"Минимальная ставка {min_bid} ₽, расход7={spend7:.0f} ₽ >3000 и ДРР7={drr7:.1f}% >15%; разрешена автопауза CPC/полок"
+    return out
+
+
+_MAIN_PRE_V90 = main
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in {"adaptive-cpm-manager", "adaptive_cpm_manager", "cpm-manager-v90", "cpm-v90"}:
+        parser = build_adaptive_cpm_parser_v90()
+        args = parser.parse_args(argv[1:])
+        return run_adaptive_cpm_v90(args)
+    if argv and argv[0] == "cpm-manager":
+        # cpm-manager now points to V90. Legacy remains available explicitly.
+        parser = build_adaptive_cpm_parser_v90()
+        args = parser.parse_args(argv[1:])
+        return run_adaptive_cpm_v90(args)
+    if argv and argv[0] == "cpm-manager-legacy":
+        parser = build_cpm_manager_parser()
+        args = parser.parse_args(argv[1:])
+        return run_cpm_query_manager(args)
+    return _MAIN_PRE_V90(argv)
+
 if __name__ == "__main__":
     raise SystemExit(main())
