@@ -1,0 +1,59 @@
+name: Ozon — Остатки и оборачиваемость
+
+on:
+  workflow_dispatch:
+    inputs:
+      store:
+        description: "Магазин"
+        required: true
+        default: "FINICK"
+        type: choice
+        options:
+          - FINICK
+          - TOPFACE
+      target_date:
+        description: "Дата отчёта YYYY-MM-DD; пусто = вчера по Москве"
+        required: false
+        default: ""
+        type: string
+  schedule:
+    # 10:15 по Москве ежедневно.
+    - cron: "15 7 * * *"
+
+jobs:
+  stock-turnover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests boto3 pandas openpyxl lxml html5lib beautifulsoup4
+
+      - name: Сформировать сводный отчёт
+        env:
+          REPORT_ENV: ${{ secrets.REPORT_ENV }}
+          OZON_CLIENT_ID_FINICK: ${{ secrets.OZON_CLIENT_ID_FINICK }}
+          OZON_API_KEY_FINICK: ${{ secrets.OZON_API_KEY_FINICK }}
+          OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
+          OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
+          YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+          YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+          YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+          YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
+          OZON_CROSSDOCK_SLA_JSON: ${{ secrets.OZON_CROSSDOCK_SLA_JSON }}
+          OZON_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.store || 'FINICK' }}
+          OZON_TARGET_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.target_date || '' }}
+        run: |
+          python ozon_stock_turnover_summary.py
