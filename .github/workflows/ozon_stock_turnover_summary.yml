@@ -1,4 +1,4 @@
-# version: v1.4
+# version: v1.6
 # В GitHub этот файл должен называться:
 # .github/workflows/ozon_stock_turnover_summary.yml
 
@@ -69,7 +69,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "WORKFLOW_VERSION=stock_summary_v1_4_store_selector_fbo_limit_clusters"
+          echo "WORKFLOW_VERSION=stock_summary_v1_6_quantity_cluster_supply_crossdock_sla"
           echo "STORE_INPUT=${STORE_INPUT}"
           echo "OZON_TARGET_DATE=${OZON_TARGET_DATE:-}"
           if [ ! -f "ozon_stock_turnover_summary.py" ]; then
