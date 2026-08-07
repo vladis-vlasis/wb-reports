@@ -1,8 +1,21 @@
+# version: v1.4
+# В GitHub этот файл должен называться:
+# .github/workflows/ozon_stock_turnover_summary.yml
+
 name: Ozon — Остатки и оборачиваемость
 
 on:
   workflow_dispatch:
     inputs:
+      store:
+        description: "Магазин / бренд Ozon"
+        required: true
+        default: "FINICK"
+        type: choice
+        options:
+          - FINICK
+          - TOPFACE
+          - ALL
       target_date:
         description: "Дата отчёта YYYY-MM-DD. Пусто = вчера по Москве"
         required: false
@@ -10,34 +23,41 @@ on:
         type: string
 
   schedule:
-    # 09:15 МСК ежедневно = 06:15 UTC
+    # 09:15 МСК ежедневно = 06:15 UTC. Автозапуск считает оба Ozon-магазина.
     - cron: "15 6 * * *"
 
 concurrency:
-  group: ozon-stock-turnover-summary-${{ github.ref }}
+  group: ozon-stock-turnover-summary-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
   run:
-    name: Остатки и оборачиваемость FINICK
+    name: Остатки и оборачиваемость Ozon
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       TZ: Europe/Moscow
-      OZON_STORE: FINICK
+      STORE_INPUT: ${{ github.event_name == 'schedule' && 'ALL' || github.event.inputs.store || 'FINICK' }}
       OZON_TARGET_DATE: ${{ github.event.inputs.target_date || '' }}
 
-      # Ключи лежат так же, как в действующих workflow проекта:
-      # часть может быть отдельными GitHub Secrets, часть — внутри REPORT_ENV.
+      # Ключи Object Storage — как в действующих workflow.
       REPORT_ENV: ${{ secrets.REPORT_ENV }}
       YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
       YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
-      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
-      YC_ENDPOINT_URL: ${{ secrets.YC_ENDPOINT_URL }}
 
+      # Ozon хранится в отдельном бакете.
+      YC_BUCKET_NAME: ozon-assist
+      YC_ENDPOINT_URL: https://storage.yandexcloud.net
+
+      # Два реально используемых Ozon-магазина.
       OZON_CLIENT_ID_FINICK: ${{ secrets.OZON_CLIENT_ID_FINICK }}
       OZON_API_KEY_FINICK: ${{ secrets.OZON_API_KEY_FINICK }}
+      OZON_CLIENT_ID_TOPFACE: ${{ secrets.OZON_CLIENT_ID_TOPFACE }}
+      OZON_API_KEY_TOPFACE: ${{ secrets.OZON_API_KEY_TOPFACE }}
+
+      # Если позже вручную зададим нормативы кросс-дока, скрипт их тоже подхватит.
+      OZON_CROSSDOCK_SLA_JSON: ${{ secrets.OZON_CROSSDOCK_SLA_JSON }}
 
       PYTHONUNBUFFERED: "1"
 
@@ -49,8 +69,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "WORKFLOW_VERSION=stock_summary_v1_3_report_env_fix"
-          echo "OZON_STORE=${OZON_STORE}"
+          echo "WORKFLOW_VERSION=stock_summary_v1_4_store_selector_fbo_limit_clusters"
+          echo "STORE_INPUT=${STORE_INPUT}"
           echo "OZON_TARGET_DATE=${OZON_TARGET_DATE:-}"
           if [ ! -f "ozon_stock_turnover_summary.py" ]; then
             echo "ERROR: ozon_stock_turnover_summary.py not found in repo root"
@@ -68,15 +88,15 @@ jobs:
           allowed = [
               "YC_ACCESS_KEY_ID",
               "YC_SECRET_ACCESS_KEY",
-              "YC_BUCKET_NAME",
-              "YC_ENDPOINT_URL",
               "OZON_CLIENT_ID_FINICK",
               "OZON_API_KEY_FINICK",
+              "OZON_CLIENT_ID_TOPFACE",
+              "OZON_API_KEY_TOPFACE",
+              "OZON_CROSSDOCK_SLA_JSON",
           ]
 
           report_env = os.getenv("REPORT_ENV", "") or ""
           parsed = {}
-
           for raw_line in report_env.splitlines():
               line = raw_line.strip()
               if not line or line.startswith("#"):
@@ -96,6 +116,7 @@ jobs:
               for key in allowed:
                   value = (os.getenv(key) or parsed.get(key) or "").strip()
                   if value:
+                      # Многострочные значения здесь не ожидаются.
                       f.write(f"{key}={value}\n")
                       loaded.append(key)
 
@@ -109,21 +130,23 @@ jobs:
           python - <<'PY'
           import os
 
-          required = [
-              "YC_ACCESS_KEY_ID",
-              "YC_SECRET_ACCESS_KEY",
-              "YC_BUCKET_NAME",
-              "OZON_CLIENT_ID_FINICK",
-              "OZON_API_KEY_FINICK",
-          ]
+          store = (os.getenv("STORE_INPUT") or "FINICK").upper()
+          required = ["YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY"]
+          stores = ["FINICK", "TOPFACE"] if store == "ALL" else [store]
+          allowed_stores = {"FINICK", "TOPFACE"}
+          unknown = [x for x in stores if x not in allowed_stores]
+          if unknown:
+              raise SystemExit("Неизвестный Ozon-магазин: " + ", ".join(unknown))
+
+          for s in stores:
+              required.extend([f"OZON_CLIENT_ID_{s}", f"OZON_API_KEY_{s}"])
 
           missing = [name for name in required if not (os.getenv(name) or "").strip()]
           if missing:
               raise SystemExit("Missing env/secrets after REPORT_ENV load: " + ", ".join(missing))
 
-          print("All required secrets are present after REPORT_ENV load.")
-          print("YC_BUCKET_NAME length:", len(os.getenv("YC_BUCKET_NAME", "")))
-          print("OZON_CLIENT_ID_FINICK length:", len(os.getenv("OZON_CLIENT_ID_FINICK", "")))
+          print("All required secrets are present.")
+          print("Stores to run:", ", ".join(stores))
           PY
 
       - name: Setup Python
@@ -136,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz
+          python -m pip install pandas openpyxl xlsxwriter requests boto3 python-dateutil numpy pytz lxml html5lib
 
       - name: Validate Python syntax
         shell: bash
@@ -148,8 +171,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ARGS=(--store FINICK)
-          if [[ -n "${OZON_TARGET_DATE:-}" ]]; then
-            ARGS+=(--target-date "$OZON_TARGET_DATE")
+
+          if [[ "${STORE_INPUT}" == "ALL" ]]; then
+            STORES=(FINICK TOPFACE)
+          else
+            STORES=("${STORE_INPUT}")
           fi
-          python ozon_stock_turnover_summary.py "${ARGS[@]}"
+
+          for STORE in "${STORES[@]}"; do
+            echo "============================================================"
+            echo "Запуск магазина: ${STORE}"
+            echo "============================================================"
+            ARGS=(--store "${STORE}")
+            if [[ -n "${OZON_TARGET_DATE:-}" ]]; then
+              ARGS+=(--target-date "${OZON_TARGET_DATE}")
+            fi
+            python ozon_stock_turnover_summary.py "${ARGS[@]}"
+          done
