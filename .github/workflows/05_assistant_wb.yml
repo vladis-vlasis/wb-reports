@@ -1,0 +1,232 @@
+name: Ассистент WB
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Что запустить"
+        required: true
+        default: "analytics"
+        type: choice
+        options:
+          - analytics
+          - clean_queries
+          - all
+      apply_clean:
+        description: "При ручном запуске реально минусовать нерелевантные CPM-запросы"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # GitHub cron = UTC, Москва = UTC+3.
+    # Аналитика: 09:05, 12:05, 16:05 МСК.
+    - cron: "5 6,9,13 * * *"
+    # Только чистка CPM-запросов: каждые 2 часа, ставки не меняем.
+    - cron: "15 */2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: assistant-wb-finick-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  TZ: "Europe/Moscow"
+  PYTHONUNBUFFERED: "1"
+  ASSISTANT_SCRIPT: "assistant_wb.py"
+  ADS_SCRIPT: "upravlenie_reklamoy.py"
+  ADS_CONFIG: "wb_ads_v90_config.json"
+
+jobs:
+  assistant_wb:
+    name: Ассистент WB
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      # Прямые secrets + fallback из REPORT_ENV, как в старом рабочем workflow.
+      REPORT_ENV: ${{ secrets.REPORT_ENV }}
+      YC_ACCESS_KEY_ID: ${{ secrets.YC_ACCESS_KEY_ID }}
+      YC_SECRET_ACCESS_KEY: ${{ secrets.YC_SECRET_ACCESS_KEY }}
+      YC_BUCKET_NAME: ${{ secrets.YC_BUCKET_NAME }}
+      YC_S3_ENDPOINT: ${{ secrets.YC_S3_ENDPOINT }}
+      FINICK_API_WB: ${{ secrets.FINICK_API_WB }}
+
+    steps:
+      - name: Забрать код
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Установить зависимости
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pandas numpy openpyxl xlsxwriter boto3 requests python-dateutil pytz reportlab
+
+      - name: Подхватить секреты из REPORT_ENV
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          allowed = [
+              "YC_ACCESS_KEY_ID",
+              "YC_SECRET_ACCESS_KEY",
+              "YC_BUCKET_NAME",
+              "YC_S3_ENDPOINT",
+              "FINICK_API_WB",
+          ]
+
+          raw = os.getenv("REPORT_ENV", "") or ""
+          parsed = {}
+          for raw_line in raw.splitlines():
+              line = raw_line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              if line.startswith("export "):
+                  line = line[7:].strip()
+              if "=" not in line:
+                  continue
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip().strip('"').strip("'")
+              if key in allowed and value:
+                  parsed[key] = value
+
+          github_env = os.environ["GITHUB_ENV"]
+          loaded = []
+          with open(github_env, "a", encoding="utf-8") as f:
+              for key in allowed:
+                  value = os.getenv(key) or parsed.get(key)
+                  if value:
+                      # Многострочные значения сюда не пишем; эти секреты однострочные.
+                      f.write(f"{key}={value}\n")
+                      loaded.append(key)
+
+          print("Доступные секреты: " + ", ".join(loaded))
+          PY
+
+      - name: Определить режим запуска
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+
+          event = "${{ github.event_name }}"
+          schedule = "${{ github.event.schedule }}"
+          manual_mode = "${{ inputs.mode }}" or "analytics"
+          manual_apply = "${{ inputs.apply_clean }}".lower() == "true"
+
+          run_analytics = False
+          run_clean = False
+          apply_clean = False
+
+          if event == "schedule":
+              if schedule == "5 6,9,13 * * *":
+                  run_analytics = True
+              elif schedule == "15 */2 * * *":
+                  run_clean = True
+                  apply_clean = True
+          else:
+              if manual_mode in {"analytics", "all"}:
+                  run_analytics = True
+              if manual_mode in {"clean_queries", "all"}:
+                  run_clean = True
+                  apply_clean = manual_apply
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"RUN_ANALYTICS={'true' if run_analytics else 'false'}\n")
+              f.write(f"RUN_CLEAN={'true' if run_clean else 'false'}\n")
+              f.write(f"APPLY_CLEAN={'true' if apply_clean else 'false'}\n")
+
+          print(f"RUN_ANALYTICS={run_analytics}")
+          print(f"RUN_CLEAN={run_clean}")
+          print(f"APPLY_CLEAN={apply_clean}")
+          PY
+
+      - name: Проверить файлы и секреты
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${ASSISTANT_SCRIPT}" || { echo "Нет ${ASSISTANT_SCRIPT} в корне репозитория"; exit 1; }
+
+          if [[ "${RUN_CLEAN}" == "true" ]]; then
+            test -f "${ADS_SCRIPT}" || { echo "Нет ${ADS_SCRIPT}; чистка запросов не может запуститься"; exit 1; }
+          fi
+
+          python -m py_compile "${ASSISTANT_SCRIPT}"
+          if [[ "${RUN_CLEAN}" == "true" ]]; then
+            python -m py_compile "${ADS_SCRIPT}"
+          fi
+
+          python - <<'PY'
+          import os
+          required = ["YC_ACCESS_KEY_ID", "YC_SECRET_ACCESS_KEY", "YC_BUCKET_NAME"]
+          if os.getenv("RUN_CLEAN") == "true":
+              required.append("FINICK_API_WB")
+          missing = [x for x in required if not os.getenv(x)]
+          if missing:
+              raise SystemExit("Не хватает secrets: " + ", ".join(missing))
+          print("Секреты для выбранного режима есть.")
+          PY
+
+      - name: Аналитика рекламы FINICK
+        if: env.RUN_ANALYTICS == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p assistant_output
+          python "${ASSISTANT_SCRIPT}" --out-dir assistant_output
+
+      - name: Чистка CPM-запросов FINICK
+        if: env.RUN_CLEAN == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXTRA=()
+          if [[ -f "${ADS_CONFIG}" ]]; then
+            EXTRA+=(--config "${ADS_CONFIG}")
+          fi
+          if [[ "${APPLY_CLEAN}" == "true" ]]; then
+            EXTRA+=(--apply-minus)
+          fi
+
+          # ВАЖНО: флагов --apply-query-bids / --apply-campaign-bids здесь нет.
+          # Этот запуск может только чистить запросы, ставки не меняет.
+          python "${ADS_SCRIPT}" cpm-manager \
+            --store FINICK \
+            --state-dir .wb_ads_state \
+            "${EXTRA[@]}"
+
+      - name: Загрузить аналитические файлы в GitHub Artifacts
+        if: always() && env.RUN_ANALYTICS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ассистент-WB-FINICK-Реклама
+          path: |
+            assistant_output/Ассистент_WB_FINICK_Реклама_технический.xlsx
+            assistant_output/Ассистент_WB_FINICK_Реклама_ui.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Итог
+        if: always()
+        shell: bash
+        run: |
+          echo "## Ассистент WB" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Магазин: **FINICK**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Аналитика: **${RUN_ANALYTICS}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Чистка запросов: **${RUN_CLEAN}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Реальная минусовка: **${APPLY_CLEAN}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Ставки этим workflow **не меняются**." >> "$GITHUB_STEP_SUMMARY"
