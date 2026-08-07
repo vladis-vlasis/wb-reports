@@ -1,4 +1,4 @@
-# version: v37_finick_free_history
+# version: v40_fbs_adverts_lag14
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -62,6 +62,8 @@ jobs:
       WB_PROMO_KEY_TOPFACE: ${{ secrets.WB_PROMO_KEY_TOPFACE }}
       WB_KEY_MISSTAIS: ${{ secrets.WB_KEY_MISSTAIS }}
       FINICK_API_WB: ${{ secrets.FINICK_API_WB }}
+      WB_MARKETPLACE_KEY_TOPFACE: ${{ secrets.WB_MARKETPLACE_KEY_TOPFACE }}
+      WB_MARKETPLACE_KEY_MISSTAIS: ${{ secrets.WB_MARKETPLACE_KEY_MISSTAIS }}
       WB_FINANCE_KEY_TOPFACE: ${{ secrets.WB_FINANCE_KEY_TOPFACE }}
       WB_FINANCE_KEY_MISSTAIS: ${{ secrets.WB_FINANCE_KEY_MISSTAIS }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -76,7 +78,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "YML_VERSION=v37_finick_free_history"
+          echo "YML_VERSION=v40_fbs_adverts_lag14"
           echo "github.event_name=${{ github.event_name }}"
           echo "github.event.schedule=${{ github.event.schedule }}"
           echo "STORE_INPUT=${STORE_INPUT}"
@@ -103,6 +105,8 @@ jobs:
               "WB_PROMO_KEY_TOPFACE",
               "WB_KEY_MISSTAIS",
               "FINICK_API_WB",
+              "WB_MARKETPLACE_KEY_TOPFACE",
+              "WB_MARKETPLACE_KEY_MISSTAIS",
               "WB_FINANCE_KEY_TOPFACE",
               "WB_FINANCE_KEY_MISSTAIS",
               "TELEGRAM_BOT_TOKEN",
@@ -292,7 +296,7 @@ jobs:
 
           key = os.environ["SCHEDULE_LOCK_KEY"]
           payload = {
-              "workflow_version": "v37_finick_free_history",
+              "workflow_version": "v40_fbs_adverts_lag14",
               "target_date": os.environ.get("WB_TARGET_DATE"),
               "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
               "store_input": os.environ.get("STORE_INPUT"),
