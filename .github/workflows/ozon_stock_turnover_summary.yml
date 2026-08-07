@@ -17,7 +17,6 @@ on:
         default: ""
         type: string
   schedule:
-    # 10:15 по Москве ежедневно.
     - cron: "15 7 * * *"
 
 jobs:
@@ -41,6 +40,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests boto3 pandas openpyxl lxml html5lib beautifulsoup4
 
+      - name: Проверить наличие скрипта
+        shell: bash
+        run: |
+          echo "Корень репозитория: $GITHUB_WORKSPACE"
+          echo "Найденные Python-файлы:"
+          find . -maxdepth 4 -type f -name "*.py" -print
+          if [ ! -f "ozon_stock_turnover_summary.py" ]; then
+            echo "ОШИБКА: в корне репозитория нет файла ozon_stock_turnover_summary.py"
+            exit 1
+          fi
+
       - name: Сформировать сводный отчёт
         env:
           REPORT_ENV: ${{ secrets.REPORT_ENV }}
@@ -55,5 +65,4 @@ jobs:
           OZON_CROSSDOCK_SLA_JSON: ${{ secrets.OZON_CROSSDOCK_SLA_JSON }}
           OZON_STORE: ${{ github.event_name == 'workflow_dispatch' && inputs.store || 'FINICK' }}
           OZON_TARGET_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.target_date || '' }}
-        run: |
-          python ozon_stock_turnover_summary.py
+        run: python ozon_stock_turnover_summary.py
