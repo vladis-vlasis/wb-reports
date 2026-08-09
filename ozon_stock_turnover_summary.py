@@ -14,12 +14,12 @@
 - среднесуточные продажи за 7 дней по артикулу и по кластеру;
 - доступный остаток FBO сейчас;
 - товары в пути внутри Ozon и возвраты покупателей на склад;
-- активные FBO-заявки продавца через рабочую связку /v3/supply-order/list -> /v3/supply-order/get;
+- активные FBO-заявки продавца через рабочую связку /v3/supply-order/list -> /v3/supply-order/get (только для ETA/статуса, без повторного прибавления количества к остатку);
 - состав активных поставок через /v1/supply-order/bundle;
 - дату отгрузки из timeslot поставки;
 - плановую дату прибытия: сначала из API, если она есть, иначе дата отгрузки + норматив кросс-дока;
 - самый свежий процент выкупа по артикулу: последние 50 завершённых единиц (delivered/cancelled), ClientReturn учитывается как невыкуп;
-- запас в днях сейчас и с учётом пути/активных заявок;
+- запас в днях сейчас и с учётом фактического пути Ozon;
 - прогноз дефицита по кластерам;
 - готовые признаки критичности товара и кластера для Control Center;
 - минимальный запас по продающим кластерам и готовый список проблемных кластеров.
@@ -53,7 +53,7 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_9_20260809"
+SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_10_20260809"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -1716,12 +1716,15 @@ class ReportBuilder:
             current = int(s["Доступно сейчас, шт."].sum()) if not s.empty else 0
             ret = int(t["Возврат покупателя в пути, шт."].sum()) if not t.empty else 0
             internal = int(t["Перемещение внутри Ozon, шт."].sum()) if not t.empty else 0
+            # ВАЖНО: количество в активных supply-order и promised_amount не прибавляем
+            # к остатку повторно. Фактический товар в пути уже приходит из
+            # /v1/analytics/stocks.transit_stock_count. Supply-order нужен только
+            # для статуса/ETA и диагностики.
             physical = int(sp.loc[sp["Уже передано Ozon"] == "Да", "Количество, шт."].sum()) if not sp.empty else 0
             requests = int(sp.loc[sp["Уже передано Ozon"] == "Нет", "Количество, шт."].sum()) if not sp.empty else 0
             supply_api_qty = int(sp["Количество, шт."].sum()) if not sp.empty else 0
             promised = int(s["Подтверждено Ozon в поставках, шт."].sum()) if (not s.empty and "Подтверждено Ozon в поставках, шт." in s.columns) else 0
-            promised_fallback = max(0, promised - supply_api_qty)
-            future = current + ret + internal + supply_api_qty + promised_fallback
+            future = current + ret + internal
             sold7 = int(sc["Заказано за 7 дней, шт."].sum()) if not sc.empty else 0
             avg = round(sold7 / 7, 1)
             days_now = int(round(current / avg)) if avg > 0 else None
@@ -1786,19 +1789,20 @@ class ReportBuilder:
                 "Выкуп, % (последние завершённые)": buyout_pct,
                 "База выкупа, шт.": buyout_base,
                 "Среднесуточные продажи за 7 дней, шт.": avg,
-                "Запас, дней: сейчас (с учётом пути и заявок)": f"{days_now if days_now is not None else '—'} ({days_future if days_future is not None else '—'})",
-                "Остаток, шт.: сейчас (с учётом пути и заявок)": f"{current} ({future})",
+                "Запас, дней: сейчас (с учётом пути)": f"{days_now if days_now is not None else '—'} ({days_future if days_future is not None else '—'})",
+                "Остаток, шт.: сейчас (с учётом пути)": f"{current} ({future})",
                 "Название товара": name,
                 "Заказано за 7 дней, шт.": sold7,
                 "Доступно к продаже сейчас, шт.": current,
                 "Возвраты покупателей в пути на склад Ozon, шт.": ret,
                 "Перемещение между складами Ozon, шт.": internal,
-                "Поставки уже переданы Ozon, шт.": physical,
-                "Активные заявки, ещё не переданы Ozon, шт.": requests,
-                "Подтверждено Ozon, но не найдено в API заявок, шт.": promised_fallback,
-                "Итого с учётом пути и заявок, шт.": future,
+                "Supply-order: уже передано Ozon, шт. (справочно)": physical,
+                "Supply-order: ещё не передано Ozon, шт. (справочно)": requests,
+                "Supply-order всего, шт. (справочно)": supply_api_qty,
+                "promised_amount Ozon, шт. (справочно)": promised,
+                "Итого с учётом пути, шт.": future,
                 "Запас сейчас, дней": days_now,
-                "Запас с учётом пути и заявок, дней": days_future,
+                "Запас с учётом пути, дней": days_future,
                 "Дата отчёта": self.target_date,
             })
         df = pd.DataFrame(rows)
@@ -1829,33 +1833,56 @@ class ReportBuilder:
             cluster_internal = int(t["Перемещение внутри Ozon, шт."].sum()) if not t.empty else 0
             sold7 = int(sale["Заказано за 7 дней, шт."].sum()) if not sale.empty else 0
             avg = round(sold7 / 7, 1)
+            # Реальный путь берём только из analytics/stocks. supply-order и
+            # promised_amount остаются справочными/прогнозными источниками и не
+            # увеличивают остаток повторно.
             future_supply = int(sp["Количество, шт."].sum()) if not sp.empty else 0
+            physical_supply = int(sp.loc[sp["Уже передано Ozon"] == "Да", "Количество, шт."].sum()) if not sp.empty else 0
+            planned_supply = int(sp.loc[sp["Уже передано Ozon"] == "Нет", "Количество, шт."].sum()) if not sp.empty else 0
             promised = int(s["Подтверждено Ozon в поставках, шт."].sum()) if (not s.empty and "Подтверждено Ozon в поставках, шт." in s.columns) else 0
-            promised_fallback = max(0, promised - future_supply)
-            future_total = current + cluster_returns + cluster_internal + future_supply + promised_fallback
+            future_total = current + cluster_returns + cluster_internal
             days_now = int(round(current / avg)) if avg > 0 else None
             days_future = int(round(future_total / avg)) if avg > 0 else None
             depletion = self.target_date + timedelta(days=math.ceil(current / avg)) if avg > 0 else None
 
+            # Для прогноза ETA можно использовать supply-order, но физически уже
+            # переданные Ozon количества ограничиваем transit_stock_count этого
+            # кластера. Так одна и та же поставка не может попасть в прогноз дважды.
             events: List[Tuple[date, int, str]] = []
+            remaining_transit = max(0, cluster_internal)
             if not sp.empty:
-                for _, r in sp.iterrows():
+                sp_sorted = sp.copy()
+                if "Плановая дата прибытия" in sp_sorted.columns:
+                    sp_sorted = sp_sorted.sort_values("Плановая дата прибытия", na_position="last")
+                for _, r in sp_sorted.iterrows():
                     eta = r.get("Плановая дата прибытия")
                     if isinstance(eta, pd.Timestamp):
                         eta = eta.date()
                     elif not isinstance(eta, date):
                         eta = parse_any_date(eta)
-                    if eta:
-                        events.append((eta, int_qty(r.get("Количество, шт.")), str(r.get("Статус") or "")))
+                    if not eta:
+                        continue
+                    qty_raw = int_qty(r.get("Количество, шт."))
+                    handed = str(r.get("Уже передано Ozon") or "") == "Да"
+                    if handed:
+                        qty = min(qty_raw, remaining_transit)
+                        remaining_transit = max(0, remaining_transit - qty)
+                        if qty <= 0:
+                            continue
+                        status = str(r.get("Статус") or "") + " | уже в transit_stock_count"
+                    else:
+                        # Плановая заявка ещё не входит в «остаток с учётом пути»,
+                        # но её ETA можно использовать в отдельном прогнозе OOS.
+                        qty = qty_raw
+                        if qty <= 0:
+                            continue
+                        status = str(r.get("Статус") or "") + " | плановая заявка"
+                    events.append((eta, qty, status.strip(" |")))
             events.sort(key=lambda x: x[0])
 
             sla_days, sla_source = self.sla.lookup(cluster, "")
             normal_lead = PREPARATION_DAYS + sla_days if sla_days is not None else None
             hypothetical_eta = self.target_date + timedelta(days=normal_lead) if normal_lead is not None else None
-
-            if promised_fallback > 0 and hypothetical_eta is not None:
-                events.append((hypothetical_eta, promised_fallback, "Подтверждено Ozon, детали заявки не получены"))
-                events.sort(key=lambda x: x[0])
 
             oos_days_existing, nearest_eta, nearest_qty, nearest_status = self._simulate_oos(current, avg, events)
             if events:
@@ -1863,7 +1890,13 @@ class ReportBuilder:
                 forecast_qty = nearest_qty
                 forecast_status = nearest_status
                 oos_days = oos_days_existing
-                forecast_basis = "Учитываем существующую заявку/поставку"
+                forecast_basis = "ETA из supply-order; количество уже переданного товара не дублирует transit_stock_count"
+            elif cluster_internal > 0:
+                forecast_eta = None
+                forecast_qty = cluster_internal
+                forecast_status = "Товар уже в пути по analytics/stocks, но ETA из supply-order не получен"
+                oos_days = None
+                forecast_basis = "Есть transit_stock_count, но точной даты прибытия нет"
             else:
                 forecast_eta = hypothetical_eta
                 forecast_qty = 0
@@ -1896,17 +1929,20 @@ class ReportBuilder:
                 "Риск дефицита по прогнозу": forecast_risk,
                 "Показывать в Control Center": show_cc,
                 "Среднесуточные продажи за 7 дней, шт.": avg,
-                "Запас, дней: сейчас (с учётом заявок)": f"{days_now if days_now is not None else '—'} ({days_future if days_future is not None else '—'})",
-                "Остаток, шт.: сейчас (с учётом заявок)": f"{current} ({future_total})",
+                "Запас, дней: сейчас (с учётом пути)": f"{days_now if days_now is not None else '—'} ({days_future if days_future is not None else '—'})",
+                "Остаток, шт.: сейчас (с учётом пути)": f"{current} ({future_total})",
                 "Заказано за 7 дней, шт.": sold7,
                 "Остаток сейчас в кластере, шт.": current,
                 "Возвраты покупателей в пути в кластер, шт.": cluster_returns,
                 "Перемещение внутри Ozon в кластер, шт.": cluster_internal,
-                "В активных поставках в кластер, шт.": future_supply,
-                "Подтверждено Ozon, но не найдено в API заявок, шт.": promised_fallback,
-                "Остаток с учётом пути и поставок, шт.": future_total,
+                "Товары в пути в кластер, шт.": cluster_returns + cluster_internal,
+                "Supply-order: уже передано Ozon, шт. (справочно)": physical_supply,
+                "Supply-order: ещё не передано Ozon, шт. (справочно)": planned_supply,
+                "Supply-order всего в кластер, шт. (справочно)": future_supply,
+                "promised_amount Ozon в кластере, шт. (справочно)": promised,
+                "Остаток с учётом пути, шт.": future_total,
                 "Запас сейчас, дней": days_now,
-                "Запас с учётом заявок, дней": days_future,
+                "Запас с учётом пути, дней": days_future,
                 "Дата ожидаемого окончания остатка": depletion if depletion else None,
                 "Ближайшее пополнение, шт.": forecast_qty,
                 "Статус ближайшего пополнения": forecast_status,
@@ -1938,9 +1974,9 @@ class ReportBuilder:
             "Кластеров с прогнозом дефицита, шт.", "Минимальный запас по продающим кластерам, дней",
             "Проблемные кластеры", "Среднесуточные продажи за 7 дней, шт.",
             "Заказано за 7 дней, шт.", "Доступно к продаже сейчас, шт.",
-            "Итого с учётом пути и заявок, шт.", "Запас сейчас, дней",
-            "Запас с учётом пути и заявок, дней", "Остаток, шт.: сейчас (с учётом пути и заявок)",
-            "Запас, дней: сейчас (с учётом пути и заявок)",
+            "Итого с учётом пути, шт.", "Запас сейчас, дней",
+            "Запас с учётом пути, дней", "Остаток, шт.: сейчас (с учётом пути)",
+            "Запас, дней: сейчас (с учётом пути)",
             "Выкуп, % (последние завершённые)", "База выкупа, шт.", "Дата отчёта",
         ]
         present = [c for c in cols if c in df.columns]
@@ -1958,9 +1994,9 @@ class ReportBuilder:
             "Критичный кластер", "Уровень критичности", "Приоритет критичности",
             "Риск дефицита по прогнозу", "Среднесуточные продажи за 7 дней, шт.",
             "Заказано за 7 дней, шт.", "Остаток сейчас в кластере, шт.",
-            "Остаток с учётом пути и поставок, шт.", "Запас сейчас, дней",
-            "Запас с учётом заявок, дней", "Остаток, шт.: сейчас (с учётом заявок)",
-            "Запас, дней: сейчас (с учётом заявок)", "Ближайшее пополнение, шт.",
+            "Товары в пути в кластер, шт.", "Остаток с учётом пути, шт.", "Запас сейчас, дней",
+            "Запас с учётом пути, дней", "Остаток, шт.: сейчас (с учётом пути)",
+            "Запас, дней: сейчас (с учётом пути)", "Ближайшее пополнение, шт.",
             "Плановая дата прибытия ближайшего пополнения", "Успеет пополнение до дефицита",
             "Прогноз дней без остатка", "Дата отчёта",
         ]
@@ -2009,16 +2045,16 @@ class ReportBuilder:
         return pd.DataFrame([
             {"Показатель": "Среднесуточные продажи за 7 дней", "Как считаем": "Заказанные FBO-штуки за последние 7 календарных дней / 7. quantity FBO автоматически проверяется на масштаб ×1000 и нормализуется только если структура данных это подтверждает."},
             {"Показатель": "Остаток сейчас", "Как считаем": "free_to_sell_amount — реально доступно к продаже на FBO-складах Ozon."},
-            {"Показатель": "Остаток в скобках по артикулу", "Как считаем": "Остаток сейчас + возвраты покупателей в пути + внутренние перемещения Ozon + все активные заявки продавца, включая ещё не переданные Ozon."},
+            {"Показатель": "Остаток в скобках по артикулу", "Как считаем": "Остаток сейчас + возвраты покупателей в пути + transit_stock_count из /v1/analytics/stocks. Количество из supply-order и promised_amount повторно не прибавляется."},
             {"Показатель": "Кластер", "Как считаем": "Сначала кластер из API, затем справочник склад→кластер, затем резерв по географическому названию склада. Физическое имя РФЦ не становится отдельным кластером."},
             {"Показатель": "Выкуп, % (последние завершённые)", "Как считаем": f"Для каждого артикула берём до {BUYOUT_TARGET_UNITS} самых свежих завершённых единиц за доступное окно {BUYOUT_LOOKBACK_DAYS} дней. status=cancelled — невыкуп; status=delivered — выкуп, кроме количества, сопоставленного с type=ClientReturn по posting_number + SKU. Cancellation из returns/list повторно не вычитаем. Незавершённые отправления не участвуют. Если завершённых единиц меньше {BUYOUT_TARGET_UNITS}, процент считается по фактической базе, её размер показан рядом."},
-            {"Показатель": "Активные поставки", "Как считаем": "Список заявок: /v3/supply-order/list с фильтром по активным статусам; метод возвращает order_ids. Детали: /v3/supply-order/get по order_ids. Состав: /v1/supply-order/bundle."},
-            {"Показатель": "promised_amount", "Как считаем": "Используем только как резерв: прибавляем часть promised_amount, которая не покрыта найденными supply-order, чтобы не считать поставку дважды."},
+            {"Показатель": "Активные поставки", "Как считаем": "Список заявок: /v3/supply-order/list → order_ids; детали: /v3/supply-order/get; состав: /v1/supply-order/bundle. Используем для статуса и ETA. Количество не прибавляем к запасу повторно, потому что фактический путь уже отражён в transit_stock_count."},
+            {"Показатель": "promised_amount", "Как считаем": "Только диагностическое поле Ozon. В остаток и запас в днях не прибавляется, чтобы не дублировать transit_stock_count/supply-order."},
             {"Показатель": "Дата отгрузки", "Как считаем": "Берём начало timeslot поставки из /v3/supply-order/get. Если timeslot отсутствует, дату не выдумываем."},
             {"Показатель": "Плановая дата прибытия", "Как считаем": "Если API Ozon вернул arrival_date/плановую дату — используем её. Иначе: дата отгрузки + верхняя граница срока кросс-дока из переданного тарифа Ozon от 03.08.2026."},
             {"Показатель": "Срок кросс-дока", "Как считаем": f"Для FINICK источник — {CROSSDOCK_ORIGIN}. Сначала берём норматив конкретного конечного склада, если он известен; иначе консервативный максимум по кластеру."},
             {"Показатель": "Новая поставка без заявки", "Как считаем": f"Для оценки, успеет ли новая поставка: {PREPARATION_DAYS} календарных дня на сборку + срок кросс-дока. Дополнительные 5 дней приёмки больше не добавляются."},
-            {"Показатель": "Прогноз дней без остатка", "Как считаем": "Сравниваем текущий запас в днях с плановой датой прибытия ближайшего известного пополнения; если заявки нет — с расчётным прибытием новой поставки."},
+            {"Показатель": "Прогноз дней без остатка", "Как считаем": "Для уже переданного Ozon пополнения ETA берём из supply-order, но количество ограничиваем фактическим transit_stock_count кластера. Плановая заявка, ещё не переданная Ozon, может участвовать только в прогнозе ETA и не увеличивает показатель «остаток с учётом пути»."},
             {"Показатель": "Критичный товар / кластер", "Как считаем": f"Готовый признак для Control Center. При наличии продаж: нет остатка = максимальная критичность; запас до {CONTROL_CENTER_URGENT_DAYS} дней = срочно; запас до {CONTROL_CENTER_CRITICAL_DAYS} дней = критично. Товар также считается критичным, если критичен хотя бы один продающий кластер."},
             {"Показатель": "Проблемные кластеры", "Как считаем": "Для каждого артикула заранее считаем количество продающих кластеров с критичным запасом, количество кластеров без остатка, минимальный запас в днях и готовую строку вида «Кластер: N дн.». Control Center ничего не пересчитывает."},
             {"Показатель": "Листы для Control Center", "Как считаем": "«Проблемные товары» и «Проблемные кластеры» уже отфильтрованы для красных карточек. «Control Center товары» и «Control Center кластеры» содержат полный сокращённый набор готовых полей для основной таблицы и раскрытия товара."},
