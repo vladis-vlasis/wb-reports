@@ -20,7 +20,9 @@
 - плановую дату прибытия: сначала из API, если она есть, иначе дата отгрузки + норматив кросс-дока;
 - самый свежий процент выкупа по артикулу: последние 50 завершённых единиц (delivered/cancelled), ClientReturn учитывается как невыкуп;
 - запас в днях сейчас и с учётом пути/активных заявок;
-- прогноз дефицита по кластерам.
+- прогноз дефицита по кластерам;
+- готовые признаки критичности товара и кластера для Control Center;
+- минимальный запас по продающим кластерам и готовый список проблемных кластеров.
 
 Для FINICK расчёт кросс-дока использует точку «Москва — Кавказский» и верхнюю
 границу сроков из переданного тарифного файла Ozon от 03.08.2026. Нормативы
@@ -51,7 +53,7 @@ from botocore.exceptions import ClientError
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_8_20260807"
+SCRIPT_VERSION = "OZON_STOCK_TURNOVER_SUMMARY_STANDALONE_V1_9_20260809"
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 DEFAULT_BUCKET = "ozon-assist"
@@ -63,6 +65,12 @@ CROSSDOCK_ORIGIN = "Москва — Кавказский"
 CROSSDOCK_TARIFF_AS_OF = "2026-08-03"
 CROSSDOCK_TARIFF_SOURCE = "Тарифы Ozon cross-dock, файл от 03.08.2026, Москва — Кавказский"
 PREPARATION_DAYS = 4
+
+# Пороговые значения уже рассчитываются в отчёте, чтобы Control Center не
+# дублировал бизнес-логику. Продающий кластер/товар считается критичным,
+# если текущего доступного остатка хватает не более чем на 14 дней.
+CONTROL_CENTER_CRITICAL_DAYS = 14
+CONTROL_CENTER_URGENT_DAYS = 7
 
 # Выкуп: считаем по самым свежим завершённым единицам товара.
 # Берём до 50 последних delivered/cancelled. Если за окно истории набралось меньше,
@@ -1611,6 +1619,26 @@ class ReportBuilder:
         return arrival, f"Дата отгрузки + {sla_days} дн. кросс-дока ({source})", sla_days
 
     # ---------- сборка ----------
+    @staticmethod
+    def _criticality(avg: float, current: int, days_now: Optional[int]) -> Tuple[str, int, str]:
+        """Возвращает готовый статус для интерфейса: уровень, приоритет, критичность Да/Нет."""
+        if avg <= 0:
+            return "Нет продаж", 99, "Нет"
+        if current <= 0:
+            return "Нет остатка", 0, "Да"
+        if days_now is not None and days_now <= CONTROL_CENTER_URGENT_DAYS:
+            return f"До {CONTROL_CENTER_URGENT_DAYS} дней", 1, "Да"
+        if days_now is not None and days_now <= CONTROL_CENTER_CRITICAL_DAYS:
+            return f"До {CONTROL_CENTER_CRITICAL_DAYS} дней", 2, "Да"
+        return "Норма", 9, "Нет"
+
+    @staticmethod
+    def _worst_criticality(levels: Iterable[Tuple[str, int]]) -> Tuple[str, int]:
+        vals = [(str(level), int(rank)) for level, rank in levels if level is not None]
+        if not vals:
+            return "Норма", 9
+        return min(vals, key=lambda x: x[1])
+
     def build(self) -> Dict[str, pd.DataFrame]:
         self.fetch_products()
         self.fetch_clusters()
@@ -1620,14 +1648,24 @@ class ReportBuilder:
         sales_cluster, _ = self.sales_7d_by_cluster()
         supplies = self.supply_orders()
         buyout = self.buyout_latest_by_article()
-        logging.info("8/8 Формирование сводки")
+        logging.info("8/8 Формирование сводки и готовых показателей Control Center")
 
-        by_article = self._build_by_article(stocks, transit, sales_cluster, supplies, buyout)
+        # Сначала строим кластерный уровень: именно из него берём минимальный запас
+        # и количество проблемных кластеров для карточки товара.
         by_cluster = self._build_by_cluster(stocks, transit, sales_cluster, supplies)
+        by_article = self._build_by_article(stocks, transit, sales_cluster, supplies, buyout, by_cluster)
+        control_articles = self._control_center_articles(by_article)
+        control_clusters = self._control_center_clusters(by_cluster)
+        problem_articles = control_articles[(control_articles["Показывать в Control Center"] == "Да") & (control_articles["Критичный товар"] == "Да")].copy() if not control_articles.empty else pd.DataFrame()
+        problem_clusters = control_clusters[(control_clusters["Продающий кластер"] == "Да") & (control_clusters["Критичный кластер"] == "Да")].copy() if not control_clusters.empty else pd.DataFrame()
         method = self._methodology()
         cluster_ref = self._cluster_reference()
         diag = self._diagnostics(stocks, supplies)
         return {
+            "Проблемные товары": problem_articles,
+            "Проблемные кластеры": problem_clusters,
+            "Control Center товары": control_articles,
+            "Control Center кластеры": control_clusters,
             "По артикулам": by_article,
             "По кластерам": by_cluster,
             "Поставки и прогноз": supplies,
@@ -1641,6 +1679,8 @@ class ReportBuilder:
     def _diagnostics(self, stocks: pd.DataFrame, supplies: pd.DataFrame) -> pd.DataFrame:
         rows: List[Dict[str, Any]] = [
             {"Проверка": "Версия кода", "Значение": SCRIPT_VERSION},
+            {"Проверка": "Порог критичного остатка Control Center, дней", "Значение": CONTROL_CENTER_CRITICAL_DAYS},
+            {"Проверка": "Порог срочного остатка Control Center, дней", "Значение": CONTROL_CENTER_URGENT_DAYS},
             {"Проверка": "Масштаб quantity в FBO postings", "Значение": self._posting_qty_scale},
             {"Проверка": "Диагностика quantity", "Значение": json.dumps(self._posting_qty_detection, ensure_ascii=False)},
             {"Проверка": "Строк остатков", "Значение": 0 if stocks is None else len(stocks)},
@@ -1658,7 +1698,7 @@ class ReportBuilder:
         return pd.DataFrame(rows)
 
     def _build_by_article(self, stocks: pd.DataFrame, transit: pd.DataFrame, sales_cluster: pd.DataFrame,
-                          supplies: pd.DataFrame, buyout: pd.DataFrame) -> pd.DataFrame:
+                          supplies: pd.DataFrame, buyout: pd.DataFrame, by_cluster: pd.DataFrame) -> pd.DataFrame:
         articles = set()
         for df in (stocks, transit, sales_cluster, supplies):
             if df is not None and not df.empty and "Артикул" in df.columns:
@@ -1670,6 +1710,7 @@ class ReportBuilder:
             sc = sales_cluster[sales_cluster["Артикул"] == article] if not sales_cluster.empty else pd.DataFrame()
             sp = supplies[supplies["Артикул"] == article] if not supplies.empty else pd.DataFrame()
             bo = buyout[buyout["Артикул"] == article] if buyout is not None and not buyout.empty else pd.DataFrame()
+            bc = by_cluster[by_cluster["Артикул"] == article] if by_cluster is not None and not by_cluster.empty else pd.DataFrame()
             buyout_pct = float(bo.iloc[0]["Выкуп, % (последние завершённые)"]) if not bo.empty else None
             buyout_base = int(bo.iloc[0]["База выкупа, шт."]) if not bo.empty else 0
             current = int(s["Доступно сейчас, шт."].sum()) if not s.empty else 0
@@ -1679,14 +1720,47 @@ class ReportBuilder:
             requests = int(sp.loc[sp["Уже передано Ozon"] == "Нет", "Количество, шт."].sum()) if not sp.empty else 0
             supply_api_qty = int(sp["Количество, шт."].sum()) if not sp.empty else 0
             promised = int(s["Подтверждено Ozon в поставках, шт."].sum()) if (not s.empty and "Подтверждено Ozon в поставках, шт." in s.columns) else 0
-            # promised_amount может дублировать supply-order. Поэтому используем его только
-            # как резерв на НЕПОКРЫТУЮ часть, если API заявок вернул меньше товара.
             promised_fallback = max(0, promised - supply_api_qty)
             future = current + ret + internal + supply_api_qty + promised_fallback
             sold7 = int(sc["Заказано за 7 дней, шт."].sum()) if not sc.empty else 0
             avg = round(sold7 / 7, 1)
             days_now = int(round(current / avg)) if avg > 0 else None
             days_future = int(round(future / avg)) if avg > 0 else None
+            article_level, article_rank, article_critical = self._criticality(avg, current, days_now)
+
+            # Готовые кластерные показатели для Control Center. Веб-коду не нужно
+            # повторно группировать кластерный лист или решать, какой кластер критичный.
+            selling = bc[bc["Продающий кластер"] == "Да"] if not bc.empty and "Продающий кластер" in bc.columns else pd.DataFrame()
+            critical_clusters = selling[selling["Критичный кластер"] == "Да"] if not selling.empty else pd.DataFrame()
+            forecast_risk = selling[selling["Риск дефицита по прогнозу"] == "Да"] if not selling.empty else pd.DataFrame()
+            no_stock = selling[selling["Остаток сейчас в кластере, шт."] <= 0] if not selling.empty else pd.DataFrame()
+
+            min_cluster_days: Optional[int] = None
+            if not selling.empty and "Запас сейчас, дней" in selling.columns:
+                vals = pd.to_numeric(selling["Запас сейчас, дней"], errors="coerce").dropna()
+                if not vals.empty:
+                    min_cluster_days = int(vals.min())
+
+            problem_clusters = []
+            if not critical_clusters.empty:
+                cc = critical_clusters.sort_values(
+                    ["Приоритет критичности", "Среднесуточные продажи за 7 дней, шт."],
+                    ascending=[True, False], na_position="last"
+                )
+                for _, r in cc.iterrows():
+                    d = r.get("Запас сейчас, дней")
+                    d_text = "—" if pd.isna(d) else str(int(d))
+                    problem_clusters.append(f"{r.get('Кластер', '')}: {d_text} дн.")
+
+            cluster_level, cluster_rank = ("Норма", 9)
+            if not critical_clusters.empty:
+                cluster_level, cluster_rank = self._worst_criticality(
+                    zip(critical_clusters["Уровень критичности"], critical_clusters["Приоритет критичности"])
+                )
+            final_level, final_rank = self._worst_criticality([(article_level, article_rank), (cluster_level, cluster_rank)])
+            final_critical = "Да" if (article_critical == "Да" or len(critical_clusters) > 0) else "Нет"
+            show_cc = "Да" if (sold7 > 0 or current > 0 or future > 0) else "Нет"
+
             name = ""
             if not s.empty and "Название" in s.columns:
                 name = next((str(x) for x in s["Название"] if str(x).strip()), "")
@@ -1698,6 +1772,17 @@ class ReportBuilder:
                         break
             rows.append({
                 "Артикул": article,
+                "Критичный товар": final_critical,
+                "Критичный по общему остатку": article_critical,
+                "Критичный по кластерам": "Да" if len(critical_clusters) > 0 else "Нет",
+                "Уровень критичности": final_level,
+                "Приоритет критичности": final_rank,
+                "Минимальный запас по продающим кластерам, дней": min_cluster_days,
+                "Проблемных кластеров, шт.": len(critical_clusters),
+                "Кластеров без остатка при наличии продаж, шт.": len(no_stock),
+                "Кластеров с прогнозом дефицита, шт.": len(forecast_risk),
+                "Проблемные кластеры": "; ".join(problem_clusters),
+                "Показывать в Control Center": show_cc,
                 "Выкуп, % (последние завершённые)": buyout_pct,
                 "База выкупа, шт.": buyout_base,
                 "Среднесуточные продажи за 7 дней, шт.": avg,
@@ -1718,7 +1803,10 @@ class ReportBuilder:
             })
         df = pd.DataFrame(rows)
         if not df.empty:
-            df = df.sort_values(["Среднесуточные продажи за 7 дней, шт.", "Запас сейчас, дней"], ascending=[False, True], na_position="last").reset_index(drop=True)
+            df = df.sort_values(
+                ["Приоритет критичности", "Среднесуточные продажи за 7 дней, шт.", "Запас сейчас, дней"],
+                ascending=[True, False, True], na_position="last"
+            ).reset_index(drop=True)
         return df
 
     def _build_by_cluster(self, stocks: pd.DataFrame, transit: pd.DataFrame, sales: pd.DataFrame,
@@ -1733,8 +1821,6 @@ class ReportBuilder:
             s = stocks[(stocks["Артикул"] == article) & (stocks["Кластер"].map(self.cluster_maps.canonical) == cluster)] if not stocks.empty else pd.DataFrame()
             sale = sales[(sales["Артикул"] == article) & (sales["Кластер"].map(self.cluster_maps.canonical) == cluster)] if not sales.empty else pd.DataFrame()
             sp = supplies[(supplies["Артикул"] == article) & (supplies["Кластер назначения"].map(self.cluster_maps.canonical) == cluster)] if not supplies.empty else pd.DataFrame()
-            # Внутренний транзит/возврат относим к кластеру только когда сам API
-            # вернул склад/кластер. Пустой кластер не размазываем пропорционально.
             t = pd.DataFrame()
             if transit is not None and not transit.empty and "Кластер" in transit.columns:
                 t = transit[(transit["Артикул"] == article) & (transit["Кластер"].astype(str).str.strip() != "") & (transit["Кластер"].map(self.cluster_maps.canonical) == cluster)]
@@ -1751,7 +1837,6 @@ class ReportBuilder:
             days_future = int(round(future_total / avg)) if avg > 0 else None
             depletion = self.target_date + timedelta(days=math.ceil(current / avg)) if avg > 0 else None
 
-            # Существующие поставки событиями по ETA.
             events: List[Tuple[date, int, str]] = []
             if not sp.empty:
                 for _, r in sp.iterrows():
@@ -1768,9 +1853,6 @@ class ReportBuilder:
             normal_lead = PREPARATION_DAYS + sla_days if sla_days is not None else None
             hypothetical_eta = self.target_date + timedelta(days=normal_lead) if normal_lead is not None else None
 
-            # Если supply-order не раскрыл всю поставку, но stock API показывает promised_amount,
-            # не теряем этот товар. Для неизвестного статуса используем консервативный ETA
-            # новой поставки: +4 дня на сборку + срок кросс-дока.
             if promised_fallback > 0 and hypothetical_eta is not None:
                 events.append((hypothetical_eta, promised_fallback, "Подтверждено Ozon, детали заявки не получены"))
                 events.sort(key=lambda x: x[0])
@@ -1799,9 +1881,20 @@ class ReportBuilder:
             else:
                 will_make = "Да" if forecast_eta <= depletion else "Нет"
 
+            level, priority, critical = self._criticality(avg, current, days_now)
+            selling = "Да" if avg > 0 else "Нет"
+            forecast_risk = "Да" if will_make == "Нет" else "Нет"
+            show_cc = "Да" if (sold7 > 0 or current > 0 or future_total > 0) else "Нет"
+
             rows.append({
                 "Артикул": article,
                 "Кластер": cluster,
+                "Продающий кластер": selling,
+                "Критичный кластер": critical,
+                "Уровень критичности": level,
+                "Приоритет критичности": priority,
+                "Риск дефицита по прогнозу": forecast_risk,
+                "Показывать в Control Center": show_cc,
                 "Среднесуточные продажи за 7 дней, шт.": avg,
                 "Запас, дней: сейчас (с учётом заявок)": f"{days_now if days_now is not None else '—'} ({days_future if days_future is not None else '—'})",
                 "Остаток, шт.: сейчас (с учётом заявок)": f"{current} ({future_total})",
@@ -1828,10 +1921,55 @@ class ReportBuilder:
             })
         df = pd.DataFrame(rows)
         if not df.empty:
-            # Критичные кластеры сверху: сначала OOS, затем короткий запас.
-            rank = df["Успеет пополнение до дефицита"].map({"Нет": 0, "Нет данных": 1, "Да": 2, "Продаж за 7 дней нет": 3}).fillna(4)
-            df = df.assign(_rank=rank).sort_values(["_rank", "Запас сейчас, дней", "Среднесуточные продажи за 7 дней, шт."], ascending=[True, True, False], na_position="last").drop(columns="_rank").reset_index(drop=True)
+            df = df.sort_values(
+                ["Приоритет критичности", "Среднесуточные продажи за 7 дней, шт.", "Запас сейчас, дней"],
+                ascending=[True, False, True], na_position="last"
+            ).reset_index(drop=True)
         return df
+
+    def _control_center_articles(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        cols = [
+            "Артикул", "Название товара", "Показывать в Control Center",
+            "Критичный товар", "Критичный по общему остатку", "Критичный по кластерам",
+            "Уровень критичности", "Приоритет критичности",
+            "Проблемных кластеров, шт.", "Кластеров без остатка при наличии продаж, шт.",
+            "Кластеров с прогнозом дефицита, шт.", "Минимальный запас по продающим кластерам, дней",
+            "Проблемные кластеры", "Среднесуточные продажи за 7 дней, шт.",
+            "Заказано за 7 дней, шт.", "Доступно к продаже сейчас, шт.",
+            "Итого с учётом пути и заявок, шт.", "Запас сейчас, дней",
+            "Запас с учётом пути и заявок, дней", "Остаток, шт.: сейчас (с учётом пути и заявок)",
+            "Запас, дней: сейчас (с учётом пути и заявок)",
+            "Выкуп, % (последние завершённые)", "База выкупа, шт.", "Дата отчёта",
+        ]
+        present = [c for c in cols if c in df.columns]
+        out = df[present].copy()
+        return out.sort_values(
+            ["Приоритет критичности", "Среднесуточные продажи за 7 дней, шт."],
+            ascending=[True, False], na_position="last"
+        ).reset_index(drop=True)
+
+    def _control_center_clusters(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            return pd.DataFrame()
+        cols = [
+            "Артикул", "Кластер", "Показывать в Control Center", "Продающий кластер",
+            "Критичный кластер", "Уровень критичности", "Приоритет критичности",
+            "Риск дефицита по прогнозу", "Среднесуточные продажи за 7 дней, шт.",
+            "Заказано за 7 дней, шт.", "Остаток сейчас в кластере, шт.",
+            "Остаток с учётом пути и поставок, шт.", "Запас сейчас, дней",
+            "Запас с учётом заявок, дней", "Остаток, шт.: сейчас (с учётом заявок)",
+            "Запас, дней: сейчас (с учётом заявок)", "Ближайшее пополнение, шт.",
+            "Плановая дата прибытия ближайшего пополнения", "Успеет пополнение до дефицита",
+            "Прогноз дней без остатка", "Дата отчёта",
+        ]
+        present = [c for c in cols if c in df.columns]
+        out = df[present].copy()
+        return out.sort_values(
+            ["Артикул", "Приоритет критичности", "Среднесуточные продажи за 7 дней, шт."],
+            ascending=[True, True, False], na_position="last"
+        ).reset_index(drop=True)
 
     def _simulate_oos(self, current: int, avg: float, events: List[Tuple[date, int, str]]) -> Tuple[Optional[int], Optional[date], int, str]:
         if not events:
@@ -1881,6 +2019,9 @@ class ReportBuilder:
             {"Показатель": "Срок кросс-дока", "Как считаем": f"Для FINICK источник — {CROSSDOCK_ORIGIN}. Сначала берём норматив конкретного конечного склада, если он известен; иначе консервативный максимум по кластеру."},
             {"Показатель": "Новая поставка без заявки", "Как считаем": f"Для оценки, успеет ли новая поставка: {PREPARATION_DAYS} календарных дня на сборку + срок кросс-дока. Дополнительные 5 дней приёмки больше не добавляются."},
             {"Показатель": "Прогноз дней без остатка", "Как считаем": "Сравниваем текущий запас в днях с плановой датой прибытия ближайшего известного пополнения; если заявки нет — с расчётным прибытием новой поставки."},
+            {"Показатель": "Критичный товар / кластер", "Как считаем": f"Готовый признак для Control Center. При наличии продаж: нет остатка = максимальная критичность; запас до {CONTROL_CENTER_URGENT_DAYS} дней = срочно; запас до {CONTROL_CENTER_CRITICAL_DAYS} дней = критично. Товар также считается критичным, если критичен хотя бы один продающий кластер."},
+            {"Показатель": "Проблемные кластеры", "Как считаем": "Для каждого артикула заранее считаем количество продающих кластеров с критичным запасом, количество кластеров без остатка, минимальный запас в днях и готовую строку вида «Кластер: N дн.». Control Center ничего не пересчитывает."},
+            {"Показатель": "Листы для Control Center", "Как считаем": "«Проблемные товары» и «Проблемные кластеры» уже отфильтрованы для красных карточек. «Control Center товары» и «Control Center кластеры» содержат полный сокращённый набор готовых полей для основной таблицы и раскрытия товара."},
         ])
 
     # ---------- Excel / S3 ----------
@@ -1902,6 +2043,8 @@ class ReportBuilder:
             "file": dated,
             "rows_articles": len(sheets.get("По артикулам", [])),
             "rows_clusters": len(sheets.get("По кластерам", [])),
+            "rows_problem_articles": len(sheets.get("Проблемные товары", [])),
+            "rows_problem_clusters": len(sheets.get("Проблемные кластеры", [])),
             "rows_supplies": len(sheets.get("Поставки и прогноз", [])),
             "crossdock_tariff_source": self.sla.source,
             "crossdock_tariff_as_of": self.sla.updated_at,
@@ -1944,7 +2087,7 @@ class ReportBuilder:
                     if fmt:
                         for cell in ws[get_column_letter(col_idx)][1:]:
                             cell.number_format = fmt
-                if sheet_name in {"По артикулам", "По кластерам"}:
+                if sheet_name in {"По артикулам", "По кластерам", "Проблемные товары", "Проблемные кластеры", "Control Center товары", "Control Center кластеры"}:
                     ws.freeze_panes = "E2"
                     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=min(5, ws.max_column)):
                         for cell in row:
