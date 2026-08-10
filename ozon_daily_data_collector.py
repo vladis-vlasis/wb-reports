@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v20
+Ozon FBO Daily Data Collector v21
 
 Назначение:
-- поддержка магазинов TOPFACE и FINICK;
+- поддержка магазинов TOPFACE, FINICK и MISSTAIS;
 - единое недельное хранение всех пользовательских отчётов, как в WB;
-- ежедневный целевой день всегда «вчера», независимо от времени запуска;
+- ежедневный целевой день всегда «вчера» по Москве; API-границы переводятся в UTC без смешивания соседних суток;
 - два автоматических запуска: ночью (EARLY) и после 15:00 МСК (FINAL);
 - проверка покрытия последних 60 дней и дозагрузка пропусков;
 - отдельный ручной режим history для первичной посуточной загрузки 60 дней;
 - рекламная статистика за каждый день и отдельное исследование 14-дневного лага
   в служебных файлах без перезаписи снимков;
 - базовые отчёты Seller API, финансы, незавершённые поставки и рекламные отчёты Performance API;
+- защита недельных заказов от частичной перезаписи подозрительно маленьким ответом API;
 - экономное хранение: успешные RAW JSON по умолчанию не сохраняются;
 - справочники товаров/складов хранятся как один актуальный снимок, без ежедневного размножения.
 
@@ -60,9 +61,9 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_FINANCE_BY_SKU_V20_20260809"
+SCRIPT_VERSION = "OZON_FBO_DAILY_REPAIR_MSK_GUARD_V21_20260810"
 
-ALLOWED_STORES = {"TOPFACE", "FINICK"}
+ALLOWED_STORES = {"TOPFACE", "FINICK", "MISSTAIS"}
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 OZON_API_BASE = "https://api-seller.ozon.ru"
 OZON_PERFORMANCE_API_BASE = "https://api-performance.ozon.ru"
@@ -79,15 +80,15 @@ PERFORMANCE_MIN_INTERVAL_SECONDS = 0.12
 
 # Версии схемы заставляют history повторно загрузить дни после изменения логики разбора.
 REPORT_SCHEMA_VERSIONS: Dict[str, int] = {
-    "orders": 4,              # замена дневного среза целиком + financial_data
-    "returns": 3,             # замена дневного среза целиком
+    "orders": 5,              # v21: календарный день МСК + защита от частичной перезаписи
+    "returns": 4,             # v21: календарный день МСК
     "funnel": 4,              # пакетные запросы метрик без ложного присвоения
     "finance_accruals": 1,
     "finance_by_sku": 1,     # управленческий финансовый отчёт по SKU/артикулу
     "realization_report": 1, # официальный отчёт реализации за последний закрытый месяц
-    "ad_statistics": 4,       # замена дневного среза и campaign_id
-    "ad_product_statistics": 2,
-    "ad_orders": 2,
+    "ad_statistics": 5,       # v21: пересборка после проверки кабинета Performance
+    "ad_product_statistics": 3,
+    "ad_orders": 3,
 }
 
 FUNNEL_METRICS: List[str] = [
@@ -175,9 +176,40 @@ def week_filename(prefix: str, d: date) -> str:
     return f"{prefix}_{year}-W{week:02d}.xlsx"
 
 
+UTC_TZ = ZoneInfo("UTC")
+
+
+def moscow_day_utc_bounds(d: date) -> Tuple[datetime, datetime]:
+    """Границы календарного дня Москвы, переведённые в UTC для Seller API.
+
+    Например, 2026-08-09 МСК = 2026-08-08T21:00:00Z ..
+    2026-08-09T20:59:59.999Z. Это не даёт хвосту следующего/предыдущего
+    UTC-дня подменять дневной срез в недельном файле.
+    """
+    start_msk = datetime(d.year, d.month, d.day, tzinfo=MOSCOW_TZ)
+    end_msk = start_msk + timedelta(days=1) - timedelta(milliseconds=1)
+    return start_msk.astimezone(UTC_TZ), end_msk.astimezone(UTC_TZ)
+
+
+def _iso_utc_z(value: datetime) -> str:
+    return value.astimezone(UTC_TZ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def to_ozon_datetime(d: date, end: bool = False) -> str:
-    suffix = "23:59:59.999Z" if end else "00:00:00.000Z"
-    return f"{d.isoformat()}T{suffix}"
+    start_utc, end_utc = moscow_day_utc_bounds(d)
+    return _iso_utc_z(end_utc if end else start_utc)
+
+
+def timestamp_to_moscow_date(value: Any) -> Optional[date]:
+    if value in (None, "", "null"):
+        return None
+    try:
+        ts = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        return ts.tz_convert(MOSCOW_TZ).date()
+    except Exception:
+        return None
 
 
 def mode_period(mode: str, target_date: date) -> Tuple[date, date]:
@@ -526,6 +558,20 @@ class S3Storage:
                 break
             token = resp.get("NextContinuationToken")
         return out
+
+    def delete_prefix(self, prefix: str) -> int:
+        """Удаляет legacy-служебные объекты под префиксом пакетами до 1000."""
+        keys = self.list_keys(prefix)
+        deleted = 0
+        for batch in batched(keys, 1000):
+            if not batch:
+                continue
+            self.client.delete_objects(
+                Bucket=self.bucket,
+                Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+            )
+            deleted += len(batch)
+        return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1041,12 @@ class OzonFboCollector:
         # Справочник для понятных пользовательских отчётов: SKU -> артикул/название.
         self.reference_sku_to_offer: Dict[str, str] = {}
         self.reference_sku_to_name: Dict[str, str] = {}
+        # Защита от случайного чтения рекламного кабинета другого магазина.
+        # None = ещё не проверено/недостаточно данных, True = подтверждено, False = явное несоответствие.
+        self.performance_identity_ok: Optional[bool] = None
+        self.performance_identity_diagnostics: Dict[str, Any] = {}
+        # Посуточная сверка заказов Seller API и воронки Ozon.
+        self.reconciliation: Dict[str, Any] = {}
         self.request_phase = resolve_request_phase()
         self.request_started_at = datetime.now(MOSCOW_TZ)
 
@@ -1026,14 +1078,18 @@ class OzonFboCollector:
             return df
 
         if code == "orders" and "created_at" in df.columns:
-            parsed = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
-            df["Дата"] = parsed.dt.strftime("%Y-%m-%d")
+            parsed_utc = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+            parsed_msk = parsed_utc.dt.tz_convert(MOSCOW_TZ)
+            df["Дата"] = parsed_msk.dt.strftime("%Y-%m-%d")
+            df["Дата заказа МСК"] = parsed_msk.dt.strftime("%Y-%m-%d %H:%M:%S")
         elif code == "returns":
             for col in ("logistic.return_date", "return_date", "logistic.final_moment"):
                 if col in df.columns:
-                    parsed = pd.to_datetime(df[col], errors="coerce", utc=True)
-                    if parsed.notna().any():
-                        df["Дата"] = parsed.dt.strftime("%Y-%m-%d")
+                    parsed_utc = pd.to_datetime(df[col], errors="coerce", utc=True)
+                    if parsed_utc.notna().any():
+                        parsed_msk = parsed_utc.dt.tz_convert(MOSCOW_TZ)
+                        df["Дата"] = parsed_msk.dt.strftime("%Y-%m-%d")
+                        df["Дата возврата МСК"] = parsed_msk.dt.strftime("%Y-%m-%d %H:%M:%S")
                         break
         elif code in {"ad_statistics", "ad_product_statistics", "ad_orders"}:
             if "Дата" not in df.columns:
@@ -1263,31 +1319,161 @@ class OzonFboCollector:
         return records_to_df(rows, {"Дата снимка": self.target_date.isoformat()}), raw, [endpoint]
 
     # ------------------------- orders/returns -------------------------
+    def _fetch_fbo_postings_day_v3(self, day: date) -> Tuple[List[Dict[str, Any]], List[Any]]:
+        """Основной FBO postings v3 за календарный день МСК.
+
+        Курсор проверяем жёстко: повтор страницы или полная страница без cursor
+        считаются неполной выгрузкой и переключают сбор на v2 fallback.
+        """
+        rows: List[Dict[str, Any]] = []
+        raw: List[Any] = []
+        seen_postings: set[str] = set()
+        seen_cursors: set[str] = set()
+        cursor = ""
+        since = to_ozon_datetime(day)
+        to = to_ozon_datetime(day, end=True)
+
+        for page in range(1, 501):
+            payload: Dict[str, Any] = {
+                "filter": {"since": since, "to": to},
+                "limit": 100,
+                "sort_dir": "ASC",
+                "with": {"analytics_data": True, "financial_data": True, "legal_info": False},
+            }
+            if cursor:
+                payload["cursor"] = cursor
+            data = self.client.post("/v3/posting/fbo/list", payload)
+            raw.append({"request": payload, "response": data})
+            postings = extract_items(
+                data,
+                [("result", "postings"), ("postings",), ("result", "items"), ("items",)],
+            )
+            added = 0
+            for posting in postings:
+                key = str(
+                    posting.get("posting_number")
+                    or posting.get("order_id")
+                    or posting.get("order_number")
+                    or ""
+                ).strip()
+                if not key:
+                    key = safe_json(posting)
+                if key in seen_postings:
+                    continue
+                seen_postings.add(key)
+                rows.append(posting)
+                added += 1
+
+            root = data.get("result", {}) if isinstance(data, Mapping) and isinstance(data.get("result"), Mapping) else {}
+            next_cursor = str(
+                (data.get("cursor") if isinstance(data, Mapping) else "")
+                or root.get("cursor")
+                or root.get("next_cursor")
+                or extract_cursor(data)
+                or ""
+            ).strip()
+            has_next_value = data.get("has_next") if isinstance(data, Mapping) else None
+            if has_next_value is None and isinstance(root, Mapping):
+                has_next_value = root.get("has_next")
+            has_next = bool(has_next_value) if has_next_value is not None else bool(next_cursor and len(postings) >= 100)
+
+            logging.info(
+                "FBO v3 %s: страница %s, получено %s, новых %s, итого %s",
+                day, page, len(postings), added, len(rows),
+            )
+            if not postings or added == 0:
+                break
+            if not has_next:
+                if len(postings) >= 100 and not next_cursor:
+                    raise RuntimeError("FBO v3: полная страница без cursor/has_next")
+                break
+            if not next_cursor:
+                raise RuntimeError("FBO v3 сообщил продолжение, но не вернул cursor")
+            if next_cursor == cursor or next_cursor in seen_cursors:
+                raise RuntimeError("FBO v3 вернул повторяющийся cursor")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        else:
+            raise RuntimeError("FBO v3: превышен лимит 500 страниц")
+
+        return rows, raw
+
+    def _fetch_fbo_postings_day_v2(self, day: date) -> Tuple[List[Dict[str, Any]], List[Any]]:
+        """Резервный v2, пока он доступен в конкретном кабинете."""
+        items, raw = self.client.offset_pages(
+            "/v2/posting/fbo/list",
+            {
+                "dir": "ASC",
+                "filter": {
+                    "since": to_ozon_datetime(day),
+                    "to": to_ozon_datetime(day, end=True),
+                    "status": "",
+                },
+                "limit": 1000,
+                "offset": 0,
+                "translit": True,
+                "with": {"analytics_data": True, "financial_data": True},
+            },
+            [("result",), ("result", "postings"), ("postings",)],
+            max_pages=100,
+        )
+        return items, raw
+
     def fetch_fbo_postings(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """FBO-заказы с полным financial_data и продуктовым финансовым разрезом."""
+        """FBO-заказы за календарный день МСК с защитой от соседних UTC-суток."""
         all_postings: List[Dict[str, Any]] = []
         raw_all: List[Any] = []
-        for day_from, day_to in iter_date_chunks(self.period_from, self.period_to, chunk_days=1):
-            items, raw = self.client.offset_pages(
-                "/v2/posting/fbo/list",
-                {
-                    "dir": "ASC",
-                    "filter": {
-                        "since": to_ozon_datetime(day_from),
-                        "to": to_ozon_datetime(day_to, end=True),
-                        "status": "",
-                    },
-                    "limit": 1000,
-                    "offset": 0,
-                    "translit": True,
-                    "with": {"analytics_data": True, "financial_data": True},
-                },
-                [("result",), ("result", "postings"), ("postings",)],
-                max_pages=100,
+        used_methods: List[str] = []
+        expected_dates = set(iter_days(self.period_from, self.period_to))
+
+        for day_from, _day_to in iter_date_chunks(self.period_from, self.period_to, chunk_days=1):
+            source = "v3"
+            try:
+                items, raw = self._fetch_fbo_postings_day_v3(day_from)
+                used_methods.append("/v3/posting/fbo/list")
+            except Exception as exc_v3:
+                logging.warning("FBO v3 %s не удалось надёжно прочитать: %s. Пробуем v2.", day_from, exc_v3)
+                source = "v2_fallback"
+                items, raw = self._fetch_fbo_postings_day_v2(day_from)
+                used_methods.append("/v2/posting/fbo/list")
+                raw_all.append({"day": day_from.isoformat(), "v3_error": str(exc_v3)})
+
+            kept: List[Dict[str, Any]] = []
+            outside: List[Dict[str, Any]] = []
+            missing_created_at = 0
+            for posting in items:
+                created_value = posting.get("created_at") or posting.get("in_process_at")
+                created_date = timestamp_to_moscow_date(created_value)
+                if created_date is None:
+                    missing_created_at += 1
+                    kept.append(posting)
+                    continue
+                if created_date in expected_dates:
+                    kept.append(posting)
+                else:
+                    outside.append({
+                        "posting_number": posting.get("posting_number"),
+                        "created_at": created_value,
+                        "date_msk": created_date.isoformat(),
+                    })
+
+            all_postings.extend(kept)
+            raw_all.append({
+                "day": day_from.isoformat(),
+                "source": source,
+                "utc_since": to_ozon_datetime(day_from),
+                "utc_to": to_ozon_datetime(day_from, end=True),
+                "received_postings": len(items),
+                "kept_postings": len(kept),
+                "outside_msk_day": len(outside),
+                "outside_examples": outside[:20],
+                "missing_created_at": missing_created_at,
+                "responses": raw,
+            })
+            logging.info(
+                "Заказы FBO %s: источник=%s, получено=%s, оставлено по дню МСК=%s, отброшено соседних=%s",
+                day_from, source, len(items), len(kept), len(outside),
             )
-            raw_all.extend(raw)
-            all_postings.extend(items)
-            logging.info("Заказы FBO: получен день %s, отправлений %s", day_from, len(items))
 
         def product_signature(value: Mapping[str, Any]) -> Tuple[str, str, str]:
             return (
@@ -1342,9 +1528,16 @@ class OzonFboCollector:
                     or (matched or {}).get("buyer_price")
                 )
                 quantity = to_number(product.get("quantity") or (matched or {}).get("quantity")) or 1.0
+                line_sum = seller_price * quantity if seller_price is not None else None
+                status_text = str(posting.get("status") or "").strip().lower()
+                is_cancelled = "cancel" in status_text
+
                 row["Цена продажи, ₽"] = seller_price
                 row["Цена покупателя, ₽"] = buyer_price
                 row["Количество, шт."] = quantity
+                row["Сумма строки заказа, ₽"] = line_sum
+                row["Отменён"] = "Да" if is_cancelled else "Нет"
+                row["Сумма строки без отмен, ₽"] = 0.0 if is_cancelled and line_sum is not None else line_sum
                 if seller_price is not None and buyer_price is not None:
                     support = seller_price - buyer_price
                     row["Поддержка скидки Ozon, ₽"] = support
@@ -1353,6 +1546,7 @@ class OzonFboCollector:
                 row["Комиссия Ozon, %"] = to_number((matched or {}).get("commission_percent"))
                 row["Выплата продавцу, ₽"] = to_number((matched or {}).get("payout"))
                 row["Финансовые услуги"] = safe_json((matched or {}).get("item_services", {}))
+                row["Акции и скидки заказа"] = safe_json((matched or {}).get("actions", []))
                 rows.append(row)
 
         df = records_to_df(rows, {
@@ -1360,7 +1554,7 @@ class OzonFboCollector:
             "Период с": self.period_from.isoformat(),
             "Период по": self.period_to.isoformat(),
         })
-        return df, raw_all, ["/v2/posting/fbo/list"]
+        return df, raw_all, sorted(set(used_methods))
 
     def fetch_returns(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         since = self.period_from
@@ -2251,10 +2445,102 @@ class OzonFboCollector:
 
     # ------------------------- Performance API -------------------------
 
+    def validate_performance_identity(self) -> Dict[str, Any]:
+        """Сверяет объекты Performance API со справочником Seller API текущего магазина.
+
+        Ключ может быть технически валиден, но указывать на другой рекламный кабинет.
+        Мы не пытаемся угадать бренд по названию кампании: проверяем реальные SKU,
+        offer_id и product_id. При явном нулевом/почти нулевом пересечении рекламные
+        отчёты блокируются, чтобы не записать чужие данные под текущим магазином.
+        """
+        result = next((r for r in self.results if r.code == "ad_products_bids" and not r.df.empty), None)
+        if result is None:
+            self.performance_identity_ok = None
+            self.performance_identity_diagnostics = {
+                "status": "UNKNOWN",
+                "reason": "Нет товарных объектов Performance API для проверки",
+            }
+            return dict(self.performance_identity_diagnostics)
+
+        df = result.df.copy()
+        seller_skus = {normalize_identifier(x) for x in self.reference_sku_to_offer.keys() if normalize_identifier(x)}
+        seller_offers = {normalize_identifier(x) for x in self.offer_ids if normalize_identifier(x)}
+        seller_product_ids = {normalize_identifier(x) for x in self.catalog_ids if normalize_identifier(x)}
+
+        sku_cols = [c for c in df.columns if str(c).strip().lower() in {"sku", "fbo_sku"}]
+        offer_cols = [c for c in df.columns if str(c).strip().lower() in {"offerid", "offer_id"}]
+        product_cols = [c for c in df.columns if str(c).strip().lower() in {"productid", "product_id"}]
+
+        identifiable = 0
+        matched = 0
+        examples_unmatched: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            row_values: List[Tuple[str, str, set[str]]] = []
+            for col in sku_cols:
+                value = normalize_identifier(row.get(col))
+                if value:
+                    row_values.append((str(col), value, seller_skus))
+            for col in offer_cols:
+                value = normalize_identifier(row.get(col))
+                if value:
+                    row_values.append((str(col), value, seller_offers))
+            for col in product_cols:
+                value = normalize_identifier(row.get(col))
+                if value:
+                    row_values.append((str(col), value, seller_product_ids))
+            if not row_values:
+                continue
+            identifiable += 1
+            if any(value in valid_set for _col, value, valid_set in row_values):
+                matched += 1
+            elif len(examples_unmatched) < 10:
+                examples_unmatched.append({col: value for col, value, _ in row_values})
+
+        ratio = (matched / identifiable) if identifiable else None
+        status = "UNKNOWN"
+        ok: Optional[bool] = None
+        reason = "Недостаточно объектов для надёжной проверки"
+        if identifiable >= 20 and (matched == 0 or (identifiable >= 50 and (ratio or 0.0) < 0.02)):
+            status = "MISMATCH"
+            ok = False
+            reason = (
+                f"Performance API не совпадает со Seller-магазином {self.store}: "
+                f"совпало {matched} из {identifiable} идентифицируемых объектов."
+            )
+        elif matched >= 5 or (identifiable >= 10 and (ratio or 0.0) >= 0.10):
+            status = "OK"
+            ok = True
+            reason = f"Совпало {matched} из {identifiable} объектов ({(ratio or 0.0) * 100:.1f}%)."
+
+        self.performance_identity_ok = ok
+        self.performance_identity_diagnostics = {
+            "status": status,
+            "store": self.store,
+            "identifiable_objects": identifiable,
+            "matched_objects": matched,
+            "match_ratio": ratio,
+            "seller_skus": len(seller_skus),
+            "seller_offers": len(seller_offers),
+            "seller_product_ids": len(seller_product_ids),
+            "unmatched_examples": examples_unmatched,
+            "reason": reason,
+            "checked_at": datetime.now(MOSCOW_TZ).isoformat(),
+        }
+        if ok is False:
+            logging.error(reason)
+        else:
+            logging.info("Performance identity: %s", reason)
+        return dict(self.performance_identity_diagnostics)
+
     def _require_performance(self) -> OzonPerformanceClient:
         if self.performance_client is None:
             raise RuntimeError(
                 "Не заданы OZON_PERFORMANCE_CLIENT_ID и OZON_PERFORMANCE_CLIENT_SECRET"
+            )
+        if self.performance_identity_ok is False:
+            raise RuntimeError(
+                "Performance API заблокирован проверкой магазина: "
+                + str(self.performance_identity_diagnostics.get("reason") or "несоответствие Seller API")
             )
         return self.performance_client
 
@@ -2336,6 +2622,8 @@ class OzonFboCollector:
         return df, raw, [meta["chosen_path"]]
 
     def _campaign_ids_from_results(self) -> List[str]:
+        if self.performance_identity_ok is False:
+            return []
         if self.campaign_ids_override:
             return sorted(set(str(x) for x in self.campaign_ids_override if str(x).strip()))
         result = next(
@@ -2359,6 +2647,8 @@ class OzonFboCollector:
         return sorted(set(ids))
 
     def _active_campaign_ids_from_results(self) -> List[str]:
+        if self.performance_identity_ok is False:
+            return []
         if self.active_campaign_ids_override:
             return sorted(set(str(x) for x in self.active_campaign_ids_override if str(x).strip()))
         result = next(
@@ -2834,6 +3124,11 @@ class OzonFboCollector:
         """Сохраняет неизменяемые снимки 14-дневного рекламного лага."""
         if self.performance_client is None:
             return {"status": "SKIPPED", "reason": "Performance credentials missing"}
+        if self.performance_identity_ok is False:
+            return {
+                "status": "SKIPPED",
+                "reason": self.performance_identity_diagnostics.get("reason") or "Performance cabinet mismatch",
+            }
 
         original_from, original_to = self.period_from, self.period_to
         request_at = datetime.now(MOSCOW_TZ)
@@ -2960,20 +3255,28 @@ class OzonFboCollector:
         )
 
         if self.performance_client is not None:
-            self._run(
+            campaigns_result = self._run(
                 "ad_campaigns", "Реклама — кампании",
                 "Реклама/Кампании", "Рекламные_кампании",
                 self.fetch_ad_campaigns, "Дата снимка",
                 ["Дата снимка", "id", "campaignId", "campaign_id"],
                 optional=True,
             )
-            self._run(
+            products_bids_result = self._run(
                 "ad_products_bids", "Реклама — товары и ставки",
                 "Реклама/Товары и ставки", "Реклама_товары_и_ставки",
                 self.fetch_ad_products_bids, "Дата снимка",
                 ["Дата снимка", "campaign_id", "sku", "productId", "offerId", "id"],
                 optional=True,
             )
+            identity = self.validate_performance_identity()
+            if self.performance_identity_ok is False:
+                message = str(identity.get("reason") or "Performance API не соответствует магазину")
+                # Не сохраняем заведомо чужие текущие рекламные снимки.
+                campaigns_result.status = "SKIPPED_OPTIONAL"
+                campaigns_result.message = message
+                products_bids_result.status = "SKIPPED_OPTIONAL"
+                products_bids_result.message = message
         else:
             logging.warning("Performance API отключён: рекламные снимки пропущены")
 
@@ -3011,6 +3314,79 @@ class OzonFboCollector:
                 optional=True,
             )
 
+
+    def build_reconciliation(self) -> Dict[str, Any]:
+        """Короткая контрольная сверка источников за целевой день.
+
+        Не подменяет бизнес-логику: воронка Ozon и postings имеют разные семантики,
+        но расхождение теперь видно числом, а не только по интерфейсу.
+        """
+        orders = next((r for r in self.results if r.code == "orders" and not r.df.empty), None)
+        funnel = next((r for r in self.results if r.code == "funnel" and not r.df.empty), None)
+
+        info: Dict[str, Any] = {
+            "store": self.store,
+            "date": self.target_date.isoformat(),
+            "created_at": datetime.now(MOSCOW_TZ).isoformat(),
+            "orders": {},
+            "funnel": {},
+            "differences": {},
+        }
+
+        if orders is not None:
+            df = orders.df.copy()
+            qty = pd.to_numeric(df.get("Количество, шт.", pd.Series(dtype=float)), errors="coerce").fillna(0)
+            seller_sum = pd.to_numeric(df.get("Сумма строки заказа, ₽", pd.Series(dtype=float)), errors="coerce").fillna(0)
+            net_sum = pd.to_numeric(df.get("Сумма строки без отмен, ₽", pd.Series(dtype=float)), errors="coerce").fillna(0)
+            cancelled_mask = df.get("Отменён", pd.Series("Нет", index=df.index)).astype(str).str.lower().eq("да")
+            posting_col = first_existing(df, ["posting_number", "order_number", "order_id"])
+            date_col = first_existing(df, ["Дата"])
+            buyer_col = first_existing(df, ["Цена покупателя, ₽"])
+            info["orders"] = {
+                "rows": int(len(df)),
+                "unique_postings": int(df[posting_col].nunique(dropna=True)) if posting_col else None,
+                "units_gross": float(qty.sum()),
+                "units_cancelled": float(qty[cancelled_mask].sum()) if len(qty) == len(cancelled_mask) else None,
+                "units_without_cancelled": float(qty[~cancelled_mask].sum()) if len(qty) == len(cancelled_mask) else None,
+                "seller_sum_gross": round(float(seller_sum.sum()), 2),
+                "seller_sum_without_cancelled": round(float(net_sum.sum()), 2),
+                "seller_price_rows": int(pd.to_numeric(df.get("Цена продажи, ₽"), errors="coerce").notna().sum()) if "Цена продажи, ₽" in df.columns else 0,
+                "buyer_price_rows": int(pd.to_numeric(df[buyer_col], errors="coerce").notna().sum()) if buyer_col else 0,
+                "dates": sorted(df[date_col].dropna().astype(str).unique().tolist()) if date_col else [],
+                "methods": list(orders.method_paths),
+            }
+
+        if funnel is not None:
+            df = funnel.df.copy()
+            def sum_col(*names: str) -> Optional[float]:
+                col = first_existing(df, list(names))
+                if not col:
+                    return None
+                values = pd.to_numeric(df[col], errors="coerce")
+                return round(float(values.fillna(0).sum()), 2)
+            info["funnel"] = {
+                "rows": int(len(df)),
+                "ordered_units": sum_col("ordered_units", "Заказы, шт."),
+                "revenue": sum_col("revenue", "Сумма заказов, ₽"),
+                "cancellations": sum_col("cancellations", "Отмены, шт."),
+                "delivered_units": sum_col("delivered_units", "Доставлено, шт."),
+                "returns": sum_col("returns", "Возвраты, шт."),
+                "methods": list(funnel.method_paths),
+            }
+
+        order_gross = to_number(info.get("orders", {}).get("seller_sum_gross"))
+        funnel_revenue = to_number(info.get("funnel", {}).get("revenue"))
+        if order_gross is not None and funnel_revenue is not None:
+            info["differences"]["funnel_revenue_minus_postings_gross"] = round(funnel_revenue - order_gross, 2)
+            info["differences"]["revenue_ratio_funnel_to_postings"] = round(funnel_revenue / order_gross, 4) if order_gross else None
+
+        order_units = to_number(info.get("orders", {}).get("units_gross"))
+        funnel_units = to_number(info.get("funnel", {}).get("ordered_units"))
+        if order_units is not None and funnel_units is not None:
+            info["differences"]["funnel_units_minus_postings_units"] = round(funnel_units - order_units, 2)
+
+        self.reconciliation = info
+        return dict(info)
 
     def collect_event_reports(self, include_heavy: bool = True) -> None:
         """Событийные отчёты строго за self.target_date."""
@@ -3060,6 +3436,8 @@ class OzonFboCollector:
 
         if include_heavy:
             self.collect_optional_event_reports()
+
+        self.build_reconciliation()
 
     def collect_all(self) -> None:
         """Совместимость для test/archive: снимки + событийные отчёты."""
@@ -3224,34 +3602,64 @@ class OzonFboCollector:
             if not part_dates:
                 part_dates = {partition_date}
 
-            # Ремонт/повторный запуск должен ЗАМЕНЯТЬ дневной срез, а не
-            # дописывать его поверх старой схемы. Именно из-за сохранения старых
-            # строк v17 получал unique_saved > unique_received.
-            if old is not None and not old.empty:
-                old_date_col = self._detect_row_date_column(old, result.date_column, result.code)
-                if old_date_col:
-                    old_dates = pd.to_datetime(old[old_date_col], errors="coerce", utc=True).dt.date
-                    old = old[~old_dates.isin(part_dates)].copy()
-            merged = dedupe_merge(old, part_df, result.keys)
-
             expected_unique = dataframe_unique_count(part_df, result.keys)
-            saved_slice = self._slice_for_dates(result, merged, part_dates)
-            saved_unique = dataframe_unique_count(saved_slice, result.keys)
-            integrity = expected_unique == saved_unique
+            existing_slice = self._slice_for_dates(result, old, part_dates) if old is not None else pd.DataFrame()
+            existing_unique = dataframe_unique_count(existing_slice, result.keys)
+            guard_applied = False
+            guard_reason = ""
+            force_suspicious = str(os.getenv("OZON_ALLOW_SUSPICIOUS_DAY_REWRITE", "0")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
 
-            self.storage.upload_bytes(
-                key, self._excel_bytes(merged, result.title),
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            # Заказы исторического дня не должны внезапно схлопываться в десятки раз.
+            # Именно такой сценарий ранее заменил полный день 08.08 одной строкой
+            # из соседних UTC-суток. При подозрительном ответе старый день сохраняем,
+            # а coverage остаётся corrupted и попробует восстановить его снова.
+            if (
+                result.code == "orders"
+                and not force_suspicious
+                and existing_unique >= 20
+                and expected_unique < max(3, int(existing_unique * 0.35))
+            ):
+                guard_applied = True
+                guard_reason = (
+                    f"Защита от частичной перезаписи: было {existing_unique} уникальных строк, "
+                    f"получено только {expected_unique}. Старый дневной срез сохранён."
+                )
+                logging.error("%s | key=%s", guard_reason, key)
+                merged = old.copy() if old is not None else pd.DataFrame()
+                saved_unique = existing_unique
+                integrity = False
+            else:
+                # Нормальный ремонт/повторный запуск ЗАМЕНЯЕТ только конкретный
+                # календарный день, остальные дни недели не затрагивает.
+                if old is not None and not old.empty:
+                    old_date_col = self._detect_row_date_column(old, result.date_column, result.code)
+                    if old_date_col:
+                        old_dates = pd.to_datetime(old[old_date_col], errors="coerce", utc=True).dt.date
+                        old = old[~old_dates.isin(part_dates)].copy()
+                merged = dedupe_merge(old, part_df, result.keys)
+                saved_slice = self._slice_for_dates(result, merged, part_dates)
+                saved_unique = dataframe_unique_count(saved_slice, result.keys)
+                integrity = expected_unique == saved_unique
+
+                self.storage.upload_bytes(
+                    key, self._excel_bytes(merged, result.title),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
             written_keys.append(key)
             audit_parts.append({
                 "key": key,
                 "dates": sorted(d.isoformat() for d in part_dates),
                 "rows_received": int(len(part_df)),
                 "unique_received": expected_unique,
+                "unique_before_for_dates": existing_unique,
                 "rows_in_week_after_save": int(len(merged)),
                 "unique_saved_for_dates": saved_unique,
                 "integrity": integrity,
+                "rewrite_guard": guard_applied,
+                "rewrite_guard_reason": guard_reason,
             })
             if not integrity:
                 logging.error(
@@ -3381,15 +3789,19 @@ class OzonFboCollector:
                 } for r in self.results
             ],
             "errors_count": len(self.errors),
+            "performance_identity": self.performance_identity_diagnostics,
+            "reconciliation": self.reconciliation,
         }
 
     def save_diagnostics(self) -> None:
+        """Перезаписываемая диагностика без размножения файлов по каждому запуску."""
         manifest = self.build_manifest()
         base = f"{self.base_prefix}/Служебные/{self.store}"
-        self.storage.upload_json(f"{base}/Запуски/{self.target_date.isoformat()}_{self.run_id}.json", manifest)
-        self.storage.upload_json(f"{base}/Последний_запуск.json", manifest)
+        self.storage.upload_json(f"{base}/Последняя_диагностика.json", manifest)
         if self.errors:
-            self.storage.upload_json(f"{base}/Ошибки_API/{self.target_date.isoformat()}_{self.run_id}.json", self.errors)
+            self.storage.upload_json(f"{base}/Последние_ошибки_API.json", self.errors)
+        else:
+            self.storage.upload_json(f"{base}/Последние_ошибки_API.json", [])
         required_errors = [r for r in self.results if r.status == "ERROR" and not r.optional]
         if required_errors:
             names = ", ".join(r.title for r in required_errors)
@@ -3397,11 +3809,10 @@ class OzonFboCollector:
                 raise RuntimeError(
                     "Есть ошибки обязательных отчётов в daily: "
                     + names
-                    + ". См. Служебные/Ошибки_API"
+                    + ". См. Отчёты/Служебные/<STORE>/Последние_ошибки_API.json"
                 )
             logging.error(
-                "В режиме %s есть ошибки обязательных отчётов: %s. "
-                "Архив/тест сохранён с diagnostics и workflow не прерывается.",
+                "В режиме %s есть ошибки обязательных отчётов: %s. Диагностика сохранена.",
                 self.mode,
                 names,
             )
@@ -3618,6 +4029,8 @@ def copy_reference_context(
     target.active_campaign_ids_override = source._active_campaign_ids_from_results()
     target.reference_sku_to_offer = dict(source.reference_sku_to_offer)
     target.reference_sku_to_name = dict(source.reference_sku_to_name)
+    target.performance_identity_ok = source.performance_identity_ok
+    target.performance_identity_diagnostics = dict(source.performance_identity_diagnostics)
 
 
 def rebuild_finance_by_sku_from_storage(
@@ -3870,7 +4283,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-date", default=env_first("OZON_TARGET_DATE"))
     p.add_argument("--store", default=env_first("OZON_STORE", "STORE", default=DEFAULT_STORE))
     p.add_argument("--bucket", default=env_first("OZON_YC_BUCKET", "YC_BUCKET_NAME", default=DEFAULT_BUCKET))
-    p.add_argument("--workdir", default="output_ozon_v19")
+    p.add_argument("--workdir", default="output_ozon_v21")
     p.add_argument(
         "--repair-days-per-run",
         type=int,
@@ -3918,6 +4331,24 @@ def main() -> int:
 
     storage = S3Storage(access_key, secret_key, args.bucket, endpoint)
     storage.ensure_bucket()
+
+    # v21: старые run-id логи больше не плодим. По умолчанию при обычном запуске
+    # удаляем legacy-каталоги диагностики; пользовательские отчёты не трогаем.
+    clean_legacy = str(os.getenv("OZON_CLEAN_LEGACY_DIAGNOSTICS", "1")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if clean_legacy and store in ALLOWED_STORES and args.mode != "archive_all":
+        deleted_logs = storage.delete_prefix(f"Отчёты/Служебные/{store}/Запуски/")
+        deleted_errors = storage.delete_prefix(f"Отчёты/Служебные/{store}/Ошибки_API/")
+        deleted_raw = 0
+        if not save_raw_enabled:
+            deleted_raw += storage.delete_prefix(f"Отчёты/Служебные/{store}/Сырые ответы/")
+            deleted_raw += storage.delete_prefix(f"Отчёты/Служебные/{store}/Рекламный лаг/Сырые ответы/")
+        if deleted_logs or deleted_errors or deleted_raw:
+            logging.info(
+                "Очистка legacy-служебных файлов: run_logs=%s, api_errors=%s, raw=%s",
+                deleted_logs, deleted_errors, deleted_raw,
+            )
 
     workdir = Path(args.workdir) / store
     workdir.mkdir(parents=True, exist_ok=True)
@@ -4002,9 +4433,10 @@ def main() -> int:
     # История должна быстро восстановить ключевые управленческие данные.
     # Нулевые экспериментальные методы не запускаем 60 раз подряд.
     active_codes = ["orders", "returns", "funnel", "finance_accruals"]
-    if performance_client is not None:
+    performance_data_allowed = performance_client is not None and snapshot.performance_identity_ok is not False
+    if performance_data_allowed:
         active_codes.append("ad_statistics")
-    if args.mode != "history" and performance_client is not None:
+    if args.mode != "history" and performance_data_allowed:
         active_codes.extend(["ad_product_statistics", "ad_orders"])
 
     coverage = CoverageTracker(storage, store, target)
@@ -4060,8 +4492,14 @@ def main() -> int:
             "date": day.isoformat(),
             "run_id": event_collector.run_id,
             "reports": collector_result_summary(event_collector.results),
+            "reconciliation": event_collector.reconciliation,
             "errors": event_collector.errors,
         })
+        # Один перезаписываемый контрольный файл на магазин — без размножения.
+        storage.upload_json(
+            f"Отчёты/Служебные/{store}/Сверка_данных_последняя.json",
+            event_collector.reconciliation,
+        )
 
         elapsed = time.monotonic() - started_monotonic
         avg = elapsed / max(1, index)
@@ -4104,15 +4542,12 @@ def main() -> int:
         "event_runs": event_runs,
         "optional_probe_reports": optional_probe_reports,
         "ad_lag": lag_info,
+        "performance_identity": snapshot.performance_identity_diagnostics,
         "coverage_key": coverage.key,
         "snapshot_errors": snapshot.errors,
     }
-    summary_key = (
-        f"Отчёты/Служебные/{store}/Запуски/"
-        f"{target.isoformat()}_{phase}_{snapshot.run_id}.json"
-    )
+    summary_key = f"Отчёты/Служебные/{store}/Последний_запуск.json"
     storage.upload_json(summary_key, summary)
-    storage.upload_json(f"Отчёты/Служебные/{store}/Последний_запуск.json", summary)
 
     # Сохраняем обычную диагностику снимков, но не прерываем history из-за optional.
     snapshot.save_diagnostics()
