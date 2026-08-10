@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ozon FBO Daily Data Collector v19
+Ozon FBO Daily Data Collector v20
 
 Назначение:
 - поддержка магазинов TOPFACE и FINICK;
@@ -12,9 +12,9 @@ Ozon FBO Daily Data Collector v19
 - отдельный ручной режим history для первичной посуточной загрузки 60 дней;
 - рекламная статистика за каждый день и отдельное исследование 14-дневного лага
   в служебных файлах без перезаписи снимков;
-- отзывы с 1 января 2026 года: накопительно по артикулам и общими недельными файлами;
-- базовые отчёты Seller API, финансы, акции, незавершённые поставки,
-  поисковая аналитика и рекламные отчёты Performance API.
+- базовые отчёты Seller API, финансы, незавершённые поставки и рекламные отчёты Performance API;
+- экономное хранение: успешные RAW JSON по умолчанию не сохраняются;
+- справочники товаров/складов хранятся как один актуальный снимок, без ежедневного размножения.
 
 Правило целевой даты:
 - OZON_TARGET_DATE / --target-date задана явно -> используем её;
@@ -28,8 +28,9 @@ Ozon FBO Daily Data Collector v19
 - archive: ZIP отчётов строго за одну выбранную дату;
 - archive_all: один ZIP со всеми накопленными пользовательскими и служебными файлами выбранного магазина или сразу обоих магазинов.
 
-Необязательные методы не останавливают базовые выгрузки. Все ответы и ошибки
-фиксируются в служебных файлах.
+Необязательные методы не останавливают базовые выгрузки. Ошибки и диагностика
+фиксируются в служебных файлах. Полные RAW-ответы сохраняются только при
+OZON_SAVE_RAW_RESPONSES=1 (по умолчанию выключено).
 """
 from __future__ import annotations
 
@@ -59,7 +60,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.utils import get_column_letter
 
-SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_FINANCE_BY_SKU_V19_20260807"
+SCRIPT_VERSION = "OZON_FBO_BASIC_PREMIUM_FINANCE_BY_SKU_V20_20260809"
 
 ALLOWED_STORES = {"TOPFACE", "FINICK"}
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -71,7 +72,6 @@ DEFAULT_HISTORY_DAYS = 60
 DEFAULT_REPAIR_DAYS_PER_RUN = 5
 MAX_EXCEL_CELL = 32000
 AD_LAG_DAYS = 14
-REVIEWS_FROM_DATE = date(2026, 1, 1)
 MAX_RUNTIME_MINUTES = 220
 API_PAUSE_SECONDS = 0.18
 SELLER_MIN_INTERVAL_SECONDS = 0.55
@@ -88,8 +88,6 @@ REPORT_SCHEMA_VERSIONS: Dict[str, int] = {
     "ad_statistics": 4,       # замена дневного среза и campaign_id
     "ad_product_statistics": 2,
     "ad_orders": 2,
-    "product_queries": 1,
-    "product_query_details": 1,
 }
 
 FUNNEL_METRICS: List[str] = [
@@ -119,8 +117,6 @@ REPORT_DATE_CANDIDATES: Dict[str, List[str]] = {
     "ad_statistics": ["Дата", "date", "day", "statDate"],
     "ad_product_statistics": ["Дата", "date", "day", "statDate"],
     "ad_orders": ["Дата", "date", "day", "statDate"],
-    "product_queries": ["Дата", "date", "day"],
-    "product_query_details": ["Дата", "date", "day"],
 }
 
 # Метрики, которые базовая аналитика Ozon стабильно возвращает и название которых
@@ -1357,7 +1353,6 @@ class OzonFboCollector:
                 row["Комиссия Ozon, %"] = to_number((matched or {}).get("commission_percent"))
                 row["Выплата продавцу, ₽"] = to_number((matched or {}).get("payout"))
                 row["Финансовые услуги"] = safe_json((matched or {}).get("item_services", {}))
-                row["Акции и скидки заказа"] = safe_json((matched or {}).get("actions", []))
                 rows.append(row)
 
         df = records_to_df(rows, {
@@ -1614,382 +1609,6 @@ class OzonFboCollector:
 
         return df, {"requests": raw, "confirmed": verification, "rejected": rejected}, [endpoint]
 
-    def _search_period_candidates(self) -> List[Tuple[date, date]]:
-        """Периоды для Premium-поиска.
-
-        Поисковая аналитика проверяет короткие окна 1, 7, 14 и 30 дней.
-        Только поисковая аналитика при отсутствии данных последовательно
-        проверяет 1, 7, 14 и 30 календарных дней, заканчивающихся target_date.
-        """
-        candidates: List[Tuple[date, date]] = []
-        for days in (1, 7, 14, 30):
-            period_to = self.target_date
-            period_from = period_to - timedelta(days=days - 1)
-            pair = (period_from, period_to)
-            if pair not in candidates:
-                candidates.append(pair)
-        return candidates
-
-    @staticmethod
-    def _is_no_search_data_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return (
-            "there is no data for the specified period" in message
-            or "getpremiumanalyticsperiod" in message
-        )
-
-    def fetch_product_queries(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Premium: сводная поисковая аналитика с подбором допустимого периода."""
-        endpoint = "/v1/analytics/product-queries"
-        sku_values = sorted({int(x) for x in self.sku_ids if x not in (None, "", 0)})
-        if not sku_values:
-            return pd.DataFrame(), {"warning": "sku_ids is empty"}, [endpoint]
-
-        attempts_raw: List[Any] = []
-        last_no_data_error: Optional[Exception] = None
-
-        for search_from, search_to in self._search_period_candidates():
-            logging.info(
-                "Поисковые запросы — сводная: пробуем период %s — %s",
-                search_from,
-                search_to,
-            )
-            all_items: List[Dict[str, Any]] = []
-            period_raw: List[Any] = []
-            page_size = 1000
-
-            try:
-                for batch_no, sku_batch in enumerate(batched(sku_values, 1000), start=1):
-                    page = 1
-                    while page <= 500:
-                        payload = {
-                            "date_from": to_ozon_datetime(search_from),
-                            "date_to": to_ozon_datetime(search_to, end=True),
-                            "skus": sku_batch,
-                            "page": page,
-                            "page_size": page_size,
-                        }
-                        data = self.client.post(endpoint, payload)
-                        period_raw.append({
-                            "request": payload,
-                            "response": data,
-                        })
-                        items = extract_items(
-                            data,
-                            [
-                                ("items",),
-                                ("result", "items"),
-                                ("result", "rows"),
-                                ("rows",),
-                            ],
-                        )
-                        for item in items:
-                            row = dict(item) if isinstance(item, Mapping) else {"value": item}
-                            row.setdefault("sku_batch_no", batch_no)
-                            row.setdefault("api_page", page)
-                            all_items.append(row)
-
-                        if not items or len(items) < page_size:
-                            break
-                        page += 1
-                        time.sleep(0.12)
-
-                attempts_raw.append({
-                    "period_from": search_from.isoformat(),
-                    "period_to": search_to.isoformat(),
-                    "status": "OK",
-                    "rows": len(all_items),
-                    "responses": period_raw,
-                })
-
-                # Даже пустой успешный ответ считаем валидным периодом.
-                df = records_to_df(all_items, {
-                    "Дата снимка": self.target_date.isoformat(),
-                    "Период с": search_from.isoformat(),
-                    "Период по": search_to.isoformat(),
-                    "Длина периода, дней": (search_to - search_from).days + 1,
-                    "Тип подписки": "Premium",
-                })
-                logging.info(
-                    "Поисковые запросы — сводная: выбран период %s — %s, строк %s",
-                    search_from,
-                    search_to,
-                    len(df),
-                )
-                return df, attempts_raw, [endpoint]
-
-            except OzonApiError as exc:
-                attempts_raw.append({
-                    "period_from": search_from.isoformat(),
-                    "period_to": search_to.isoformat(),
-                    "status": "ERROR",
-                    "error": str(exc),
-                    "responses": period_raw,
-                })
-                if self._is_no_search_data_error(exc):
-                    last_no_data_error = exc
-                    logging.warning(
-                        "Поисковые запросы — сводная: данных за %s дней нет, пробуем больший период",
-                        (search_to - search_from).days + 1,
-                    )
-                    continue
-                raise
-
-        if last_no_data_error:
-            raise last_no_data_error
-        return pd.DataFrame(), attempts_raw, [endpoint]
-
-    def fetch_product_query_details(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Premium: SKU × запрос с limit_by_sku=15 и подбором периода."""
-        endpoint = "/v1/analytics/product-queries/details"
-        sku_values = sorted({int(x) for x in self.sku_ids if x not in (None, "", 0)})
-        if not sku_values:
-            return pd.DataFrame(), {"warning": "sku_ids is empty"}, [endpoint]
-
-        page_size = 100
-        limit_by_sku = 15
-        attempts_raw: List[Any] = []
-        last_no_data_error: Optional[Exception] = None
-
-        for search_from, search_to in self._search_period_candidates():
-            logging.info(
-                "Поисковые запросы — детализация: пробуем период %s — %s",
-                search_from,
-                search_to,
-            )
-            all_items: List[Dict[str, Any]] = []
-            period_raw: List[Any] = []
-
-            try:
-                for batch_no, sku_batch in enumerate(batched(sku_values, 100), start=1):
-                    page = 1
-                    previous_signature: Optional[str] = None
-                    batch_rows_before = len(all_items)
-
-                    while page <= 1000:
-                        payload = {
-                            "date_from": to_ozon_datetime(search_from),
-                            "date_to": to_ozon_datetime(search_to, end=True),
-                            "skus": sku_batch,
-                            "page": page,
-                            "page_size": page_size,
-                            "limit_by_sku": limit_by_sku,
-                        }
-                        data = self.client.post(endpoint, payload)
-                        items = extract_items(
-                            data,
-                            [
-                                ("items",),
-                                ("result", "items"),
-                                ("result", "rows"),
-                                ("rows",),
-                            ],
-                        )
-
-                        signature_parts: List[str] = []
-                        for item in items[:20]:
-                            if isinstance(item, Mapping):
-                                signature_parts.append(
-                                    json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
-                                )
-                            else:
-                                signature_parts.append(str(item))
-                        page_signature = "|".join(signature_parts)
-
-                        pagination_meta: Dict[str, Any] = {
-                            "batch_no": batch_no,
-                            "page": page,
-                            "page_size": page_size,
-                            "limit_by_sku": limit_by_sku,
-                            "skus_count": len(sku_batch),
-                            "items_count": len(items),
-                            "same_as_previous_page": bool(
-                                previous_signature is not None
-                                and page_signature == previous_signature
-                            ),
-                        }
-
-                        if isinstance(data, Mapping):
-                            for key in (
-                                "total", "total_count", "has_next", "next_page",
-                                "next_cursor", "cursor"
-                            ):
-                                if key in data:
-                                    pagination_meta[key] = data.get(key)
-                            result_obj = data.get("result")
-                            if isinstance(result_obj, Mapping):
-                                for key in (
-                                    "total", "total_count", "has_next", "next_page",
-                                    "next_cursor", "cursor"
-                                ):
-                                    if key in result_obj:
-                                        pagination_meta[f"result.{key}"] = result_obj.get(key)
-
-                        period_raw.append({
-                            "request": payload,
-                            "pagination": pagination_meta,
-                            "response": data,
-                        })
-
-                        for item in items:
-                            row = dict(item) if isinstance(item, Mapping) else {"value": item}
-                            row.setdefault("sku_batch_no", batch_no)
-                            row.setdefault("api_page", page)
-                            row.setdefault("limit_by_sku", limit_by_sku)
-                            all_items.append(row)
-
-                        if (
-                            previous_signature is not None
-                            and page_signature == previous_signature
-                        ):
-                            logging.warning(
-                                "Поисковые запросы: пакет %s, страница %s повторяет предыдущую; "
-                                "пагинация остановлена",
-                                batch_no,
-                                page,
-                            )
-                            break
-                        previous_signature = page_signature
-
-                        has_next = None
-                        next_page = None
-                        total = None
-                        if isinstance(data, Mapping):
-                            has_next = data.get("has_next")
-                            next_page = data.get("next_page")
-                            total = data.get("total", data.get("total_count"))
-                            result_obj = data.get("result")
-                            if isinstance(result_obj, Mapping):
-                                if has_next is None:
-                                    has_next = result_obj.get("has_next")
-                                if next_page is None:
-                                    next_page = result_obj.get("next_page")
-                                if total is None:
-                                    total = result_obj.get(
-                                        "total", result_obj.get("total_count")
-                                    )
-
-                        if not items:
-                            break
-                        if has_next is False:
-                            break
-                        if (
-                            isinstance(total, (int, float))
-                            and len(all_items) - batch_rows_before >= int(total)
-                        ):
-                            break
-                        if (
-                            len(items) < page_size
-                            and has_next not in (True, 1, "true", "True")
-                        ):
-                            break
-
-                        page = (
-                            int(next_page)
-                            if isinstance(next_page, int) and next_page > page
-                            else page + 1
-                        )
-                        time.sleep(0.12)
-
-                    logging.info(
-                        "Поисковые запросы — детализация: пакет %s, SKU %s, добавлено %s",
-                        batch_no,
-                        len(sku_batch),
-                        len(all_items) - batch_rows_before,
-                    )
-                    time.sleep(0.15)
-
-                attempts_raw.append({
-                    "period_from": search_from.isoformat(),
-                    "period_to": search_to.isoformat(),
-                    "status": "OK",
-                    "rows": len(all_items),
-                    "responses": period_raw,
-                })
-
-                df = records_to_df(all_items, {
-                    "Дата снимка": self.target_date.isoformat(),
-                    "Период с": search_from.isoformat(),
-                    "Период по": search_to.isoformat(),
-                    "Длина периода, дней": (search_to - search_from).days + 1,
-                    "Тип подписки": "Premium",
-                    "Лимит запросов на SKU": limit_by_sku,
-                })
-
-                aliases = {
-                    "Поисковый запрос": ["query", "search_query", "query_text", "text"],
-                    "Позиция": [
-                        "position", "avg_position", "average_position", "median_position"
-                    ],
-                    "Пользователи поиска": [
-                        "unique_search_users", "search_users"
-                    ],
-                    "Просмотры карточки": [
-                        "unique_view_users", "view_users"
-                    ],
-                    "Конверсия в просмотр": [
-                        "view_conversion", "conversion"
-                    ],
-                    "Продажи по запросу, руб": [
-                        "gmv", "revenue", "order_sum"
-                    ],
-                    "Заказы по запросу, шт": [
-                        "orders", "orders_count", "ordered_units"
-                    ],
-                }
-                for target, candidates in aliases.items():
-                    if target in df.columns:
-                        continue
-                    for candidate in candidates:
-                        if candidate in df.columns:
-                            df[target] = df[candidate]
-                            break
-
-                if (
-                    "Пользователи поиска" in df.columns
-                    and "Просмотры карточки" in df.columns
-                    and "CTR-аналог, %" not in df.columns
-                ):
-                    search_users = pd.to_numeric(
-                        df["Пользователи поиска"], errors="coerce"
-                    )
-                    view_users = pd.to_numeric(
-                        df["Просмотры карточки"], errors="coerce"
-                    )
-                    df["CTR-аналог, %"] = view_users.div(
-                        search_users.where(search_users.ne(0))
-                    ).mul(100)
-
-                logging.info(
-                    "Поисковые запросы — детализация: выбран период %s — %s, строк %s",
-                    search_from,
-                    search_to,
-                    len(df),
-                )
-                return df, attempts_raw, [endpoint]
-
-            except OzonApiError as exc:
-                attempts_raw.append({
-                    "period_from": search_from.isoformat(),
-                    "period_to": search_to.isoformat(),
-                    "status": "ERROR",
-                    "error": str(exc),
-                    "responses": period_raw,
-                })
-                if self._is_no_search_data_error(exc):
-                    last_no_data_error = exc
-                    logging.warning(
-                        "Поисковые запросы — детализация: данных за %s дней нет, пробуем больший период",
-                        (search_to - search_from).days + 1,
-                    )
-                    continue
-                raise
-
-        if last_no_data_error:
-            raise last_no_data_error
-        return pd.DataFrame(), attempts_raw, [endpoint]
-
-    # ------------------------- supplies/warehouses -------------------------
     def fetch_supply_orders(self) -> Tuple[pd.DataFrame, Any, List[str]]:
         """Только незавершённые FBO-поставки: запланированные, готовые и в пути.
 
@@ -2249,7 +1868,7 @@ class OzonFboCollector:
         }, ["/v2/analytics/stock_on_warehouses"]
 
 
-    # ------------------------- finance/actions/reviews -------------------------
+    # ------------------------- finance -------------------------
     def _product_article_map(self) -> Tuple[Dict[str, str], Dict[str, str]]:
         """Возвращает отображения SKU/product_id -> offer_id."""
         sku_to_offer: Dict[str, str] = dict(self.reference_sku_to_offer)
@@ -2591,320 +2210,44 @@ class OzonFboCollector:
             })
         return pd.DataFrame(out), {"request": payload, "response": data}, [endpoint]
 
-    def fetch_promotions(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Доступные акции и товары в них — снимок на дату запуска."""
-        actions_endpoint = "/v1/actions"
-        products_endpoint = "/v1/actions/products"
-        actions_data = self.client.get(actions_endpoint)
-        actions = extract_items(
-            actions_data,
-            [
-                ("result",),
-                ("result", "actions"),
-                ("actions",),
-                ("items",),
-            ],
-        )
-        rows: List[Dict[str, Any]] = []
-        raw_products: List[Any] = []
+    def collect_realization_report_if_needed(self) -> Optional[ReportResult]:
+        """Обновляет месячный отчёт реализации только при смене закрытого месяца.
 
-        for action in actions:
-            action_id = (
-                action.get("id")
-                or action.get("action_id")
-                or action.get("actionId")
-            )
-            base = {f"action.{k}": v for k, v in action.items()}
-            if not action_id:
-                row = dict(base)
-                row["Дата снимка"] = self.target_date.isoformat()
-                rows.append(row)
-                continue
-
-            offset = 0
-            got_any = False
-            for _ in range(500):
-                payload = {
-                    "action_id": action_id,
-                    "limit": 100,
-                    "offset": offset,
-                }
-                try:
-                    data = self.client.post(products_endpoint, payload)
-                except OzonApiError as exc:
-                    # В некоторых версиях action_id строковый/числовой.
-                    if exc.status == 400:
-                        payload["action_id"] = str(action_id)
-                        data = self.client.post(products_endpoint, payload)
-                    else:
-                        raise
-                raw_products.append({"request": payload, "response": data})
-                items = extract_items(
-                    data,
-                    [
-                        ("result", "products"),
-                        ("products",),
-                        ("result", "items"),
-                        ("items",),
-                    ],
-                )
-                if not items:
-                    break
-                got_any = True
-                for product in items:
-                    row = dict(base)
-                    row.update({f"product.{k}": v for k, v in product.items()})
-                    row["Дата снимка"] = self.target_date.isoformat()
-                    rows.append(row)
-                if len(items) < 100:
-                    break
-                offset += len(items)
-                time.sleep(API_PAUSE_SECONDS)
-
-            if not got_any:
-                row = dict(base)
-                row["Дата снимка"] = self.target_date.isoformat()
-                rows.append(row)
-
-        return records_to_df(rows), {
-            "actions": actions_data,
-            "products": raw_products,
-        }, [actions_endpoint, products_endpoint]
-
-    @staticmethod
-    def _review_date(item: Mapping[str, Any]) -> Optional[date]:
-        candidates = [
-            item.get("published_at"),
-            item.get("publishedAt"),
-            item.get("created_at"),
-            item.get("createdAt"),
-            item.get("date"),
-        ]
-        for value in candidates:
-            if value in (None, ""):
-                continue
-            parsed = pd.to_datetime(value, errors="coerce", utc=True)
-            if pd.notna(parsed):
-                return parsed.date()
-        return None
-
-    def fetch_reviews_since_year_start(self) -> Tuple[pd.DataFrame, Any, List[str]]:
-        """Отзывы с 01.01.2026. В пользовательских файлах даты не показываются."""
-        endpoints = ["/v2/review/list", "/v1/review/list"]
-        request_variants: List[Dict[str, Any]] = [
-            {"limit": 100, "last_id": "", "sort_dir": "DESC", "status": "ALL"},
-            {"limit": 100, "last_id": "", "sort_dir": "DESC"},
-        ]
-        raw: List[Any] = []
-        selected_endpoint = ""
-        selected_variant: Optional[Dict[str, Any]] = None
-        last_exc: Optional[Exception] = None
-        items_all: List[Dict[str, Any]] = []
-
-        for endpoint in endpoints:
-            for variant in request_variants:
-                cursor = str(variant.get("last_id", "") or "")
-                local_rows: List[Dict[str, Any]] = []
-                try:
-                    stop = False
-                    for page in range(1, 5000):
-                        body = dict(variant)
-                        body["last_id"] = cursor
-                        data = self.client.post(endpoint, body)
-                        raw.append({"endpoint": endpoint, "request": body, "response": data})
-                        items = extract_items(
-                            data,
-                            [
-                                ("reviews",),
-                                ("result", "reviews"),
-                                ("result", "items"),
-                                ("items",),
-                            ],
-                        )
-                        if not items:
-                            break
-                        for item in items:
-                            published = self._review_date(item)
-                            if published and published < REVIEWS_FROM_DATE:
-                                stop = True
-                                continue
-                            local_rows.append(item)
-                        next_cursor = (
-                            extract_cursor(data)
-                            or str(
-                                (data.get("last_id") if isinstance(data, Mapping) else "")
-                                or ""
-                            )
-                        )
-                        if stop or not next_cursor or next_cursor == cursor:
-                            break
-                        cursor = next_cursor
-                        time.sleep(API_PAUSE_SECONDS)
-                    items_all = local_rows
-                    selected_endpoint = endpoint
-                    selected_variant = variant
-                    break
-                except OzonApiError as exc:
-                    last_exc = exc
-                    raw.append({
-                        "endpoint": endpoint,
-                        "request": variant,
-                        "status": "ERROR",
-                        "error": str(exc),
-                    })
-                    if exc.status in {400, 404, 422}:
-                        continue
-                    raise
-            if selected_endpoint:
-                break
-
-        if not selected_endpoint:
-            if last_exc:
-                raise last_exc
-            return pd.DataFrame(), raw, endpoints
-
-        sku_to_offer, product_to_offer = self._product_article_map()
-        rows: List[Dict[str, Any]] = []
-        for item in items_all:
-            review_id = (
-                item.get("id")
-                or item.get("review_id")
-                or item.get("reviewId")
-            )
-            sku = (
-                item.get("sku")
-                or item.get("product_sku")
-                or item.get("productSku")
-            )
-            product_id = (
-                item.get("product_id")
-                or item.get("productId")
-            )
-            article = (
-                item.get("offer_id")
-                or item.get("offerId")
-                or sku_to_offer.get(str(sku))
-                or product_to_offer.get(str(product_id))
-                or "_UNMAPPED"
-            )
-            rating = (
-                item.get("rating")
-                or item.get("score")
-                or item.get("grade")
-            )
-            text_value = (
-                item.get("text")
-                or item.get("review_text")
-                or item.get("content")
-                or ""
-            )
-            published = self._review_date(item)
-            rows.append({
-                "_review_id": str(review_id or safe_json(item)),
-                "_published_date": published.isoformat() if published else "",
-                "Артикул": str(article),
-                "Оценка": rating,
-                "Текст отзыва": text_value,
-            })
-
-        df = pd.DataFrame(rows)
-        return df, {
-            "selected_endpoint": selected_endpoint,
-            "selected_variant": selected_variant,
-            "responses": raw,
-        }, [selected_endpoint]
-
-    def save_reviews_files(self, review_df: pd.DataFrame) -> Dict[str, Any]:
-        """Сохраняет отзывы поартикульно и общими недельными файлами.
-
-        Видимые колонки: Артикул (только в недельном файле), Оценка, Текст отзыва.
-        Даты и review_id остаются только в служебном JSON-индексе.
+        В дневной archive этот отчёт не включается: он относится ко всему месяцу,
+        а не к выбранному дню. В обычных запусках хранится один актуальный файл.
         """
-        if review_df is None or review_df.empty:
-            return {"rows": 0, "new_reviews": 0, "files": []}
+        if self.mode == "archive":
+            logging.info("Отчёт реализации: пропущен в дневном archive (месячный отчёт)")
+            return None
 
-        index_key = (
-            f"{self.base_prefix}/Служебные/{self.store}/Отзывы/"
-            "Индекс_отзывов.json"
+        first_day = self.target_date.replace(day=1)
+        month_day = first_day - timedelta(days=1)
+        expected_month = f"{month_day.year:04d}-{month_day.month:02d}"
+        key = (
+            f"{self.base_prefix}/Отчёт реализации/{self.store}/"
+            "Отчёт_реализации_последний_закрытый_месяц.xlsx"
         )
-        index_data = self.storage.read_json(index_key, default={"reviews": {}})
-        if not isinstance(index_data, Mapping):
-            index_data = {"reviews": {}}
-        known = dict(index_data.get("reviews", {}) or {})
-
-        work = review_df.copy()
-        work["_review_id"] = work["_review_id"].astype(str)
-        new_rows = work[~work["_review_id"].isin(set(known.keys()))].copy()
-        written: List[str] = []
-
-        if not new_rows.empty:
-            # Накопительные поартикульные файлы.
-            for article, part in new_rows.groupby("Артикул", dropna=False):
-                safe_article = re.sub(r'[\\/:*?"<>|]+', "_", str(article)).strip() or "_UNMAPPED"
-                key = (
-                    f"{self.base_prefix}/Отзывы/{self.store}/По артикулам/"
-                    f"{safe_article}/Отзывы_{safe_article}.xlsx"
-                )
-                visible = part[["Оценка", "Текст отзыва"]].copy()
+        if self.storage.exists(key):
+            try:
                 old = self.storage.read_excel(key)
-                merged = pd.concat([old, visible], ignore_index=True, sort=False)
-                self.storage.upload_bytes(
-                    key,
-                    self._excel_bytes(merged, "Отзывы"),
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                written.append(key)
+                if not old.empty and "Месяц отчёта" in old.columns:
+                    months = set(old["Месяц отчёта"].dropna().astype(str).str[:7])
+                    if expected_month in months:
+                        logging.info(
+                            "Отчёт реализации: %s уже сохранён, повторный API-запрос не нужен",
+                            expected_month,
+                        )
+                        return None
+            except Exception as exc:
+                logging.warning("Не удалось проверить кэш отчёта реализации: %s", exc)
 
-            # Общие недельные файлы.
-            new_rows["_date"] = pd.to_datetime(
-                new_rows["_published_date"], errors="coerce"
-            ).dt.date
-            undated = new_rows[new_rows["_date"].isna()].copy()
-            dated = new_rows[new_rows["_date"].notna()].copy()
-            week_parts: List[Tuple[date, pd.DataFrame]] = []
-            if not dated.empty:
-                dated["_week"] = dated["_date"].map(iso_week)
-                for _, part in dated.groupby("_week"):
-                    week_parts.append((part["_date"].iloc[0], part))
-            if not undated.empty:
-                week_parts.append((self.target_date, undated))
-
-            for partition_date, part in week_parts:
-                key = (
-                    f"{self.base_prefix}/Отзывы/{self.store}/Недельные/"
-                    f"{week_filename('Отзывы', partition_date)}"
-                )
-                visible = part[["Артикул", "Оценка", "Текст отзыва"]].copy()
-                old = self.storage.read_excel(key)
-                merged = pd.concat([old, visible], ignore_index=True, sort=False)
-                self.storage.upload_bytes(
-                    key,
-                    self._excel_bytes(merged, "Отзывы"),
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                written.append(key)
-
-        now = datetime.now(MOSCOW_TZ).isoformat()
-        for _, row in work.iterrows():
-            rid = str(row["_review_id"])
-            known[rid] = {
-                "article": str(row.get("Артикул", "")),
-                "published_at": str(row.get("_published_date", "")),
-                "last_seen_at": now,
-            }
-
-        self.storage.upload_json(index_key, {
-            "store": self.store,
-            "from_date": REVIEWS_FROM_DATE.isoformat(),
-            "updated_at": now,
-            "reviews": known,
-        })
-        return {
-            "rows": len(work),
-            "new_reviews": len(new_rows),
-            "files": sorted(set(written)),
-            "index_key": index_key,
-        }
+        return self._run(
+            "realization_report", "Отчёт реализации Ozon — последний закрытый месяц",
+            "Отчёт реализации", "Отчёт_реализации_последний_закрытый_месяц",
+            self.fetch_realization_report, "Месяц отчёта",
+            ["Месяц отчёта", "SKU Ozon"],
+            snapshot=True, optional=True,
+        )
 
     # ------------------------- Performance API -------------------------
 
@@ -3547,11 +2890,16 @@ class OzonFboCollector:
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        raw_key = (
-            f"{self.base_prefix}/Служебные/{self.store}/Рекламный лаг/"
-            f"Сырые ответы/{request_at:%Y-%m-%d}/{self.run_id}.json"
-        )
-        self.storage.upload_json(raw_key, raw)
+        raw_key = ""
+        save_raw = str(os.getenv("OZON_SAVE_RAW_RESPONSES", "0")).strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if save_raw:
+            raw_key = (
+                f"{self.base_prefix}/Служебные/{self.store}/Рекламный лаг/"
+                f"Сырые ответы/{request_at:%Y-%m-%d}/{self.run_id}.json"
+            )
+            self.storage.upload_json(raw_key, raw)
         return {
             "status": "OK",
             "rows_added": len(work),
@@ -3565,18 +2913,19 @@ class OzonFboCollector:
 
     # ------------------------- collect/save -------------------------
     def collect_snapshot_reports(self) -> None:
-        """Снимки состояния на целевую дату. Все сохраняются недельными файлами."""
+        """Снимки состояния: динамические — недельно, статические — только latest."""
         self._run(
             "products", "Справочник товаров", "Товары", "Товары",
             self.fetch_product_catalog, "Дата снимка",
             ["Дата снимка", "product_id", "offer_id"],
+            snapshot=True,
         )
         self._run(
             "product_info", "Подробная информация о товарах",
             "Информация о товарах", "Информация_о_товарах",
             self.fetch_product_info, "Дата снимка",
             ["Дата снимка", "id", "product_id", "offer_id"],
-            optional=True,
+            snapshot=True, optional=True,
         )
         self._run(
             "prices", "Цены", "Цены", "Цены",
@@ -3629,13 +2978,6 @@ class OzonFboCollector:
             logging.warning("Performance API отключён: рекламные снимки пропущены")
 
         self._run(
-            "promotions", "Акции и промо",
-            "Акции и промо", "Акции_и_промо",
-            self.fetch_promotions, "Дата снимка",
-            ["Дата снимка", "action.id", "action.action_id", "product.id", "product.sku"],
-            optional=True,
-        )
-        self._run(
             "supplies", "Поставки FBO — запланированные и в пути",
             "Поставки", "Поставки",
             self.fetch_supply_orders, "Дата снимка",
@@ -3647,18 +2989,12 @@ class OzonFboCollector:
             "Склады", "Склады",
             self.fetch_warehouses, "Дата снимка",
             ["Дата снимка", "warehouse_id", "name"],
-            optional=True,
-        )
-        self._run(
-            "realization_report", "Отчёт реализации Ozon — последний закрытый месяц",
-            "Отчёт реализации", "Отчёт_реализации_последний_закрытый_месяц",
-            self.fetch_realization_report, "Месяц отчёта",
-            ["Месяц отчёта", "SKU Ozon"],
             snapshot=True, optional=True,
         )
+        self.collect_realization_report_if_needed()
 
     def collect_optional_event_reports(self) -> None:
-        """Дорогие/экспериментальные методы. В history выполняются один раз, не 60 раз."""
+        """Дополнительная товарная рекламная аналитика."""
         if self.performance_client is not None:
             self._run(
                 "ad_product_statistics", "Реклама — статистика по товарам",
@@ -3675,20 +3011,6 @@ class OzonFboCollector:
                 optional=True,
             )
 
-        self._run(
-            "product_queries", "Поисковые запросы — сводная",
-            "Поисковые запросы", "Поисковые_запросы_сводная",
-            self.fetch_product_queries, "Дата",
-            ["Дата", "offer_id", "sku", "query", "search_query", "query_text"],
-            optional=True,
-        )
-        self._run(
-            "product_query_details", "Поисковые запросы — товар × запрос",
-            "Поисковые запросы по товарам", "Поисковые_запросы_по_товарам",
-            self.fetch_product_query_details, "Дата",
-            ["Дата", "offer_id", "sku", "query", "search_query", "query_text"],
-            optional=True,
-        )
 
     def collect_event_reports(self, include_heavy: bool = True) -> None:
         """Событийные отчёты строго за self.target_date."""
@@ -3739,37 +3061,10 @@ class OzonFboCollector:
         if include_heavy:
             self.collect_optional_event_reports()
 
-    def collect_reviews_report(self) -> Optional[ReportResult]:
-        """Отзывы хранятся отдельной логикой, без дат в пользовательских файлах."""
-        logging.info("=== Отзывы с %s ===", REVIEWS_FROM_DATE)
-        result = ReportResult(
-            code="reviews",
-            title="Отзывы",
-            folder="Отзывы",
-            filename_prefix="Отзывы",
-            optional=True,
-            skip_standard_save=True,
-        )
-        try:
-            df, raw, methods = self.fetch_reviews_since_year_start()
-            result.df = normalize_columns(df)
-            result.raw = raw
-            result.method_paths = list(methods)
-            result.status = "EMPTY" if result.df.empty else "OK"
-            if result.df.empty:
-                result.message = "Отзывы не найдены"
-        except Exception as exc:
-            self.log_error("reviews", "Отзывы", exc, optional=True)
-            result.status = "SKIPPED_OPTIONAL"
-            result.message = str(exc)
-        self.results.append(result)
-        return result
-
     def collect_all(self) -> None:
-        """Совместимость для test/archive: снимки + события + отзывы."""
+        """Совместимость для test/archive: снимки + событийные отчёты."""
         self.collect_snapshot_reports()
         self.collect_event_reports()
-        self.collect_reviews_report()
 
     @staticmethod
     def _clean_excel_value(value: Any) -> Any:
@@ -4023,10 +3318,17 @@ class OzonFboCollector:
                 result.s3_key = key
                 logging.info("Сохранено: s3://%s/%s (%s строк)", self.storage.bucket, key, len(merged))
 
-            # Сырые ответы — отдельная служебная папка, не смешиваем с отчётами.
-            if result.raw is not None:
-                raw_key = (f"{self.base_prefix}/Служебные/{self.store}/Сырые ответы/{self.target_date.isoformat()}/"
-                           f"{result.code}_{self.run_id}.json")
+            # Полные RAW JSON очень быстро раздувают Object Storage.
+            # По умолчанию НЕ сохраняем. Включать только временно для отладки:
+            # OZON_SAVE_RAW_RESPONSES=1.
+            save_raw = str(os.getenv("OZON_SAVE_RAW_RESPONSES", "0")).strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+            if save_raw and result.raw is not None:
+                raw_key = (
+                    f"{self.base_prefix}/Служебные/{self.store}/Сырые ответы/"
+                    f"{self.target_date.isoformat()}/{result.code}_{self.run_id}.json"
+                )
                 self.storage.upload_json(raw_key, result.raw)
 
         if self.mode == "archive":
@@ -4119,8 +3421,6 @@ EVENT_REPORT_CODES = [
     "ad_statistics",
     "ad_product_statistics",
     "ad_orders",
-    "product_queries",
-    "product_query_details",
 ]
 
 EVENT_REPORT_LOCATIONS: Dict[str, Tuple[str, str]] = {
@@ -4132,8 +3432,6 @@ EVENT_REPORT_LOCATIONS: Dict[str, Tuple[str, str]] = {
     "ad_statistics": ("Реклама/Статистика", "Реклама_статистика"),
     "ad_product_statistics": ("Реклама/По товарам", "Реклама_по_товарам"),
     "ad_orders": ("Реклама/Заказы", "Рекламные_заказы"),
-    "product_queries": ("Поисковые запросы", "Поисковые_запросы_сводная"),
-    "product_query_details": ("Поисковые запросы по товарам", "Поисковые_запросы_по_товарам"),
 }
 
 
@@ -4591,6 +3889,13 @@ def main() -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     logging.info("VERSION: %s", SCRIPT_VERSION)
+    save_raw_enabled = str(os.getenv("OZON_SAVE_RAW_RESPONSES", "0")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    logging.info(
+        "RAW JSON в Object Storage: %s",
+        "ВКЛЮЧЕНЫ (debug)" if save_raw_enabled else "ВЫКЛЮЧЕНЫ",
+    )
 
     store = str(args.store).upper().strip() or DEFAULT_STORE
     if store not in ALLOWED_STORES and not (args.mode == "archive_all" and store == "ALL"):
@@ -4667,13 +3972,9 @@ def main() -> int:
             performance_client=performance_client,
         )
         collector.collect_all()
-        review_result = next((r for r in collector.results if r.code == "reviews"), None)
-        review_info: Dict[str, Any] = {}
-        if review_result is not None and review_result.status in {"OK", "EMPTY"}:
-            review_info = collector.save_reviews_files(review_result.df)
         collector.save_results()
         collector.save_diagnostics()
-        logging.info("Архив завершён. Отзывы: %s", review_info)
+        logging.info("Архив завершён")
         return 0
 
     # 1. Текущие снимки состояния.
@@ -4687,19 +3988,7 @@ def main() -> int:
         performance_client=performance_client,
     )
     snapshot.collect_snapshot_reports()
-    review_result = snapshot.collect_reviews_report()
     snapshot.save_results()
-
-    review_info: Dict[str, Any] = {}
-    if review_result is not None and review_result.status in {"OK", "EMPTY"}:
-        review_info = snapshot.save_reviews_files(review_result.df)
-        if review_result.raw is not None:
-            raw_key = (
-                f"Отчёты/Служебные/{store}/Отзывы/Сырые ответы/"
-                f"{target.isoformat()}_{snapshot.run_id}.json"
-            )
-            storage.upload_json(raw_key, review_result.raw)
-            review_info["raw_key"] = raw_key
 
     # 2. Служебный рекламный лаг — отдельно от основных отчётов.
     lag_info: Dict[str, Any] = {}
@@ -4715,10 +4004,8 @@ def main() -> int:
     active_codes = ["orders", "returns", "funnel", "finance_accruals"]
     if performance_client is not None:
         active_codes.append("ad_statistics")
-    if args.mode != "history":
-        active_codes.extend(["product_queries", "product_query_details"])
-        if performance_client is not None:
-            active_codes.extend(["ad_product_statistics", "ad_orders"])
+    if args.mode != "history" and performance_client is not None:
+        active_codes.extend(["ad_product_statistics", "ad_orders"])
 
     coverage = CoverageTracker(storage, store, target)
     process_dates = coverage.dates_to_process(
@@ -4790,7 +4077,7 @@ def main() -> int:
     # 4. Дорогие экспериментальные методы в history проверяем один раз.
     optional_probe_reports: List[Dict[str, Any]] = []
     if args.mode == "history":
-        logging.info("=== Однократная проверка поисковой и товарной рекламной аналитики ===")
+        logging.info("=== Однократная проверка товарной рекламной аналитики ===")
         probe = OzonFboCollector(
             seller_client, storage, store, target, "test",
             workdir / "optional_probe",
@@ -4816,7 +4103,6 @@ def main() -> int:
         "snapshot_reports": collector_result_summary(snapshot.results),
         "event_runs": event_runs,
         "optional_probe_reports": optional_probe_reports,
-        "reviews": review_info,
         "ad_lag": lag_info,
         "coverage_key": coverage.key,
         "snapshot_errors": snapshot.errors,
