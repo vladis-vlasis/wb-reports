@@ -11,6 +11,7 @@
 Поисковые запросы: загружается целевая дата по правилу времени запуска.
 Реклама: каждый день заново получает последние 14 дат статистики и хранит ежедневные снимки для анализа лага.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
+Добавлен agent_catalog: единый ZIP для ИИ-агента с карточками WB, характеристиками, размерами, фото и AI-friendly паспортом по каждому артикулу продавца.
 Для TOPFACE/MISSTAIS используются основные WB-токены; FBS по этим магазинам собирается только по подтверждённым складам в Липецке (ID 1728667/1935990). Для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB; finance и keywords для FINICK отключены. FINICK при первом запуске догружает 7 полностью завершённых недель истории (без текущей недели) для доступных исторических отчётов.
 """
 
@@ -25,6 +26,9 @@ import traceback
 import re
 import sys
 import argparse
+import hashlib
+import mimetypes
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple, Any, Set
 import warnings
@@ -39,7 +43,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-08-07_v41_FBS_LIPETSK_ONLY"
+SCRIPT_VERSION = "2026-08-11_v42_AGENT_CATALOG_ARCHIVE"
 
 # Для TOPFACE и MISSTAIS FBS собираем только с двух подтверждённых липецких
 # складов продавца. Набор общий намеренно: токен каждого магазина видит только
@@ -144,6 +148,28 @@ class S3Storage:
 
     def upload_file(self, local_path: str, key: str):
         self.s3.upload_file(local_path, self.bucket, key)
+
+    def read_json(self, key: str) -> Optional[dict]:
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+            raw = obj['Body'].read()
+            return json.loads(raw.decode('utf-8'))
+        except ClientError as e:
+            if e.response['Error']['Code'] in {'NoSuchKey', '404'}:
+                return None
+            raise
+        except Exception as e:
+            print(f"Ошибка чтения JSON {key}: {e}")
+            return None
+
+    def write_json(self, key: str, data: dict):
+        payload = json.dumps(data, ensure_ascii=False, indent=2, default=str).encode('utf-8')
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=payload,
+            ContentType='application/json; charset=utf-8',
+        )
 
     def file_exists(self, key: str) -> bool:
         try:
@@ -272,6 +298,7 @@ class WildberriesDailyUpdater:
             'funnel': 30,
             'adverts': 30,
             '1c_stocks': 0,
+            'agent_catalog': 0,
         }
 
         # v22: поисковые запросы выгружаем по всем артикулам из заказов, без ограничения 4 категориями.
@@ -2762,6 +2789,532 @@ class WildberriesDailyUpdater:
                 self.log("🧹 Временный файл удалён")
 
 
+    # ====================== ИИ-АГЕНТ: КАРТОЧКИ / ХАРАКТЕРИСТИКИ / ФОТО ======================
+
+    @staticmethod
+    def _agent_env_set(name: str) -> Set[str]:
+        """Прочитать список значений из env: запятая/точка с запятой/перенос строки."""
+        raw = (os.environ.get(name, "") or "").strip()
+        if not raw:
+            return set()
+        return {x.strip() for x in re.split(r"[,;\n\r]+", raw) if x.strip()}
+
+    @staticmethod
+    def _agent_safe_name(value: Any, fallback: str = "UNKNOWN") -> str:
+        text = str(value or "").strip() or fallback
+        # Windows/S3/ZIP-safe имя папки, но сохраняем кириллицу и пробелы.
+        text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', text)
+        text = re.sub(r'\s+', ' ', text).strip(' .')
+        return (text[:140] or fallback)
+
+    @staticmethod
+    def _agent_json_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    def _agent_archive_keys(self, store_name: str) -> Tuple[str, str]:
+        base = f"Отзывы/Обучение/{store_name}"
+        return (
+            f"{base}/WB_Агент_Ассортимент_{store_name}.zip",
+            f"{base}/WB_Агент_Ассортимент_{store_name}.manifest.json",
+        )
+
+    def _fetch_all_content_cards(self, store_name: str) -> Optional[List[dict]]:
+        """Получить все карточки продавца из Content API.
+
+        Используется POST /content/v2/get/cards/list. В ответе WB уже отдаёт
+        описание, characteristics, sizes, photos, video, tags и прочие поля карточки.
+        Сохраняем ответ карточки целиком, чтобы не потерять новые поля API.
+        """
+        token = (self.api_keys[store_name].get('content') or self.api_keys[store_name].get('promo') or '').strip()
+        if not token:
+            self.log(f"❌ agent_catalog {store_name}: не найден Content-токен")
+            return None
+
+        url = "https://content-api.wildberries.ru/content/v2/get/cards/list"
+        headers = {"Authorization": token, "Content-Type": "application/json"}
+        cursor: Dict[str, Any] = {'limit': 100}
+        last_cursor: Optional[Tuple[Any, Any]] = None
+        cards_all: List[dict] = []
+
+        for page in range(1, 1000):
+            payload = {
+                'settings': {
+                    'sort': {'ascending': True},
+                    'filter': {'withPhoto': -1},
+                    'cursor': cursor,
+                }
+            }
+
+            data = None
+            for attempt in range(1, 6):
+                try:
+                    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        break
+                    if resp.status_code == 429:
+                        wait = self._rate_limit_wait_seconds(resp, default_seconds=max(5, attempt * 5), max_seconds=120)
+                        self.log(f"⚠️ agent_catalog cards/list: 429, попытка {attempt}/5, ждём {wait} сек")
+                        time.sleep(wait)
+                        continue
+                    if resp.status_code in (500, 502, 503, 504):
+                        wait = 10 * attempt
+                        self.log(f"⚠️ agent_catalog cards/list: HTTP {resp.status_code}, попытка {attempt}/5, ждём {wait} сек")
+                        time.sleep(wait)
+                        continue
+                    if resp.status_code in (401, 403):
+                        self.log(
+                            f"❌ agent_catalog {store_name}: Content API вернул {resp.status_code}. "
+                            f"Нужен токен с категорией Content. Ответ: {resp.text[:700]}"
+                        )
+                        return None
+                    self.log(f"❌ agent_catalog cards/list HTTP {resp.status_code}: {resp.text[:1000]}")
+                    return None
+                except Exception as e:
+                    if attempt >= 5:
+                        self.log(f"❌ agent_catalog cards/list: {e}")
+                        return None
+                    time.sleep(5 * attempt)
+
+            if data is None:
+                return None
+
+            cards = data.get('cards') or []
+            cards_all.extend(cards)
+            self.log(f"📦 agent_catalog: страница {page}, карточек {len(cards)}, всего {len(cards_all)}")
+
+            cur = data.get('cursor') or {}
+            if not cards or len(cards) < 100:
+                break
+            next_cursor = (cur.get('updatedAt'), cur.get('nmID', cur.get('nmId')))
+            if not next_cursor[0] or not next_cursor[1] or next_cursor == last_cursor:
+                break
+            last_cursor = next_cursor
+            cursor = {'limit': 100, 'updatedAt': next_cursor[0], 'nmID': next_cursor[1]}
+            time.sleep(0.65)
+
+        # На случай повторов курсора оставляем одну последнюю карточку на nmID.
+        dedup: Dict[str, dict] = {}
+        for card in cards_all:
+            nm_id = str(card.get('nmID', card.get('nmId', '')) or '').strip()
+            key = nm_id or f"vendor:{card.get('vendorCode', '')}:{len(dedup)}"
+            dedup[key] = card
+        return list(dedup.values())
+
+    def _agent_filter_cards(self, cards: List[dict]) -> List[dict]:
+        """Опциональные фильтры для выведенных из оборота/служебных карточек.
+
+        WB_AGENT_INCLUDE_VENDOR_CODES — если задан, экспортируются только эти артикулы продавца.
+        WB_AGENT_EXCLUDE_VENDOR_CODES — исключить артикулы продавца.
+        WB_AGENT_EXCLUDE_NMIDS — исключить nmID.
+        """
+        include_vendor = self._agent_env_set('WB_AGENT_INCLUDE_VENDOR_CODES')
+        exclude_vendor = self._agent_env_set('WB_AGENT_EXCLUDE_VENDOR_CODES')
+        exclude_nmids = self._agent_env_set('WB_AGENT_EXCLUDE_NMIDS')
+
+        result = []
+        skipped = 0
+        for card in cards or []:
+            vendor = str(card.get('vendorCode', '') or '').strip()
+            nm_id = str(card.get('nmID', card.get('nmId', '')) or '').strip()
+            if include_vendor and vendor not in include_vendor:
+                skipped += 1
+                continue
+            if vendor in exclude_vendor or nm_id in exclude_nmids:
+                skipped += 1
+                continue
+            result.append(card)
+
+        if skipped:
+            self.log(f"🧹 agent_catalog: исключено карточек фильтрами: {skipped}")
+        return result
+
+    @staticmethod
+    def _agent_photo_urls(card: dict) -> List[dict]:
+        photos = card.get('photos') or []
+        result: List[dict] = []
+        seen: Set[str] = set()
+        preferred = ['big', 'c516x688', 'c246x328', 'square', 'tm']
+
+        for idx, photo in enumerate(photos, start=1):
+            url = ''
+            variants = {}
+            if isinstance(photo, str):
+                url = photo.strip()
+                variants = {'source': url}
+            elif isinstance(photo, dict):
+                variants = photo
+                for key in preferred:
+                    candidate = photo.get(key)
+                    if isinstance(candidate, str) and candidate.startswith(('http://', 'https://')):
+                        url = candidate
+                        break
+                if not url:
+                    for key, candidate in photo.items():
+                        if isinstance(candidate, str) and candidate.startswith(('http://', 'https://')):
+                            url = candidate
+                            break
+            if url and url not in seen:
+                seen.add(url)
+                result.append({'index': idx, 'url': url, 'variants': variants})
+        return result
+
+    @staticmethod
+    def _agent_ext_from_response(url: str, content_type: str) -> str:
+        ct = (content_type or '').split(';')[0].strip().lower()
+        ext = mimetypes.guess_extension(ct) if ct else None
+        if ext == '.jpe':
+            ext = '.jpg'
+        if ext in {'.jpg', '.jpeg', '.png', '.webp', '.gif'}:
+            return ext
+        path_ext = os.path.splitext(urlparse(url).path)[1].lower()
+        if path_ext in {'.jpg', '.jpeg', '.png', '.webp', '.gif'}:
+            return path_ext
+        return '.jpg'
+
+    def _agent_download_media(self, url: str, dst_without_ext: str) -> Tuple[Optional[str], Optional[str]]:
+        """Скачать изображение с retry. Возвращает (путь, ошибка)."""
+        for attempt in range(1, 4):
+            try:
+                resp = requests.get(
+                    url,
+                    timeout=90,
+                    stream=True,
+                    headers={'User-Agent': 'Mozilla/5.0 WB-Agent-Catalog/1.0'},
+                )
+                if resp.status_code == 200:
+                    ext = self._agent_ext_from_response(url, resp.headers.get('Content-Type', ''))
+                    dst = dst_without_ext + ext
+                    with open(dst, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                f.write(chunk)
+                    if os.path.getsize(dst) <= 0:
+                        return None, 'скачан пустой файл'
+                    return dst, None
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                    time.sleep(3 * attempt)
+                    continue
+                return None, f"HTTP {resp.status_code}"
+            except Exception as e:
+                if attempt >= 3:
+                    return None, str(e)
+                time.sleep(3 * attempt)
+        return None, 'неизвестная ошибка'
+
+    def _agent_product_markdown(self, card: dict) -> str:
+        nm_id = card.get('nmID', card.get('nmId', ''))
+        vendor = card.get('vendorCode', '')
+        title = card.get('title', '')
+        brand = card.get('brand', card.get('brandName', ''))
+        subject = card.get('subjectName', '')
+        description = card.get('description', '')
+        characteristics = card.get('characteristics') or []
+        sizes = card.get('sizes') or []
+        dimensions = card.get('dimensions') or {}
+        tags = card.get('tags') or []
+        need_kiz = card.get('needKiz', '')
+
+        lines = [
+            f"# {vendor or nm_id} — {title}",
+            "",
+            "## Идентификация",
+            f"- Артикул продавца: {vendor}",
+            f"- Артикул WB (nmID): {nm_id}",
+            f"- Бренд: {brand}",
+            f"- Предмет: {subject}",
+            f"- Требуется маркировка КИЗ: {need_kiz}",
+            f"- Создано: {card.get('createdAt', '')}",
+            f"- Обновлено: {card.get('updatedAt', '')}",
+            "",
+            "## Название",
+            str(title or ''),
+            "",
+            "## Описание",
+            str(description or ''),
+            "",
+            "## Габариты",
+        ]
+        if isinstance(dimensions, dict) and dimensions:
+            for key, value in dimensions.items():
+                lines.append(f"- {key}: {self._agent_json_text(value)}")
+        else:
+            lines.append("- Нет данных")
+
+        lines += ["", "## Характеристики"]
+        if characteristics:
+            for item in characteristics:
+                if isinstance(item, dict):
+                    name = item.get('name') or item.get('id') or 'Характеристика'
+                    value = item.get('value', item.get('values', ''))
+                    lines.append(f"- {name}: {self._agent_json_text(value)}")
+                else:
+                    lines.append(f"- {self._agent_json_text(item)}")
+        else:
+            lines.append("- Нет данных")
+
+        lines += ["", "## Размеры и баркоды"]
+        if sizes:
+            for size in sizes:
+                if isinstance(size, dict):
+                    lines.append(
+                        "- " + "; ".join([
+                            f"chrtID={size.get('chrtID', size.get('chrtId', ''))}",
+                            f"techSize={size.get('techSize', '')}",
+                            f"wbSize={size.get('wbSize', '')}",
+                            f"skus={self._agent_json_text(size.get('skus') or [])}",
+                        ])
+                    )
+                else:
+                    lines.append(f"- {self._agent_json_text(size)}")
+        else:
+            lines.append("- Нет данных")
+
+        lines += [
+            "",
+            "## Медиа",
+            f"- Фотографий в карточке: {len(card.get('photos') or [])}",
+            f"- Видео: {self._agent_json_text(card.get('video', ''))}",
+            "",
+            "## Теги",
+            self._agent_json_text(tags) or "Нет данных",
+            "",
+            "## Примечание для ИИ-агента",
+            "Факты в этом файле получены из текущей карточки продавца через WB Content API. "
+            "Для спорных характеристик приоритет имеет карточка_WB.json и актуальные данные API. "
+            "Не делай вывод о материале, размере или совместимости только по внешнему виду фотографии.",
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _agent_catalog_signature(self, cards: List[dict]) -> str:
+        canonical = json.dumps(cards, ensure_ascii=False, sort_keys=True, separators=(',', ':'), default=str)
+        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
+    def update_agent_catalog(self, store_name: str) -> bool:
+        """Создать один ZIP для базы знаний ИИ-агента, разбитый по артикулам продавца.
+
+        Структура архива:
+          Каталог.xlsx
+          manifest.json
+          README.txt
+          <Артикул продавца>/
+              паспорт_товара.md
+              карточка_WB.json
+              характеристики.json
+              размеры_и_баркоды.json
+              медиа.json
+              фото/01.jpg ...
+
+        Архив перезаписывается по одному стабильному ключу в Object Storage.
+        Если карточки не изменились, фотографии повторно не скачиваются.
+        """
+        self.log("")
+        self.log(f"📌 ОБНОВЛЕНИЕ: Архив знаний ИИ-агента для магазина {store_name}")
+
+        cards = self._fetch_all_content_cards(store_name)
+        if cards is None:
+            return False
+        cards = self._agent_filter_cards(cards)
+        if not cards:
+            self.log("⚠️ agent_catalog: после фильтров не осталось карточек")
+            return False
+
+        cards = sorted(
+            cards,
+            key=lambda c: (str(c.get('vendorCode', '') or '').lower(), int(c.get('nmID', c.get('nmId', 0)) or 0))
+        )
+        signature = self._agent_catalog_signature(cards)
+        archive_key, manifest_key = self._agent_archive_keys(store_name)
+        force = (os.environ.get('WB_AGENT_CATALOG_FORCE', '') or '').strip().lower() in {'1', 'true', 'yes', 'y', 'да'}
+        old_manifest = self.s3.read_json(manifest_key) if self.s3.file_exists(manifest_key) else None
+
+        if (
+            not force
+            and old_manifest
+            and old_manifest.get('signature') == signature
+            and bool(old_manifest.get('complete'))
+            and self.s3.file_exists(archive_key)
+        ):
+            self.log(
+                f"✅ agent_catalog: карточки не изменились ({len(cards)} шт.), "
+                f"готовый архив уже есть: {archive_key}"
+            )
+            return True
+
+        max_photos_raw = (os.environ.get('WB_AGENT_MAX_PHOTOS', '') or '').strip()
+        try:
+            max_photos = int(max_photos_raw) if max_photos_raw else 0
+        except ValueError:
+            max_photos = 0
+        # 0 = все фотографии.
+
+        now_msk = datetime.now(pytz.timezone('Europe/Moscow'))
+        catalog_rows: List[dict] = []
+        photo_errors: List[dict] = []
+        total_photos = 0
+        downloaded_photos = 0
+        used_folder_names: Set[str] = set()
+
+        with tempfile.TemporaryDirectory(prefix='wb_agent_catalog_') as tmp_dir:
+            root_dir = os.path.join(tmp_dir, f"WB_Агент_Ассортимент_{store_name}")
+            os.makedirs(root_dir, exist_ok=True)
+
+            for idx, card in enumerate(cards, start=1):
+                nm_id = card.get('nmID', card.get('nmId', ''))
+                vendor = str(card.get('vendorCode', '') or '').strip()
+                base_folder = self._agent_safe_name(vendor, fallback=f"nm_{nm_id}")
+                folder_name = base_folder
+                if folder_name in used_folder_names:
+                    folder_name = self._agent_safe_name(f"{base_folder}__nm{nm_id}")
+                used_folder_names.add(folder_name)
+
+                product_dir = os.path.join(root_dir, folder_name)
+                photos_dir = os.path.join(product_dir, 'фото')
+                os.makedirs(photos_dir, exist_ok=True)
+
+                # Источник истины — карточка целиком.
+                with open(os.path.join(product_dir, 'карточка_WB.json'), 'w', encoding='utf-8') as f:
+                    json.dump(card, f, ensure_ascii=False, indent=2, default=str)
+
+                with open(os.path.join(product_dir, 'характеристики.json'), 'w', encoding='utf-8') as f:
+                    json.dump(card.get('characteristics') or [], f, ensure_ascii=False, indent=2, default=str)
+
+                with open(os.path.join(product_dir, 'размеры_и_баркоды.json'), 'w', encoding='utf-8') as f:
+                    json.dump(card.get('sizes') or [], f, ensure_ascii=False, indent=2, default=str)
+
+                with open(os.path.join(product_dir, 'паспорт_товара.md'), 'w', encoding='utf-8') as f:
+                    f.write(self._agent_product_markdown(card))
+
+                photo_items = self._agent_photo_urls(card)
+                if max_photos > 0:
+                    photo_items = photo_items[:max_photos]
+                media_manifest = {
+                    'nmID': nm_id,
+                    'vendorCode': vendor,
+                    'photos': photo_items,
+                    'video': card.get('video'),
+                }
+
+                for photo_pos, media in enumerate(photo_items, start=1):
+                    total_photos += 1
+                    dst_no_ext = os.path.join(photos_dir, f"{photo_pos:02d}")
+                    local_path, error = self._agent_download_media(media['url'], dst_no_ext)
+                    if local_path:
+                        downloaded_photos += 1
+                        media['downloaded_file'] = f"фото/{os.path.basename(local_path)}"
+                        media['download_error'] = None
+                    else:
+                        media['downloaded_file'] = None
+                        media['download_error'] = error
+                        photo_errors.append({
+                            'vendorCode': vendor,
+                            'nmID': nm_id,
+                            'photo_index': photo_pos,
+                            'url': media['url'],
+                            'error': error,
+                        })
+
+                with open(os.path.join(product_dir, 'медиа.json'), 'w', encoding='utf-8') as f:
+                    json.dump(media_manifest, f, ensure_ascii=False, indent=2, default=str)
+
+                catalog_rows.append({
+                    'Магазин': store_name,
+                    'Артикул продавца': vendor,
+                    'Артикул WB': nm_id,
+                    'Название': card.get('title', ''),
+                    'Бренд': card.get('brand', card.get('brandName', '')),
+                    'Предмет': card.get('subjectName', ''),
+                    'Описание': card.get('description', ''),
+                    'Фото в карточке': len(card.get('photos') or []),
+                    'Фото в архиве': len([x for x in photo_items if x.get('downloaded_file')]),
+                    'Характеристик': len(card.get('characteristics') or []),
+                    'Размеров': len(card.get('sizes') or []),
+                    'Требуется КИЗ': card.get('needKiz', ''),
+                    'Создано': card.get('createdAt', ''),
+                    'Обновлено': card.get('updatedAt', ''),
+                    'Папка в архиве': folder_name,
+                })
+                self.log(
+                    f"   [{idx}/{len(cards)}] {vendor or nm_id}: "
+                    f"характеристик={len(card.get('characteristics') or [])}, "
+                    f"фото={len(photo_items)}"
+                )
+
+            catalog_df = pd.DataFrame(catalog_rows)
+            catalog_path = os.path.join(root_dir, 'Каталог.xlsx')
+            with pd.ExcelWriter(catalog_path, engine='openpyxl') as writer:
+                catalog_df.to_excel(writer, sheet_name='Товары', index=False)
+                if photo_errors:
+                    pd.DataFrame(photo_errors).to_excel(writer, sheet_name='Ошибки фото', index=False)
+
+            manifest = {
+                'version': SCRIPT_VERSION,
+                'store': store_name,
+                'generated_at_msk': now_msk.strftime('%Y-%m-%d %H:%M:%S'),
+                'signature': signature,
+                'cards': len(cards),
+                'photos_total': total_photos,
+                'photos_downloaded': downloaded_photos,
+                'photo_errors': len(photo_errors),
+                'complete': len(photo_errors) == 0,
+                'archive_key': archive_key,
+                'source': 'WB Content API POST /content/v2/get/cards/list',
+                'filters': {
+                    'include_vendor_codes': sorted(self._agent_env_set('WB_AGENT_INCLUDE_VENDOR_CODES')),
+                    'exclude_vendor_codes': sorted(self._agent_env_set('WB_AGENT_EXCLUDE_VENDOR_CODES')),
+                    'exclude_nmids': sorted(self._agent_env_set('WB_AGENT_EXCLUDE_NMIDS')),
+                    'max_photos_per_product': max_photos,
+                },
+            }
+            with open(os.path.join(root_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2, default=str)
+
+            readme = (
+                "АРХИВ БАЗЫ ЗНАНИЙ ИИ-АГЕНТА WB\n\n"
+                "Каждая папка соответствует артикулу продавца.\n"
+                "паспорт_товара.md — удобный текст для ИИ/человека.\n"
+                "карточка_WB.json — полная актуальная карточка из Content API.\n"
+                "характеристики.json — характеристики товара.\n"
+                "размеры_и_баркоды.json — chrtID, размеры и SKU/баркоды.\n"
+                "медиа.json — URL всех медиа и имена скачанных фотографий.\n"
+                "фото/ — изображения карточки в максимальном доступном качестве из ответа WB.\n\n"
+                "Архив перезаписывается при изменении карточек и не создаёт ежедневных дублей.\n"
+            )
+            with open(os.path.join(root_dir, 'README.txt'), 'w', encoding='utf-8') as f:
+                f.write(readme)
+
+            zip_path = os.path.join(tmp_dir, f"WB_Агент_Ассортимент_{store_name}.zip")
+            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                for dirpath, _, filenames in os.walk(root_dir):
+                    for filename in filenames:
+                        full_path = os.path.join(dirpath, filename)
+                        arcname = os.path.relpath(full_path, root_dir)
+                        zf.write(full_path, arcname=arcname)
+
+            archive_size_mb = os.path.getsize(zip_path) / 1024 / 1024
+            self.s3.upload_file(zip_path, archive_key)
+            self.s3.write_json(manifest_key, manifest)
+
+        self.log(
+            f"✅ agent_catalog сохранён: {archive_key}; товаров={len(cards)}, "
+            f"фото={downloaded_photos}/{total_photos}, размер={archive_size_mb:.1f} МБ"
+        )
+        if photo_errors:
+            self.log(
+                f"⚠️ agent_catalog: не скачано фотографий {len(photo_errors)}. "
+                f"Список ошибок есть в Каталог.xlsx; следующий ежедневный запуск повторит сбор, "
+                f"пока manifest.complete=false."
+            )
+        return True
+
+
     # ====================== FBS: ЗАКАЗЫ / ОСТАТКИ / ПОСТАВКИ ======================
 
     def _fbs_headers(self, store_name: str) -> dict:
@@ -3546,7 +4099,7 @@ class WildberriesDailyUpdater:
     # ====================== ОСНОВНОЙ ЗАПУСК ======================
     def run_daily_update(self, store_name: str, reports: List[str] = None):
         # Исключаем 1c_stocks из списка по умолчанию.
-        all_reports = ['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords']
+        all_reports = ['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords', 'agent_catalog']
         disabled_for_finick = {'finance', 'keywords'}
 
         if reports is None:
@@ -3615,6 +4168,14 @@ STORE_MARKETPLACE_SECRET_ENV = {
     'TOPFACE': 'WB_MARKETPLACE_KEY_TOPFACE',
     'MISSTAIS': 'WB_MARKETPLACE_KEY_MISSTAIS',
     'FINICK': 'FINICK_API_WB',
+}
+
+# Для карточек/характеристик/медиа ИИ-агента нужен токен категории Content.
+# Если отдельный токен не задан, пробуем основной токен магазина.
+STORE_CONTENT_SECRET_ENV = {
+    'TOPFACE': 'WB_CONTENT_KEY_TOPFACE',
+    'MISSTAIS': 'WB_CONTENT_KEY_MISSTAIS',
+    'FINICK': 'WB_CONTENT_KEY_FINICK',
 }
 
 # Новый финансовый API с 15 июля требует токен категории Finance.
@@ -3695,11 +4256,26 @@ def build_api_keys_for_stores(stores: List[str]) -> Dict[str, Dict[str, str]]:
             marketplace_key_value = key_value
             print(f"ℹ️ Для {store} отдельный Marketplace/FBS token не задан, пробуем основной токен {secret_env}")
 
+        content_secret_env = STORE_CONTENT_SECRET_ENV.get(store)
+        content_key_value = os.environ.get(content_secret_env or '', '').strip() if content_secret_env else ''
+        if content_key_value:
+            if content_secret_env == secret_env:
+                print(f"✅ Для {store} основной токен {secret_env} используется для Content API")
+            else:
+                print(f"✅ Для {store} используется отдельный Content token: {content_secret_env}")
+        else:
+            content_key_value = key_value
+            print(
+                f"ℹ️ Для {store} отдельный Content token не задан, пробуем основной токен {secret_env}. "
+                f"Для agent_catalog у него должна быть категория Content."
+            )
+
         api_keys[store] = {
             'promo': key_value,
             'stats': key_value,
             'finance': finance_key_value,
             'marketplace': marketplace_key_value,
+            'content': content_key_value,
         }
     return api_keys
 
@@ -3729,7 +4305,7 @@ def show_menu() -> int:
 
 def run_specific_report(updater: WildberriesDailyUpdater, store: str):
     """Подменю для выбора конкретного отчёта."""
-    reports = ['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords']
+    reports = ['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords', 'agent_catalog']
     print("\n" + "="*60)
     print("ДОСТУПНЫЕ ОТЧЁТЫ:")
     for i, report in enumerate(reports, 1):
@@ -3765,7 +4341,7 @@ def main():
     """Основная функция запуска с поддержкой меню и магазинов TOPFACE/MISSTAIS/FINICK/ALL."""
     parser = argparse.ArgumentParser(description='Wildberries Daily Updater')
     parser.add_argument('--full', action='store_true', help='Полное ежедневное обновление (все отчёты)')
-    parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords'],
+    parser.add_argument('--report', type=str, choices=['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords', 'agent_catalog'],
                         help='Обновить конкретный отчёт')
     parser.add_argument('--store', type=str, default='TOPFACE', help='Магазин: TOPFACE, MISSTAIS, FINICK или ALL')
 
