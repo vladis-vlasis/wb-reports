@@ -1,12 +1,20 @@
-# version: v41_fbs_adverts_lag14
+# version: v42_agent_catalog_manual_only
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
-name: Ежедневное обновление данных
+name: Ежедневное обновление данных + ручной каталог ИИ
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Что запустить"
+        required: true
+        default: "DAILY_WITHOUT_AGENT_CATALOG"
+        type: choice
+        options:
+          - DAILY_WITHOUT_AGENT_CATALOG
+          - AGENT_CATALOG
       store:
         description: "Магазин"
         required: true
@@ -23,6 +31,8 @@ on:
         default: ""
         type: string
 
+  # Автоматический cron сохраняем для обычных ежедневных отчётов.
+  # Каталог ИИ (agent_catalog) через schedule НЕ запускается — только вручную.
   schedule:
     # GitHub cron работает в UTC. Москва = UTC+3.
     # Частые попытки после обновления данных WB:
@@ -51,6 +61,7 @@ jobs:
 
     env:
       TZ: Europe/Moscow
+      MODE_INPUT: ${{ github.event.inputs.mode || 'DAILY_WITHOUT_AGENT_CATALOG' }}
       STORE_INPUT: ${{ github.event.inputs.store || 'ALL' }}
       TARGET_DATE_INPUT: ${{ github.event.inputs.target_date || '' }}
 
@@ -66,6 +77,9 @@ jobs:
       WB_MARKETPLACE_KEY_MISSTAIS: ${{ secrets.WB_MARKETPLACE_KEY_MISSTAIS }}
       WB_FINANCE_KEY_TOPFACE: ${{ secrets.WB_FINANCE_KEY_TOPFACE }}
       WB_FINANCE_KEY_MISSTAIS: ${{ secrets.WB_FINANCE_KEY_MISSTAIS }}
+      WB_CONTENT_KEY_TOPFACE: ${{ secrets.WB_CONTENT_KEY_TOPFACE }}
+      WB_CONTENT_KEY_MISSTAIS: ${{ secrets.WB_CONTENT_KEY_MISSTAIS }}
+      WB_CONTENT_KEY_FINICK: ${{ secrets.WB_CONTENT_KEY_FINICK }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       TORGSTAT_ABC_URL: ${{ secrets.TORGSTAT_ABC_URL }}
@@ -78,9 +92,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "YML_VERSION=v41_fbs_adverts_lag14"
+          echo "YML_VERSION=v42_agent_catalog_manual_only"
           echo "github.event_name=${{ github.event_name }}"
           echo "github.event.schedule=${{ github.event.schedule }}"
+          echo "MODE_INPUT=${MODE_INPUT}"
           echo "STORE_INPUT=${STORE_INPUT}"
           echo "UTC now=$(date -u '+%Y-%m-%d %H:%M:%S')"
           TZ=Europe/Moscow date '+MSK now=%Y-%m-%d %H:%M:%S'
@@ -109,6 +124,9 @@ jobs:
               "WB_MARKETPLACE_KEY_MISSTAIS",
               "WB_FINANCE_KEY_TOPFACE",
               "WB_FINANCE_KEY_MISSTAIS",
+              "WB_CONTENT_KEY_TOPFACE",
+              "WB_CONTENT_KEY_MISSTAIS",
+              "WB_CONTENT_KEY_FINICK",
               "TELEGRAM_BOT_TOKEN",
               "TELEGRAM_CHAT_ID",
               "TORGSTAT_ABC_URL",
@@ -271,12 +289,66 @@ jobs:
           set -euo pipefail
           python -m py_compile ezhednevnoe_obnovlenie_dannyh.py
 
-      - name: Run daily update
+      - name: Run selected mode
         shell: bash
         run: |
           set -euo pipefail
-          echo "Running daily update for STORE_INPUT=${STORE_INPUT}, WB_TARGET_DATE=${WB_TARGET_DATE}"
-          python ezhednevnoe_obnovlenie_dannyh.py --full --store "$STORE_INPUT"
+
+          # Scheduled runs NEVER export the AI product catalog.
+          # agent_catalog is available only from workflow_dispatch -> AGENT_CATALOG.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            MODE="DAILY_WITHOUT_AGENT_CATALOG"
+          else
+            MODE="${MODE_INPUT}"
+          fi
+
+          echo "Run mode=${MODE}, store=${STORE_INPUT}, WB_TARGET_DATE=${WB_TARGET_DATE}"
+
+          if [ "$MODE" = "AGENT_CATALOG" ]; then
+            echo "Manual AI catalog export: cards, characteristics, media and photos"
+            python ezhednevnoe_obnovlenie_dannyh.py --report agent_catalog --store "$STORE_INPUT"
+          else
+            # Preserve the normal daily workflow, but explicitly exclude agent_catalog.
+            # We call run_daily_update with an explicit report list so the Python --full
+            # list may contain agent_catalog without causing daily photo/card exports.
+            python - <<'PY'
+          import os
+          import sys
+          import ezhednevnoe_obnovlenie_dannyh as wb
+
+          store_arg = wb.normalize_store_name(os.environ.get("STORE_INPUT", "ALL"))
+          stores = list(wb.STORE_SECRET_ENV.keys()) if store_arg == "ALL" else [store_arg]
+
+          s3 = wb.S3Storage(
+              access_key=os.environ["YC_ACCESS_KEY_ID"],
+              secret_key=os.environ["YC_SECRET_ACCESS_KEY"],
+              bucket_name=os.environ["YC_BUCKET_NAME"],
+          )
+          api_keys = wb.build_api_keys_for_stores(stores)
+          updater = wb.WildberriesDailyUpdater(api_keys, s3)
+
+          daily_reports = [
+              "orders",
+              "stocks",
+              "fbs_orders",
+              "fbs_stocks",
+              "finance",
+              "funnel",
+              "adverts",
+              "keywords",
+          ]
+
+          overall = True
+          for idx, store in enumerate(stores, start=1):
+              updater.log(f"===== Магазин {idx}/{len(stores)}: {store} =====")
+              ok = updater.run_daily_update(store, reports=daily_reports)
+              if ok is False:
+                  overall = False
+
+          if not overall:
+              sys.exit(1)
+          PY
+          fi
 
       - name: Write schedule marker after success
         if: success() && github.event_name == 'schedule'
@@ -296,7 +368,7 @@ jobs:
 
           key = os.environ["SCHEDULE_LOCK_KEY"]
           payload = {
-              "workflow_version": "v41_fbs_adverts_lag14",
+              "workflow_version": "v42_agent_catalog_manual_only",
               "target_date": os.environ.get("WB_TARGET_DATE"),
               "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
               "store_input": os.environ.get("STORE_INPUT"),
