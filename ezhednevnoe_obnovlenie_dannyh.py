@@ -12,7 +12,7 @@
 Реклама: каждый день заново получает последние 14 дат статистики и хранит ежедневные снимки для анализа лага.
 Отчёт 1c_stocks временно исключён из списка (можно вернуть позже).
 Добавлен agent_catalog: единый ZIP для ИИ-агента с карточками WB, характеристиками, размерами, фото и AI-friendly паспортом по каждому артикулу продавца.
-Для TOPFACE/MISSTAIS используются основные WB-токены; FBS по этим магазинам собирается только по подтверждённым складам в Липецке (ID 1728667/1935990). Для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB; finance и keywords для FINICK отключены. FINICK при первом запуске догружает 7 полностью завершённых недель истории (без текущей недели) для доступных исторических отчётов.
+Для TOPFACE/MISSTAIS используются основные WB-токены; FBS по этим магазинам собирается только по подтверждённым складам в Липецке (ID 1728667/1935990). Для Finance можно задать отдельные WB_FINANCE_KEY_TOPFACE/WB_FINANCE_KEY_MISSTAIS. Для FINICK используется FINICK_API_WB; finance для FINICK отключён. Keywords для FINICK включены после подключения Джем: лимит топа поисковых запросов 30, для остальных магазинов — 100. FINICK при первом запуске догружает 7 полностью завершённых недель истории (без текущей недели) для доступных исторических отчётов.
 """
 
 import os
@@ -43,7 +43,7 @@ import pytz
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-SCRIPT_VERSION = "2026-08-11_v42_AGENT_CATALOG_ARCHIVE"
+SCRIPT_VERSION = "2026-08-12_v43_FINICK_JAM_KEYWORDS"
 
 # Для TOPFACE и MISSTAIS FBS собираем только с двух подтверждённых липецких
 # складов продавца. Набор общий намеренно: токен каждого магазина видит только
@@ -51,6 +51,13 @@ SCRIPT_VERSION = "2026-08-11_v42_AGENT_CATALOG_ARCHIVE"
 # Все остальные FBS-склады этих магазинов игнорируются. FINICK не ограничиваем.
 FBS_LIPETSK_WAREHOUSE_IDS = {1728667, 1935990}
 FBS_LIPETSK_ONLY_STORES = {'TOPFACE', 'MISSTAIS'}
+
+# Лимит количества поисковых фраз в ответе search-texts зависит от тарифа Джем.
+# FINICK подключён на тарифе с максимумом 30; TOPFACE/MISSTAIS используют лимит 100.
+KEYWORDS_SEARCH_TEXT_LIMIT_DEFAULT = 100
+KEYWORDS_SEARCH_TEXT_LIMIT_BY_STORE = {
+    'FINICK': 30,
+}
 
 
 def parse_date_yyyy_mm_dd(value: str) -> datetime.date:
@@ -1225,6 +1232,15 @@ class WildberriesDailyUpdater:
         self.log(f"✅ Финансовые показатели обновлены. Загружено дней: {total_loaded_days}, строк: {total_loaded_rows}")
         return True
 
+    def _get_keywords_search_text_limit(self, store_name: str) -> int:
+        """Лимит top search texts для магазина по тарифу Джем."""
+        limit = KEYWORDS_SEARCH_TEXT_LIMIT_BY_STORE.get(
+            store_name,
+            KEYWORDS_SEARCH_TEXT_LIMIT_DEFAULT,
+        )
+        self.log(f"🔎 Лимит поисковых запросов для {store_name}: {limit}")
+        return limit
+
     # ---------- Повторные попытки для поисковых запросов ----------
     def _retry_keyword_errors(self, store_name: str):
         if not self.keyword_errors:
@@ -1234,6 +1250,7 @@ class WildberriesDailyUpdater:
         api_key = self.api_keys[store_name]['promo']
         headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
         url = self.reports_config['keywords']['api_url']
+        search_text_limit = self._get_keywords_search_text_limit(store_name)
         filters = ["orders", "openCard", "addToCart"]
 
         # Группируем по дате и фильтру
@@ -1258,7 +1275,7 @@ class WildberriesDailyUpdater:
                     "includeSubstitutedSKUs": False,
                     "includeSearchTexts": True,
                     "orderBy": {"field": "avgPosition", "mode": "asc"},
-                    "limit": 30
+                    "limit": search_text_limit
                 }
                 max_retries = 5
                 for attempt in range(max_retries):
@@ -1397,6 +1414,7 @@ class WildberriesDailyUpdater:
         api_key = self.api_keys[store_name]['promo']
         headers = {"Authorization": f"Bearer {api_key.strip()}", "Content-Type": "application/json"}
         url = self.reports_config['keywords']['api_url']
+        search_text_limit = self._get_keywords_search_text_limit(store_name)
 
         self.keyword_errors = []
         new_data = []
@@ -1421,7 +1439,7 @@ class WildberriesDailyUpdater:
                     "includeSubstitutedSKUs": False,
                     "includeSearchTexts": True,
                     "orderBy": {"field": "avgPosition", "mode": "asc"},
-                    "limit": 30
+                    "limit": search_text_limit
                 }
 
                 max_retries = 5
@@ -4100,7 +4118,7 @@ class WildberriesDailyUpdater:
     def run_daily_update(self, store_name: str, reports: List[str] = None):
         # Исключаем 1c_stocks из списка по умолчанию.
         all_reports = ['orders', 'stocks', 'fbs_orders', 'fbs_stocks', 'finance', 'funnel', 'adverts', 'keywords', 'agent_catalog']
-        disabled_for_finick = {'finance', 'keywords'}
+        disabled_for_finick = {'finance'}
 
         if reports is None:
             reports = list(all_reports)
@@ -4319,10 +4337,10 @@ def run_specific_report(updater: WildberriesDailyUpdater, store: str):
                 return
             if 1 <= choice <= len(reports):
                 selected = reports[choice-1]
-                if store == "FINICK" and selected in {'finance', 'keywords'}:
+                if store == "FINICK" and selected == 'finance':
                     updater.log(
                         f"⏭️ Отчёт {selected} для FINICK временно отключён: "
-                        f"нет необходимого доступа/подписки."
+                        f"финансовый метод для этого магазина пока не подключён."
                     )
                     return
                 updater.log(f"➡️ Запуск обновления отчёта: {selected}")
@@ -4376,10 +4394,10 @@ def main():
         if args.full:
             return updater.run_daily_update(store)
         if args.report:
-            if store == "FINICK" and args.report in {'finance', 'keywords'}:
+            if store == "FINICK" and args.report == 'finance':
                 updater.log(
                     f"⏭️ Отчёт {args.report} для FINICK временно отключён: "
-                    f"нет необходимого доступа/подписки. Другие магазины не затронуты."
+                    f"финансовый метод для этого магазина пока не подключён. Другие магазины не затронуты."
                 )
                 return True
             updater.log(f"➡️ Запуск обновления отчёта: {args.report} | магазин {store}")
