@@ -1,4 +1,4 @@
-# version: v42_agent_catalog_manual_only
+# version: v43_finick_jam_keywords
 # Заменить файл в репозитории:
 # .github/workflows/01_ezhednevnoe_obnovlenie_dannyh.yml
 
@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "YML_VERSION=v42_agent_catalog_manual_only"
+          echo "YML_VERSION=v43_finick_jam_keywords"
           echo "github.event_name=${{ github.event_name }}"
           echo "github.event.schedule=${{ github.event.schedule }}"
           echo "MODE_INPUT=${MODE_INPUT}"
@@ -368,7 +368,7 @@ jobs:
 
           key = os.environ["SCHEDULE_LOCK_KEY"]
           payload = {
-              "workflow_version": "v42_agent_catalog_manual_only",
+              "workflow_version": "v43_finick_jam_keywords",
               "target_date": os.environ.get("WB_TARGET_DATE"),
               "target_date_rule": os.environ.get("TARGET_DATE_RULE"),
               "store_input": os.environ.get("STORE_INPUT"),
